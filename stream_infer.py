@@ -51,7 +51,7 @@ def read_tensors_direct(filepath, tensor_names, header_cache, file_handle_cache=
     - BF16 -> read as uint16, shift to float32, cast to bfloat16
 
     If file_handle_cache is provided (dict), file handles are kept open across calls
-    to avoid ~3456 open/close cycles per token (72 tensors × 48 layers).
+    to avoid thousands of open/close cycles per token (many tensors x many layers).
     """
     if filepath not in header_cache:
         header_cache[filepath] = parse_safetensors_header(filepath)
@@ -491,7 +491,7 @@ def manual_forward(model, input_ids, cache):
     h = text_model.embed_tokens(input_ids)
 
     # Create masks (same logic as the model)
-    from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
     fa_mask = create_attention_mask(h, cache[text_model.fa_idx])
     ssm_mask = create_ssm_mask(h, cache[text_model.ssm_idx])
 
@@ -522,7 +522,7 @@ def manual_forward_layerwise(model, input_ids, cache, weight_index=None, file_ca
     h = text_model.embed_tokens(input_ids)
     mx.eval(h)
 
-    from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
     fa_mask = create_attention_mask(h, cache[text_model.fa_idx])
     ssm_mask = create_ssm_mask(h, cache[text_model.ssm_idx])
 
@@ -834,7 +834,7 @@ def generate_offload(model, tokenizer, prompt, max_tokens, weight_index, model_p
 
     For each token:
       1. Embed (weights already pinned in DRAM)
-      2. For each of 48 layers:
+      2. For each layer:
          a. Load layer weights from safetensors (~1.3GB)
          b. Run layer forward pass
          c. Clear layer weights (replace with tiny dummies)
@@ -847,7 +847,7 @@ def generate_offload(model, tokenizer, prompt, max_tokens, weight_index, model_p
     If lazy_eval=True, skip mx.eval(layers[i].parameters()) after load_weights.
     This leaves weights as lazy mmap'd references. The subsequent layer forward
     pass + mx.eval(h) should only page in the expert weights actually accessed
-    by the router (~40MB for 8/256 experts) instead of all ~1.3GB per layer.
+    by the router (only active experts) instead of all experts per layer.
     """
     t_start = time.time()
 
@@ -865,7 +865,7 @@ def generate_offload(model, tokenizer, prompt, max_tokens, weight_index, model_p
     peak_mem = get_mem_gb()
     file_cache = {}  # Cache mx.load() dicts across tokens to avoid re-parsing safetensors headers
 
-    from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     for token_idx in range(max_tokens):
         t_token_start = time.time()
@@ -1052,7 +1052,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
     For each token, for each layer:
       Phase 2: Run attention + router (weights already resident, no loading needed)
-      Phase 3: Load ONLY the 8 selected expert slices (~40MB), run MoE computation
+      Phase 3: Load ONLY the selected expert slices, run MoE computation
       Phase 4: Clear only expert weights (keep attention/norms/shared_expert resident)
 
     This reduces per-token I/O to just expert slices (~40MB/layer), eliminating the
@@ -1073,7 +1073,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     all_layer_timings = []
     peak_mem = get_mem_gb()
 
-    from mlx_lm.models.qwen3_5 import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     # === Pre-load all non-expert weights using DIRECT I/O (not mmap) ===
     # mmap-backed arrays get evicted from page cache when expert weights are loaded.
@@ -1113,13 +1113,15 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     print(f"  Pre-loaded non-expert weights for {num_layers} layers in {preload_time:.1f}s ({get_mem_gb():.1f}GB)")
 
     # === File handle cache: keep safetensors files open for duration of inference ===
-    # Avoids ~3456 open/close cycles per token (72 tensor reads × 48 layers).
+    # Avoids thousands of open/close cycles per token (many tensor reads per layer).
     file_handle_cache = {}
 
     # === LRU cache for expert weight slices ===
-    # 3072 entries = 48 layers × 8 experts × 8 tokens worth. ~15.2GB max.
-    # ~5% faster than 1536 entries (2.67 vs 2.54 tok/s) at cost of higher memory.
-    expert_cache = ExpertCache(max_entries=3072)
+    # Size = num_layers * active_experts_per_token * 8 tokens worth of history.
+    # E.g., 48 layers * 8 experts * 8 = 3072 (122B), or 60 * 10 * 8 = 4800 (397B).
+    active_experts = lm.args.num_experts_per_tok
+    cache_entries = num_layers * active_experts * 8
+    expert_cache = ExpertCache(max_entries=cache_entries)
 
     # === Cache quantization parameters from model config (read once) ===
     # These are needed by compute_moe_direct for mx.gather_qmm calls.
@@ -1302,9 +1304,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
         all_layer_timings.append(layer_timings)
 
-        # Free Metal memory from stacked expert tensor copies accumulated across 48 layers.
+        # Free Metal memory from stacked expert tensor copies accumulated across all layers.
         # Direct MoE doesn't mutate model weights (no dummy-weight clearing needed), but
-        # the Metal allocator still holds dead stacked-tensor memory (~40MB/layer x 48 = ~1.9GB).
+        # the Metal allocator still holds dead stacked-tensor memory (~40MB/layer x num_layers).
         # Without clear_cache(), memory pressure triggers OS paging that slows file I/O.
         t_clear = time.time()
         mx.clear_cache()
@@ -1586,8 +1588,8 @@ def main():
                              "offload=per-layer load/compute/clear for models larger than DRAM, "
                              "offload_lazy=like offload but skips mx.eval(params) so only "
                              "accessed expert pages are read via lazy mmap (~40MB vs ~1.3GB/layer), "
-                             "offload_selective=run router first, then load only 8/256 selected "
-                             "expert slices per layer (~40MB vs ~1.3GB, ~32x I/O reduction)")
+                             "offload_selective=run router first, then load only selected "
+                             "expert slices per layer (large I/O reduction vs full layer load)")
     parser.add_argument("--max-mem-gb", type=float, default=40.0,
                         help="Abort if RSS exceeds this (GB)")
     args = parser.parse_args()
@@ -1665,8 +1667,8 @@ def main():
     if args.mode == "baseline":
         result = generate_baseline(model, tokenizer, args.prompt, args.tokens)
     elif args.mode == "offload_selective":
-        # Selective offload: run attention+router first, then load only 8/256 expert slices.
-        # ~32x I/O reduction vs full offload (~40MB vs ~1.3GB per layer).
+        # Selective offload: run attention+router first, then load only selected expert slices.
+        # Large I/O reduction vs full offload (only active experts loaded per layer).
         result = generate_offload_selective(model, tokenizer, args.prompt, args.tokens,
                                             weight_index, model_path)
     elif args.mode in ("offload", "offload_lazy"):
