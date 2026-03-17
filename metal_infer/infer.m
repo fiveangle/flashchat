@@ -824,18 +824,29 @@ static void full_attention_forward(
     KVCache *kv,
     int pos              // position in sequence
 ) {
-    (void)fa_debug_count; fa_debug_count++;
+    fa_debug_count++;
+    int do_debug = 0;  // set to (fa_debug_count <= N) to enable debug
 
     char name[256];
     float *normed = malloc(HIDDEN_DIM * sizeof(float));
     float *residual = malloc(HIDDEN_DIM * sizeof(float));
     cpu_vec_copy(residual, hidden, HIDDEN_DIM);
 
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] layer=%d pos=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, pos, vec_rms(hidden, HIDDEN_DIM),
+                hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+    }
 
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
     uint16_t *norm_w = get_tensor_ptr(wf, name);
     cpu_rms_norm(hidden, norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] normed_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(normed, HIDDEN_DIM), normed[0], normed[1], normed[2], normed[3], normed[4]);
+    }
 
     // ---- QKV Projection ----
     // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
@@ -856,6 +867,11 @@ static void full_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", layer_idx);
     uint16_t *qb = get_tensor_ptr(wf, name);
     if (qw && qs && qb) fast_dequant_matvec(qw, qs, qb, normed, q_proj_out, q_proj_dim, HIDDEN_DIM, GROUP_SIZE);
+
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] q_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                q_proj_out[0], q_proj_out[1], q_proj_out[2], q_proj_out[3], q_proj_out[4]);
+    }
 
     // Split q_proj_out into queries and gate
     // MLX does: q_proj_output.reshape(B, L, num_heads, 2*head_dim) then split(2, axis=-1)
@@ -889,6 +905,19 @@ static void full_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", layer_idx);
     uint16_t *vb = get_tensor_ptr(wf, name);
     if (vw && vs && vb) fast_dequant_matvec(vw, vs, vb, normed, v, kv_dim, HIDDEN_DIM, GROUP_SIZE);
+
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] v_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(v, kv_dim), v[0], v[1], v[2], v[3], v[4]);
+        fprintf(stderr, "[FA-DBG] q_gate_rms=%.6f gate_first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(q_gate, q_dim), q_gate[0], q_gate[1], q_gate[2], q_gate[3], q_gate[4]);
+        // Check sigmoid(gate) stats
+        float gate_sigmoid_sum = 0.0f;
+        for (int i = 0; i < q_dim; i++) {
+            gate_sigmoid_sum += 1.0f / (1.0f + expf(-q_gate[i]));
+        }
+        fprintf(stderr, "[FA-DBG] gate_sigmoid_mean=%.6f\n", gate_sigmoid_sum / q_dim);
+    }
 
     // ---- Q/K RMSNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
@@ -987,9 +1016,21 @@ static void full_attention_forward(
     uint16_t *ob = get_tensor_ptr(wf, name);
     if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE);
 
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] attn_out_rms=%.6f o_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(attn_out, q_dim),
+                attn_projected[0], attn_projected[1], attn_projected[2], attn_projected[3], attn_projected[4]);
+    }
+
     // ---- Residual connection ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = residual[i] + attn_projected[i];
+    }
+
+    if (do_debug) {
+        fprintf(stderr, "[FA-DBG] AFTER layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, vec_rms(hidden, HIDDEN_DIM),
+                hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 
     free(normed);
@@ -1039,6 +1080,16 @@ static void linear_attention_forward(
     if (linear_attn_bypass) {
         (void)wf; (void)layer_idx; (void)state;
         return;
+    }
+
+    static int la_debug_count = 0;
+    la_debug_count++;
+    int la_debug = 0;  // set to (la_debug_count <= N) to enable debug
+
+    if (la_debug) {
+        fprintf(stderr, "[LA-DBG] layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, vec_rms(hidden, HIDDEN_DIM),
+                hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 
     char name[256];
@@ -1262,6 +1313,13 @@ static void linear_attention_forward(
         hidden[i] = residual[i] + attn_out[i];
     }
 
+    if (la_debug) {
+        fprintf(stderr, "[LA-DBG] AFTER layer=%d out_proj_rms=%.6f gated_rms=%.6f hidden_rms=%.6f\n",
+                layer_idx, vec_rms(attn_out, HIDDEN_DIM),
+                vec_rms(gated_out, LINEAR_TOTAL_VALUE),
+                vec_rms(hidden, HIDDEN_DIM));
+    }
+
     free(normed);
     free(residual);
     free(qkv);
@@ -1278,6 +1336,8 @@ static void linear_attention_forward(
 // MoE forward (routing + expert computation + shared expert)
 // ============================================================================
 
+static int moe_debug_count = 0;
+
 static void moe_forward(
     WeightFile *wf,
     int layer_idx,
@@ -1286,6 +1346,10 @@ static void moe_forward(
     int K,                 // number of active experts (e.g. 4)
     int packed_fd          // fd for this layer's packed expert file (-1 if not available)
 ) {
+    moe_debug_count++;
+    int moe_debug = 0;  // set to (moe_debug_count <= N) to enable debug
+    int moe_dump = 0;
+
     char name[256];
     float *h_post = malloc(HIDDEN_DIM * sizeof(float));
     float *h_mid = malloc(HIDDEN_DIM * sizeof(float));
@@ -1317,6 +1381,12 @@ static void moe_forward(
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+
+    if (moe_dump) {
+        fprintf(stderr, "[MOE-DUMP] routing: K=%d experts=[", K);
+        for (int k = 0; k < K; k++) fprintf(stderr, "%d(%.4f)%s", expert_indices[k], expert_weights[k], k<K-1?",":"");
+        fprintf(stderr, "]\n");
+    }
 
     // ---- Routed expert computation ----
     float *moe_out = calloc(HIDDEN_DIM, sizeof(float));
@@ -1372,6 +1442,11 @@ static void moe_forward(
                                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
 
             // Accumulate weighted
+            if (moe_dump) {
+                fprintf(stderr, "[MOE-DUMP] expert[%d] out_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                        eidx, vec_rms(expert_out, HIDDEN_DIM),
+                        expert_out[0], expert_out[1], expert_out[2], expert_out[3], expert_out[4]);
+            }
             cpu_vec_madd(moe_out, expert_out, expert_weights[k], HIDDEN_DIM);
 
             free(expert_data);
@@ -1416,6 +1491,20 @@ static void moe_forward(
     // SwiGLU
     cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
 
+    if (moe_dump) {
+        fprintf(stderr, "[MOE-DUMP] layer=%d h_post_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                layer_idx, vec_rms(h_post, HIDDEN_DIM), h_post[0], h_post[1], h_post[2], h_post[3], h_post[4]);
+        fprintf(stderr, "[MOE-DUMP] gate_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(shared_gate, SHARED_INTERMEDIATE),
+                shared_gate[0], shared_gate[1], shared_gate[2], shared_gate[3], shared_gate[4]);
+        fprintf(stderr, "[MOE-DUMP] up_proj_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(shared_up, SHARED_INTERMEDIATE),
+                shared_up[0], shared_up[1], shared_up[2], shared_up[3], shared_up[4]);
+        fprintf(stderr, "[MOE-DUMP] swiglu_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(shared_act, SHARED_INTERMEDIATE),
+                shared_act[0], shared_act[1], shared_act[2], shared_act[3], shared_act[4]);
+    }
+
     // shared_expert down_proj
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
     uint32_t *sdw = get_tensor_ptr(wf, name);
@@ -1447,11 +1536,16 @@ static void moe_forward(
         shared_out[i] *= shared_weight;
     }
 
-    // (debug removed)
-
     // ---- Combine: hidden = h_mid + moe_out + shared_out ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
+    }
+
+    if (moe_debug) {
+        fprintf(stderr, "[MOE-DBG] layer=%d h_mid_rms=%.4f moe_rms=%.4f shared_rms=%.4f shared_gate=%.4f hidden_rms=%.4f\n",
+                layer_idx, vec_rms(h_mid, HIDDEN_DIM), vec_rms(moe_out, HIDDEN_DIM),
+                vec_rms(shared_out, HIDDEN_DIM), shared_weight,
+                vec_rms(hidden, HIDDEN_DIM));
     }
 
     free(h_post);
@@ -1855,7 +1949,7 @@ int main(int argc, char **argv) {
                 break;
             }
 
-            // Embed the just-generated token
+            // Embed the just-generated token (next iteration)
             embed_lookup(wf, next_token, hidden);
 
             // Run 60 layers

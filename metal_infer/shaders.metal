@@ -264,7 +264,6 @@ kernel void dequant_matvec_4bit_v3(
 ) {
     // Which output row this SIMD group handles
     uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
 
     uint packed_cols = in_dim / 8;      // uint32 columns per row
     uint num_groups  = in_dim / group_size;
@@ -275,10 +274,16 @@ kernel void dequant_matvec_4bit_v3(
     threadgroup float x_shared[4096];
 
     // Cooperative load: 256 threads load 4096 floats (16 per thread)
+    // ALL threads must participate in this load + barrier, even if their
+    // row is out of bounds. Early return before the barrier causes only
+    // partial loading of x_shared, corrupting results for valid rows.
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Now safe to bail out for out-of-bounds rows
+    if (row >= out_dim) return;
 
     // ---- Pointer setup for this row ----
     device const uint32_t* w_row = W_packed + row * packed_cols;
@@ -360,17 +365,18 @@ kernel void dequant_matvec_4bit_v4(
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
 
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    // Cache input vector
+    // Cache input vector — ALL threads must participate before the barrier
     threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
 
     // Pointers — cast to uint4 for vector loads
     device const uint4* w_row_v = (device const uint4*)(W_packed + row * packed_cols);
