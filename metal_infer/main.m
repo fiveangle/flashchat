@@ -184,6 +184,7 @@ typedef struct {
     id<MTLComputePipelineState> weighted_sum;
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
+    id<MTLComputePipelineState> fused_gate_up;
 } MetalContext;
 
 static MetalContext *metal_init(void) {
@@ -308,6 +309,7 @@ static MetalContext *metal_init(void) {
     ctx->weighted_sum   = makePipeline(@"weighted_sum");
     ctx->rms_norm_sum   = makePipeline(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipeline(@"rms_norm_apply");
+    ctx->fused_gate_up  = makePipeline(@"fused_gate_up_swiglu");
 
     // Required pipelines (v3 is the primary optimized path)
     if (!ctx->matvec_naive || !ctx->matvec_v3 || !ctx->swiglu ||
