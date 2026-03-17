@@ -518,38 +518,237 @@ static void cpu_conv1d_step(
 }
 
 // ============================================================================
+// Metal context for GPU-accelerated matmuls
+// ============================================================================
+
+typedef struct {
+    id<MTLDevice>               device;
+    id<MTLCommandQueue>         queue;
+    id<MTLLibrary>              library;
+    id<MTLComputePipelineState> matvec_v3;
+    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
+    id<MTLComputePipelineState> rms_norm_sum;
+    id<MTLComputePipelineState> rms_norm_apply;
+    // Reusable buffers for attention matmuls
+    id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
+    id<MTLBuffer> buf_output;    // output vector [max projection output]
+    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer
+} MetalCtx;
+
+static MetalCtx *g_metal = NULL;
+
+static MetalCtx *metal_setup(void) {
+    MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
+    ctx->device = MTLCreateSystemDefaultDevice();
+    if (!ctx->device) {
+        fprintf(stderr, "ERROR: No Metal device\n");
+        free(ctx); return NULL;
+    }
+    printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
+
+    ctx->queue = [ctx->device newCommandQueue];
+    if (!ctx->queue) {
+        fprintf(stderr, "ERROR: No command queue\n");
+        free(ctx); return NULL;
+    }
+
+    // Compile shaders from source
+    NSError *error = nil;
+    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+    NSString *src = nil;
+    for (NSString *p in paths) {
+        src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+        if (src) break;
+    }
+    if (!src) {
+        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+        free(ctx); return NULL;
+    }
+
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.mathMode = MTLMathModeFast;
+    opts.languageVersion = MTLLanguageVersion3_1;
+    double t0 = now_ms();
+    ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
+    if (!ctx->library) {
+        fprintf(stderr, "ERROR: Shader compile failed: %s\n",
+                [[error localizedDescription] UTF8String]);
+        free(ctx); return NULL;
+    }
+    printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+
+    // Create pipelines
+    id<MTLComputePipelineState> (^makePipe)(NSString *) = ^(NSString *name) {
+        id<MTLFunction> fn = [ctx->library newFunctionWithName:name];
+        if (!fn) { fprintf(stderr, "ERROR: shader '%s' not found\n", [name UTF8String]); return (id<MTLComputePipelineState>)nil; }
+        NSError *e2 = nil;
+        id<MTLComputePipelineState> ps = [ctx->device newComputePipelineStateWithFunction:fn error:&e2];
+        if (!ps) { fprintf(stderr, "ERROR: pipeline '%s': %s\n", [name UTF8String], [[e2 localizedDescription] UTF8String]); }
+        return ps;
+    };
+
+    ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
+    ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
+
+    if (!ctx->matvec_v3 || !ctx->matvec_fast) {
+        fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
+        free(ctx); return NULL;
+    }
+
+    // Allocate reusable buffers (large enough for biggest projection)
+    // Q proj output is 16384 floats, lm_head output is 248320 floats
+    // o_proj input is 8192, linear attn out_proj input is 8192
+    size_t max_out = VOCAB_SIZE * sizeof(float);  // lm_head is largest
+    size_t max_in = LINEAR_TOTAL_VALUE * sizeof(float);  // 8192 floats (linear_attn out_proj)
+    if (max_in < (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float)) {
+        max_in = (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float);  // o_proj input = 8192
+    }
+    ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
+    ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
+
+    printf("[metal] Inference pipelines ready\n");
+    return ctx;
+}
+
+// Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
+// mmap returns page-aligned addresses, Metal requires the same.
+// On Apple Silicon, page size is 16KB.
+static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
+    // Round size up to page boundary (16KB)
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+
+    ctx->wf_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                 length:aligned_size
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+    if (!ctx->wf_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap weight file as Metal buffer (size=%.2f GB)\n",
+                size / 1e9);
+        fprintf(stderr, "  data=%p, aligned_size=%zu -- GPU matmul will fall back to CPU\n",
+                data, aligned_size);
+    } else {
+        printf("[metal] Weight file wrapped as Metal buffer (%.2f GB)\n",
+               aligned_size / 1e9);
+    }
+}
+
+// GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
+// W_packed, scales, biases are pointers into mmap'd weight file
+// x_f32 is CPU float array, result written back to out_f32
+//
+// We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
+// byte offsets to point each shader argument at the right tensor.
+// This avoids per-tensor buffer creation and the page-alignment constraint.
+static void gpu_dequant_matvec(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+) {
+    // Copy input to Metal buffer
+    memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+
+    // Compute offsets into the mmap'd weight buffer
+    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+
+    // Ensure output buffer is large enough
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+
+    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
+    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
+    int use_v3 = (in_dim <= 4096);
+    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
+    [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+    [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
+    [enc setBuffer:o_buf        offset:0     atIndex:4];
+    [enc setBytes:&out_dim      length:4     atIndex:5];
+    [enc setBytes:&in_dim       length:4     atIndex:6];
+    [enc setBytes:&group_size   length:4     atIndex:7];
+
+    if (use_v3) {
+        // v3: tiled threadgroups, 256 threads, 8 rows per TG
+        uint32_t num_tgs = (out_dim + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else {
+        // fast: one threadgroup per output row, 64 threads per TG
+        NSUInteger tg_size = 64;
+        [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    }
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    // Copy result back
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
+// Wrapper: use GPU if available and weight buffer is set, CPU otherwise
+static void fast_dequant_matvec(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    if (g_metal && g_metal->wf_buf) {
+        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
+                           (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
+// ============================================================================
 // Rotary position embedding (for full attention layers)
 // ============================================================================
 
 static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
                               int head_dim, int rotary_dim) {
     // Apply RoPE to the first rotary_dim dimensions of each head
+    // NON-TRADITIONAL (MLX default): pairs are (x[i], x[i + half_dim])
+    // where half_dim = rotary_dim / 2
+    int half = rotary_dim / 2;
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
-        for (int i = 0; i < rotary_dim / 2; i++) {
+        for (int i = 0; i < half; i++) {
             float freq = 1.0f / powf(ROPE_THETA, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
-            float q0 = qh[2 * i];
-            float q1 = qh[2 * i + 1];
-            qh[2 * i]     = q0 * cos_a - q1 * sin_a;
-            qh[2 * i + 1] = q0 * sin_a + q1 * cos_a;
+            float q0 = qh[i];
+            float q1 = qh[i + half];
+            qh[i]        = q0 * cos_a - q1 * sin_a;
+            qh[i + half]  = q0 * sin_a + q1 * cos_a;
         }
     }
     for (int h = 0; h < num_kv_heads; h++) {
         float *kh = k + h * head_dim;
-        for (int i = 0; i < rotary_dim / 2; i++) {
+        for (int i = 0; i < half; i++) {
             float freq = 1.0f / powf(ROPE_THETA, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
-            float k0 = kh[2 * i];
-            float k1 = kh[2 * i + 1];
-            kh[2 * i]     = k0 * cos_a - k1 * sin_a;
-            kh[2 * i + 1] = k0 * sin_a + k1 * cos_a;
+            float k0 = kh[i];
+            float k1 = kh[i + half];
+            kh[i]        = k0 * cos_a - k1 * sin_a;
+            kh[i + half]  = k0 * sin_a + k1 * cos_a;
         }
     }
 }
@@ -610,6 +809,14 @@ static void linear_attn_state_free(LinearAttnState *s) {
 // Full attention layer forward (single token, incremental)
 // ============================================================================
 
+static int fa_debug_count = 0;
+
+static float vec_rms(const float *v, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += v[i] * v[i];
+    return sqrtf(sum / n);
+}
+
 static void full_attention_forward(
     WeightFile *wf,
     int layer_idx,
@@ -617,10 +824,13 @@ static void full_attention_forward(
     KVCache *kv,
     int pos              // position in sequence
 ) {
+    (void)fa_debug_count; fa_debug_count++;
+
     char name[256];
     float *normed = malloc(HIDDEN_DIM * sizeof(float));
     float *residual = malloc(HIDDEN_DIM * sizeof(float));
     cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+
 
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
@@ -628,21 +838,39 @@ static void full_attention_forward(
     cpu_rms_norm(hidden, norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
 
     // ---- QKV Projection ----
-    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;     // 32 * 256 = 8192
-    int kv_dim = NUM_KV_HEADS * HEAD_DIM;      // 2 * 256 = 512
+    // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
+    // The second half is a sigmoid gate applied after attention
+    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // 32 * 256 * 2 = 16384
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 32 * 256 = 8192
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;             // 2 * 256 = 512
 
-    float *q = calloc(q_dim, sizeof(float));
+    float *q_proj_out = calloc(q_proj_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
     float *v = calloc(kv_dim, sizeof(float));
 
-    // Q projection
+    // Q projection (output dim = 16384, includes queries + gate)
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
     uint32_t *qw = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", layer_idx);
     uint16_t *qs = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", layer_idx);
     uint16_t *qb = get_tensor_ptr(wf, name);
-    if (qw && qs && qb) cpu_dequant_matvec(qw, qs, qb, normed, q, q_dim, HIDDEN_DIM, GROUP_SIZE);
+    if (qw && qs && qb) fast_dequant_matvec(qw, qs, qb, normed, q_proj_out, q_proj_dim, HIDDEN_DIM, GROUP_SIZE);
+
+    // Split q_proj_out into queries and gate
+    // MLX does: q_proj_output.reshape(B, L, num_heads, 2*head_dim) then split(2, axis=-1)
+    // So for each head h: queries[h*head_dim .. (h+1)*head_dim] and gate[h*head_dim .. (h+1)*head_dim]
+    // are interleaved per head: [q0_head0, gate0_head0, q0_head1, gate1_head1, ...]
+    // Reshape to [num_heads, 2*head_dim], then split along last dim
+    float *q = calloc(q_dim, sizeof(float));
+    float *q_gate = calloc(q_dim, sizeof(float));  // sigmoid gate per head
+    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+        // Each head has 2*HEAD_DIM values: first HEAD_DIM are queries, next HEAD_DIM are gate
+        float *src = q_proj_out + h * (2 * HEAD_DIM);
+        memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
+        memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+    }
+    free(q_proj_out);
 
     // K projection
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
@@ -651,7 +879,7 @@ static void full_attention_forward(
     uint16_t *ks = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", layer_idx);
     uint16_t *kb = get_tensor_ptr(wf, name);
-    if (kw && ks && kb) cpu_dequant_matvec(kw, ks, kb, normed, k, kv_dim, HIDDEN_DIM, GROUP_SIZE);
+    if (kw && ks && kb) fast_dequant_matvec(kw, ks, kb, normed, k, kv_dim, HIDDEN_DIM, GROUP_SIZE);
 
     // V projection
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
@@ -660,7 +888,7 @@ static void full_attention_forward(
     uint16_t *vs = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", layer_idx);
     uint16_t *vb = get_tensor_ptr(wf, name);
-    if (vw && vs && vb) cpu_dequant_matvec(vw, vs, vb, normed, v, kv_dim, HIDDEN_DIM, GROUP_SIZE);
+    if (vw && vs && vb) fast_dequant_matvec(vw, vs, vb, normed, v, kv_dim, HIDDEN_DIM, GROUP_SIZE);
 
     // ---- Q/K RMSNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
@@ -692,6 +920,7 @@ static void full_attention_forward(
             }
         }
     }
+
 
     // ---- RoPE ----
     apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
@@ -725,9 +954,6 @@ static void full_attention_forward(
             scores[p] = dot * scale;
         }
 
-        // Causal mask: only attend to positions <= current
-        // (Already handled since kv->len only includes positions up to current)
-
         // Softmax
         cpu_softmax(scores, kv->len);
 
@@ -742,6 +968,15 @@ static void full_attention_forward(
         free(scores);
     }
 
+
+    // ---- Apply sigmoid gate to attention output ----
+    // MLX: return self.o_proj(output * mx.sigmoid(gate))
+    // gate is reshaped to [B, L, num_heads*head_dim] = flat [q_dim]
+    for (int i = 0; i < q_dim; i++) {
+        float g = 1.0f / (1.0f + expf(-q_gate[i]));
+        attn_out[i] *= g;
+    }
+
     // ---- Output projection ----
     float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
@@ -750,7 +985,7 @@ static void full_attention_forward(
     uint16_t *os_ptr = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
     uint16_t *ob = get_tensor_ptr(wf, name);
-    if (ow && os_ptr && ob) cpu_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE);
+    if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE);
 
     // ---- Residual connection ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
@@ -760,6 +995,7 @@ static void full_attention_forward(
     free(normed);
     free(residual);
     free(q);
+    free(q_gate);
     free(k);
     free(v);
     free(attn_out);
@@ -791,12 +1027,20 @@ static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w
     }
 }
 
+static int linear_attn_bypass = 0;  // set to 1 to skip linear attention (identity)
+
 static void linear_attention_forward(
     WeightFile *wf,
     int layer_idx,
     float *hidden,           // [HIDDEN_DIM] in/out
     LinearAttnState *state
 ) {
+    // If bypass is enabled, just pass through (identity)
+    if (linear_attn_bypass) {
+        (void)wf; (void)layer_idx; (void)state;
+        return;
+    }
+
     char name[256];
     float *normed = malloc(HIDDEN_DIM * sizeof(float));
     float *residual = malloc(HIDDEN_DIM * sizeof(float));
@@ -818,7 +1062,7 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", layer_idx);
     uint16_t *qkv_b = get_tensor_ptr(wf, name);
     if (qkv_w && qkv_s && qkv_b) {
-        cpu_dequant_matvec(qkv_w, qkv_s, qkv_b, normed, qkv, qkv_dim, HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(qkv_w, qkv_s, qkv_b, normed, qkv, qkv_dim, HIDDEN_DIM, GROUP_SIZE);
     }
 
     // ---- Z projection: normed -> [value_dim] = 8192 ----
@@ -832,7 +1076,7 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", layer_idx);
     uint16_t *z_b = get_tensor_ptr(wf, name);
     if (z_w && z_s && z_b) {
-        cpu_dequant_matvec(z_w, z_s, z_b, normed, z, z_dim, HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(z_w, z_s, z_b, normed, z, z_dim, HIDDEN_DIM, GROUP_SIZE);
     }
 
     // ---- B (beta) projection: normed -> [num_v_heads] = 64 ----
@@ -844,7 +1088,7 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", layer_idx);
     uint16_t *b_b = get_tensor_ptr(wf, name);
     if (b_w && b_s && b_b) {
-        cpu_dequant_matvec(b_w, b_s, b_b, normed, beta, LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(b_w, b_s, b_b, normed, beta, LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
     }
 
     // ---- A (alpha) projection: normed -> [num_v_heads] = 64 ----
@@ -856,7 +1100,7 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", layer_idx);
     uint16_t *a_b = get_tensor_ptr(wf, name);
     if (a_w && a_s && a_b) {
-        cpu_dequant_matvec(a_w, a_s, a_b, normed, alpha, LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(a_w, a_s, a_b, normed, alpha, LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
     }
 
     // ---- Conv1d step ----
@@ -905,13 +1149,15 @@ static void linear_attention_forward(
     }
 
     // ---- Gated delta net recurrence ----
-    // For single-token inference, the recurrence simplifies to:
-    //   For each value head (64 heads):
-    //     decay = sigmoid(-alpha) * exp(-A)   (per head)
-    //     beta_val = sigmoid(beta + dt_bias)  (per head)
-    //     outer_product = beta_val * (v_head outer k_head)
-    //     state = decay * state + outer_product
-    //     output = state @ q_head  (matmul: [v_dim, k_dim] @ [k_dim] -> [v_dim])
+    // From gated_delta.py:
+    //   g = exp(-exp(A_log) * softplus(a + dt_bias))   -- per-head decay
+    //   beta_gate = sigmoid(b)                          -- per-head beta (NO dt_bias)
+    //   For each v_head:
+    //     state = state * g                             -- decay
+    //     kv_mem = sum(state * k, axis=key_dim)         -- predict v from state
+    //     delta = (v - kv_mem) * beta_gate              -- error signal
+    //     state = state + outer(delta, k)               -- update state
+    //     output = sum(state * q, axis=key_dim)         -- read from state
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", layer_idx);
     float *A_log = get_tensor_ptr(wf, name);
@@ -923,32 +1169,54 @@ static void linear_attention_forward(
 
     int k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;  // 64/16 = 4
 
+    // Precompute per-head decay (g) and beta
+    float g_decay[LINEAR_NUM_V_HEADS];
+    float beta_gate[LINEAR_NUM_V_HEADS];
+    for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
+        // g = exp(-exp(A_log) * softplus(a + dt_bias))
+        float a_val = alpha[vh];
+        float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
+        float A_val = A_log ? expf(A_log[vh]) : 1.0f;
+        float softplus_val = logf(1.0f + expf(a_val + dt_b));  // softplus(a + dt_bias)
+        g_decay[vh] = expf(-A_val * softplus_val);
+
+        // beta = sigmoid(b)  (just b, NO dt_bias)
+        beta_gate[vh] = cpu_sigmoid(beta[vh]);
+    }
+
     for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
         int kh = vh / k_heads_per_v;  // which k head this v head maps to
 
-        // Decay factor
-        float a_val = alpha[vh];
-        float A_val = (A_log) ? expf(A_log[vh]) : 1.0f;
-        float decay = cpu_sigmoid(-a_val) * expf(-A_val);
+        float g = g_decay[vh];
+        float b_gate = beta_gate[vh];
 
-        // Beta gate
-        float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
-        float beta_val = cpu_sigmoid(beta[vh] + dt_b);
-
-        // State update: state[vh] = decay * state[vh] + beta_val * (v_h @ k_h^T)
         // state is [head_v_dim, head_k_dim]
         float *S = state->ssm_state + vh * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
         float *v_h = lin_v + vh * LINEAR_VALUE_DIM;
         float *k_h = lin_k + kh * LINEAR_KEY_DIM;
 
+        // Step 1: Decay state
         for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
             for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
-                S[vi * LINEAR_KEY_DIM + ki] = decay * S[vi * LINEAR_KEY_DIM + ki]
-                                              + beta_val * v_h[vi] * k_h[ki];
+                S[vi * LINEAR_KEY_DIM + ki] *= g;
             }
         }
 
-        // Output: out[vh] = S @ q_h
+        // Step 2: Compute kv_mem[vi] = sum_ki(S[vi,ki] * k[ki])
+        // Then delta[vi] = (v[vi] - kv_mem[vi]) * beta
+        // Then state[vi,ki] += k[ki] * delta[vi]
+        for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
+            float kv_mem = 0.0f;
+            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
+                kv_mem += S[vi * LINEAR_KEY_DIM + ki] * k_h[ki];
+            }
+            float delta = (v_h[vi] - kv_mem) * b_gate;
+            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
+                S[vi * LINEAR_KEY_DIM + ki] += k_h[ki] * delta;
+            }
+        }
+
+        // Step 3: Output: y[vi] = sum_ki(S[vi,ki] * q[ki])
         float *q_h = lin_q + kh * LINEAR_KEY_DIM;
         float *o_h = out_values + vh * LINEAR_VALUE_DIM;
         for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
@@ -985,8 +1253,8 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", layer_idx);
     uint16_t *out_b = get_tensor_ptr(wf, name);
     if (out_w && out_s && out_b) {
-        cpu_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
-                           LINEAR_TOTAL_VALUE, GROUP_SIZE);
+        fast_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
+                            LINEAR_TOTAL_VALUE, GROUP_SIZE);
     }
 
     // ---- Residual ----
@@ -1037,8 +1305,8 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", layer_idx);
     uint16_t *gate_b = get_tensor_ptr(wf, name);
     if (gate_w && gate_s && gate_b) {
-        cpu_dequant_matvec(gate_w, gate_s, gate_b, h_post, gate_scores, NUM_EXPERTS,
-                           HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(gate_w, gate_s, gate_b, h_post, gate_scores, NUM_EXPERTS,
+                            HIDDEN_DIM, GROUP_SIZE);
     }
 
     // Softmax routing scores
@@ -1129,8 +1397,8 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
     uint16_t *sgb = get_tensor_ptr(wf, name);
     if (sgw && sgs && sgb) {
-        cpu_dequant_matvec(sgw, sgs, sgb, h_post, shared_gate, SHARED_INTERMEDIATE,
-                           HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(sgw, sgs, sgb, h_post, shared_gate, SHARED_INTERMEDIATE,
+                            HIDDEN_DIM, GROUP_SIZE);
     }
 
     // shared_expert up_proj
@@ -1141,8 +1409,8 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
     uint16_t *sub = get_tensor_ptr(wf, name);
     if (suw && sus && sub) {
-        cpu_dequant_matvec(suw, sus, sub, h_post, shared_up, SHARED_INTERMEDIATE,
-                           HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(suw, sus, sub, h_post, shared_up, SHARED_INTERMEDIATE,
+                            HIDDEN_DIM, GROUP_SIZE);
     }
 
     // SwiGLU
@@ -1156,8 +1424,8 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
     uint16_t *sdb = get_tensor_ptr(wf, name);
     if (sdw && sds && sdb) {
-        cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out, HIDDEN_DIM,
-                           SHARED_INTERMEDIATE, GROUP_SIZE);
+        fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out, HIDDEN_DIM,
+                            SHARED_INTERMEDIATE, GROUP_SIZE);
     }
 
     // ---- Shared expert gate (sigmoid) ----
@@ -1169,8 +1437,8 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
     uint16_t *seg_b = get_tensor_ptr(wf, name);
     if (seg_w && seg_s && seg_b) {
-        cpu_dequant_matvec(seg_w, seg_s, seg_b, h_post, &shared_gate_score, 1,
-                           HIDDEN_DIM, GROUP_SIZE);
+        fast_dequant_matvec(seg_w, seg_s, seg_b, h_post, &shared_gate_score, 1,
+                            HIDDEN_DIM, GROUP_SIZE);
     }
     float shared_weight = cpu_sigmoid(shared_gate_score);
 
@@ -1178,6 +1446,8 @@ static void moe_forward(
     for (int i = 0; i < HIDDEN_DIM; i++) {
         shared_out[i] *= shared_weight;
     }
+
+    // (debug removed)
 
     // ---- Combine: hidden = h_mid + moe_out + shared_out ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
@@ -1267,8 +1537,8 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
-    // Full matmul (slow but correct)
-    cpu_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    // Full matmul — use GPU if available (248320 output rows!)
+    fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
 }
 
 // ============================================================================
@@ -1308,12 +1578,13 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
+            {"skip-linear",   no_argument,       0, 'S'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:h", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:Sh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -1323,6 +1594,7 @@ int main(int argc, char **argv) {
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
+                case 'S': linear_attn_bypass = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -1361,6 +1633,12 @@ int main(int argc, char **argv) {
             vocab_path = default_vocab;
         }
 
+        // ---- Initialize Metal ----
+        g_metal = metal_setup();
+        if (!g_metal) {
+            fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
+        }
+
         printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
@@ -1376,6 +1654,11 @@ int main(int argc, char **argv) {
         if (!wf) {
             fprintf(stderr, "ERROR: Failed to load weights\n");
             return 1;
+        }
+
+        // Wrap weight file for Metal GPU access
+        if (g_metal) {
+            metal_set_weights(g_metal, wf->data, wf->size);
         }
 
         // ---- Load vocabulary ----
@@ -1534,6 +1817,25 @@ int main(int argc, char **argv) {
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
         double ttft_ms = now_ms() - t0;
+
+        // Debug: show top-5 logits for first token
+        {
+            // Find top 5 manually
+            int top5[5] = {0,0,0,0,0};
+            float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+            for (int i = 0; i < VOCAB_SIZE; i++) {
+                int min_k = 0;
+                for (int k = 1; k < 5; k++) if (topv[k] < topv[min_k]) min_k = k;
+                if (logits[i] > topv[min_k]) { topv[min_k] = logits[i]; top5[min_k] = i; }
+            }
+            fprintf(stderr, "[debug] Top 5 logits (next_token=%d):\n", next_token);
+            for (int i = 0; i < 5; i++) {
+                fprintf(stderr, "  token %d (\"%s\") logit=%.4f\n",
+                        top5[i], decode_token(vocab, top5[i]), topv[i]);
+            }
+            fprintf(stderr, "[debug] hidden rms after final_norm=%.4f, logits rms=%.4f\n",
+                    vec_rms(hidden, HIDDEN_DIM), vec_rms(logits, VOCAB_SIZE));
+        }
         printf("[ttft] %.0f ms (prefill %d tokens + lm_head %.0f ms)\n",
                ttft_ms, pt->count, lm_ms);
 
