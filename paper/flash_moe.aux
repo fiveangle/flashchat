@@ -49,15 +49,15 @@
 \@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Performance of Qwen3.5-397B-A17B inference configurations on M3 Max (48\,GB). Expert bits: quantization precision. Cache: application-level LRU size. tok/s measured as average over 50+ tokens after warmup. Quality assessed by output coherence across math, code, and reasoning prompts.}}{5}{table.caption.16}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
 \newlabel{tab:configs}{{1}{5}{Performance of Qwen3.5-397B-A17B inference configurations on M3 Max (48\,GB). Expert bits: quantization precision. Cache: application-level LRU size. tok/s measured as average over 50+ tokens after warmup. Quality assessed by output coherence across math, code, and reasoning prompts}{table.caption.16}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost.}}{5}{figure.caption.17}\protected@file@percent }
-\newlabel{fig:breakdown}{{1}{5}{Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost}{figure.caption.17}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Per-layer time breakdown (2-bit, OS page cache). Total: 2.9\,ms/layer $\times $ 60 = 174\,ms/token $\approx $ 5.7\,tok/s.}}{5}{table.caption.17}\protected@file@percent }
+\newlabel{tab:breakdown}{{2}{5}{Per-layer time breakdown (2-bit, OS page cache). Total: 2.9\,ms/layer $\times $ 60 = 174\,ms/token $\approx $ 5.7\,tok/s}{table.caption.17}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Expert Routing Statistics}{5}{subsection.4.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces 2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values.}}{5}{table.caption.18}\protected@file@percent }
-\newlabel{tab:rmse}{{2}{5}{2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values}{table.caption.18}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces 2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values.}}{5}{table.caption.18}\protected@file@percent }
+\newlabel{tab:rmse}{{3}{5}{2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values}{table.caption.18}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Quantization Quality}{5}{subsection.4.4}\protected@file@percent }
 \newlabel{sec:quality}{{4.4}{5}{Quantization Quality}{subsection.4.4}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts.}}{6}{table.caption.19}\protected@file@percent }
-\newlabel{tab:pruning}{{3}{6}{Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts}{table.caption.19}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts.}}{6}{table.caption.19}\protected@file@percent }
+\newlabel{tab:pruning}{{4}{6}{Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts}{table.caption.19}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Expert Pruning: Top-$K$ Selection}{6}{subsection.4.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.6}What Did Not Work}{6}{subsection.4.6}\protected@file@percent }
 \newlabel{sec:negative}{{4.6}{6}{What Did Not Work}{subsection.4.6}{}}
@@ -76,8 +76,8 @@
 \newlabel{sec:tokenizer}{{5.6}{7}{C Tokenizer}{subsection.5.6}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.7}Session Caching}{7}{subsection.5.7}\protected@file@percent }
 \newlabel{sec:session_cache}{{5.7}{7}{Session Caching}{subsection.5.7}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s.}}{8}{figure.caption.25}\protected@file@percent }
-\newlabel{fig:journey}{{2}{8}{Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s}{figure.caption.25}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s.}}{8}{figure.caption.25}\protected@file@percent }
+\newlabel{fig:journey}{{1}{8}{Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s}{figure.caption.25}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.8}Comparison to Prior Art}{8}{subsection.5.8}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.9}Scaling Projections}{8}{subsection.5.9}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {6}The Optimization Journey}{8}{section.6}\protected@file@percent }
@@ -104,17 +104,17 @@
 \@writefile{toc}{\contentsline {section}{\numberline {A}Model Architecture Details}{10}{appendix.A}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {B}2-Bit Expert Binary Layout}{10}{appendix.B}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {C}Complete Experiment Log}{10}{appendix.C}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Failed optimization attempts and their failure modes.}}{10}{table.caption.20}\protected@file@percent }
-\newlabel{tab:failures}{{4}{10}{Failed optimization attempts and their failure modes}{table.caption.20}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces DRAM budget breakdown.}}{11}{table.caption.21}\protected@file@percent }
-\newlabel{tab:memory}{{5}{11}{DRAM budget breakdown}{table.caption.21}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Effect of cache strategy on throughput.}}{11}{table.caption.22}\protected@file@percent }
-\newlabel{tab:trust_os}{{6}{11}{Effect of cache strategy on throughput}{table.caption.22}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Flash-MoE in context: model-to-DRAM ratio and throughput.}}{11}{table.caption.23}\protected@file@percent }
-\newlabel{tab:comparison}{{7}{11}{Flash-MoE in context: model-to-DRAM ratio and throughput}{table.caption.23}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Projected Flash-MoE performance on future hardware.}}{11}{table.caption.24}\protected@file@percent }
-\newlabel{tab:scaling}{{8}{11}{Projected Flash-MoE performance on future hardware}{table.caption.24}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Qwen3.5-397B-A17B architecture constants.}}{11}{table.caption.33}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces 2-bit expert binary layout. Offsets in bytes from expert start.}}{11}{table.caption.34}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces Selected experiments from the optimization trajectory. Full log (90 entries with git hashes) available in supplementary material.}}{12}{table.caption.35}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Failed optimization attempts and their failure modes.}}{10}{table.caption.20}\protected@file@percent }
+\newlabel{tab:failures}{{5}{10}{Failed optimization attempts and their failure modes}{table.caption.20}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces DRAM budget breakdown.}}{11}{table.caption.21}\protected@file@percent }
+\newlabel{tab:memory}{{6}{11}{DRAM budget breakdown}{table.caption.21}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Effect of cache strategy on throughput.}}{11}{table.caption.22}\protected@file@percent }
+\newlabel{tab:trust_os}{{7}{11}{Effect of cache strategy on throughput}{table.caption.22}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Flash-MoE in context: model-to-DRAM ratio and throughput.}}{11}{table.caption.23}\protected@file@percent }
+\newlabel{tab:comparison}{{8}{11}{Flash-MoE in context: model-to-DRAM ratio and throughput}{table.caption.23}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Projected Flash-MoE performance on future hardware.}}{11}{table.caption.24}\protected@file@percent }
+\newlabel{tab:scaling}{{9}{11}{Projected Flash-MoE performance on future hardware}{table.caption.24}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Qwen3.5-397B-A17B architecture constants.}}{11}{table.caption.33}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces 2-bit expert binary layout. Offsets in bytes from expert start.}}{11}{table.caption.34}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {12}{\ignorespaces Selected experiments from the optimization trajectory. Full log (90 entries with git hashes) available in supplementary material.}}{12}{table.caption.35}\protected@file@percent }
 \gdef \@abspage@last{12}

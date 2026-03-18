@@ -283,44 +283,27 @@ Third, the final ``Trust OS'' configuration demonstrates that removing \emph{all
 
 \subsection{Per-Layer Breakdown}
 
-Figure~\ref{fig:breakdown} shows the average time budget per layer at the final 2-bit + F\_NOCACHE configuration.
+Table~\ref{tab:breakdown} shows the average time budget per layer at the final 2-bit + OS page cache configuration.
 Expert I/O dominates at 48\% of per-layer time, followed by GPU command buffer synchronization (CMD1 wait at 28\%), CMD2 wait at 15\%, and CPU attention at 9\%.
 
-\begin{figure}[t]
+\begin{table}[t]
 \centering
-\begin{tikzpicture}
-\begin{axis}[
-    xbar stacked,
-    width=\columnwidth,
-    height=3.5cm,
-    xlabel={Time (ms)},
-    xlabel style={font=\small},
-    ytick={1},
-    yticklabels={Per-layer avg},
-    yticklabel style={font=\small},
-    xmin=0, xmax=3.5,
-    tick label style={font=\footnotesize},
-    legend style={
-        font=\scriptsize,
-        at={(0.5,-0.45)},
-        anchor=north,
-        legend columns=3,
-        draw=none
-    },
-    bar width=16pt,
-    nodes near coords style={font=\tiny, /pgf/number format/.cd, fixed, precision=2},
-]
-\addplot+[draw=blue!80,fill=blue!40] coordinates {(1.49,1)};
-\addplot+[draw=red!80,fill=red!40] coordinates {(0.87,1)};
-\addplot+[draw=orange!80,fill=orange!50] coordinates {(0.45,1)};
-\addplot+[draw=green!70!black,fill=green!30] coordinates {(0.27,1)};
-\addplot+[draw=gray!80,fill=gray!30] coordinates {(0.06,1)};
-\legend{Expert I/O (1.49), CMD1 wait (0.87), CMD2 wait (0.45), CPU attn (0.27), Other (0.06)}
-\end{axis}
-\end{tikzpicture}
-\caption{Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times$ 60 layers = 188\,ms/token $\approx$ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost.}
-\label{fig:breakdown}
-\end{figure}
+\caption{Per-layer time breakdown (2-bit, OS page cache). Total: 2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s.}
+\label{tab:breakdown}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Phase} & \textbf{Time (ms)} & \textbf{\% of total} \\
+\midrule
+Expert I/O (parallel \texttt{pread}) & 1.37 & 47\% \\
+CMD1 wait (GPU projections + CMD3) & 0.87 & 30\% \\
+CMD2 wait (GPU routing + shared) & 0.45 & 15\% \\
+CPU attention (BLAS delta-net) & 0.15 & 5\% \\
+Other (encode, submit, routing) & 0.06 & 2\% \\
+\midrule
+\textbf{Total per layer} & \textbf{2.90} & \textbf{100\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 The I/O cost of 1.49\,ms per layer corresponds to reading $\sim$15.7\,MB of expert data (4 experts $\times$ 3.93\,MB) at an effective rate of 10.5\,GB/s---below the SSD's 17.5\,GB/s peak but consistent with the overhead of 4 scattered \texttt{pread()} calls rather than a single sequential read.
 
