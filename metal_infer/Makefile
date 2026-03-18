@@ -59,9 +59,9 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
-# Build the chat TUI
-$(CHAT_TARGET): $(CHAT_SRC) $(INFER_SRC)
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(CHAT_SRC) -o $(CHAT_TARGET)
+# Build the chat client (thin HTTP/SSE client — no Metal/model deps)
+$(CHAT_TARGET): $(CHAT_SRC)
+	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) -o $(CHAT_TARGET)
 
 clean:
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
