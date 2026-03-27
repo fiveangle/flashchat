@@ -655,9 +655,15 @@ cmd_serve() {
     local server_port
     server_port="${port:-$(flashmoe_get SERVER_PORT)}"
     
-    # Check if port is available
+    # Check if WE already started the server
+    if is_server_running; then
+        echo "Server is already running (PID: $(cat $(flashmoe_get_pid_file))."
+        return
+    fi
+    
+    # Check if port is available (may be used by another process)
     if nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
-        echo "Port $server_port is in use."
+        echo "Port $server_port is in use by another process."
         local suggested
         suggested=$(find_available_port $((server_port + 1)))
         echo "Suggested available port: $suggested"
@@ -668,12 +674,6 @@ cmd_serve() {
         else
             error "Cannot start server on port $server_port"
         fi
-    fi
-    
-    # Check if server is already running
-    if is_server_running; then
-        echo "Server is already running."
-        return
     fi
     
     # Start server in background
