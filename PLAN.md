@@ -140,6 +140,12 @@ Options:
      Enter number or session ID: 
      ```
 
+7. **Benchmark Commands**
+   - Add `flashchat benchmark` command for performance testing
+   - Based on existing Makefile targets: run, verify, bench, moe, moebench, full, fullbench
+   - Also include infer options: --timing, --freq, --cache-telemetry
+   - Could be power-user feature or `flashchat status --verbose` diagnostic
+
 ---
 
 ## Notes
