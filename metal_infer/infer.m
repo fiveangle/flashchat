@@ -688,6 +688,11 @@ static const char *decode_token(Vocabulary *v, int token_id) {
         if (s[0] == 0xC4 && s[1] == 0xA0) { *dst++ = ' '; s += 2; continue; }
         // 0xC4 0xA1 = U+0121 (ãŁ - often before punctuation)
         if (s[0] == 0xC4 && s[1] == 0xA1) { *dst++ = ' '; s += 2; continue; }
+        // 0xC3 0xA2 0xC4 0xA2 0xC4 0xB6 = corrupted "âĢĶ" (double-encoded ellipsis/space)
+        // Found in Qwen3 tokenizer vocab - convert to space
+        if (s[0] == 0xC3 && s[1] == 0xA2 && s[2] == 0xC4 && s[3] == 0xA2 && s[4] == 0xC4 && s[5] == 0xB6) {
+            *dst++ = ' '; s += 6; continue;
+        }
         // 0xE2 0x80 0xA6 = U+2026 (ellipsis â€¦)
         if (s[0] == 0xE2 && s[1] == 0x80 && s[2] == 0xA6) { *dst++ = '.'; *dst++ = '.'; *dst++ = '.'; s += 3; continue; }
         // 0xE2 0x80 0xA0 = U+2020 (en space)
