@@ -312,8 +312,8 @@ cmd_config() {
                 echo ""
                 echo "Config removed. Re-running setup..."
                 echo ""
-                # Re-run setup wizard
-                ensure_setup
+                # Re-run setup wizard with force mode
+                ensure_setup 1
             else
                 echo "Cancelled."
             fi
@@ -499,11 +499,12 @@ prompt_extract_experts() {
     echo "  [Q] Quit"
     echo ""
     
-    read -p "Select option [4/2/Q]: " -n 1 -r
+    echo -n "Select option [4/2/Q]: "
+    read -r REPLY
     echo ""
     
     local extraction_mode=""
-    if [[ $REPLY =~ ^[4]$ ]]; then
+    if [[ "$REPLY" =~ ^[4]$ ]]; then
         extraction_mode="4bit"
     elif [[ $REPLY =~ ^[2]$ ]]; then
         extraction_mode="2bit"
@@ -572,6 +573,8 @@ prompt_save_config() {
 }
 
 ensure_setup() {
+    local force="${1:-0}"
+    
     set +e  # Temporarily disable exit on error for setup checks
     flashmoe_load_config
     
@@ -595,11 +598,40 @@ ensure_setup() {
         prompt_export_vocab
     fi
     
-    # Check experts
+    # Check experts - always prompt if force mode, or if not extracted
     local quantization
     quantization=$(flashmoe_get QUANTIZATION)
     
-    if [ "$quantization" = "2bit" ]; then
+    if [ "$force" = "1" ]; then
+        # Force mode: show current status and offer to re-extract
+        echo ""
+        echo "=== Expert Weights Status ==="
+        echo ""
+        echo "Current quantization: $quantization"
+        echo ""
+        
+        if [ "$quantization" = "2bit" ]; then
+            if check_experts_2bit_extracted; then
+                echo "2-bit experts: extracted"
+            else
+                echo "2-bit experts: NOT extracted"
+            fi
+        else
+            if check_experts_extracted; then
+                echo "4-bit experts: extracted"
+            else
+                echo "4-bit experts: NOT extracted"
+            fi
+        fi
+        
+        echo ""
+        read -p "Re-extract experts? [y/N] " -n 1 -r
+        echo ""
+        
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            prompt_extract_experts
+        fi
+    elif [ "$quantization" = "2bit" ]; then
         if ! check_experts_2bit_extracted; then
             # For 2bit, we need 4bit first
             if ! check_experts_extracted; then
