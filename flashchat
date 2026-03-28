@@ -144,7 +144,7 @@ cmd_status() {
     echo "=== Flash-MoE Status ==="
     echo ""
     echo "Model: $(flashmoe_get MODEL_REPO)"
-    echo "Quantization: $(flashmoe_get QUANTIZATION)"
+    echo "Expert mode: $(flashmoe_get QUANTIZATION)"
     echo "Model path: $(flashmoe_get MODEL_PATH)"
     echo "Non-expert weights: $weights_dir/model_weights.bin"
     echo "Weight manifest: $weights_dir/model_weights.json"
@@ -377,7 +377,7 @@ cmd_config_interactive() {
     echo ""
     echo "=== Configure Settings ==="
     echo "  -Model: $(flashmoe_get MODEL_REPO)"
-    echo "  -Quantization (2/4 bit): $(flashmoe_get QUANTIZATION)"
+    echo "  -Expert mode (4bit/2bit): $(flashmoe_get QUANTIZATION)"
     echo "  -Context window size: $(flashmoe_get MAX_TOKENS)"
     echo "  -Temperature (0.0-2.0): $(flashmoe_get TEMPERATURE)"
     echo "  -Top-p (0.0-1.0): $(flashmoe_get TOP_P)"
@@ -456,10 +456,10 @@ prompt_config_interactive() {
     read -r REPLY
     echo "MODEL_REPO=\"${REPLY:-$default_repo}\"" >> /tmp/flashmoe_new_config
     
-    # Quantization
+    # Expert mode
     local default_quant
     default_quant=$(flashmoe_get QUANTIZATION)
-    printf "Quantization (4bit/2bit) [%s]: " "$default_quant"
+    printf "Expert mode (4bit/2bit) [%s]: " "$default_quant"
     read -r REPLY
     echo "QUANTIZATION=\"${REPLY:-$default_quant}\"" >> /tmp/flashmoe_new_config
     
