@@ -470,9 +470,6 @@ prompt_config_interactive() {
     flashmoe_create_default_config
     cat /tmp/flashmoe_new_config >> "$(flashmoe_get CONFIG_FILE)"
     rm -f /tmp/flashmoe_new_config
-    
-    echo ""
-    echo "Settings configured."
 }
 
 # -----------------------------------------------------------------------------
