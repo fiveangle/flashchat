@@ -170,7 +170,7 @@ cmd_status() {
     fi
     
     echo ""
-    echo "Max tokens: $(flashmoe_get MAX_TOKENS)"
+    echo "Max context window: $(flashmoe_get MAX_TOKENS)"
     echo "Temperature: $(flashmoe_get TEMPERATURE)"
     echo "Top-p: $(flashmoe_get TOP_P)"
 }
@@ -466,7 +466,7 @@ prompt_config_interactive() {
     # Max Tokens
     local default_tokens
     default_tokens=$(flashmoe_get MAX_TOKENS)
-    printf "Max tokens to generate [%s]: " "$default_tokens"
+    printf "Max context window to generate [%s]: " "$default_tokens"
     read -r REPLY
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashmoe_new_config
     

@@ -66,6 +66,7 @@ clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 - **When the user gives specific instructions for moving forward, ask if you should update the AGENTS.md file to ensure the instruction is adhered to.**
 - **When testing interactive scripts (especially with piped input), if output is confusing or unreadable, improve the output formatting for clarity before continuing**
 - **Never assume the user has knowledge of the system, commands, or syntax. Always provide instruction that is atomic and self-explanatory.**
+- **Use user-friendly terminology, not technical precision.** For example, use "context window" instead of "max tokens" since that's what users expect in modern LLM interfaces, even though the technical term is different.
 
 ### C/Objective-C
 
