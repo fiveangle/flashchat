@@ -64,6 +64,7 @@ clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 - Keep functions focused and single-purpose
 - **Always ask the user before modifying their system** (e.g., installing packages, changing config files, running system commands)
 - **When the user gives specific instructions for moving forward, ask if you should update the AGENTS.md file to ensure the instruction is adhered to.**
+- **When testing interactive scripts (especially with piped input), if output is confusing or unreadable, improve the output formatting for clarity before continuing**
 
 ### C/Objective-C
 
