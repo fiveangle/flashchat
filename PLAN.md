@@ -25,8 +25,7 @@ This document captures the implementation plan for the Flash-MoE unified managem
 | Config location | `~/.config/flash-moe/config` |
 | Config created | Automatically on first run |
 | PID file | `~/.config/flash-moe/server.pid` |
-| Sessions | `~/.config/flash-moe/sessions/` |
-| Migration | None - streamchat features incorporated directly |
+| Sessions | `~/.flash-moe/sessions/` (for compatibility with chat.m) |
 | Reset | `flashchat config` → re-run setup wizard (retains sessions) |
 
 ### Command Interface
@@ -66,11 +65,6 @@ Options:
 - Check if port is in use
 - If in use: notify user, suggest next available port (port+1, port+2)
 - Let user choose
-
-### streamchat Deprecation
-- Use streamchat as reference during development
-- Remove entirely when flashchat is complete
-- No deprecation warning needed (direct replacement)
 
 ---
 
@@ -115,9 +109,8 @@ Options:
      temperature, top-p, server port, server host, show thinking, color output
    - Interactive prompts when run from terminal, defaults when piped
 
-2. **Remove streamchat**
-   - Original plan: remove entirely when flashchat complete
-   - Not yet done - streamchat still exists for reference
+2. **Remove streamchat** ✅ COMPLETED
+   - streamchat has been removed
 
 3. **2-bit expert extraction wizard**
    - Currently prompts for quantization but extraction logic needs testing

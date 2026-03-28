@@ -188,7 +188,3 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `<model>/packed_experts_2bit/` | 120GB | 2-bit expert weights |
 | `~/.config/flash-moe/config` | - | User configuration |
 | `~/.config/flash-moe/sessions/` | - | Chat session history |
-
-## Deprecated: streamchat
-
-The old `streamchat` script has been replaced by `flashchat`. Use `flashchat` for all operations.
