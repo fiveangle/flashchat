@@ -113,6 +113,9 @@ flashmoe_load_config() {
     elif [ -f "${FLASHMOE_CONFIG_DIR}/config" ]; then
         FLASHMOE_CONFIG_FILE="${FLASHMOE_CONFIG_DIR}/config"
         _flashmoe_source_config "${FLASHMOE_CONFIG_DIR}/config"
+    # 3. No config file - use default path
+    else
+        FLASHMOE_CONFIG_FILE="${FLASHMOE_CONFIG_DIR}/config"
     fi
     
     # 3. Environment variables override
@@ -173,6 +176,7 @@ flashmoe_get() {
 # Create default config file
 # -----------------------------------------------------------------------------
 flashmoe_create_default_config() {
+    local quiet="${1:-0}"
     mkdir -p "$FLASHMOE_CONFIG_DIR"
     cat > "${FLASHMOE_CONFIG_DIR}/config" << EOF
 # Flash-MoE Configuration
@@ -198,7 +202,7 @@ SHOW_THINKING="${FLASHMOE_DEFAULT_SHOW_THINKING}"
 COLOR_OUTPUT="${FLASHMOE_DEFAULT_COLOR_OUTPUT}"
 EOF
     FLASHMOE_CONFIG_FILE="${FLASHMOE_CONFIG_DIR}/config"
-    echo "Created default config at ${FLASHMOE_CONFIG_DIR}/config"
+    [ "$quiet" = "0" ] && echo "Created default config at ${FLASHMOE_CONFIG_DIR}/config"
 }
 
 # -----------------------------------------------------------------------------

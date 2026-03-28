@@ -138,19 +138,10 @@ EOF
 cmd_status() {
     flashmoe_load_config
     
-    local weights_dir
-    weights_dir=$(flashmoe_get WEIGHTS_DIR)
-    
     echo "=== Flash-MoE Status ==="
     echo ""
     echo "Model: $(flashmoe_get MODEL_REPO)"
     echo "Experts quantization: $(flashmoe_get QUANTIZATION)"
-    echo "Model path: $(flashmoe_get MODEL_PATH)"
-    echo "Non-expert weights: $weights_dir/model_weights.bin"
-    echo "Weight manifest: $weights_dir/model_weights.json"
-    echo "Vocabulary: $weights_dir/vocab.bin"
-    echo "4-bit experts: $(flashmoe_get EXPERTS_DIR)"
-    echo "2-bit experts: $(flashmoe_get EXPERTS_2BIT_DIR)"
     echo ""
     echo "Server: $(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
     
@@ -170,7 +161,7 @@ cmd_status() {
     fi
     
     echo ""
-    echo "Max context window: $(flashmoe_get MAX_TOKENS)"
+    echo "Context window: $(flashmoe_get MAX_TOKENS)"
     echo "Temperature: $(flashmoe_get TEMPERATURE)"
     echo "Top-p: $(flashmoe_get TOP_P)"
 }
@@ -219,11 +210,9 @@ cmd_sessions() {
     
     echo "=== Chat Sessions ==="
     echo ""
-    echo "Usage: flashchat sessions [--delete <id>]"
-    echo ""
     
     if [ ! -d "$sessions_dir" ]; then
-        echo "No sessions directory found."
+        echo "(no sessions)"
         return
     fi
     
@@ -236,15 +225,12 @@ cmd_sessions() {
         lines=$(wc -l < "$f")
         local last_modified
         last_modified=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$f" 2>/dev/null || stat -c "%y" "$f" 2>/dev/null | cut -d' ' -f1)
-        echo "  $session_id"
-        echo "    Turns: $lines"
-        echo "    Last modified: $last_modified"
-        echo ""
+        echo "  $session_id ($lines turns, $last_modified)"
         count=$((count + 1))
     done
     
     if [ $count -eq 0 ]; then
-        echo "  (no sessions)"
+        echo "(no sessions)"
     else
         echo "To resume a session: flashchat chat --resume <session_id>"
         echo "To delete a session: flashchat sessions --delete <session_id>"
@@ -339,33 +325,13 @@ cmd_config() {
     
     echo "=== Flash-MoE Configuration ==="
     echo ""
-    echo "Config file: $config_file"
+    echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
+    echo "Context window: $(flashmoe_get MAX_TOKENS) | Temperature: $(flashmoe_get TEMPERATURE) | Top-p: $(flashmoe_get TOP_P)"
+    echo "Server: $(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
+    echo "Show thinking: $(flashmoe_get SHOW_THINKING) | Color: $(flashmoe_get COLOR_OUTPUT)"
     echo ""
-    echo "Current settings:"
-    echo ""
-    echo "Model:"
-    echo "  MODEL_REPO:      $(flashmoe_get MODEL_REPO)"
-    echo "  MODEL_PATH:      $(flashmoe_get MODEL_PATH)"
-    echo "  QUANTIZATION:    $(flashmoe_get QUANTIZATION)"
-    echo ""
-    echo "Generation:"
-    echo "  MAX_TOKENS:      $(flashmoe_get MAX_TOKENS)"
-    echo "  TEMPERATURE:     $(flashmoe_get TEMPERATURE)"
-    echo "  TOP_P:           $(flashmoe_get TOP_P)"
-    echo ""
-    echo "Server:"
-    echo "  SERVER_PORT:     $(flashmoe_get SERVER_PORT)"
-    echo "  SERVER_HOST:     $(flashmoe_get SERVER_HOST)"
-    echo ""
-    echo "UI:"
-    echo "  SHOW_THINKING:   $(flashmoe_get SHOW_THINKING)"
-    echo "  COLOR_OUTPUT:    $(flashmoe_get COLOR_OUTPUT)"
-    echo ""
-    echo "Options:"
-    echo "  flashchat config --reset      Re-run setup wizard (keep sessions)"
-    echo "  flashchat config --full-reset Delete everything"
-    echo ""
-    echo "To modify, edit: $config_file"
+    echo "Edit: flashchat config --reset | Delete all: flashchat config --full-reset"
+    echo "File: $config_file"
 }
 
 # -----------------------------------------------------------------------------
@@ -374,7 +340,6 @@ cmd_config() {
 cmd_config_interactive() {
     flashmoe_load_config
     
-    echo ""
     echo "=== Configure Settings ==="
     echo "  -Model: $(flashmoe_get MODEL_REPO)"
     echo "  -Experts quantization (4bit/2bit): $(flashmoe_get QUANTIZATION)"
@@ -385,8 +350,7 @@ cmd_config_interactive() {
     echo "  -Chat client API host IP: $(flashmoe_get SERVER_HOST)"
     echo "  -Show thinking tokens (0/1): $(flashmoe_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashmoe_get COLOR_OUTPUT)"
-    echo ""
-    read -p "Start edit config wizard? (y/n): " -n 1 -r
+    read -p "Start edit config wizard? [Y/n]: " -n 1 -r
     echo ""
     
     if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -466,7 +430,7 @@ prompt_config_interactive() {
     # Max Tokens
     local default_tokens
     default_tokens=$(flashmoe_get MAX_TOKENS)
-    printf "Max context window to generate [%s]: " "$default_tokens"
+    printf "Context window to generate [%s]: " "$default_tokens"
     read -r REPLY
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashmoe_new_config
     
@@ -577,8 +541,11 @@ prompt_download_model() {
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         echo "Downloading model..."
-        echo "Command: huggingface-cli download $model_repo"
-        huggingface-cli download "$model_repo"
+        HF_VENV="/tmp/hf_$$"
+        python3 -m venv "$HF_VENV"
+        "$HF_VENV/bin/pip" install huggingface-hub -q 2>/dev/null
+        "$HF_VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model_repo')"
+        rm -rf "$HF_VENV"
         echo "Download complete."
     else
         echo "Download cancelled. Run 'flashchat' again when ready."
@@ -1049,6 +1016,12 @@ cmd_prompt() {
 # Interactive menu
 # -----------------------------------------------------------------------------
 interactive_menu() {
+    flashmoe_load_config
+    if [ ! -f "$(flashmoe_get CONFIG_FILE)" ]; then
+        echo "Welcome to Flash-MoE. Running initial setup..."
+        ensure_setup
+    fi
+    
     while true; do
         flashmoe_load_config
         
@@ -1069,22 +1042,10 @@ interactive_menu() {
         echo "=================================================="
         echo "           Flash-MoE Management"
         echo "=================================================="
-        echo ""
         echo "Status: $setup_status"
         echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
         echo "Server: $server_status"
-        echo ""
-        echo "Select an action:"
-        echo ""
-        echo "  [N] New Chat Session"
-        echo "  [R] Resume Chat Session"
-        echo "  [S] Start API Server"
-        echo "  [T] Stop API Server"
-        echo "  [C] Configuration"
-        echo "  [L] List Sessions"
-        echo "  [V] View Status"
-        echo "  [Q] Quit"
-        echo ""
+        echo "Select: [N]ew [R]esume [S]tart [T]op [C]onfig [L]ist [V]iew [Q]uit"
         read -p "> " -n 1 -r
         
         case "$REPLY" in
