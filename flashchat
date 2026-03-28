@@ -309,7 +309,7 @@ cmd_config() {
     fi
     
     if [ ! -f "$config_file" ]; then
-        echo "No config file found. Creating default..."
+        echo "No config file found. Using defaults..."
         flashmoe_create_default_config
         flashmoe_load_config
         config_file=$(flashmoe_get CONFIG_FILE)
