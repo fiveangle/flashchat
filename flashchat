@@ -97,15 +97,15 @@ Usage:
   flashchat [command] [options]
 
 Commands:
-  chat              Start chat (auto-sets up if missing)
-  chat --resume ID  Resume session
-  serve             Start API server (auto-sets up if missing)
-  serve --stop      Stop running server
-  prompt "..."      Single prompt (auto-sets up if missing)
-  benchmark         Run benchmarks (run, verify, bench, moe, full, etc.)
-  config            Edit configuration
+  chat              Start chat interface
+  chat --resume ID  Resume existing chat session
+  serve             Start API server
+  serve --stop      Stop running API server
+  prompt "..."      Run single prompt and exit
+  benchmark         Run performance benchmarks (use: flashchat benchmark)
+  config            Edit configuration settings
   status            Show system status
-  sessions          List sessions
+  sessions          List chat sessions
   help              Show this help
 
 Options:
