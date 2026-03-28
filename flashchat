@@ -138,15 +138,19 @@ EOF
 cmd_status() {
     flashmoe_load_config
     
+    local weights_dir
+    weights_dir=$(flashmoe_get WEIGHTS_DIR)
+    
     echo "=== Flash-MoE Status ==="
     echo ""
-    echo "Model:"
-    echo "  Repository: $(flashmoe_get MODEL_REPO)"
-    echo "  Path: $(flashmoe_get MODEL_PATH)"
-    echo "  Quantization: $(flashmoe_get QUANTIZATION)"
-    echo "  Weights: $(flashmoe_get WEIGHTS_DIR)"
-    echo "  Experts: $(flashmoe_get EXPERTS_DIR)"
-    echo "  Experts (2bit): $(flashmoe_get EXPERTS_2BIT_DIR)"
+    echo "Model: $(flashmoe_get MODEL_REPO)"
+    echo "Quantization: $(flashmoe_get QUANTIZATION)"
+    echo "Model path: $(flashmoe_get MODEL_PATH)"
+    echo "Non-expert weights: $weights_dir/model_weights.bin"
+    echo "Weight manifest: $weights_dir/model_weights.json"
+    echo "Vocabulary: $weights_dir/vocab.bin"
+    echo "4-bit experts: $(flashmoe_get EXPERTS_DIR)"
+    echo "2-bit experts: $(flashmoe_get EXPERTS_2BIT_DIR)"
     echo ""
     echo "Server:"
     echo "  Port: $(flashmoe_get SERVER_PORT)"
