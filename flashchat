@@ -1194,6 +1194,12 @@ cmd_benchmark() {
     
     target="$1"
     
+    # Load config and export environment variables
+    flashmoe_load_config
+    export FLASHMOE_MODEL_PATH="$(flashmoe_get MODEL_PATH)"
+    export FLASHMOE_WEIGHTS_DIR="$(flashmoe_get WEIGHTS_DIR)"
+    export FLASHMOE_EXPERTS_DIR="$(flashmoe_get EXPERTS_DIR)"
+    
     cd "$SCRIPT_DIR/metal_infer"
     
     case "$target" in
