@@ -112,8 +112,9 @@ Options:
 2. **Remove streamchat** ✅ COMPLETED
    - streamchat has been removed
 
-3. **2-bit expert extraction wizard**
-   - Currently prompts for quantization but extraction logic needs testing
+3. **2-bit expert extraction wizard** ⏸ DEFERRED
+   - Currently prompts for quantization, code logic is correct
+   - Full testing deferred to fresh "out of the box" test at end
 
 4. **Server persistence validation**
    - Need to test server --stop functionality
