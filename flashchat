@@ -152,9 +152,7 @@ cmd_status() {
     echo "4-bit experts: $(flashmoe_get EXPERTS_DIR)"
     echo "2-bit experts: $(flashmoe_get EXPERTS_2BIT_DIR)"
     echo ""
-    echo "Server:"
-    echo "  Port: $(flashmoe_get SERVER_PORT)"
-    echo "  Host: $(flashmoe_get SERVER_HOST)"
+    echo "Server: $(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
     
     # Check if server is running
     local pid_file
@@ -163,19 +161,18 @@ cmd_status() {
         local pid
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
-            echo "  Status: Running (PID: $pid)"
+            echo "Server status: Running (PID: $pid)"
         else
-            echo "  Status: Not running (stale PID file)"
+            echo "Server status: Not running (stale PID file)"
         fi
     else
-        echo "  Status: Not running"
+        echo "Server status: Not running"
     fi
     
     echo ""
-    echo "Generation:"
-    echo "  Max tokens: $(flashmoe_get MAX_TOKENS)"
-    echo "  Temperature: $(flashmoe_get TEMPERATURE)"
-    echo "  Top-p: $(flashmoe_get TOP_P)"
+    echo "Max tokens: $(flashmoe_get MAX_TOKENS)"
+    echo "Temperature: $(flashmoe_get TEMPERATURE)"
+    echo "Top-p: $(flashmoe_get TOP_P)"
 }
 
 # -----------------------------------------------------------------------------
