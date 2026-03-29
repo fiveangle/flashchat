@@ -24,11 +24,9 @@ Running `flashchat` with no arguments launches an interactive menu where you can
    cd metal_infer && make
    ```
 
-2. Create Python virtual environment:
+2. Ensure numpy is available (system-wide or in a venv):
    ```bash
-   cd metal_infer
-   python3 -m venv .venv
-   .venv/bin/pip install numpy
+   pip install numpy   # or: python3 -m venv .venv && .venv/bin/pip install numpy
    ```
 
 That's it! On first run, flashchat will automatically:
