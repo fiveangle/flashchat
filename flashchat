@@ -503,6 +503,29 @@ run_python() {
     "$FLASHMOE_VENV/bin/python" "$@"
 }
 
+check_binaries() {
+    [ -f "$SCRIPT_DIR/metal_infer/infer" ] && [ -f "$SCRIPT_DIR/metal_infer/chat" ]
+    return $?
+}
+
+ensure_binaries() {
+    if check_binaries; then
+        return 0
+    fi
+    
+    echo "Binaries not found. Building..."
+    cd "$SCRIPT_DIR/metal_infer"
+    make all chat
+    cd "$SCRIPT_DIR"
+    
+    if check_binaries; then
+        echo "Build complete."
+    else
+        echo "ERROR: Build failed."
+        exit 1
+    fi
+}
+
 check_weights_extracted() {
     local weights_dir
     weights_dir=$(flashmoe_get WEIGHTS_DIR)
@@ -910,6 +933,7 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashmoe_get_pid_file)
     
+    ensure_binaries
     cd "$SCRIPT_DIR/metal_infer"
     
     # Set environment for infer
@@ -973,6 +997,7 @@ cmd_chat() {
     fi
     
     # Launch chat
+    ensure_binaries
     cd "$SCRIPT_DIR/metal_infer"
     
     local chat_args=""
@@ -1161,6 +1186,7 @@ cmd_benchmark() {
     export FLASHMOE_EXPERTS_DIR="$(flashmoe_get EXPERTS_DIR)"
     
     cd "$SCRIPT_DIR/metal_infer"
+    ensure_binaries
     
     case "$target" in
         run)
