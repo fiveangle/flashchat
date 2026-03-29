@@ -892,6 +892,7 @@ cmd_serve() {
         pid_file=$(flashmoe_get_pid_file)
         
         if [ -f "$pid_file" ]; then
+            # Server was started by flashchat
             local pid
             pid=$(cat "$pid_file")
             if kill -0 "$pid" 2>/dev/null; then
@@ -903,6 +904,20 @@ cmd_serve() {
             else
                 echo "Server not running (stale PID file)."
                 rm -f "$pid_file"
+            fi
+        elif nc -z 127.0.0.1 "$(flashmoe_get SERVER_PORT)" 2>/dev/null; then
+            # Server is running externally - try to find and kill it
+            local port
+            port=$(flashmoe_get SERVER_PORT)
+            local pid
+            pid=$(lsof -ti:$port 2>/dev/null | head -1)
+            if [ -n "$pid" ]; then
+                echo "Stopping external server (PID: $pid)..."
+                kill "$pid" 2>/dev/null
+                sleep 0.5
+                echo "Server stopped."
+            else
+                echo "Server port $port in use but cannot find process."
             fi
         else
             echo "No server running."
