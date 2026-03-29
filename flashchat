@@ -154,17 +154,18 @@ cmd_status() {
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
             echo "Server status: Running (PID: $pid)"
-            echo ""
-            echo "API Endpoints:"
-            echo "  POST /v1/chat/completions"
-            echo "  GET  /v1/models"
-            echo "  GET  /health"
         else
             echo "Server status: Not running (stale PID file)"
         fi
     else
         echo "Server status: Not running"
     fi
+    
+    echo ""
+    echo "API Endpoints (when server running):"
+    echo "  POST /v1/chat/completions"
+    echo "  GET  /v1/models"
+    echo "  GET  /health"
     
     echo ""
     echo "Context window size: $(flashmoe_get MAX_TOKENS)"
