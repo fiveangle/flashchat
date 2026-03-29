@@ -4,6 +4,25 @@
 
 set -e
 
+# Parse arguments
+FORCE=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)
+            FORCE=1
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--force]"
+            echo "  --force  Skip integrity checks and force toggle"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 FLASHMOE_CONFIG_DIR="${HOME}/.config/flash-moe"
 FLASHMOE_SESSIONS_DIR="${HOME}/.flash-moe/sessions"
 HF_CACHE_DIR="${HOME}/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit"
@@ -41,61 +60,72 @@ if [ -d "${HF_CACHE_DIR}${SUFFIX}" ]; then
     
     # Safety check: verify backup is valid before restoring
     echo "Checking backup integrity..."
-    if verify_model_cache "${HF_CACHE_DIR}${SUFFIX}"; then
+    if [ $FORCE -eq 1 ]; then
+        echo "  --force flag set, skipping integrity check"
+    elif verify_model_cache "${HF_CACHE_DIR}${SUFFIX}"; then
         local backup_size
         backup_size=$(get_cache_size "${HF_CACHE_DIR}${SUFFIX}")
         echo "  Backup size: $backup_size (valid)"
-        
-        # Check if current is also valid (would be overwritten)
-        if [ -d "$HF_CACHE_DIR" ] && verify_model_cache "$HF_CACHE_DIR"; then
-            local current_size
-            current_size=$(get_cache_size "$HF_CACHE_DIR")
-            echo "  Current size: $current_size (will be replaced)"
-            echo ""
-            echo "WARNING: Replacing current model with backup."
-            echo "  Current: $current_size"
-            echo "  Backup:  $backup_size"
-            echo ""
-            read -p "Continue? [y/N] " -n 1 -r
-            echo ""
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo "Cancelled."
-                exit 0
-            fi
-            # Remove current (invalid) model
-            rm -rf "$HF_CACHE_DIR"
-        fi
-        
-        # Restore HuggingFace cache
-        echo "Restoring live environment..."
-        mv "${HF_CACHE_DIR}${SUFFIX}" "$HF_CACHE_DIR"
-        
-        # Restore config
-        if [ -f "${FLASHMOE_CONFIG_DIR}/config${SUFFIX}" ]; then
-            mv "${FLASHMOE_CONFIG_DIR}/config${SUFFIX}" "${FLASHMOE_CONFIG_DIR}/config"
-        fi
-        
-        # Restore sessions
-        if [ -d "${FLASHMOE_SESSIONS_DIR}${SUFFIX}" ]; then
-            mv "${FLASHMOE_SESSIONS_DIR}${SUFFIX}" "$FLASHMOE_SESSIONS_DIR"
-        fi
-        
-        echo "Live environment restored."
     else
-        echo "ERROR: Backup is invalid or incomplete!"
-        echo "  Backup location: ${HF_CACHE_DIR}${SUFFIX}"
-        echo ""
-        echo "Manual recovery needed. Your live data may be lost."
-        echo "  Live data was moved to: ${HF_CACHE_DIR}${SUFFIX}"
-        exit 1
+        if [ $FORCE -eq 1 ]; then
+            echo "  --force flag set, proceeding anyway"
+        else
+            echo "ERROR: Backup is invalid or incomplete!"
+            echo "  Backup location: ${HF_CACHE_DIR}${SUFFIX}"
+            echo ""
+            echo "Manual recovery needed. Your live data may be lost."
+            echo "  Live data was moved to: ${HF_CACHE_DIR}${SUFFIX}"
+            exit 1
+        fi
     fi
+    
+    # Check if current is also valid (would be overwritten)
+    if [ -d "$HF_CACHE_DIR" ] && verify_model_cache "$HF_CACHE_DIR"; then
+        local current_size
+        current_size=$(get_cache_size "$HF_CACHE_DIR")
+        echo "  Current size: $current_size (will be replaced)"
+        echo ""
+        echo "WARNING: Replacing current model with backup."
+        echo "  Current: $current_size"
+        if [ -d "${HF_CACHE_DIR}${SUFFIX}" ]; then
+            local backup_size
+            backup_size=$(get_cache_size "${HF_CACHE_DIR}${SUFFIX}")
+            echo "  Backup:  $backup_size"
+        fi
+        echo ""
+        read -p "Continue? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        rm -rf "$HF_CACHE_DIR"
+    fi
+    
+    # Restore HuggingFace cache
+    echo "Restoring live environment..."
+    mv "${HF_CACHE_DIR}${SUFFIX}" "$HF_CACHE_DIR"
+    
+    # Restore config
+    if [ -f "${FLASHMOE_CONFIG_DIR}/config${SUFFIX}" ]; then
+        mv "${FLASHMOE_CONFIG_DIR}/config${SUFFIX}" "${FLASHMOE_CONFIG_DIR}/config"
+    fi
+    
+    # Restore sessions
+    if [ -d "${FLASHMOE_SESSIONS_DIR}${SUFFIX}" ]; then
+        mv "${FLASHMOE_SESSIONS_DIR}${SUFFIX}" "$FLASHMOE_SESSIONS_DIR"
+    fi
+    
+    echo "Live environment restored."
     
 else
     # Currently in live mode - switch to test
     
     # Safety check: verify current model is valid before backing up
     echo "Checking live model integrity..."
-    if [ -d "$HF_CACHE_DIR" ] && verify_model_cache "$HF_CACHE_DIR"; then
+    if [ $FORCE -eq 1 ]; then
+        echo "  --force flag set, skipping integrity check"
+    elif [ -d "$HF_CACHE_DIR" ] && verify_model_cache "$HF_CACHE_DIR"; then
         local live_size
         live_size=$(get_cache_size "$HF_CACHE_DIR")
         echo "  Live model size: $live_size (valid)"
@@ -104,7 +134,7 @@ else
         echo "  Location: $HF_CACHE_DIR"
         echo ""
         echo "Cannot toggle - live data is already corrupted."
-        echo "Aborting to prevent further damage."
+        echo "Use --force to override (data may be lost)."
         exit 1
     fi
     
