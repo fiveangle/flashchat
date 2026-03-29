@@ -457,9 +457,8 @@ prompt_config_interactive() {
     read -r REPLY
     echo "COLOR_OUTPUT=\"${REPLY:-$default_color}\"" >> /tmp/flashmoe_new_config
     
-    # Save config
-    flashmoe_create_default_config
-    cat /tmp/flashmoe_new_config >> "$(flashmoe_get CONFIG_FILE)"
+    # Save config (always save, even if same - simpler than diff)
+    cp /tmp/flashmoe_new_config "$(flashmoe_get CONFIG_FILE)"
     rm -f /tmp/flashmoe_new_config
 }
 
