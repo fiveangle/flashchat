@@ -28,6 +28,7 @@
 #     4. Hardcoded defaults
 
 set -e
+set +m  # Disable job control messages
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/lib/config.sh"
@@ -940,8 +941,8 @@ cmd_serve() {
     export FLASHMOE_MODEL_PATH="$(flashmoe_get MODEL_PATH)"
     export FLASHMOE_SERVER_PORT="$server_port"
     
-    # Start server
-    ./infer --serve "$server_port" &
+    # Start server (redirect output to avoid mixing with TUI)
+    ./infer --serve "$server_port" > /dev/null 2>&1 &
     local infer_pid=$!
     
     cd "$SCRIPT_DIR"
