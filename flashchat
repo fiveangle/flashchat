@@ -891,6 +891,7 @@ cmd_serve() {
             if kill -0 "$pid" 2>/dev/null; then
                 echo "Stopping server (PID: $pid)..."
                 kill "$pid"
+                sleep 0.5
                 rm -f "$pid_file"
                 echo "Server stopped."
             else
