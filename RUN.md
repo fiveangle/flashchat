@@ -19,33 +19,22 @@ Running `flashchat` with no arguments launches an interactive menu where you can
 
 ### Prerequisites
 
-1. Download the model from HuggingFace (if not already downloaded):
-   ```bash
-   huggingface-cli download mlx-community/Qwen3.5-397B-A17B-4bit
-   ```
-
-2. Build the binaries:
+1. Build the binaries:
    ```bash
    cd metal_infer && make
    ```
 
-3. Create Python virtual environment:
+2. Create Python virtual environment:
    ```bash
    cd metal_infer
    python3 -m venv .venv
    .venv/bin/pip install numpy
    ```
 
-### First Run
-
-On first run, flashchat will automatically detect missing components and guide you through setup:
-
-1. If model is not downloaded → prompt to download from HuggingFace
-2. If weights are not extracted → prompt to extract (~5.5GB)
-3. If vocabulary is not exported → prompt to export (~8MB)
-4. If expert weights are not extracted → prompt to choose quantization mode:
-   - 4-bit (~218GB) - Full quality, tool calling supported
-   - 2-bit (~120GB) - Faster but breaks tool calling
+That's it! On first run, flashchat will automatically:
+- Download the model from HuggingFace (if not present)
+- Create a default configuration file
+- Prompt you through extracting weights and expert data
 
 ## Commands
 
@@ -108,7 +97,7 @@ Runs performance benchmarks. Uses configuration for model paths.
 ./flashchat config --full-reset    # Delete all data and start fresh
 ```
 
-View and edit settings. The reset option allows you to reconfigure while preserving chat sessions.
+View and edit settings. If no config exists, defaults are used automatically. The reset option allows you to reconfigure while preserving chat sessions.
 
 ### Status
 
