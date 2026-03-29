@@ -6129,6 +6129,33 @@ static char *load_system_prompt(void) {
     return strdup("You are a helpful assistant. /think");
 }
 
+// Build tool instructions to prepend to system prompt
+static char *build_tool_instructions(ToolDef *tools, int tool_count) {
+    if (tool_count == 0) return strdup("");
+    
+    char *instructions = malloc(8192);
+    int pos = 0;
+    
+    pos += snprintf(instructions + pos, 8192 - pos,
+        "\n\n## Available Tools\n"
+        "You can call functions to help answer questions. When you need to run a command, "
+        "use the following format:\n\n"
+        "<tool_call>\n{\"command\": \"your command here\"}\n</tool_call>\n\n"
+        "Available functions:\n");
+    
+    for (int i = 0; i < tool_count && pos < 7000; i++) {
+        pos += snprintf(instructions + pos, 8192 - pos,
+            "- %s: %s\n", tools[i].name, tools[i].description);
+    }
+    
+    pos += snprintf(instructions + pos, 8192 - pos,
+        "\nWhen you need to execute a command, output exactly:\n"
+        "<tool_call>\n{\"command\": \"the command to run\"}\n</tool_call>\n\n"
+        "Then the result will be provided back to you.\n");
+    
+    return instructions;
+}
+
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
@@ -6442,6 +6469,20 @@ static void serve_loop(
             int is_continuation = (has_session &&
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
+            
+            // Prepend tool instructions to content for new sessions
+            if (has_tools && !is_continuation) {
+                char *tool_instr = build_tool_instructions(tools, tool_count);
+                if (tool_instr && tool_instr[0]) {
+                    char *new_content = malloc(strlen(content) + strlen(tool_instr) + 256);
+                    snprintf(new_content, strlen(content) + strlen(tool_instr) + 256,
+                        "%s\n%s", tool_instr, content);
+                    free(content);
+                    content = new_content;
+                    fprintf(stderr, "[serve] Added tool instructions to prompt\n");
+                }
+                free(tool_instr);
+            }
 
             // Session persistence is handled by the client (chat.m)
 
