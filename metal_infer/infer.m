@@ -6133,25 +6133,30 @@ static char *load_system_prompt(void) {
 static char *build_tool_instructions(ToolDef *tools, int tool_count) {
     if (tool_count == 0) return strdup("");
     
-    char *instructions = malloc(8192);
+    char *instructions = malloc(16384);
     int pos = 0;
     
-    pos += snprintf(instructions + pos, 8192 - pos,
-        "\n\n## Available Tools\n"
-        "You can call functions to help answer questions. When you need to run a command, "
-        "use the following format:\n\n"
-        "<tool_call>\n{\"command\": \"your command here\"}\n</tool_call>\n\n"
+    pos += snprintf(instructions + pos, 16384 - pos,
+        "\n\n## Tools\n"
+        "You have access to functions. To execute a command, you MUST use the special tool_call format below.\n\n"
+        "IMPORTANT - Use this EXACT format when you want to run a command:\n"
+        "<tool_call>\n{\"command\": \"ls -la\"}\n</tool_call>\n\n"
+        "Do NOT just describe what you would do - you MUST use the tool_call format above.\n\n"
         "Available functions:\n");
     
-    for (int i = 0; i < tool_count && pos < 7000; i++) {
-        pos += snprintf(instructions + pos, 8192 - pos,
+    for (int i = 0; i < tool_count && pos < 14000; i++) {
+        pos += snprintf(instructions + pos, 16384 - pos,
             "- %s: %s\n", tools[i].name, tools[i].description);
+        if (tools[i].has_parameters && tools[i].parameters[0]) {
+            pos += snprintf(instructions + pos, 16384 - pos,
+                "  parameters: %s\n", tools[i].parameters);
+        }
     }
     
-    pos += snprintf(instructions + pos, 8192 - pos,
-        "\nWhen you need to execute a command, output exactly:\n"
-        "<tool_call>\n{\"command\": \"the command to run\"}\n</tool_call>\n\n"
-        "Then the result will be provided back to you.\n");
+    pos += snprintf(instructions + pos, 16384 - pos,
+        "\nRemember: When you need to run a command, output:\n"
+        "<tool_call>\n{\"command\": \"your command here\"}\n</tool_call>\n\n"
+        "Then wait for the result before responding to the user.\n");
     
     return instructions;
 }
@@ -6707,9 +6712,11 @@ static void serve_loop(
                         tool_call_len += tlen;
                         tool_call_buf[tool_call_len] = 0;
                         
-                        // Check for complete tool_call block
+                        // Check for complete tool_call block (multiple formats)
                         char *tc_start = strstr(tool_call_buf, "<tool_call>");
+                        if (!tc_start) tc_start = strstr(tool_call_buf, "<tool_call");
                         char *tc_end = strstr(tool_call_buf, "</tool_call>");
+                        if (!tc_end) tc_end = strstr(tool_call_buf, "</tool_call");
                         
                         if (tc_start && tc_end && (tc_end - tc_start) < 7000) {
                             // Extract tool call content
@@ -6719,14 +6726,17 @@ static void serve_loop(
                                 char tc_body[7000] = {0};
                                 memcpy(tc_body, tc_start, tc_body_len);
                                 
-                                // Find command in the tool call
+                                // Find command in the tool call - try multiple patterns
                                 char command[4096] = {0};
+                                int ci = 0;
+                                
+                                // Try JSON format: "command": "..."
                                 char *cmd_key = strstr(tc_body, "\"command\"");
                                 if (cmd_key) {
                                     cmd_key = strchr(cmd_key + 9, '"');
                                     if (cmd_key) {
                                         cmd_key++;
-                                        int ci = 0;
+                                        ci = 0;
                                         while (*cmd_key && *cmd_key != '"' && ci < 4095) {
                                             if (*cmd_key == '\\' && *(cmd_key+1)) {
                                                 cmd_key++;
@@ -6740,6 +6750,24 @@ static void serve_loop(
                                                 command[ci++] = *cmd_key;
                                             }
                                             cmd_key++;
+                                        }
+                                    }
+                                }
+                                
+                                // Fallback: look for "arguments": {"command": "..."}
+                                if (ci == 0) {
+                                    char *args = strstr(tc_body, "\"arguments\"");
+                                    if (args) {
+                                        char *cmd_in_args = strstr(args, "\"command\"");
+                                        if (cmd_in_args) {
+                                            cmd_in_args = strchr(cmd_in_args + 9, '"');
+                                            if (cmd_in_args) {
+                                                cmd_in_args++;
+                                                ci = 0;
+                                                while (*cmd_in_args && *cmd_in_args != '"' && ci < 4095) {
+                                                    command[ci++] = *cmd_in_args++;
+                                                }
+                                            }
                                         }
                                     }
                                 }
