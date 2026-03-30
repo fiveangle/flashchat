@@ -734,6 +734,37 @@ prompt_save_config() {
     echo ""
 }
 
+check_xcode_cli() {
+    if xcode-select -p >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+prompt_install_xcode_cli() {
+    echo ""
+    echo "=== Xcode Command Line Tools Required ==="
+    echo ""
+    echo "Flash-MoE requires Xcode command line tools to compile the inference engine."
+    echo "Without it, the model cannot run."
+    echo ""
+    read -p "Would you like to install Xcode CLI tools now? [Y/n] " -n 1 -r
+    echo ""
+    
+    if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+        echo "Installing Xcode command line tools..."
+        echo "(This may prompt for your password)"
+        xcode-select --install
+        echo ""
+        echo "Please complete the installation in the dialog, then run flashchat again."
+        exit 0
+    else
+        echo "Cannot proceed without Xcode CLI tools. Exiting."
+        exit 1
+    fi
+}
+
 ensure_setup() {
     local force="${1:-0}"
     
@@ -741,6 +772,11 @@ ensure_setup() {
     flashmoe_load_config
     
     logv "Checking setup status..."
+    
+    # Check for Xcode CLI tools first (required for building)
+    if ! check_xcode_cli; then
+        prompt_install_xcode_cli
+    fi
     
     # Check model
     if ! check_model_downloaded; then
