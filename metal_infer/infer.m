@@ -6008,6 +6008,111 @@ static int extract_session_id(const char *buf, char *out_buf, int out_size) {
     return i > 0 ? 1 : 0;
 }
 
+// Extract tool results from messages for continuing after tool call.
+// Returns allocated string with tool results formatted as <tool_response>, or NULL if none.
+// The returned string should be freed by caller.
+static char *extract_tool_results(const char *buf) {
+    // Look for role: "tool" with tool_call_id and content
+    // Format: {"role": "tool", "tool_call_id": "call_xxx", "content": "..."}
+    // We need to find all such entries and format them as tool responses
+    
+    char *results = malloc(131072);  // 128KB should be enough
+    if (!results) return NULL;
+    results[0] = '\0';
+    int results_len = 0;
+    
+    const char *p = buf;
+    while (*p) {
+        // Find next role field
+        const char *role_start = strstr(p, "\"role\"");
+        if (!role_start) break;
+        
+        // Check if it's "tool"
+        const char *colon = strchr(role_start, ':');
+        if (!colon) break;
+        colon++;
+        while (*colon == ' ' || *colon == '\t') colon++;
+        if (*colon != '"') { p = colon; continue; }
+        colon++;
+        
+        // Check for "tool"
+        if (strncmp(colon, "tool", 4) != 0 || colon[4] != '"') {
+            p = colon;
+            continue;
+        }
+        
+        // Found tool role, now find tool_call_id
+        const char *id_start = strstr(colon, "\"tool_call_id\"");
+        if (!id_start) { p = colon; continue; }
+        
+        const char *id_colon = strchr(id_start, ':');
+        if (!id_colon) { p = id_start; continue; }
+        id_colon++;
+        while (*id_colon == ' ' || *id_colon == '\t') id_colon++;
+        if (*id_colon != '"') { p = id_colon; continue; }
+        id_colon++;
+        
+        // Extract tool_call_id
+        char tool_call_id[64] = {0};
+        int id_len = 0;
+        while (*id_colon && *id_colon != '"' && id_len < 63) {
+            tool_call_id[id_len++] = *id_colon++;
+        }
+        
+        // Find content after tool_call_id
+        const char *content_start = strstr(id_colon, "\"content\"");
+        if (!content_start) { p = id_colon; continue; }
+        
+        const char *content_colon = strchr(content_start, ':');
+        if (!content_colon) { p = content_start; continue; }
+        content_colon++;
+        while (*content_colon == ' ' || *content_colon == '\t') content_colon++;
+        if (*content_colon != '"') { p = content_colon; continue; }
+        content_colon++;
+        
+        // Extract content
+        char content[65536] = {0};
+        int content_len = 0;
+        while (*content_colon && content_len < 65535) {
+            if (*content_colon == '\\' && *(content_colon+1)) {
+                content_colon++;
+                switch (*content_colon) {
+                    case 'n': content[content_len++] = '\n'; break;
+                    case '"': content[content_len++] = '"'; break;
+                    case '\\': content[content_len++] = '\\'; break;
+                    default: content[content_len++] = *content_colon; break;
+                }
+                content_colon++;
+            } else if (*content_colon == '"') {
+                break;
+            } else {
+                content[content_len++] = *content_colon++;
+            }
+        }
+        
+        // Append as tool response
+        int written = snprintf(results + results_len, 131072 - results_len,
+            "<tool_response>\n%s\n</tool_response>", content);
+        if (written > 0) {
+            results_len += written;
+        }
+        
+        p = content_colon;
+    }
+    
+    if (results_len == 0) {
+        free(results);
+        return NULL;
+    }
+    
+    return results;
+}
+
+// Check if request contains tool results (continuing after tool call)
+static int has_tool_results(const char *buf) {
+    return extract_tool_results(buf) != NULL;
+}
+
 // Write a full HTTP response string to fd
 static void http_write(int fd, const char *data, int len) {
     int sent = 0;
@@ -6056,6 +6161,48 @@ static void sse_send_done(int fd, const char *request_id) {
         "data: [DONE]\n\n",
         request_id);
     http_write(fd, chunk, n);
+}
+
+// Send SSE chunk with tool_calls (for OpenAI-compatible tool calling)
+// Returns 0 on success, -1 if client disconnected
+static int sse_send_tool_calls(int fd, const char *request_id, const char *tool_call_id, 
+                                const char *function_name, const char *arguments) {
+    // Escape the JSON strings
+    char escaped_name[256];
+    char escaped_args[8192];
+    
+    char *w = escaped_name;
+    for (const char *r = function_name; *r && w < escaped_name + sizeof(escaped_name) - 2; r++) {
+        if (*r == '"' || *r == '\\') { *w++ = '\\'; }
+        *w++ = *r;
+    }
+    *w = '\0';
+    
+    w = escaped_args;
+    for (const char *r = arguments; *r && w < escaped_args + sizeof(escaped_args) - 2; r++) {
+        if (*r == '"' || *r == '\\') { *w++ = '\\'; }
+        *w++ = *r;
+    }
+    *w = '\0';
+    
+    char chunk[12288];
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\","
+        "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        request_id, tool_call_id, escaped_name, escaped_args);
+    
+    ssize_t wr = write(fd, chunk, n);
+    if (wr <= 0) return -1;
+    
+    // Send done after tool_calls
+    n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n",
+        request_id);
+    wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
 }
 
 static const char *SSE_HEADERS =
@@ -6475,6 +6622,8 @@ static void serve_loop(
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
             
+            int content_allocated = 0;
+            
             // Prepend tool instructions to content for new sessions
             if (has_tools && !is_continuation) {
                 char *tool_instr = build_tool_instructions(tools, tool_count);
@@ -6482,8 +6631,8 @@ static void serve_loop(
                     char *new_content = malloc(strlen(content) + strlen(tool_instr) + 256);
                     snprintf(new_content, strlen(content) + strlen(tool_instr) + 256,
                         "%s\n%s", tool_instr, content);
-                    free(content);
                     content = new_content;
+                    content_allocated = 1;
                     fprintf(stderr, "[serve] Added tool instructions to prompt\n");
                 }
                 free(tool_instr);
@@ -6581,6 +6730,15 @@ static void serve_loop(
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
+            // ---- Check for tool results (continuing after tool call) ----
+            char *tool_results = NULL;
+            if (has_tools && is_continuation) {
+                tool_results = extract_tool_results(body);
+                if (tool_results) {
+                    fprintf(stderr, "[serve] Processing tool results, %zu chars\n", strlen(tool_results));
+                }
+            }
+
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
@@ -6667,6 +6825,50 @@ static void serve_loop(
             int in_tool_call = 0;
             char tool_call_buf[8192] = {0};
             int tool_call_len = 0;
+
+            // ---- Process tool results if present (continuing after tool call) ----
+            if (tool_results && tool_results[0]) {
+                fprintf(stderr, "[serve] Feeding tool results to model...\n");
+                
+                // Tokenize tool results
+                PromptTokens *tool_pt = tokenize_user_turn(tool_results);
+                if (tool_pt) {
+                    fprintf(stderr, "[serve] Tool results tokenized: %d tokens\n", tool_pt->count);
+                    
+                    // Process each token through the model
+                    for (int ti = 0; ti < tool_pt->count; ti++) {
+                        embed_lookup(wf, tool_pt->ids[ti], hidden);
+                        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                            int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                            fused_layer_forward(wf, layer, hidden,
+                                                is_full ? kv_caches[layer] : NULL,
+                                                is_full ? NULL : layer_states[layer],
+                                                pos,
+                                                layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                                K, layer_fds[layer]);
+                        }
+                        discard_deferred_experts();
+                        pos++;
+                    }
+                    
+                    // Final logits after tool results
+                    if (final_norm_w) {
+                        float *normed = malloc(HIDDEN_DIM * sizeof(float));
+                        cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+                        memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
+                        free(normed);
+                    }
+                    lm_head_forward(wf, hidden, logits);
+                    next_token = cpu_argmax(logits, VOCAB_SIZE);
+                    
+                    free(tool_pt->ids);
+                    free(tool_pt);
+                }
+                free(tool_results);
+                tool_results = NULL;
+                
+                fprintf(stderr, "[serve] Tool results processed, continuing generation\n");
+            }
 
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
@@ -6773,63 +6975,40 @@ static void serve_loop(
                                 }
                                 
                                 if (command[0]) {
-                                    fprintf(stderr, "[serve] Executing tool: %s\n", command);
+                                    // Generate a tool call ID
+                                    static int tool_call_counter = 0;
+                                    char tool_call_id[32];
+                                    snprintf(tool_call_id, sizeof(tool_call_id), "call_%d", ++tool_call_counter);
                                     
-                                    // Execute the command
-                                    FILE *proc = popen(command, "r");
-                                    char output[65536] = {0};
-                                    int out_len = 0;
-                                    if (proc) {
-                                        while (out_len < 65535) {
-                                            int ch = fgetc(proc);
-                                            if (ch == EOF) break;
-                                            output[out_len++] = (char)ch;
-                                        }
-                                        output[out_len] = 0;
-                                        pclose(proc);
+                                    fprintf(stderr, "[serve] Returning tool_calls: %s(%s)\n", tool_call_id, command);
+                                    
+                                    // Send SSE with tool_calls format (OpenAI-compatible)
+                                    if (sse_send_tool_calls(client_fd, request_id, tool_call_id, 
+                                                           "bash", command) < 0) {
+                                        fprintf(stderr, "[serve] %s client disconnected during tool call\n", request_id);
+                                        break;
                                     }
                                     
-                                    // Format as tool response and feed back to model
-                                    char tool_msg[70000];
-                                    snprintf(tool_msg, sizeof(tool_msg), 
-                                        "<tool_response>\n%s\n</tool_response>", output);
+                                    // Store tool call info in session for later
+                                    // For now, we just return - client will send tool results in next request
                                     
-                                    // Tokenize and feed tool response
-                                    PromptTokens *tool_pt = tokenize_user_turn(tool_msg);
-                                    if (tool_pt) {
-                                        // Process tool response tokens
-                                        for (int ti = 0; ti < tool_pt->count; ti++) {
-                                            embed_lookup(wf, tool_pt->ids[ti], hidden);
-                                            for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                                                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                                                fused_layer_forward(wf, layer, hidden,
-                                                                    is_full ? kv_caches[layer] : NULL,
-                                                                    is_full ? NULL : layer_states[layer],
-                                                                    pos,
-                                                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                                                    K, layer_fds[layer]);
-                                            }
-                                            pos++;
-                                        }
-                                        // Final logits after tool response
-                                        if (final_norm_w) {
-                                            float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                                            cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                                            memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                                            free(normed);
-                                        }
-                                        lm_head_forward(wf, hidden, logits);
-                                        next_token = cpu_argmax(logits, VOCAB_SIZE);
-                                        
-                                        free(tool_pt->ids);
-                                        free(tool_pt);
+                                    // Save session state before returning
+                                    session_pos = pos;
+                                    fprintf(stderr, "[serve] %s session_pos=%d (tool call, waiting for results)\n",
+                                            request_id, session_pos,
+                                            active_session_id[0] ? active_session_id : "(none)");
+                                    
+                                    // Close SSE stream
+                                    close(client_fd);
+                                    
+                                    // Free allocated memory
+                                    free(pt->ids);
+                                    free(pt);
+                                    if (content_allocated) {
+                                        free(content);
                                     }
-                                    
-                                    // Reset tool call buffer
-                                    tool_call_len = 0;
-                                    tool_call_buf[0] = 0;
-                                    
-                                    continue;  // Continue with next token from tool response
+                                    free(reqbuf);
+                                    goto next_request;
                                 }
                             }
                         }
@@ -6889,8 +7068,13 @@ static void serve_loop(
 
             free(pt->ids);
             free(pt);
+            if (content_allocated) {
+                free(content);
+            }
             free(reqbuf);
             close(client_fd);
+
+        next_request:
             continue;
         }
 
