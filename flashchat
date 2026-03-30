@@ -646,6 +646,23 @@ prompt_extract_experts() {
     
     local model_path
     model_path=$(flashmoe_get MODEL_PATH)
+    local model_repo
+    model_repo=$(flashmoe_get MODEL_REPO)
+    
+    # Check if model is supported
+    if [[ "$model_repo" != *"Qwen3.5-397B-A17B"* ]]; then
+        echo ""
+        echo "=== Model Not Supported ==="
+        echo ""
+        echo "Currently, only Qwen3.5-397B-A17B is supported."
+        echo "The selected model '$model_repo' has a different architecture"
+        echo "and is not compatible with this inference engine."
+        echo ""
+        echo "Supported model: mlx-community/Qwen3.5-397B-A17B-4bit"
+        echo ""
+        echo "Expert extraction cancelled."
+        exit 0
+    fi
     
     local expert_index_path=""
     if [ -f "$model_path/expert_index.json" ]; then
