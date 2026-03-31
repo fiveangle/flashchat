@@ -527,8 +527,62 @@ prompt_config_interactive() {
 check_model_downloaded() {
     local model_path
     model_path=$(flashmoe_get MODEL_PATH)
-    [ -d "$model_path" ] && [ -f "$model_path/model.safetensors.index.json" ]
+    local weights_dir
+    weights_dir=$(flashmoe_get WEIGHTS_DIR)
+    local quantization
+    quantization=$(flashmoe_get QUANTIZATION)
+    
+    # Check core model files (model_weights.bin + model_weights.json + vocab.bin)
+    if ! [ -f "$model_path/model_weights.bin" ] || \
+       ! [ -f "$model_path/model_weights.json" ] || \
+       ! [ -f "$weights_dir/vocab.bin" ]; then
+        return 1
+    fi
+    
+    # Check experts based on quantization setting
+    if [ "$quantization" = "2bit" ]; then
+        local experts_2bit_dir
+        experts_2bit_dir=$(flashmoe_get EXPERTS_2BIT_DIR)
+        [ -f "$experts_2bit_dir/layer_59.bin" ] && return 0
+    else
+        local experts_dir
+        experts_dir=$(flashmoe_get EXPERTS_DIR)
+        [ -f "$experts_dir/layer_59.bin" ] && return 0
+    fi
+    
+    return 1
+}
+
+check_model_extracted() {
+    local model_path
+    model_path=$(flashmoe_get MODEL_PATH)
+    
+    # Check if original HuggingFace model exists (safetensors)
+    [ -f "$model_path/model-00001-of-00046.safetensors" ] || \
+    [ -f "$model_path/model.safetensors" ] || \
+    [ -f "$model_path/config.json" ]
     return $?
+}
+
+prompt_extract_setup() {
+    echo ""
+    echo "=== Model Files Required ==="
+    echo ""
+    echo "The model has been downloaded but the following need to be extracted:"
+    echo "  - Non-expert weights (~5.5GB): model_weights.bin + model_weights.json"
+    echo "  - Vocabulary: vocab.bin"
+    echo "  - Expert weights (4-bit or 2-bit): packed_experts/"
+    echo ""
+    echo "This is a ONE-TIME setup operation."
+    read -p "Run extraction now? [Y/n] " -n 1 -r
+    echo ""
+    
+    if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+        ensure_setup
+    else
+        echo "Extraction cancelled. Run 'flashchat' again when ready."
+        exit 0
+    fi
 }
 
 FLASHMOE_VENV=""
@@ -1072,13 +1126,23 @@ cmd_serve() {
     
     # Verify model is available before starting server
     if ! check_model_downloaded; then
-        echo ""
-        echo "=== Model Not Found ==="
-        echo ""
-        echo "The configured model is not in the HuggingFace cache."
-        echo "Download is required before starting the server."
-        echo ""
-        prompt_download_model
+        if check_model_extracted; then
+            echo ""
+            echo "=== Model Not Extracted ==="
+            echo ""
+            echo "The model is downloaded but not extracted for inference."
+            echo "Extraction is required before starting the server."
+            echo ""
+            prompt_extract_setup
+        else
+            echo ""
+            echo "=== Model Not Found ==="
+            echo ""
+            echo "The configured model is not in the HuggingFace cache."
+            echo "Download is required before starting the server."
+            echo ""
+            prompt_download_model
+        fi
     fi
     
     local server_port
@@ -1165,13 +1229,23 @@ cmd_chat() {
     
     # Verify model is available before starting chat
     if ! check_model_downloaded; then
-        echo ""
-        echo "=== Model Not Found ==="
-        echo ""
-        echo "The configured model is not in the HuggingFace cache."
-        echo "Download is required before starting chat."
-        echo ""
-        prompt_download_model
+        if check_model_extracted; then
+            echo ""
+            echo "=== Model Not Extracted ==="
+            echo ""
+            echo "The model is downloaded but not extracted for inference."
+            echo "Extraction is required before starting chat."
+            echo ""
+            prompt_extract_setup
+        else
+            echo ""
+            echo "=== Model Not Found ==="
+            echo ""
+            echo "The configured model is not in the HuggingFace cache."
+            echo "Download is required before starting chat."
+            echo ""
+            prompt_download_model
+        fi
     fi
     
     local server_port
@@ -1208,13 +1282,24 @@ cmd_prompt() {
     
     # Verify model is available before running prompt
     if ! check_model_downloaded; then
-        echo ""
-        echo "=== Model Not Found ==="
-        echo ""
-        echo "The configured model is not in the HuggingFace cache."
-        echo "Download is required before running prompts."
-        echo ""
-        prompt_download_model
+        # Check if original HF model exists but not extracted
+        if check_model_extracted; then
+            echo ""
+            echo "=== Model Not Extracted ==="
+            echo ""
+            echo "The model is downloaded but not extracted for inference."
+            echo "Extraction is required before running prompts."
+            echo ""
+            prompt_extract_setup
+        else
+            echo ""
+            echo "=== Model Not Found ==="
+            echo ""
+            echo "The configured model is not in the HuggingFace cache."
+            echo "Download is required before running prompts."
+            echo ""
+            prompt_download_model
+        fi
     fi
     
     local server_port
@@ -1252,13 +1337,23 @@ interactive_menu() {
     else
         # Config exists - verify model is available, download if missing
         if ! check_model_downloaded; then
-            echo ""
-            echo "=== Model Not Found ==="
-            echo ""
-            echo "The configured model is not in the HuggingFace cache."
-            echo "Downloading is required before running."
-            echo ""
-            prompt_download_model
+            if check_model_extracted; then
+                echo ""
+                echo "=== Model Not Extracted ==="
+                echo ""
+                echo "The model is downloaded but not extracted for inference."
+                echo "Extraction is required before running."
+                echo ""
+                prompt_extract_setup
+            else
+                echo ""
+                echo "=== Model Not Found ==="
+                echo ""
+                echo "The configured model is not in the HuggingFace cache."
+                echo "Downloading is required before running."
+                echo ""
+                prompt_download_model
+            fi
         fi
     fi
     
