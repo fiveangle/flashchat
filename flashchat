@@ -1088,6 +1088,7 @@ cmd_serve() {
     # Set environment for infer
     export FLASHMOE_MODEL_PATH="$(flashmoe_get MODEL_PATH)"
     export FLASHMOE_SERVER_PORT="$server_port"
+    export FLASHMOE_QUANTIZATION="$(flashmoe_get QUANTIZATION)"
     
     # Start server (redirect output to avoid mixing with TUI)
     ./infer --serve "$server_port" > /dev/null 2>&1 &
@@ -1329,6 +1330,7 @@ cmd_benchmark() {
     export FLASHMOE_MODEL_PATH="$(flashmoe_get MODEL_PATH)"
     export FLASHMOE_WEIGHTS_DIR="$(flashmoe_get WEIGHTS_DIR)"
     export FLASHMOE_EXPERTS_DIR="$(flashmoe_get EXPERTS_DIR)"
+    export FLASHMOE_QUANTIZATION="$(flashmoe_get QUANTIZATION)"
     
     cd "$SCRIPT_DIR/metal_infer"
     ensure_binaries

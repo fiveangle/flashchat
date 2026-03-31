@@ -7249,6 +7249,52 @@ int main(int argc, char **argv) {
         const char *env_serve_port = getenv("FLASHMOE_SERVER_PORT");
         int serve_port = env_serve_port ? atoi(env_serve_port) : 0;
 
+        // Support FLASHMOE_QUANTIZATION environment variable (4bit or 2bit)
+        const char *env_quantization = getenv("FLASHMOE_QUANTIZATION");
+        if (env_quantization && strcmp(env_quantization, "2bit") == 0) {
+            g_use_2bit = 1;
+        }
+
+        // Also try to read config from ~/.config/flash-moe/config if env vars not set
+        const char *home = getenv("HOME");
+        if (home) {
+            char config_path[1024];
+            snprintf(config_path, sizeof(config_path), "%s/.config/flash-moe/config", home);
+            
+            FILE *cfg = fopen(config_path, "r");
+            if (cfg) {
+                char line[512];
+                while (fgets(line, sizeof(line), cfg)) {
+                    // Parse QUANTIZATION from config file
+                    if (strncmp(line, "QUANTIZATION=", 13) == 0) {
+                        char *val = line + 13;
+                        // Remove quotes
+                        char *quote = strchr(val, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            if (strcmp(quote + 1, "2bit") == 0) {
+                                g_use_2bit = 1;
+                            }
+                        }
+                    }
+                    // Parse MODEL_PATH from config file (for when env var not set)
+                    if (strncmp(line, "MODEL_PATH=", 11) == 0) {
+                        if (!env_model_path) {
+                            char *val = line + 11;
+                            char *quote = strchr(val, '"');
+                            if (quote) {
+                                char *end_quote = strchr(quote + 1, '"');
+                                if (end_quote) *end_quote = '\0';
+                                model_path = strdup(quote + 1);
+                            }
+                        }
+                    }
+                }
+                fclose(cfg);
+            }
+        }
+
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
             {"weights",       required_argument, 0, 'w'},
