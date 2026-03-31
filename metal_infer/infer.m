@@ -124,7 +124,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "/Users/speedster/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
 // Timing helper
@@ -6825,7 +6825,6 @@ static void serve_loop(
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
             // Tool call state
-            int in_tool_call = 0;
             char tool_call_buf[8192] = {0};
             int tool_call_len = 0;
 
@@ -6904,7 +6903,10 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
-                // Accumulate non-thinking response for session persistence
+                int send_as_delta = 1;
+                if (next_token == THINK_START_TOKEN || next_token == THINK_END_TOKEN) {
+                    send_as_delta = 0;
+                }
                 if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
@@ -6922,6 +6924,14 @@ static void serve_loop(
                         if (!tc_start) tc_start = strstr(tool_call_buf, "<tool_call");
                         char *tc_end = strstr(tool_call_buf, "</tool_call>");
                         if (!tc_end) tc_end = strstr(tool_call_buf, "</tool_call");
+                        
+                        // Don't send as delta if we're inside a potential tool_call block
+                        // (once we see <tool_call, suppress until we confirm it's complete or not)
+                        if (tc_start && (!tc_end || (tc_end > tc_start))) {
+                            send_as_delta = 0;
+                            fprintf(stderr, "[serve] suppressing tool_call content: tc_start=%p tc_end=%p\n", 
+                                    (void*)tc_start, (void*)tc_end);
+                        }
                         
                         if (tc_start && tc_end && (tc_end - tc_start) < 7000) {
                             // Extract tool call content
@@ -7102,9 +7112,13 @@ static void serve_loop(
                         }
                     }
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                if (send_as_delta && sse_send_delta(client_fd, request_id, tok_str) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                     break;
+                }
+                if (gen_count % 50 == 0) {
+                    fprintf(stderr, "[serve] gen_count=%d send_as_delta=%d tok='%.32s' tool_call_len=%d\n", 
+                            gen_count, send_as_delta, tok_str ? tok_str : "(null)", tool_call_len);
                 }
                 gen_count++;
 

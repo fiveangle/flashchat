@@ -410,8 +410,14 @@ prompt_config_interactive() {
     # Experts quantization
     local default_quant
     default_quant=$(flashmoe_get QUANTIZATION)
-    printf "Experts quantization (4bit/2bit) [%s]: " "$default_quant"
+    printf "Experts quantization (2/4 for 2bit/4bit) [%s]: " "$default_quant"
     read -r REPLY
+    # Convert shortcuts: 2 -> 2bit, 4 -> 4bit
+    if [ "$REPLY" = "2" ]; then
+        REPLY="2bit"
+    elif [ "$REPLY" = "4" ]; then
+        REPLY="4bit"
+    fi
     echo "QUANTIZATION=\"${REPLY:-$default_quant}\"" >> /tmp/flashmoe_new_config
     
     # Max Tokens
