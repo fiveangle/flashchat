@@ -1070,6 +1070,17 @@ cmd_serve() {
     # Start server
     flashmoe_load_config
     
+    # Verify model is available before starting server
+    if ! check_model_downloaded; then
+        echo ""
+        echo "=== Model Not Found ==="
+        echo ""
+        echo "The configured model is not in the HuggingFace cache."
+        echo "Download is required before starting the server."
+        echo ""
+        prompt_download_model
+    fi
+    
     local server_port
     server_port="${port:-$(flashmoe_get SERVER_PORT)}"
     
@@ -1152,6 +1163,17 @@ cmd_chat() {
     
     flashmoe_load_config
     
+    # Verify model is available before starting chat
+    if ! check_model_downloaded; then
+        echo ""
+        echo "=== Model Not Found ==="
+        echo ""
+        echo "The configured model is not in the HuggingFace cache."
+        echo "Download is required before starting chat."
+        echo ""
+        prompt_download_model
+    fi
+    
     local server_port
     server_port="${port:-$(flashmoe_get SERVER_PORT)}"
     
@@ -1184,6 +1206,17 @@ cmd_prompt() {
     
     flashmoe_load_config
     
+    # Verify model is available before running prompt
+    if ! check_model_downloaded; then
+        echo ""
+        echo "=== Model Not Found ==="
+        echo ""
+        echo "The configured model is not in the HuggingFace cache."
+        echo "Download is required before running prompts."
+        echo ""
+        prompt_download_model
+    fi
+    
     local server_port
     server_port=$(flashmoe_get SERVER_PORT)
     
@@ -1211,9 +1244,22 @@ cmd_prompt() {
 # -----------------------------------------------------------------------------
 interactive_menu() {
     flashmoe_load_config
+    
+    # Check if config exists
     if [ ! -f "$(flashmoe_get CONFIG_FILE)" ]; then
         echo "Welcome to Flash-MoE. Running initial setup..."
         ensure_setup
+    else
+        # Config exists - verify model is available, download if missing
+        if ! check_model_downloaded; then
+            echo ""
+            echo "=== Model Not Found ==="
+            echo ""
+            echo "The configured model is not in the HuggingFace cache."
+            echo "Downloading is required before running."
+            echo ""
+            prompt_download_model
+        fi
     fi
     
     while true; do
