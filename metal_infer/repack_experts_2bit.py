@@ -36,6 +36,8 @@ import sys
 import time
 import numpy as np
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 
 # ============================================================================
@@ -395,6 +397,63 @@ def verify_expert(expert_4bit: bytes, expert_2bit: bytes) -> dict:
 
 
 # ============================================================================
+# Process single layer (for parallel execution)
+# ============================================================================
+
+def process_layer_parallel(args_tuple):
+    """
+    Process a single layer - for parallel execution via ProcessPoolExecutor.
+    Takes a tuple of (layer_idx, input_dir_str, output_dir_str, num_experts, verify)
+    Returns (layer_idx, success, message)
+    """
+    import sys
+    import time
+    import numpy as np
+    from pathlib import Path
+    
+    layer_idx, input_dir_str, output_dir_str, num_experts_arg, verify_arg = args_tuple
+    
+    input_dir = Path(input_dir_str)
+    output_dir = Path(output_dir_str)
+    num_experts = num_experts_arg
+    
+    input_path = input_dir / f'layer_{layer_idx:02d}.bin'
+    output_path = output_dir / f'layer_{layer_idx:02d}.bin'
+
+    expected_size = num_experts * EXPERT_SIZE_4BIT
+    actual_size = input_path.stat().st_size
+    if actual_size != expected_size:
+        num_experts_actual = actual_size // EXPERT_SIZE_4BIT
+        if actual_size % EXPERT_SIZE_4BIT != 0:
+            return layer_idx, False, f"ERROR: File size not a multiple of EXPERT_SIZE_4BIT"
+    else:
+        num_experts_actual = num_experts
+
+    layer_t0 = time.time()
+    rmse_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
+
+    with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
+        for eidx in range(num_experts_actual):
+            fin.seek(eidx * EXPERT_SIZE_4BIT)
+            expert_4bit = fin.read(EXPERT_SIZE_4BIT)
+            if len(expert_4bit) != EXPERT_SIZE_4BIT:
+                return layer_idx, False, f"ERROR: Short read for expert {eidx}"
+
+            expert_2bit, proj_rmses = requantize_expert(expert_4bit)
+            assert len(expert_2bit) == EXPERT_SIZE_2BIT
+
+            for p in ("gate", "up", "down"):
+                rmse_accum[p] += proj_rmses[p]
+
+            fout.write(expert_2bit)
+
+    layer_elapsed = time.time() - layer_t0
+    avg_rmse = {p: rmse_accum[p] / num_experts_actual for p in rmse_accum}
+    
+    return layer_idx, True, f"Layer {layer_idx:02d} done in {layer_elapsed:.1f}s ({num_experts_actual / layer_elapsed:.1f} experts/s), RMSE: {avg_rmse}"
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -427,6 +486,8 @@ def main():
                         help='Verify by dequantizing 2-bit output and comparing to 4-bit')
     parser.add_argument('--experts', type=int, default=NUM_EXPERTS,
                         help=f'Number of experts per layer (default: {NUM_EXPERTS})')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Number of parallel workers for layer processing (default: CPU cores)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -452,12 +513,14 @@ def main():
             sys.exit(1)
 
     num_experts = args.experts
+    num_workers = args.workers if args.workers else multiprocessing.cpu_count()
 
     print(f"Model:       {model_path}")
     print(f"Input:       {input_dir}")
     print(f"Output:      {output_dir}")
     print(f"Layers:      {layers}")
     print(f"Experts:     {num_experts}")
+    print(f"Workers:     {num_workers}")
     print(f"4-bit size:  {EXPERT_SIZE_4BIT:,} bytes/expert  "
           f"({num_experts * EXPERT_SIZE_4BIT / 1e9:.2f} GB/layer)")
     print(f"2-bit size:  {EXPERT_SIZE_2BIT:,} bytes/expert  "
@@ -467,85 +530,96 @@ def main():
 
     total_t0 = time.time()
 
-    for layer_idx in layers:
-        input_path = input_dir / f'layer_{layer_idx:02d}.bin'
-        output_path = output_dir / f'layer_{layer_idx:02d}.bin'
-
-        expected_size = num_experts * EXPERT_SIZE_4BIT
-        actual_size = input_path.stat().st_size
-        if actual_size != expected_size:
-            print(f"WARNING: layer_{layer_idx:02d}.bin is {actual_size:,} bytes, "
-                  f"expected {expected_size:,} ({num_experts} x {EXPERT_SIZE_4BIT:,})")
-            num_experts_actual = actual_size // EXPERT_SIZE_4BIT
-            if actual_size % EXPERT_SIZE_4BIT != 0:
-                print(f"ERROR: File size not a multiple of EXPERT_SIZE_4BIT, skipping",
-                      file=sys.stderr)
-                continue
-            print(f"  Adjusting to {num_experts_actual} experts based on file size")
-        else:
-            num_experts_actual = num_experts
-
-        print(f"=== Layer {layer_idx:02d} ({num_experts_actual} experts, "
-              f"{actual_size / 1e9:.2f} GB -> "
-              f"{num_experts_actual * EXPERT_SIZE_2BIT / 1e9:.2f} GB) ===")
-
-        layer_t0 = time.time()
-
-        # Per-projection RMSE accumulators
-        rmse_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
-        max_error_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
-
-        # Process experts one at a time to limit memory
-        with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
-            for eidx in range(num_experts_actual):
-                fin.seek(eidx * EXPERT_SIZE_4BIT)
-                expert_4bit = fin.read(EXPERT_SIZE_4BIT)
-                if len(expert_4bit) != EXPERT_SIZE_4BIT:
-                    print(f"  ERROR: Short read for expert {eidx}: "
-                          f"{len(expert_4bit)} bytes", file=sys.stderr)
-                    break
-
-                # Requantize
-                expert_2bit, proj_rmses = requantize_expert(expert_4bit)
-                assert len(expert_2bit) == EXPERT_SIZE_2BIT
-
-                # Optional verification (first 4 experts per layer)
-                if args.verify and eidx < 4:
-                    max_errs = verify_expert(expert_4bit, expert_2bit)
-                    for p in ("gate", "up", "down"):
-                        max_error_accum[p] = max(max_error_accum[p], max_errs[p])
-
-                # Accumulate RMSE
-                for p in ("gate", "up", "down"):
-                    rmse_accum[p] += proj_rmses[p]
-
-                # Write 2-bit expert (sequential, no seeking needed)
-                fout.write(expert_2bit)
-
-                # Progress every 32 experts
-                if (eidx + 1) % 32 == 0 or eidx == num_experts_actual - 1:
-                    elapsed = time.time() - layer_t0
-                    rate = (eidx + 1) / elapsed
-                    eta = (num_experts_actual - eidx - 1) / rate if rate > 0 else 0
-                    print(f"  [{eidx+1:3d}/{num_experts_actual}] "
-                          f"{elapsed:.1f}s elapsed, {rate:.1f} experts/s, "
-                          f"ETA {eta:.0f}s")
-
-        layer_elapsed = time.time() - layer_t0
-
-        # Per-layer stats
-        avg_rmse = {p: rmse_accum[p] / num_experts_actual for p in rmse_accum}
-        print(f"\n  Layer {layer_idx:02d} done in {layer_elapsed:.1f}s "
-              f"({num_experts_actual / layer_elapsed:.1f} experts/s)")
-        print(f"  Avg RMSE:  gate={avg_rmse['gate']:.6f}  "
-              f"up={avg_rmse['up']:.6f}  down={avg_rmse['down']:.6f}")
-        if args.verify:
-            print(f"  Max error: gate={max_error_accum['gate']:.6f}  "
-                  f"up={max_error_accum['up']:.6f}  down={max_error_accum['down']:.6f}")
-
-        out_size = output_path.stat().st_size
-        print(f"  Output: {output_path} ({out_size / 1e9:.2f} GB)")
+    if num_workers > 1 and len(layers) > 1:
+        print(f"Processing {len(layers)} layers in parallel with {num_workers} workers...")
         print()
+        
+        input_dir_str = str(input_dir)
+        output_dir_str = str(output_dir)
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            args_list = [(layer_idx, input_dir_str, output_dir_str, num_experts, args.verify) for layer_idx in layers]
+            futures = {executor.submit(process_layer_parallel, args): args[0] for args in args_list}
+            completed = 0
+            for future in as_completed(futures):
+                layer_idx, success, message = future.result()
+                completed += 1
+                if success:
+                    print(f"[{completed}/{len(layers)}] {message}")
+                else:
+                    print(f"[{completed}/{len(layers)}] Layer {layer_idx:02d}: {message}", file=sys.stderr)
+    else:
+        for layer_idx in layers:
+            input_path = input_dir / f'layer_{layer_idx:02d}.bin'
+            output_path = output_dir / f'layer_{layer_idx:02d}.bin'
+
+            expected_size = num_experts * EXPERT_SIZE_4BIT
+            actual_size = input_path.stat().st_size
+            if actual_size != expected_size:
+                print(f"WARNING: layer_{layer_idx:02d}.bin is {actual_size:,} bytes, "
+                      f"expected {expected_size:,} ({num_experts} x {EXPERT_SIZE_4BIT:,})")
+                num_experts_actual = actual_size // EXPERT_SIZE_4BIT
+                if actual_size % EXPERT_SIZE_4BIT != 0:
+                    print(f"ERROR: File size not a multiple of EXPERT_SIZE_4BIT, skipping",
+                          file=sys.stderr)
+                    continue
+                print(f"  Adjusting to {num_experts_actual} experts based on file size")
+            else:
+                num_experts_actual = num_experts
+
+            print(f"=== Layer {layer_idx:02d} ({num_experts_actual} experts, "
+                  f"{actual_size / 1e9:.2f} GB -> "
+                  f"{num_experts_actual * EXPERT_SIZE_2BIT / 1e9:.2f} GB) ===")
+
+            layer_t0 = time.time()
+
+            rmse_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
+            max_error_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
+
+            with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
+                for eidx in range(num_experts_actual):
+                    fin.seek(eidx * EXPERT_SIZE_4BIT)
+                    expert_4bit = fin.read(EXPERT_SIZE_4BIT)
+                    if len(expert_4bit) != EXPERT_SIZE_4BIT:
+                        print(f"  ERROR: Short read for expert {eidx}: "
+                              f"{len(expert_4bit)} bytes", file=sys.stderr)
+                        break
+
+                    expert_2bit, proj_rmses = requantize_expert(expert_4bit)
+                    assert len(expert_2bit) == EXPERT_SIZE_2BIT
+
+                    if args.verify and eidx < 4:
+                        max_errs = verify_expert(expert_4bit, expert_2bit)
+                        for p in ("gate", "up", "down"):
+                            max_error_accum[p] = max(max_error_accum[p], max_errs[p])
+
+                    for p in ("gate", "up", "down"):
+                        rmse_accum[p] += proj_rmses[p]
+
+                    fout.write(expert_2bit)
+
+                    if (eidx + 1) % 32 == 0 or eidx == num_experts_actual - 1:
+                        elapsed = time.time() - layer_t0
+                        rate = (eidx + 1) / elapsed
+                        eta = (num_experts_actual - eidx - 1) / rate if rate > 0 else 0
+                        print(f"  [{eidx+1:3d}/{num_experts_actual}] "
+                              f"{elapsed:.1f}s elapsed, {rate:.1f} experts/s, "
+                              f"ETA {eta:.0f}s")
+
+            layer_elapsed = time.time() - layer_t0
+
+            avg_rmse = {p: rmse_accum[p] / num_experts_actual for p in rmse_accum}
+            print(f"\n  Layer {layer_idx:02d} done in {layer_elapsed:.1f}s "
+                  f"({num_experts_actual / layer_elapsed:.1f} experts/s)")
+            print(f"  Avg RMSE:  gate={avg_rmse['gate']:.6f}  "
+                  f"up={avg_rmse['up']:.6f}  down={avg_rmse['down']:.6f}")
+            if args.verify:
+                print(f"  Max error: gate={max_error_accum['gate']:.6f}  "
+                      f"up={max_error_accum['up']:.6f}  down={max_error_accum['down']:.6f}")
+
+            out_size = output_path.stat().st_size
+            print(f"  Output: {output_path} ({out_size / 1e9:.2f} GB)")
+            print()
 
     total_elapsed = time.time() - total_t0
     print(f"Total time: {total_elapsed:.1f}s")

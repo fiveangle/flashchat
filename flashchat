@@ -434,9 +434,11 @@ prompt_config_interactive() {
             echo ""
             
             if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
-                echo "Extracting 2-bit experts..."
+                local num_workers
+                num_workers=$(get_performance_cores)
+                echo "Extracting 2-bit experts using $num_workers parallel workers..."
                 cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py
+                run_python repack_experts_2bit.py --workers "$num_workers"
                 cd "$SCRIPT_DIR"
                 
                 if check_experts_2bit_extracted; then
@@ -590,15 +592,25 @@ check_vocab_exported() {
 check_experts_extracted() {
     local experts_dir
     experts_dir=$(flashmoe_get EXPERTS_DIR)
-    [ -f "$experts_dir/layer_00.bin" ]
+    [ -f "$experts_dir/layer_59.bin" ]
     return $?
 }
 
 check_experts_2bit_extracted() {
     local experts_2bit_dir
     experts_2bit_dir=$(flashmoe_get EXPERTS_2BIT_DIR)
-    [ -f "$experts_2bit_dir/layer_00.bin" ]
+    [ -f "$experts_2bit_dir/layer_59.bin" ]
     return $?
+}
+
+get_performance_cores() {
+    local p_cores
+    p_cores=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)
+    if [ -n "$p_cores" ] && [ "$p_cores" -gt 0 ]; then
+        echo "$p_cores"
+    else
+        echo "1"
+    fi
 }
 
 prompt_download_model() {
@@ -778,8 +790,11 @@ prompt_extract_experts() {
         echo "Requantizing to 2-bit..."
         echo "Estimated time: 15-30 minutes."
         echo ""
+        local num_workers
+        num_workers=$(get_performance_cores)
+        echo "Using $num_workers parallel workers..."
         cd "$SCRIPT_DIR/metal_infer"
-        run_python repack_experts_2bit.py
+        run_python repack_experts_2bit.py --workers "$num_workers"
         echo "2-bit experts created successfully."
     fi
 }
@@ -909,8 +924,10 @@ ensure_setup() {
                 prompt_extract_experts
             else
                 # 4bit exists, just need 2bit
+                local num_workers
+                num_workers=$(get_performance_cores)
                 cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py
+                run_python repack_experts_2bit.py --workers "$num_workers"
                 cd "$SCRIPT_DIR"
             fi
         fi
