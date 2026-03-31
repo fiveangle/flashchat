@@ -1,15 +1,15 @@
 #!/bin/bash
-# Test APFS transparent compression on expert data.
-# Compresses a copy of one layer file with APFS compression,
+# Test ZStandard transparent compression on expert data.
+# Compresses a copy of one layer file with ZStandard compression,
 # then benchmarks pread throughput on compressed vs uncompressed.
 
 set -e
 
 EXPERTS_DIR="/Users/speedster/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3/packed_experts"
 SRC="$EXPERTS_DIR/layer_00.bin"
-WORKDIR="/tmp/apfs_compress_test"
+WORKDIR="/tmp/zstd_compress_test"
 
-echo "=== APFS Transparent Compression Test ==="
+echo "=== ZStandard Transparent Compression Test ==="
 
 # Check source
 if [ ! -f "$SRC" ]; then
@@ -30,9 +30,9 @@ echo ""
 echo "--- Copying uncompressed ---"
 cp "$SRC" "$WORKDIR/layer_uncompressed.bin"
 
-# Copy and compress with APFS compression (using ditto --hfsCompression or afsctool)
+# Copy and compress with ZStandard compression (using ditto --hfsCompression or afsctool)
 echo ""
-echo "--- Compressing with APFS ---"
+echo "--- Compressing with ZStandard ---"
 
 # Method 1: afsctool (if available)
 if command -v afsctool &>/dev/null; then
@@ -44,7 +44,7 @@ if command -v afsctool &>/dev/null; then
 # Method 2: ditto with --hfsCompression
 else
     echo "(afsctool not found, trying ditto --hfsCompression)"
-    # ditto preserves and can apply HFS+ compression (which APFS also supports)
+    # ditto preserves and can apply HFS+ compression (which ZStandard also supports)
     ditto --hfsCompression "$SRC" "$WORKDIR/layer_compressed.bin" 2>/dev/null || {
         # Method 3: copy and use afscutil
         echo "(ditto failed, trying /usr/bin/compression_tool)"
@@ -145,7 +145,7 @@ echo "=== Benchmark: Uncompressed ==="
 "$WORKDIR/bench_pread" "$WORKDIR/layer_uncompressed.bin" 20
 
 echo ""
-echo "=== Benchmark: APFS Compressed ==="
+echo "=== Benchmark: ZStandard Compressed ==="
 "$WORKDIR/bench_pread" "$WORKDIR/layer_compressed.bin" 20
 
 echo ""

@@ -5829,7 +5829,7 @@ static int extract_max_tokens(const char *buf, int default_val) {
 // Tool definitions for OpenAI function calling
 #define MAX_TOOLS 16
 #define MAX_TOOL_NAME 64
-#define MAX_TOOL_DESC 512
+#define MAX_TOOL_DESC 16000
 
 typedef struct {
     char name[MAX_TOOL_NAME];
@@ -5885,42 +5885,50 @@ static int extract_tools(const char *body, ToolDef *tools, int *tool_count) {
         obj = strchr(obj, '{');
         if (!obj || obj > arr_end) break;
         
-        // Extract name
-        const char *name_start = strstr(obj, "\"name\"");
-        if (name_start && name_start < arr_end) {
-            name_start = strchr(name_start, ':');
-            if (name_start) {
-                name_start++;
-                // Skip whitespace and find opening quote
-                while (*name_start && (*name_start == ' ' || *name_start == '\t')) name_start++;
-                if (*name_start == '"') {
-                    name_start++;
-                    int i = 0;
-                    while (*name_start && *name_start != '"' && i < MAX_TOOL_NAME - 1) {
-                        tools[count].name[i++] = *name_start++;
-                    }
-                    tools[count].name[i] = '\0';
-                }
-            }
-        }
+         // Extract name
+         const char *name_start = strstr(obj, "\"name\"");
+         if (name_start && name_start < arr_end) {
+             name_start = strchr(name_start, ':');
+             if (name_start) {
+                 name_start++;
+                 // Skip whitespace and find opening quote
+                 while (*name_start && (*name_start == ' ' || *name_start == '\t')) name_start++;
+                 if (*name_start == '"') {
+                     name_start++;
+                     int i = 0;
+                     while (*name_start && i < MAX_TOOL_NAME - 1) {
+                         // Handle escaped quotes: if we see a quote that's not preceded by a backslash, it's the end
+                         if (*name_start == '"' && (i == 0 || name_start[-1] != '\\')) {
+                             break;
+                         }
+                         tools[count].name[i++] = *name_start++;
+                     }
+                     tools[count].name[i] = '\0';
+                 }
+             }
+         }
         
-        // Extract description
-        const char *desc_start = strstr(obj, "\"description\"");
-        if (desc_start && desc_start < arr_end) {
-            desc_start = strchr(desc_start, ':');
-            if (desc_start) {
-                desc_start++;
-                while (*desc_start && (*desc_start == ' ' || *desc_start == '\t')) desc_start++;
-                if (*desc_start == '"') {
-                    desc_start++;
-                    int i = 0;
-                    while (*desc_start && *desc_start != '"' && i < MAX_TOOL_DESC - 1) {
-                        tools[count].description[i++] = *desc_start++;
-                    }
-                    tools[count].description[i] = '\0';
-                }
-            }
-        }
+         // Extract description
+         const char *desc_start = strstr(obj, "\"description\"");
+         if (desc_start && desc_start < arr_end) {
+             desc_start = strchr(desc_start, ':');
+             if (desc_start) {
+                 desc_start++;
+                 while (*desc_start && (*desc_start == ' ' || *desc_start == '\t')) desc_start++;
+                 if (*desc_start == '"') {
+                     desc_start++;
+                     int i = 0;
+                     while (*desc_start && i < MAX_TOOL_DESC - 1) {
+                         // Handle escaped quotes: if we see a quote that's not preceded by a backslash, it's the end
+                         if (*desc_start == '"' && (i == 0 || desc_start[-1] != '\\')) {
+                             break;
+                         }
+                         tools[count].description[i++] = *desc_start++;
+                     }
+                     tools[count].description[i] = '\0';
+                 }
+             }
+         }
         
         // Extract parameters
         const char *params_start = strstr(obj, "\"parameters\"");
@@ -6280,10 +6288,10 @@ static char *load_system_prompt(void) {
 static char *build_tool_instructions(ToolDef *tools, int tool_count) {
     if (tool_count == 0) return strdup("");
     
-    char *instructions = malloc(16384);
+    char *instructions = malloc(65536);
     int pos = 0;
     
-    pos += snprintf(instructions + pos, 16384 - pos,
+    pos += snprintf(instructions + pos, 65536 - pos,
         "\n\n## Tools\n"
         "You have access to functions. To execute a command, you MUST use the special tool_call format below.\n\n"
         "IMPORTANT - Use this EXACT format when you want to run a command:\n"
@@ -6292,16 +6300,16 @@ static char *build_tool_instructions(ToolDef *tools, int tool_count) {
         "The 'description' field should be a brief 3-5 word summary of what the command does.\n\n"
         "Available functions:\n");
     
-    for (int i = 0; i < tool_count && pos < 14000; i++) {
-        pos += snprintf(instructions + pos, 16384 - pos,
+    for (int i = 0; i < tool_count && pos < 60000; i++) {
+        pos += snprintf(instructions + pos, 65536 - pos,
             "- %s: %s\n", tools[i].name, tools[i].description);
         if (tools[i].has_parameters && tools[i].parameters[0]) {
-            pos += snprintf(instructions + pos, 16384 - pos,
+            pos += snprintf(instructions + pos, 65536 - pos,
                 "  parameters: %s\n", tools[i].parameters);
         }
     }
     
-    pos += snprintf(instructions + pos, 16384 - pos,
+    pos += snprintf(instructions + pos, 65536 - pos,
         "\nRemember: When you need to run a command, output:\n"
         "<tool_call>\n{\"command\": \"your command here\", \"description\": \"Brief description\"}\n</tool_call>\n\n"
         "Then wait for the result before responding to the user.\n");
@@ -6625,12 +6633,13 @@ static void serve_loop(
             
             int content_allocated = 0;
             
-            // Prepend tool instructions to content for new sessions
+             // Prepend tool instructions to content for new sessions
             if (has_tools && !is_continuation) {
                 char *tool_instr = build_tool_instructions(tools, tool_count);
                 if (tool_instr && tool_instr[0]) {
-                    char *new_content = malloc(strlen(content) + strlen(tool_instr) + 256);
-                    snprintf(new_content, strlen(content) + strlen(tool_instr) + 256,
+                    size_t new_size = strlen(content) + strlen(tool_instr) + 1024;
+                    char *new_content = malloc(new_size);
+                    snprintf(new_content, new_size,
                         "%s\n%s", tool_instr, content);
                     content = new_content;
                     content_allocated = 1;
