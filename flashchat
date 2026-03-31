@@ -613,6 +613,14 @@ get_performance_cores() {
     fi
 }
 
+check_hf_cli() {
+    if command -v hf &> /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 prompt_download_model() {
     local model_repo
     model_repo=$(flashmoe_get MODEL_REPO)
@@ -629,11 +637,19 @@ prompt_download_model() {
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         echo "Downloading model..."
-        HF_VENV="/tmp/hf_$$"
-        python3 -m venv "$HF_VENV"
-        "$HF_VENV/bin/pip" install huggingface-hub -q 2>/dev/null
-        "$HF_VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model_repo')"
-        rm -rf "$HF_VENV"
+        
+        if check_hf_cli; then
+            echo "Using Homebrew hf CLI..."
+            hf model download "$model_repo"
+        else
+            echo "Installing huggingface-hub in temporary venv..."
+            HF_VENV="/tmp/hf_$$"
+            python3 -m venv "$HF_VENV"
+            "$HF_VENV/bin/pip" install huggingface-hub -q 2>/dev/null
+            "$HF_VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model_repo')"
+            rm -rf "$HF_VENV"
+        fi
+        
         echo "Download complete."
     else
         echo "Download cancelled. Run 'flashchat' again when ready."
@@ -729,8 +745,8 @@ prompt_extract_experts() {
     echo "=== Extract Expert Weights ==="
     echo ""
     
-    local size_4bit="218GB"
-    local size_2bit="120GB"
+    local size_4bit="218GB (203GiB)"
+    local size_2bit="121GB (113GiB)"
     
     echo "Available disk space:"
     df -h . | tail -1
