@@ -410,15 +410,49 @@ prompt_config_interactive() {
     # Experts quantization
     local default_quant
     default_quant=$(flashmoe_get QUANTIZATION)
+    local selected_quant=""
     printf "Experts quantization (2/4 for 2bit/4bit) [%s]: " "$default_quant"
-    read -r REPLY
+    read -r selected_quant
+    selected_quant="${selected_quant:-$default_quant}"
     # Convert shortcuts: 2 -> 2bit, 4 -> 4bit
-    if [ "$REPLY" = "2" ]; then
-        REPLY="2bit"
-    elif [ "$REPLY" = "4" ]; then
-        REPLY="4bit"
+    if [ "$selected_quant" = "2" ]; then
+        selected_quant="2bit"
+    elif [ "$selected_quant" = "4" ]; then
+        selected_quant="4bit"
     fi
-    echo "QUANTIZATION=\"${REPLY:-$default_quant}\"" >> /tmp/flashmoe_new_config
+    
+    # Check if 2bit is selected and verify experts exist
+    if [ "$selected_quant" = "2bit" ]; then
+        if ! check_experts_2bit_extracted; then
+            echo ""
+            echo "=== 2-bit Experts Not Found ==="
+            echo ""
+            echo "The 2-bit experts have not been extracted yet."
+            echo "You can extract them now, or use 4-bit mode instead."
+            echo ""
+            read -p "Extract 2-bit experts now? [Y/n] " -n 1 -r
+            echo ""
+            
+            if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+                echo "Extracting 2-bit experts..."
+                cd "$SCRIPT_DIR/metal_infer"
+                run_python repack_experts_2bit.py
+                cd "$SCRIPT_DIR"
+                
+                if check_experts_2bit_extracted; then
+                    echo "2-bit experts extracted successfully."
+                else
+                    echo "ERROR: Failed to extract 2-bit experts. Reverting to 4bit."
+                    selected_quant="4bit"
+                fi
+            else
+                echo "Cancelled. Reverting to 4bit."
+                selected_quant="4bit"
+            fi
+        fi
+    fi
+    
+    echo "QUANTIZATION=\"$selected_quant\"" >> /tmp/flashmoe_new_config
     
     # Max Tokens
     local default_tokens
