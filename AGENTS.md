@@ -112,6 +112,7 @@ clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 - **When changing the HTTP/API surface, add or update an automated smoke test whenever feasible.** Prefer a lightweight script that exercises the live endpoints the same way frontend harnesses will.
 - **Shell helpers should preserve the caller's working directory unless changing directories is the explicit purpose of the helper.** Save and restore `pwd` inside build/setup helpers that `cd` internally.
 - **Always verify the environment state before and after making changes.** Check that config files, model caches, and other state are preserved or properly restored. Test that changes don't inadvertently delete or corrupt user data.
+- **Server-side debug visibility matters.** Changes to `infer --serve` should preserve persistent logging so background server runs remain debuggable without requiring an interactive launch.
 
 ### C/Objective-C
 

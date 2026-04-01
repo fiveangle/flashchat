@@ -7,6 +7,7 @@
 # Commands:
 #   chat              Start chat (auto-sets up if missing)
 #   chat --resume ID  Resume session
+#   opencode          Launch OpenCode against the local Flash-MoE server
 #   serve             Start API server (auto-sets up if missing)
 #   serve --stop      Stop running server
 #   prompt "..."      Single prompt (auto-sets up if missing)
@@ -100,6 +101,7 @@ Usage:
 Commands:
   chat              Start chat interface
   chat --resume ID  Resume existing chat session
+  opencode          Launch OpenCode with the local Flash-MoE server
   serve             Start API server
   serve --stop      Stop running API server
   prompt "..."      Run single prompt and exit
@@ -131,6 +133,67 @@ Environment variables:
 
 For more info, see: https://github.com/flash-moE/flash-moe
 EOF
+}
+
+print_opencode_config_snippet() {
+    local server_port="$1"
+    local model_repo
+    model_repo="$(flashmoe_get MODEL_REPO)"
+    cat << EOF
+Add this provider to ~/.config/opencode/opencode.jsonc:
+
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "flashchat": {
+      "name": "flashchat",
+      "npm": "@ai-sdk/openai-compatible",
+      "models": {
+        "${model_repo}": {
+          "name": "Qwen3.5-397B-A17B-4bit",
+          "tools": true,
+          "limit": {
+            "context": 220000,
+            "output": 16000
+          }
+        }
+      },
+      "options": {
+        "baseURL": "http://127.0.0.1:${server_port}/v1"
+      }
+    }
+  }
+}
+EOF
+}
+
+check_opencode_config() {
+    local server_port="$1"
+    local config_path="${HOME}/.config/opencode/opencode.jsonc"
+
+    if [ ! -f "$config_path" ]; then
+        echo "OpenCode config not found: $config_path"
+        echo ""
+        print_opencode_config_snippet "$server_port"
+        return 1
+    fi
+
+    if ! rg -q '@ai-sdk/openai-compatible' "$config_path"; then
+        echo "OpenCode config exists but does not appear to define an OpenAI-compatible provider."
+        echo ""
+        print_opencode_config_snippet "$server_port"
+        return 1
+    fi
+
+    if ! rg -q "127\\.0\\.0\\.1:${server_port}/v1|localhost:${server_port}/v1" "$config_path"; then
+        echo "OpenCode config does not currently point at http://127.0.0.1:${server_port}/v1"
+        echo "Continuing, but if the harness connects to the wrong backend, update your config to:"
+        echo ""
+        print_opencode_config_snippet "$server_port"
+        echo ""
+    fi
+
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1350,6 +1413,49 @@ cmd_prompt() {
     echo ""
 }
 
+cmd_opencode() {
+    local port=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port|-p)
+                port="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    flashmoe_load_config
+
+    if ! command -v opencode >/dev/null 2>&1; then
+        error "OpenCode CLI not found in PATH"
+    fi
+
+    local server_port
+    server_port="${port:-$(flashmoe_get SERVER_PORT)}"
+
+    if ! nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+        echo "Starting server..."
+        cmd_serve --port "$server_port"
+        echo ""
+    fi
+
+    if ! wait_for_server "$server_port"; then
+        error "Server not responding"
+    fi
+
+    if ! check_opencode_config "$server_port"; then
+        error "OpenCode config is missing or incomplete"
+    fi
+
+    echo "Launching OpenCode against http://127.0.0.1:${server_port}/v1"
+    cd "$SCRIPT_DIR"
+    opencode "$@"
+}
+
 # -----------------------------------------------------------------------------
 # Interactive menu
 # -----------------------------------------------------------------------------
@@ -1737,6 +1843,10 @@ main() {
         prompt)
             ensure_setup
             cmd_prompt "$@"
+            ;;
+        opencode)
+            ensure_setup
+            cmd_opencode "$@"
             ;;
         benchmark)
             cmd_benchmark "$@"

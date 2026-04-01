@@ -48,11 +48,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
+#include <limits.h>
 #include <math.h>
 #include <getopt.h>
 #include <pthread.h>
@@ -134,6 +138,124 @@ static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static void server_log_timestamp(FILE *f) {
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
+    fprintf(f, "[%s] ", ts);
+}
+
+static FILE *g_server_log = NULL;
+static char g_server_log_path[PATH_MAX] = {0};
+
+static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
+    va_list stream_ap;
+    va_copy(stream_ap, ap);
+    vfprintf(stream, fmt, stream_ap);
+    fflush(stream);
+    va_end(stream_ap);
+
+    if (g_server_log) {
+        va_list file_ap;
+        va_copy(file_ap, ap);
+        server_log_timestamp(g_server_log);
+        vfprintf(g_server_log, fmt, file_ap);
+        fflush(g_server_log);
+        va_end(file_ap);
+    }
+}
+
+static void server_logf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    server_log_emit(stdout, fmt, ap);
+    va_end(ap);
+}
+
+static void server_log_errorf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    server_log_emit(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void server_log_close(void) {
+    if (!g_server_log) return;
+    server_log_timestamp(g_server_log);
+    fprintf(g_server_log, "[serve] Logging stopped\n");
+    fflush(g_server_log);
+    fclose(g_server_log);
+    g_server_log = NULL;
+}
+
+static void server_log_open(void) {
+    if (g_server_log) return;
+
+    const char *env_path = getenv("FLASHMOE_SERVER_LOG");
+    NSString *log_path = nil;
+    if (env_path && env_path[0]) {
+        log_path = [NSString stringWithUTF8String:env_path];
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) return;
+        log_path = [NSString stringWithFormat:@"%s/.config/flash-moe/logs/server.log", home];
+    }
+
+    if (!log_path || [log_path length] == 0) return;
+
+    NSString *log_dir = [log_path stringByDeletingLastPathComponent];
+    NSError *dir_error = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:log_dir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:&dir_error]) {
+        fprintf(stderr, "WARNING: could not create server log dir %s: %s\n",
+                [log_dir UTF8String],
+                dir_error ? [[dir_error localizedDescription] UTF8String] : "unknown error");
+        return;
+    }
+
+    const char *utf8_path = [log_path fileSystemRepresentation];
+    FILE *f = fopen(utf8_path, "a");
+    if (!f) {
+        fprintf(stderr, "WARNING: could not open server log %s: %s\n",
+                utf8_path, strerror(errno));
+        return;
+    }
+
+    g_server_log = f;
+    strncpy(g_server_log_path, utf8_path, sizeof(g_server_log_path) - 1);
+    g_server_log_path[sizeof(g_server_log_path) - 1] = '\0';
+    server_log_timestamp(g_server_log);
+    fprintf(g_server_log, "[serve] Logging started\n");
+    fflush(g_server_log);
+    atexit(server_log_close);
+}
+
+static volatile sig_atomic_t g_server_shutdown_signal = 0;
+static int g_server_listen_fd = -1;
+
+static void serve_signal_handler(int signo) {
+    g_server_shutdown_signal = signo;
+    if (g_server_listen_fd >= 0) {
+        close(g_server_listen_fd);
+        g_server_listen_fd = -1;
+    }
+}
+
+static void install_serve_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = serve_signal_handler;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 // ============================================================================
@@ -6902,11 +7024,14 @@ static void serve_loop(
     float *hidden, float *logits,
     uint16_t *final_norm_w, int K)
 {
-    // Ignore SIGPIPE (client disconnect mid-write)
-    signal(SIGPIPE, SIG_IGN);
+    g_server_shutdown_signal = 0;
+    g_server_listen_fd = -1;
+    install_serve_signal_handlers();
+    server_log_open();
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return; }
+    if (server_fd < 0) { perror("socket"); server_log_errorf("[serve] socket failed: %s\n", strerror(errno)); return; }
+    g_server_listen_fd = server_fd;
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -6917,15 +7042,17 @@ static void serve_loop(
     addr.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(server_fd); return;
+        perror("bind"); server_log_errorf("[serve] bind failed on port %d: %s\n", port, strerror(errno)); close(server_fd); g_server_listen_fd = -1; return;
     }
     if (listen(server_fd, 8) < 0) {
-        perror("listen"); close(server_fd); return;
+        perror("listen"); server_log_errorf("[serve] listen failed on port %d: %s\n", port, strerror(errno)); close(server_fd); g_server_listen_fd = -1; return;
     }
 
-    printf("[serve] Listening on http://0.0.0.0:%d\n", port);
-    printf("[serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health\n");
-    fflush(stdout);
+    server_logf("[serve] Listening on http://0.0.0.0:%d\n", port);
+    server_logf("[serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health\n");
+    if (g_server_log_path[0]) {
+        server_logf("[serve] Persistent log: %s\n", g_server_log_path);
+    }
 
     static uint64_t req_counter = 0;
 
@@ -6933,7 +7060,7 @@ static void serve_loop(
     // Tokenize the system prompt and run it through all 60 layers.
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
-    fprintf(stderr, "[serve] Pre-caching system prompt...\n");
+    server_log_errorf("[serve] Pre-caching system prompt...\n");
     PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
@@ -6990,7 +7117,7 @@ static void serve_loop(
         if (sys_embed_batch) { free(sys_embed_batch); sys_embed_batch = NULL; }
         // Sync CPU state → GPU for delta-net
         sync_cpu_to_gpu_delta_state_serve(layer_states);
-        fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
+        server_log_errorf("[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
     }
     free(sys_pt);
 
@@ -7053,10 +7180,20 @@ static void serve_loop(
     int sys_prompt_len = sys_pos;
 
     for (;;) {
+        if (g_server_shutdown_signal) {
+            server_log_errorf("[serve] Shutdown requested by signal %d\n", g_server_shutdown_signal);
+            break;
+        }
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) { perror("accept"); continue; }
+        if (client_fd < 0) {
+            if (g_server_shutdown_signal) {
+                server_log_errorf("[serve] Shutdown requested by signal %d\n", g_server_shutdown_signal);
+                break;
+            }
+            perror("accept"); server_log_errorf("[serve] accept failed: %s\n", strerror(errno)); continue;
+        }
 
         char *reqbuf = malloc(1024 * 1024);
         int reqlen = read_http_request(client_fd, reqbuf, 1024 * 1024);
@@ -7127,11 +7264,11 @@ static void serve_loop(
         char request_id[64];
         snprintf(request_id, sizeof(request_id),
                  "%s-%llu", is_chat ? "chatcmpl" : "resp", ++req_counter);
-        fprintf(stderr, "[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f reasoning=%d snapshot=%d\n",
-                request_id, is_chat ? "chat" : "responses",
-                req.conversation_text ? strlen(req.conversation_text) : 0,
-                req.tool_count, req.stream, req.temperature, req.top_p,
-                req.reasoning_enabled, req.used_snapshot);
+        server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f reasoning=%d snapshot=%d\n",
+                          request_id, is_chat ? "chat" : "responses",
+                          req.conversation_text ? strlen(req.conversation_text) : 0,
+                          req.tool_count, req.stream, req.temperature, req.top_p,
+                          req.reasoning_enabled, req.used_snapshot);
 
         int pos = 0;
         if (req.used_snapshot) {
@@ -7215,7 +7352,7 @@ static void serve_loop(
             pos++;
         }
         free(serve_embed_batch);
-        fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
+        server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
 
         if (final_norm_w) {
             float *normed = malloc(HIDDEN_DIM * sizeof(float));
@@ -7331,10 +7468,10 @@ static void serve_loop(
             send_json_ok(client_fd, final_json);
         }
 
-        fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)%s\n",
-                request_id, gen_count, now_ms() - t_gen,
-                gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
-                parsed_tool_call.is_tool_call ? " [tool_call]" : "");
+        server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)%s\n",
+                          request_id, gen_count, now_ms() - t_gen,
+                          gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
+                          parsed_tool_call.is_tool_call ? " [tool_call]" : "");
         if (g_expert_cache) cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
         else if (g_malloc_cache) cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
 
@@ -7345,7 +7482,15 @@ static void serve_loop(
         api_request_free(&req);
         free(reqbuf);
         close(client_fd);
+
+        if (g_server_shutdown_signal) {
+            server_log_errorf("[serve] Shutdown requested by signal %d after request drain\n", g_server_shutdown_signal);
+            break;
+        }
     }
+
+    if (server_fd >= 0 && g_server_listen_fd == server_fd) close(server_fd);
+    g_server_listen_fd = -1;
 }
 
 // ============================================================================

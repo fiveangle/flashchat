@@ -47,6 +47,15 @@ Launches an interactive menu with options for chat, server, configuration, and m
 
 Starts the interactive chat TUI. Automatically starts the server if not running.
 
+### OpenCode Harness
+
+```bash
+./flashchat opencode
+./flashchat opencode --port 8080
+```
+
+Starts the local Flash-MoE server if needed, checks for an OpenCode config at `~/.config/opencode/opencode.jsonc`, and launches `opencode` from the repo root.
+
 ### API Server
 
 ```bash
@@ -56,6 +65,24 @@ Starts the interactive chat TUI. Automatically starts the server if not running.
 ```
 
 Starts the OpenAI-compatible HTTP server. Server runs persistently until stopped.
+
+When `infer` runs in server mode, it also appends timestamped server activity to:
+
+```text
+~/.config/flash-moe/logs/server.log
+```
+
+This is useful when `flashchat` starts the server in the background and you want to review request timing or errors afterward. You can tail it directly:
+
+```bash
+tail -f ~/.config/flash-moe/logs/server.log
+```
+
+To override the log path for a single run:
+
+```bash
+FLASHMOE_SERVER_LOG=/tmp/flash-moe-server.log ./flashchat serve
+```
 
 ### Single Prompt
 
@@ -229,6 +256,35 @@ metal_infer/api_perf_log.tsv
 
 Each row records the date, branch, commit, endpoint scenario, request mode, duration, and derived stream tok/s when available. This is meant for spotting regressions over time, not for scientific benchmarking.
 The log also records the hostname, hardware model, RAM size, and a compact CPU/GPU core summary so results from different Apple Silicon machines can be compared later.
+
+## Harness Config
+
+For OpenCode, a working provider entry looks like:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "flashchat": {
+      "name": "flashchat",
+      "npm": "@ai-sdk/openai-compatible",
+      "models": {
+        "mlx-community/Qwen3.5-397B-A17B-4bit": {
+          "name": "Qwen3.5-397B-A17B-4bit",
+          "tools": true,
+          "limit": {
+            "context": 220000,
+            "output": 16000
+          }
+        }
+      },
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1"
+      }
+    }
+  }
+}
+```
 
 ## Setup Artifacts
 
