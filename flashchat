@@ -139,7 +139,7 @@ EOF
 cmd_status() {
     flashmoe_load_config
     
-    echo "=== Flash-MoE Status ==="
+    echo "=== Flash-MoE Show Status ==="
     echo "Server: http://$(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
     
     # Check if server is running
@@ -336,7 +336,7 @@ cmd_config_interactive() {
     flashmoe_load_config
     
     echo ""
-    echo "=== Configure Settings ==="
+    echo "=== Configuration Settings ==="
     echo "  -Model: $(flashmoe_get MODEL_REPO)"
     echo "  -Experts quantization (4bit/2bit): $(flashmoe_get QUANTIZATION)"
     echo "  -Context window size: $(flashmoe_get MAX_TOKENS) tokens"
@@ -347,7 +347,7 @@ cmd_config_interactive() {
     echo "  -Show thinking tokens (0/1): $(flashmoe_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashmoe_get COLOR_OUTPUT)"
     unset REPLY
-    read -p "Start edit config wizard? [Y/n]: " -n 1 -r
+    read -p "Start configuration wizard? [Y/n]: " -n 1 -r
     echo ""
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
@@ -367,7 +367,7 @@ prompt_config_options() {
     else
         # Non-interactive: use defaults
         echo ""
-        echo "=== Configure Settings ==="
+        echo "=== Configuration Settings ==="
         echo "(Running in non-interactive mode - using defaults)"
         echo ""
         
@@ -457,7 +457,7 @@ prompt_config_interactive() {
     # Max Tokens
     local default_tokens
     default_tokens=$(flashmoe_get MAX_TOKENS)
-    printf "Context window to generate [%s]: " "$default_tokens"
+    printf "Context window limit [%s]: " "$default_tokens"
     read -r REPLY
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashmoe_new_config
     
@@ -530,15 +530,17 @@ check_model_downloaded() {
     local quantization
     quantization=$(flashmoe_get QUANTIZATION)
     
-    # Check core model files (model_weights.bin + model_weights.json + vocab.bin)
-    # Note: model_weights are in metal_infer/, not in model path
+    if [[ "$weights_dir" != /* ]]; then
+        weights_dir="${weights_dir#./}"
+        weights_dir="${SCRIPT_DIR}/$weights_dir"
+    fi
+    
     if ! [ -f "$weights_dir/model_weights.bin" ] || \
        ! [ -f "$weights_dir/model_weights.json" ] || \
        ! [ -f "$weights_dir/vocab.bin" ]; then
         return 1
     fi
     
-    # Check experts based on quantization setting (experts are in model path)
     if [ "$quantization" = "2bit" ]; then
         local experts_2bit_dir
         experts_2bit_dir=$(flashmoe_get EXPERTS_2BIT_DIR)
@@ -631,6 +633,10 @@ ensure_binaries() {
 check_weights_extracted() {
     local weights_dir
     weights_dir=$(flashmoe_get WEIGHTS_DIR)
+    if [[ "$weights_dir" != /* ]]; then
+        weights_dir="${weights_dir#./}"
+        weights_dir="${SCRIPT_DIR}/$weights_dir"
+    fi
     [ -f "$weights_dir/model_weights.bin" ] && [ -f "$weights_dir/model_weights.json" ]
     return $?
 }
@@ -638,6 +644,10 @@ check_weights_extracted() {
 check_vocab_exported() {
     local weights_dir
     weights_dir=$(flashmoe_get WEIGHTS_DIR)
+    if [[ "$weights_dir" != /* ]]; then
+        weights_dir="${weights_dir#./}"
+        weights_dir="${SCRIPT_DIR}/$weights_dir"
+    fi
     [ -f "$weights_dir/vocab.bin" ]
     return $?
 }
@@ -645,6 +655,10 @@ check_vocab_exported() {
 check_experts_extracted() {
     local experts_dir
     experts_dir=$(flashmoe_get EXPERTS_DIR)
+    if [[ "$experts_dir" != /* ]]; then
+        experts_dir="${experts_dir#./}"
+        experts_dir="${SCRIPT_DIR}/$experts_dir"
+    fi
     [ -f "$experts_dir/layer_59.bin" ]
     return $?
 }
@@ -652,6 +666,10 @@ check_experts_extracted() {
 check_experts_2bit_extracted() {
     local experts_2bit_dir
     experts_2bit_dir=$(flashmoe_get EXPERTS_2BIT_DIR)
+    if [[ "$experts_2bit_dir" != /* ]]; then
+        experts_2bit_dir="${experts_2bit_dir#./}"
+        experts_2bit_dir="${SCRIPT_DIR}/$experts_2bit_dir"
+    fi
     [ -f "$experts_2bit_dir/layer_59.bin" ]
     return $?
 }
@@ -660,6 +678,8 @@ get_performance_cores() {
     local p_cores
     p_cores=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)
     if [ -n "$p_cores" ] && [ "$p_cores" -gt 0 ]; then
+        # Comment line below out to risk minor multithreaded extraction fragmentation
+        p_cores="1" 
         echo "$p_cores"
     else
         echo "1"
@@ -1083,6 +1103,7 @@ cmd_serve() {
     
     if [ "$stop" -eq 1 ]; then
         # Stop server
+        set +m  # Disable job control to suppress termination messages
         local pid_file
         pid_file=$(flashmoe_get_pid_file)
         
@@ -1092,7 +1113,7 @@ cmd_serve() {
             pid=$(cat "$pid_file")
             if kill -0 "$pid" 2>/dev/null; then
                 echo "Stopping server (PID: $pid)..."
-                kill "$pid"
+                kill "$pid" 2>/dev/null
                 sleep 0.5
                 rm -f "$pid_file"
                 echo "Server stopped."
@@ -1107,6 +1128,7 @@ cmd_serve() {
             local pid
             pid=$(lsof -ti:$port 2>/dev/null | head -1)
             if [ -n "$pid" ]; then
+                set +m  # Disable job control
                 echo "Stopping external server (PID: $pid)..."
                 kill "$pid" 2>/dev/null
                 sleep 0.5
@@ -1374,14 +1396,19 @@ interactive_menu() {
         
         local server_url="http://$(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)/v1"
         
+        local server_line="Server: $server_status"
+        if [ "$server_status" = "Running" ] || [ "$server_status" = "Running (external)" ]; then
+            server_line="$server_line   API: $server_url"
+        fi
+        
         echo ""
         echo "=================================================="
         echo "           Flash-MoE Management"
         echo "=================================================="
         echo "Status: $setup_status at $server_url"
         echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
-        echo "Server: $server_status"
-        echo "Select: [N]ew [R]esume [S]tart [X]stop [C]onfig [D]etails [L]clean [Q]uit"
+        echo "$server_line"
+        echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]odels, [Q]uit"
         read -p "> " -n 1 -r
         
         case "$REPLY" in
@@ -1389,9 +1416,9 @@ interactive_menu() {
                 echo ""
                 cmd_chat
                 ;;
-            r|R)
+            d|D)
                 echo ""
-                echo "Select a session to resume:"
+                echo "Select a chat dialog to resume:"
                 echo ""
                 
                 # Get sessions list
@@ -1399,7 +1426,7 @@ interactive_menu() {
                 sessions_dir=$(flashmoe_get_sessions_dir)
                 
                 if [ ! -d "$sessions_dir" ]; then
-                    echo "  (no sessions found)"
+                    echo "  (no chat dialogs found)"
                     echo ""
                 else
                     local count=0
@@ -1417,10 +1444,10 @@ interactive_menu() {
                     done
                     
                     if [ $count -eq 0 ]; then
-                        echo "  (no sessions)"
+                        echo "  (no chat dialogs)"
                     else
                         echo ""
-                        echo -n "Enter number or session ID: "
+                        echo -n "Enter number or chat dialog ID: "
                         read -r session_id
                         
                         # Check if input is a number
@@ -1436,20 +1463,20 @@ interactive_menu() {
                 ;;
             s|S)
                 echo ""
-                cmd_serve
+                cmd_status
                 ;;
-            x|X)
+            o|O)
                 echo ""
-                cmd_serve --stop
+                if is_server_running; then
+                    cmd_serve --stop
+                else
+                    cmd_serve
+                fi
                 ;;
             c|C)
                 cmd_config_interactive
                 ;;
-            d|D)
-                echo ""
-                cmd_status
-                ;;
-            l|L)
+            m|M)
                 echo ""
                 cmd_clean
                 ;;
