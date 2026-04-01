@@ -1381,7 +1381,7 @@ interactive_menu() {
         echo "Status: $setup_status at $server_url"
         echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
         echo "Server: $server_status"
-        echo "Select: [N]ew [R]esume [S]tart [X]stop [C]onfig [D]etails [Q]uit"
+        echo "Select: [N]ew [R]esume [S]tart [X]stop [C]onfig [D]etails [L]clean [Q]uit"
         read -p "> " -n 1 -r
         
         case "$REPLY" in
@@ -1449,6 +1449,10 @@ interactive_menu() {
                 echo ""
                 cmd_status
                 ;;
+            l|L)
+                echo ""
+                cmd_clean
+                ;;
             q|Q)
                 echo ""
                 echo "Goodbye!"
@@ -1458,6 +1462,136 @@ interactive_menu() {
                 echo ""
                 ;;
         esac
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Command: clean
+# -----------------------------------------------------------------------------
+cmd_clean() {
+    flashmoe_load_config
+    
+    local model_path
+    model_path=$(flashmoe_get MODEL_PATH)
+    local quantization
+    quantization=$(flashmoe_get QUANTIZATION)
+    
+    while true; do
+        echo "=== Clean Model Files ==="
+        echo ""
+        echo "Current model: $(flashmoe_get MODEL_REPO)"
+        echo ""
+        
+        # Blobs directory (original safetensors)
+        local blobs_dir="$model_path/.cache"
+        local blobs_size=""
+        if [ -d "$blobs_dir" ]; then
+            blobs_size=$(du -sh "$blobs_dir" 2>/dev/null | cut -f1)
+        fi
+        
+        # Packed experts (4-bit)
+        local experts_dir="$model_path/packed_experts"
+        local experts_size=""
+        if [ -d "$experts_dir" ]; then
+            experts_size=$(du -sh "$experts_dir" 2>/dev/null | cut -f1)
+        fi
+        
+        # Packed experts 2-bit
+        local experts_2bit_dir="$model_path/packed_experts_2bit"
+        local experts_2bit_size=""
+        if [ -d "$experts_2bit_dir" ]; then
+            experts_2bit_size=$(du -sh "$experts_2bit_dir" 2>/dev/null | cut -f1)
+        fi
+        
+        echo "Removable directories:"
+        echo ""
+        
+        # Show numbered list with descriptions
+        if [ -n "$blobs_size" ]; then
+            echo "  [1] $blobs_size - model blobs (needed only to extract 4bit quants)"
+        else
+            echo "  [1] (empty) - model blobs"
+        fi
+        
+        if [ -n "$experts_size" ]; then
+            echo "  [2] $experts_size - packed_experts (needed to run 4bit quant and extract 2bit quants)"
+        else
+            echo "  [2] (empty) - packed_experts"
+        fi
+        
+        if [ -n "$experts_2bit_size" ]; then
+            echo "  [3] $experts_2bit_size - packed_experts_2bit (needed to run 2bit quant)"
+        else
+            echo "  [3] (empty) - packed_experts_2bit"
+        fi
+        
+        echo ""
+        echo "Enter numbers to delete (e.g., 1,3), [Q]uit to exit: "
+        read -r REPLY
+        
+        if [[ "$REPLY" =~ ^[Qq]$ ]] || [ -z "$REPLY" ]; then
+            echo "Done."
+            return
+        fi
+        
+        # Process each selected number
+        local deleted=0
+        
+        for num in $(echo "$REPLY" | tr ',' ' '); do
+            case "$num" in
+                1)
+                    if [ -n "$blobs_size" ]; then
+                        rm -rf "$blobs_dir"
+                        echo "Deleted model blobs."
+                        deleted=1
+                    fi
+                    ;;
+                2)
+                    if [ -n "$experts_size" ]; then
+                        # Warn if current quant is 4bit
+                        if [ "$quantization" = "4bit" ]; then
+                            echo ""
+                            echo "WARNING: Your config currently uses 4bit quantization."
+                            echo "Deleting packed_experts will prevent the server from running."
+                            read -p "Delete anyway? [y/N] " -n 1 -r
+                            echo ""
+                            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                echo "Skipped."
+                                continue
+                            fi
+                        fi
+                        rm -rf "$experts_dir"
+                        echo "Deleted packed_experts."
+                        deleted=1
+                    fi
+                    ;;
+                3)
+                    if [ -n "$experts_2bit_size" ]; then
+                        # Warn if current quant is 2bit
+                        if [ "$quantization" = "2bit" ]; then
+                            echo ""
+                            echo "WARNING: Your config currently uses 2bit quantization."
+                            echo "Deleting packed_experts_2bit will prevent the server from running."
+                            read -p "Delete anyway? [y/N] " -n 1 -r
+                            echo ""
+                            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                echo "Skipped."
+                                continue
+                            fi
+                        fi
+                        rm -rf "$experts_2bit_dir"
+                        echo "Deleted packed_experts_2bit."
+                        deleted=1
+                    fi
+                    ;;
+            esac
+        done
+        
+        if [ "$deleted" -eq 0 ]; then
+            echo "No valid directories selected."
+        fi
+        
+        echo ""
     done
 }
 
