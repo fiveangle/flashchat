@@ -184,7 +184,8 @@ static void generate_session_id(char *buf, size_t bufsize) {
              (int)getpid(), (long)tv.tv_sec, (int)tv.tv_usec);
 }
 
-static int send_chat_request(int port, const char *user_message, int max_tokens, const char *session_id) {
+static int send_chat_request(int port, const char *user_message, int max_tokens,
+                             const char *session_id, int show_thinking) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
@@ -205,8 +206,8 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
     char body[MAX_INPUT_LINE * 3];
     int body_len = snprintf(body, sizeof(body),
         "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
-        "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
-        escaped, max_tokens, session_id);
+        "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\",\"reasoning\":%s}",
+        escaped, max_tokens, session_id, show_thinking ? "true" : "false");
 
     char request[MAX_INPUT_LINE * 4];
     int req_len = snprintf(request, sizeof(request),
@@ -615,7 +616,7 @@ int main(int argc, char **argv) {
         // Save user turn
         session_save_turn(session_id, "user", input_line);
 
-        sock = send_chat_request(port, input_line, max_tokens, session_id);
+        sock = send_chat_request(port, input_line, max_tokens, session_id, show_thinking);
         if (sock < 0) continue;
 
         printf("\n");
@@ -743,7 +744,7 @@ int main(int argc, char **argv) {
             snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
 
             free(response);
-            sock = send_chat_request(port, tool_msg, max_tokens, session_id);
+            sock = send_chat_request(port, tool_msg, max_tokens, session_id, show_thinking);
             free(tool_msg);
             if (sock < 0) { response = NULL; break; }
 
