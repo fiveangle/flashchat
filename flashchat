@@ -104,6 +104,7 @@ Commands:
   opencode          Launch OpenCode with the local Flash-MoE server
   serve             Start API server
   serve --stop      Stop running API server
+  serve --stop --force  Force-stop running API server
   prompt "..."      Run single prompt and exit
   benchmark         Run benchmarks (run, verify, bench, moe, moebench, full, fullbench)
   config            Edit configuration settings
@@ -1115,13 +1116,48 @@ is_server_running() {
     return 1
 }
 
+is_server_healthy() {
+    local port="$1"
+    curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1
+}
+
 wait_for_server() {
     local port="$1"
     local max_wait=30
     local waited=0
     
     while [ $waited -lt $max_wait ]; do
-        if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+        if nc -z 127.0.0.1 "$port" 2>/dev/null && is_server_healthy "$port"; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+wait_for_pid_exit() {
+    local pid="$1"
+    local timeout="${2:-10}"
+    local waited=0
+
+    while [ "$waited" -lt "$timeout" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+wait_for_port_clear() {
+    local port="$1"
+    local timeout="${2:-10}"
+    local waited=0
+
+    while [ "$waited" -lt "$timeout" ]; do
+        if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
             return 0
         fi
         sleep 1
@@ -1146,14 +1182,106 @@ find_available_port() {
     return 1
 }
 
+resolve_model_blob_target() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        local target
+        local dir
+        dir=$(dirname "$path")
+        target=$(readlink "$path")
+        if [[ "$target" != /* ]]; then
+            target="$dir/$target"
+        fi
+        (
+            cd "$(dirname "$target")" 2>/dev/null || exit 1
+            printf "%s/%s\n" "$(pwd -P)" "$(basename "$target")"
+        )
+        return
+    fi
+    printf "%s\n" "$path"
+}
+
+list_model_blob_targets() {
+    local model_path="$1"
+    local path
+    for path in "$model_path"/model-*.safetensors "$model_path"/model.safetensors; do
+        [ -e "$path" ] || continue
+        resolve_model_blob_target "$path"
+    done | awk '!seen[$0]++'
+}
+
+bytes_to_human() {
+    local bytes="$1"
+    awk -v bytes="$bytes" '
+        function human(x) {
+            split("B KiB MiB GiB TiB PiB", u, " ")
+            i = 1
+            while (x >= 1024 && i < 6) {
+                x /= 1024
+                i++
+            }
+            if (i == 1) return sprintf("%d %s", x, u[i])
+            return sprintf("%.1f %s", x, u[i])
+        }
+        BEGIN { print human(bytes) }
+    '
+}
+
+get_model_blobs_size() {
+    local model_path="$1"
+    local total=0
+    local target
+    while IFS= read -r target; do
+        [ -f "$target" ] || continue
+        local size
+        size=$(stat -f %z "$target" 2>/dev/null || echo 0)
+        total=$((total + size))
+    done < <(list_model_blob_targets "$model_path")
+    if [ "$total" -gt 0 ]; then
+        bytes_to_human "$total"
+    fi
+}
+
+delete_model_blobs() {
+    local model_path="$1"
+    local path
+    local deleted=0
+
+    while IFS= read -r path; do
+        [ -e "$path" ] || continue
+        local target
+        target=$(resolve_model_blob_target "$path")
+        if [ -n "$target" ] && [ -f "$target" ]; then
+            rm -f "$target"
+            deleted=1
+        fi
+        rm -f "$path"
+    done < <(
+        for path in "$model_path"/model-*.safetensors "$model_path"/model.safetensors; do
+            [ -e "$path" ] || continue
+            printf "%s\n" "$path"
+        done
+    )
+
+    if [ "$deleted" -eq 1 ]; then
+        return 0
+    fi
+    return 1
+}
+
 cmd_serve() {
     local stop=0
+    local force=0
     local port=""
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --stop)
                 stop=1
+                shift
+                ;;
+            --force)
+                force=1
                 shift
                 ;;
             -p|--port)
@@ -1167,39 +1295,64 @@ cmd_serve() {
     done
     
     if [ "$stop" -eq 1 ]; then
-        # Stop server
+        flashmoe_load_config
         set +m  # Disable job control to suppress termination messages
         local pid_file
+        local server_port
         pid_file=$(flashmoe_get_pid_file)
-        
+        server_port="${port:-$(flashmoe_get SERVER_PORT)}"
+
         if [ -f "$pid_file" ]; then
-            # Server was started by flashchat
             local pid
             pid=$(cat "$pid_file")
             if kill -0 "$pid" 2>/dev/null; then
                 echo "Stopping server (PID: $pid)..."
                 kill "$pid" 2>/dev/null
-                sleep 0.5
-                rm -f "$pid_file"
-                echo "Server stopped."
+                if wait_for_pid_exit "$pid" 10 && wait_for_port_clear "$server_port" 10; then
+                    rm -f "$pid_file"
+                    echo "Server stopped."
+                elif [ "$force" -eq 1 ]; then
+                    echo "Server did not exit after waiting. Sending SIGKILL..."
+                    kill -9 "$pid" 2>/dev/null || true
+                    if wait_for_pid_exit "$pid" 5 && wait_for_port_clear "$server_port" 5; then
+                        rm -f "$pid_file"
+                        echo "Server force-stopped."
+                    else
+                        error "Server process $pid is still present after SIGKILL"
+                    fi
+                else
+                    echo "Server is still running after SIGTERM."
+                    echo "Try: flashchat serve --stop --force"
+                    return 1
+                fi
             else
                 echo "Server not running (stale PID file)."
                 rm -f "$pid_file"
             fi
-        elif nc -z 127.0.0.1 "$(flashmoe_get SERVER_PORT)" 2>/dev/null; then
-            # Server is running externally - try to find and kill it
-            local port
-            port=$(flashmoe_get SERVER_PORT)
+        elif nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
             local pid
-            pid=$(lsof -ti:$port 2>/dev/null | head -1)
+            pid=$(lsof -ti:"$server_port" 2>/dev/null | head -1)
             if [ -n "$pid" ]; then
-                set +m  # Disable job control
                 echo "Stopping external server (PID: $pid)..."
                 kill "$pid" 2>/dev/null
-                sleep 0.5
-                echo "Server stopped."
+                if wait_for_pid_exit "$pid" 10 && wait_for_port_clear "$server_port" 10; then
+                    echo "External server stopped."
+                elif [ "$force" -eq 1 ]; then
+                    echo "External server did not exit after waiting. Sending SIGKILL..."
+                    kill -9 "$pid" 2>/dev/null || true
+                    if wait_for_pid_exit "$pid" 5 && wait_for_port_clear "$server_port" 5; then
+                        echo "External server force-stopped."
+                    else
+                        error "External server process $pid is still present after SIGKILL"
+                    fi
+                else
+                    echo "External server is still running after SIGTERM."
+                    echo "Try: flashchat serve --stop --force"
+                    return 1
+                fi
             else
-                echo "Server port $port in use but cannot find process."
+                echo "Server port $server_port is in use but the owning process could not be found."
+                echo "Use 'lsof -i :$server_port' to inspect it manually."
             fi
         else
             echo "No server running."
@@ -1620,12 +1773,9 @@ cmd_clean() {
         echo "Current model: $(flashmoe_get MODEL_REPO)"
         echo ""
         
-        # Blobs directory (original safetensors)
-        local blobs_dir="$model_path/.cache"
+        # Original Hugging Face model shards
         local blobs_size=""
-        if [ -d "$blobs_dir" ]; then
-            blobs_size=$(du -sh "$blobs_dir" 2>/dev/null | cut -f1)
-        fi
+        blobs_size=$(get_model_blobs_size "$model_path")
         
         # Packed experts (4-bit)
         local experts_dir="$model_path/packed_experts"
@@ -1679,9 +1829,10 @@ cmd_clean() {
             case "$num" in
                 1)
                     if [ -n "$blobs_size" ]; then
-                        rm -rf "$blobs_dir"
-                        echo "Deleted model blobs."
-                        deleted=1
+                        if delete_model_blobs "$model_path"; then
+                            echo "Deleted model blobs."
+                            deleted=1
+                        fi
                     fi
                     ;;
                 2)

@@ -150,7 +150,10 @@ static void server_log_timestamp(FILE *f) {
 }
 
 static FILE *g_server_log = NULL;
+static int g_server_log_fd = -1;
 static char g_server_log_path[PATH_MAX] = {0};
+static char g_server_log_dir[PATH_MAX] = {0};
+static int g_server_debug_enabled = 0;
 
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
@@ -188,6 +191,7 @@ static void server_log_close(void) {
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Logging stopped\n");
     fflush(g_server_log);
+    g_server_log_fd = -1;
     fclose(g_server_log);
     g_server_log = NULL;
 }
@@ -204,6 +208,11 @@ static void server_log_open(void) {
         if (!home || !home[0]) return;
         log_path = [NSString stringWithFormat:@"%s/.config/flash-moe/logs/server.log", home];
     }
+    const char *env_debug = getenv("FLASHMOE_SERVER_DEBUG");
+    g_server_debug_enabled = (env_debug && env_debug[0] &&
+                              strcmp(env_debug, "0") != 0 &&
+                              strcasecmp(env_debug, "false") != 0 &&
+                              strcasecmp(env_debug, "off") != 0);
 
     if (!log_path || [log_path length] == 0) return;
 
@@ -228,10 +237,17 @@ static void server_log_open(void) {
     }
 
     g_server_log = f;
+    g_server_log_fd = fileno(f);
     strncpy(g_server_log_path, utf8_path, sizeof(g_server_log_path) - 1);
     g_server_log_path[sizeof(g_server_log_path) - 1] = '\0';
+    strncpy(g_server_log_dir, [log_dir fileSystemRepresentation], sizeof(g_server_log_dir) - 1);
+    g_server_log_dir[sizeof(g_server_log_dir) - 1] = '\0';
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Logging started\n");
+    if (g_server_debug_enabled) {
+        server_log_timestamp(g_server_log);
+        fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
+    }
     fflush(g_server_log);
     atexit(server_log_close);
 }
@@ -240,6 +256,10 @@ static volatile sig_atomic_t g_server_shutdown_signal = 0;
 static int g_server_listen_fd = -1;
 
 static void serve_signal_handler(int signo) {
+    const char *msg = "[signal] Shutdown requested\n";
+    size_t len = sizeof("[signal] Shutdown requested\n") - 1;
+    if (g_server_log_fd >= 0) write(g_server_log_fd, msg, len);
+    write(STDERR_FILENO, msg, len);
     g_server_shutdown_signal = signo;
     if (g_server_listen_fd >= 0) {
         close(g_server_listen_fd);
@@ -256,6 +276,21 @@ static void install_serve_signal_handlers(void) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+}
+
+static void server_debug_write_text(const char *request_id, const char *suffix, const char *text) {
+    if (!g_server_debug_enabled || !g_server_log_dir[0] || !request_id || !request_id[0] || !suffix || !suffix[0]) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.%s", g_server_log_dir, request_id, suffix);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        server_log_errorf("[serve] %s debug_write_failed path=%s error=%s\n",
+                          request_id, path, strerror(errno));
+        return;
+    }
+    if (text && text[0]) fwrite(text, 1, strlen(text), f);
+    fclose(f);
+    server_log_errorf("[serve] %s debug_dump=%s\n", request_id, path);
 }
 
 // ============================================================================
@@ -6021,6 +6056,13 @@ typedef struct {
 static char *build_tool_instructions(ToolDef *tools, int tool_count);
 
 typedef struct {
+    size_t upstream_system_chars;
+    size_t default_system_chars;
+    size_t tool_instruction_chars;
+    size_t final_system_chars;
+} PromptBuildInfo;
+
+typedef struct {
     ApiKind api_kind;
     char *system_prompt;
     char *conversation_text;
@@ -6216,17 +6258,23 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
-static char *build_system_prompt_for_request(ApiRequest *req) {
+static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *info) {
+    if (info) memset(info, 0, sizeof(*info));
     char *base_c = load_system_prompt();
     NSString *base = [NSString stringWithUTF8String:base_c ?: "You are a helpful assistant. /think"];
     free(base_c);
     NSString *system = req->system_prompt && req->system_prompt[0]
         ? [NSString stringWithUTF8String:req->system_prompt]
         : base;
+    if (info) {
+        info->default_system_chars = strlen([base UTF8String] ?: "");
+        info->upstream_system_chars = req->system_prompt ? strlen(req->system_prompt) : 0;
+    }
     NSMutableString *final = [NSMutableString string];
     [final appendString:req->reasoning_enabled ? system : strip_think_directive(system)];
     if (req->tool_count > 0 && req->tool_choice_mode != TOOL_CHOICE_NONE) {
         char *tool_instr = build_tool_instructions(req->tools, req->tool_count);
+        if (info) info->tool_instruction_chars = tool_instr ? strlen(tool_instr) : 0;
         if (tool_instr && tool_instr[0]) {
             [final appendString:@"\n"];
             [final appendString:[NSString stringWithUTF8String:tool_instr]];
@@ -6238,20 +6286,44 @@ static char *build_system_prompt_for_request(ApiRequest *req) {
     } else if (req->tool_choice_mode == TOOL_CHOICE_NONE) {
         [final appendString:@"\nDo not call tools. Respond directly to the user.\n"];
     }
+    if (info) info->final_system_chars = strlen([final UTF8String] ?: "");
     return dup_nsstring(final);
 }
 
-static PromptTokens *tokenize_request_prompt(ApiRequest *req) {
+static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *request_id) {
     if (!req || !req->conversation_text) return NULL;
     size_t conv_len = strlen(req->conversation_text);
     if (req->used_snapshot) {
-        return encode_prompt_text_to_tokens(req->conversation_text);
+        server_log_errorf("[serve] %s tokenizing snapshot continuation chars=%zu\n",
+                          request_id ? request_id : "request", conv_len);
+        PromptTokens *pt = encode_prompt_text_to_tokens(req->conversation_text);
+        server_log_errorf("[serve] %s tokenized snapshot continuation tokens=%d\n",
+                          request_id ? request_id : "request", pt ? pt->count : -1);
+        return pt;
     }
-    char *sys_prompt = build_system_prompt_for_request(req);
+    PromptBuildInfo build_info;
+    char *sys_prompt = build_system_prompt_for_request(req, &build_info);
     size_t total = strlen(sys_prompt) + conv_len + 128;
+    server_log_errorf("[serve] %s prompt_parts upstream_system_chars=%zu default_system_chars=%zu tool_instruction_chars=%zu final_system_chars=%zu conversation_chars=%zu total_chars=%zu\n",
+                      request_id ? request_id : "request",
+                      build_info.upstream_system_chars,
+                      build_info.default_system_chars,
+                      build_info.tool_instruction_chars,
+                      build_info.final_system_chars,
+                      conv_len, total);
+    if (g_server_debug_enabled) {
+        server_debug_write_text(request_id ? request_id : "request", "system_prompt.txt", sys_prompt);
+    }
     char *prompt = malloc(total);
     snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n%s", sys_prompt, req->conversation_text);
+    server_log_errorf("[serve] %s tokenizing prompt chars=%zu\n",
+                      request_id ? request_id : "request", strlen(prompt));
+    if (g_server_debug_enabled) {
+        server_debug_write_text(request_id ? request_id : "request", "assembled_prompt.txt", prompt);
+    }
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    server_log_errorf("[serve] %s tokenized prompt tokens=%d\n",
+                      request_id ? request_id : "request", pt ? pt->count : -1);
     free(sys_prompt);
     free(prompt);
     return pt;
@@ -7237,6 +7309,13 @@ static void serve_loop(
         }
         body += 4;
 
+        char request_id[64];
+        snprintf(request_id, sizeof(request_id),
+                 "%s-%llu", is_chat ? "chatcmpl" : "resp", ++req_counter);
+        if (g_server_debug_enabled) {
+            server_debug_write_text(request_id, "request.json", body);
+        }
+
         NSError *json_error = nil;
         NSDictionary *root = parse_json_body(body, &json_error);
         if (!root) {
@@ -7260,10 +7339,6 @@ static void serve_loop(
             close(client_fd);
             continue;
         }
-
-        char request_id[64];
-        snprintf(request_id, sizeof(request_id),
-                 "%s-%llu", is_chat ? "chatcmpl" : "resp", ++req_counter);
         server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f reasoning=%d snapshot=%d\n",
                           request_id, is_chat ? "chat" : "responses",
                           req.conversation_text ? strlen(req.conversation_text) : 0,
@@ -7310,7 +7385,8 @@ static void serve_loop(
         }
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
-        PromptTokens *pt = tokenize_request_prompt(&req);
+        server_log_errorf("[serve] %s request parsed; beginning prompt tokenization\n", request_id);
+        PromptTokens *pt = tokenize_request_prompt(&req, request_id);
         if (!pt) {
             send_json_error(client_fd, 500, "server_error", "tokenization failed");
             api_request_free(&req);
@@ -7362,6 +7438,7 @@ static void serve_loop(
         }
         lm_head_forward(wf, hidden, logits);
         int next_token = pick_next_token(logits, VOCAB_SIZE, req.temperature, req.top_p, req.reasoning_enabled);
+        server_log_errorf("[serve] %s first_token=%d\n", request_id, next_token);
 
         if (g_pred_enabled) {
             g_pred_generating = 1;
@@ -7422,9 +7499,16 @@ static void serve_loop(
                 int rc = is_chat
                     ? sse_send_delta(client_fd, request_id, tok_str)
                     : sse_send_response_text_delta(client_fd, request_id, tok_str);
-                if (rc < 0) break;
+                if (rc < 0) {
+                    server_log_errorf("[serve] %s client disconnected during stream\n", request_id);
+                    break;
+                }
             }
             gen_count++;
+            if ((gen_count % 32) == 0) {
+                server_log_errorf("[serve] %s progress generated=%d pos=%d next_token=%d\n",
+                                  request_id, gen_count, pos, next_token);
+            }
 
             cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
