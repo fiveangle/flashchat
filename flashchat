@@ -387,7 +387,7 @@ cmd_config() {
     echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
     echo "Context window size: $(flashmoe_get MAX_TOKENS) tokens | Temperature: $(flashmoe_get TEMPERATURE) (creativity) | Top-p: $(flashmoe_get TOP_P) (nucleus)"
     echo "Server: http://$(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
-    echo "Show thinking: $(flashmoe_get SHOW_THINKING) | Color: $(flashmoe_get COLOR_OUTPUT)"
+    echo "Show thinking: $(flashmoe_get SHOW_THINKING) | Server debug: $(flashmoe_get SERVER_DEBUG) | Color: $(flashmoe_get COLOR_OUTPUT)"
     echo ""
     echo "Edit: flashchat config --reset | Delete all: flashchat config --full-reset"
     echo "File: $config_file"
@@ -408,6 +408,7 @@ cmd_config_interactive() {
     echo "  -Top-p (0.0-1.0): $(flashmoe_get TOP_P) (nucleus sampling - controls output diversity)"
     echo "  -Server API publishing port: $(flashmoe_get SERVER_PORT)"
     echo "  -Chat client API host IP: $(flashmoe_get SERVER_HOST)"
+    echo "  -Server debug logging artifacts (0/1): $(flashmoe_get SERVER_DEBUG)"
     echo "  -Show thinking tokens (0/1): $(flashmoe_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashmoe_get COLOR_OUTPUT)"
     unset REPLY
@@ -436,7 +437,7 @@ prompt_config_options() {
         echo ""
         
         local default_repo default_quant default_tokens default_temp
-        local default_top_p default_port default_host default_think default_color
+        local default_top_p default_port default_host default_debug default_think default_color
         
         default_repo=$(flashmoe_get MODEL_REPO)
         default_quant=$(flashmoe_get QUANTIZATION)
@@ -445,6 +446,7 @@ prompt_config_options() {
         default_top_p=$(flashmoe_get TOP_P)
         default_port=$(flashmoe_get SERVER_PORT)
         default_host=$(flashmoe_get SERVER_HOST)
+        default_debug=$(flashmoe_get SERVER_DEBUG)
         default_think=$(flashmoe_get SHOW_THINKING)
         default_color=$(flashmoe_get COLOR_OUTPUT)
         
@@ -552,7 +554,14 @@ prompt_config_interactive() {
     printf "Server host [%s]: " "$default_host"
     read -r REPLY
     echo "SERVER_HOST=\"${REPLY:-$default_host}\"" >> /tmp/flashmoe_new_config
-    
+
+    # Server Debug
+    local default_debug
+    default_debug=$(flashmoe_get SERVER_DEBUG)
+    printf "Server debug logging artifacts (0/1) [%s]: " "$default_debug"
+    read -r REPLY
+    echo "SERVER_DEBUG=\"${REPLY:-$default_debug}\"" >> /tmp/flashmoe_new_config
+
     # Show Thinking
     local default_think
     default_think=$(flashmoe_get SHOW_THINKING)
@@ -1421,6 +1430,7 @@ cmd_serve() {
     export FLASHMOE_QUANTIZATION="$(flashmoe_get QUANTIZATION)"
     export FLASHMOE_TEMPERATURE="$(flashmoe_get TEMPERATURE)"
     export FLASHMOE_TOP_P="$(flashmoe_get TOP_P)"
+    export FLASHMOE_SERVER_DEBUG="$(flashmoe_get SERVER_DEBUG)"
     
     # Start server (redirect output to avoid mixing with TUI)
     ./infer --serve "$server_port" > /dev/null 2>&1 &
@@ -1732,7 +1742,15 @@ interactive_menu() {
             o|O)
                 echo ""
                 if is_server_running; then
-                    cmd_serve --stop
+                    if ! cmd_serve --stop; then
+                        read -p "Server is not responding. Force stop the server? [Y/n] " -n 1 -r
+                        echo ""
+                        if [[ $REPLY =~ ^[Nn]$ ]]; then
+                            :
+                        else
+                            cmd_serve --stop --force
+                        fi
+                    fi
                 else
                     cmd_serve
                 fi
