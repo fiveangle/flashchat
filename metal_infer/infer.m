@@ -208,14 +208,14 @@ static void server_log_close(void) {
 static void server_log_open(void) {
     if (g_server_log) return;
 
-    const char *env_path = getenv("FLASHMOE_SERVER_LOG");
-    NSString *log_path = nil;
+    const char *env_path = getenv("FLASHCHAT_SERVER_LOG");
+    NSString *configured_path = nil;
     if (env_path && env_path[0]) {
-        log_path = [NSString stringWithUTF8String:env_path];
+        configured_path = [NSString stringWithUTF8String:env_path];
     } else {
         const char *home = getenv("HOME");
         if (!home || !home[0]) return;
-        log_path = [NSString stringWithFormat:@"%s/.config/flash-moe/logs/server.log", home];
+        configured_path = [NSString stringWithFormat:@"%s/.config/flashchat/logs/server.log", home];
     }
     const char *env_debug = getenv("FLASHMOE_SERVER_DEBUG");
     const char *env_http_log = getenv("FLASHMOE_SERVER_HTTP_LOG");
@@ -228,14 +228,30 @@ static void server_log_open(void) {
                                  strcasecmp(env_http_log, "false") != 0 &&
                                  strcasecmp(env_http_log, "off") != 0);
 
-    if (!log_path || [log_path length] == 0) return;
+    if (!configured_path || [configured_path length] == 0) return;
 
-    NSString *log_dir = [log_path stringByDeletingLastPathComponent];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL is_dir = NO;
+    BOOL path_exists = [fm fileExistsAtPath:configured_path isDirectory:&is_dir];
+    if (!path_exists && [configured_path hasSuffix:@"/"]) {
+        is_dir = YES;
+    }
+
+    NSString *log_dir = nil;
+    NSString *log_path = nil;
+    if (is_dir) {
+        log_dir = configured_path;
+        log_path = [configured_path stringByAppendingPathComponent:@"server.log"];
+    } else {
+        log_path = configured_path;
+        log_dir = [log_path stringByDeletingLastPathComponent];
+    }
+
     NSError *dir_error = nil;
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:log_dir
-                                   withIntermediateDirectories:YES
-                                                    attributes:nil
-                                                         error:&dir_error]) {
+    if (![fm createDirectoryAtPath:log_dir
+       withIntermediateDirectories:YES
+                        attributes:nil
+                             error:&dir_error]) {
         fprintf(stderr, "WARNING: could not create server log dir %s: %s\n",
                 [log_dir UTF8String],
                 dir_error ? [[dir_error localizedDescription] UTF8String] : "unknown error");

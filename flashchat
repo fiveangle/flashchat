@@ -132,7 +132,7 @@ Environment variables:
   FLASHMOE_WEIGHTS_DIR    Path to extracted weights
   FLASHMOE_EXPERTS_DIR   Path to expert weights
 
-For more info, see: https://github.com/flash-moE/flash-moe
+For more info, see: https://github.com/fiveangle/flash-moe
 EOF
 }
 
@@ -387,7 +387,8 @@ cmd_config() {
     echo "Model: $(flashmoe_get MODEL_REPO) ($(flashmoe_get QUANTIZATION))"
     echo "Context window size: $(flashmoe_get MAX_TOKENS) tokens | Temperature: $(flashmoe_get TEMPERATURE) (creativity) | Top-p: $(flashmoe_get TOP_P) (nucleus)"
     echo "Server: http://$(flashmoe_get SERVER_HOST):$(flashmoe_get SERVER_PORT)"
-    echo "Show thinking: $(flashmoe_get SHOW_THINKING) | Server debug: $(flashmoe_get SERVER_DEBUG) | Color: $(flashmoe_get COLOR_OUTPUT)"
+    echo "Show thinking: $(flashmoe_get SHOW_THINKING) | Server debug: $(flashmoe_get SERVER_DEBUG) | HTTP log: $(flashmoe_get SERVER_HTTP_LOG) | Color: $(flashmoe_get COLOR_OUTPUT)"
+    echo "Server log path: $(flashmoe_get SERVER_LOG_PATH)"
     echo ""
     echo "Edit: flashchat config --reset | Delete all: flashchat config --full-reset"
     echo "File: $config_file"
@@ -401,16 +402,18 @@ cmd_config_interactive() {
     
     echo ""
     echo "=== Configuration Settings ==="
-    echo "  -Model: $(flashmoe_get MODEL_REPO)"
-    echo "  -Experts quantization (4bit/2bit): $(flashmoe_get QUANTIZATION)"
-    echo "  -Context window size: $(flashmoe_get MAX_TOKENS) tokens"
-    echo "  -Temperature (0.0-2.0): $(flashmoe_get TEMPERATURE) (randomness - higher = more creative)"
-    echo "  -Top-p (0.0-1.0): $(flashmoe_get TOP_P) (nucleus sampling - controls output diversity)"
-    echo "  -Server API publishing port: $(flashmoe_get SERVER_PORT)"
-    echo "  -Chat client API host IP: $(flashmoe_get SERVER_HOST)"
-    echo "  -Server debug logging artifacts (0/1): $(flashmoe_get SERVER_DEBUG)"
-    echo "  -Show thinking tokens (0/1): $(flashmoe_get SHOW_THINKING)"
-    echo "  -Color output (0/1): $(flashmoe_get COLOR_OUTPUT)"
+    echo "  -Model: $(flashchat_get MODEL_REPO)"
+    echo "  -Experts quantization (4bit/2bit): $(flashchat_get QUANTIZATION)"
+    echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
+    echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
+    echo "  -Top-p (0.0-1.0): $(flashchat_get TOP_P) (nucleus sampling - controls output diversity)"
+    echo "  -Server API publishing port: $(flashchat_get SERVER_PORT)"
+    echo "  -Chat client API host IP: $(flashchat_get SERVER_HOST)"
+    echo "  -Server log path (file or directory): $(flashchat_get SERVER_LOG_PATH)"
+    echo "  -Server debug logging artifacts (0/1): $(flashchat_get SERVER_DEBUG)"
+    echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
+    echo "  -Show thinking tokens (0/1): $(flashchat_get SHOW_THINKING)"
+    echo "  -Color output (0/1): $(flashchat_get COLOR_OUTPUT)"
     unset REPLY
     read -p "Start configuration wizard? [Y/n]: " -n 1 -r
     echo ""
@@ -437,7 +440,7 @@ prompt_config_options() {
         echo ""
         
         local default_repo default_quant default_tokens default_temp
-        local default_top_p default_port default_host default_debug default_think default_color
+        local default_top_p default_port default_host default_log_path default_debug default_http_log default_think default_color
         
         default_repo=$(flashmoe_get MODEL_REPO)
         default_quant=$(flashmoe_get QUANTIZATION)
@@ -446,7 +449,9 @@ prompt_config_options() {
         default_top_p=$(flashmoe_get TOP_P)
         default_port=$(flashmoe_get SERVER_PORT)
         default_host=$(flashmoe_get SERVER_HOST)
+        default_log_path=$(flashmoe_get SERVER_LOG_PATH)
         default_debug=$(flashmoe_get SERVER_DEBUG)
+        default_http_log=$(flashmoe_get SERVER_HTTP_LOG)
         default_think=$(flashmoe_get SHOW_THINKING)
         default_color=$(flashmoe_get COLOR_OUTPUT)
         
@@ -555,12 +560,26 @@ prompt_config_interactive() {
     read -r REPLY
     echo "SERVER_HOST=\"${REPLY:-$default_host}\"" >> /tmp/flashmoe_new_config
 
+    # Server Log Path
+    local default_log_path
+    default_log_path=$(flashchat_get SERVER_LOG_PATH)
+    printf "Server log path (file or directory) [%s]: " "$default_log_path"
+    read -r REPLY
+    echo "SERVER_LOG_PATH=\"${REPLY:-$default_log_path}\"" >> /tmp/flashmoe_new_config
+
     # Server Debug
     local default_debug
     default_debug=$(flashmoe_get SERVER_DEBUG)
     printf "Server debug logging artifacts (0/1) [%s]: " "$default_debug"
     read -r REPLY
     echo "SERVER_DEBUG=\"${REPLY:-$default_debug}\"" >> /tmp/flashmoe_new_config
+
+    # Server HTTP Log
+    local default_http_log
+    default_http_log=$(flashmoe_get SERVER_HTTP_LOG)
+    printf "Server HTTP traffic log (0/1) [%s]: " "$default_http_log"
+    read -r REPLY
+    echo "SERVER_HTTP_LOG=\"${REPLY:-$default_http_log}\"" >> /tmp/flashmoe_new_config
 
     # Show Thinking
     local default_think
@@ -1430,7 +1449,9 @@ cmd_serve() {
     export FLASHMOE_QUANTIZATION="$(flashmoe_get QUANTIZATION)"
     export FLASHMOE_TEMPERATURE="$(flashmoe_get TEMPERATURE)"
     export FLASHMOE_TOP_P="$(flashmoe_get TOP_P)"
+    export FLASHMOE_SERVER_LOG="$(flashmoe_get SERVER_LOG_PATH)"
     export FLASHMOE_SERVER_DEBUG="$(flashmoe_get SERVER_DEBUG)"
+    export FLASHMOE_SERVER_HTTP_LOG="$(flashmoe_get SERVER_HTTP_LOG)"
     
     # Start server (redirect output to avoid mixing with TUI)
     ./infer --serve "$server_port" > /dev/null 2>&1 &
