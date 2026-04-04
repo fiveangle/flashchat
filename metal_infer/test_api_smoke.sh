@@ -24,6 +24,7 @@ Usage: $0 [--port N] [--host HOST] [--no-start] [--no-perf-log] [--perf-log FILE
 
 Smoke-tests the local Flash-MoE HTTP API:
   - GET /health
+  - GET /v1
   - GET /v1/models
   - POST /v1/chat/completions (stream=false)
   - POST /v1/chat/completions (stream=true)
@@ -348,6 +349,14 @@ cat "${TMPDIR}/health.json"
 echo ""
 assert_contains "${TMPDIR}/health.json" '"status":"ok"' "health returned ok"
 log_perf_row "health" "/health" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
+
+echo ""
+echo "--- GET /v1 ---"
+measure_request_to_file "${TMPDIR}/v1_root.json" curl -fsS "${BASE_URL}/v1"
+cat "${TMPDIR}/v1_root.json"
+echo ""
+assert_contains "${TMPDIR}/v1_root.json" '"object":"service"' "v1 root returned service object"
+log_perf_row "v1_root" "/v1" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
 
 echo ""
 echo "--- GET /v1/models ---"

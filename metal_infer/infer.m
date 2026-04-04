@@ -151,9 +151,11 @@ static void server_log_timestamp(FILE *f) {
 
 static FILE *g_server_log = NULL;
 static int g_server_log_fd = -1;
+static FILE *g_server_http_log = NULL;
 static char g_server_log_path[PATH_MAX] = {0};
 static char g_server_log_dir[PATH_MAX] = {0};
 static int g_server_debug_enabled = 0;
+static int g_server_http_log_enabled = 0;
 
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
@@ -187,6 +189,13 @@ static void server_log_errorf(const char *fmt, ...) {
 }
 
 static void server_log_close(void) {
+    if (g_server_http_log) {
+        server_log_timestamp(g_server_http_log);
+        fprintf(g_server_http_log, "[http] Logging stopped\n");
+        fflush(g_server_http_log);
+        fclose(g_server_http_log);
+        g_server_http_log = NULL;
+    }
     if (!g_server_log) return;
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Logging stopped\n");
@@ -209,10 +218,15 @@ static void server_log_open(void) {
         log_path = [NSString stringWithFormat:@"%s/.config/flash-moe/logs/server.log", home];
     }
     const char *env_debug = getenv("FLASHMOE_SERVER_DEBUG");
+    const char *env_http_log = getenv("FLASHMOE_SERVER_HTTP_LOG");
     g_server_debug_enabled = (env_debug && env_debug[0] &&
                               strcmp(env_debug, "0") != 0 &&
                               strcasecmp(env_debug, "false") != 0 &&
                               strcasecmp(env_debug, "off") != 0);
+    g_server_http_log_enabled = (env_http_log && env_http_log[0] &&
+                                 strcmp(env_http_log, "0") != 0 &&
+                                 strcasecmp(env_http_log, "false") != 0 &&
+                                 strcasecmp(env_http_log, "off") != 0);
 
     if (!log_path || [log_path length] == 0) return;
 
@@ -249,7 +263,38 @@ static void server_log_open(void) {
         fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
     }
     fflush(g_server_log);
+
+    if (g_server_http_log_enabled) {
+        char http_log_path[PATH_MAX];
+        snprintf(http_log_path, sizeof(http_log_path), "%s/http.log", g_server_log_dir);
+        g_server_http_log = fopen(http_log_path, "a");
+        if (!g_server_http_log) {
+            server_log_timestamp(g_server_log);
+            fprintf(g_server_log, "[serve] WARNING: could not open HTTP log %s: %s\n",
+                    http_log_path, strerror(errno));
+            fflush(g_server_log);
+            g_server_http_log_enabled = 0;
+        } else {
+            server_log_timestamp(g_server_http_log);
+            fprintf(g_server_http_log, "[http] Logging started\n");
+            fflush(g_server_http_log);
+        }
+    }
     atexit(server_log_close);
+}
+
+static void server_http_log_block(const char *request_id, const char *direction,
+                                  const char *label, const char *payload) {
+    if (!g_server_http_log_enabled || !g_server_http_log) return;
+    server_log_timestamp(g_server_http_log);
+    fprintf(g_server_http_log, "[%s] %s %s\n", direction,
+            request_id ? request_id : "-", label ? label : "");
+    if (payload && payload[0]) {
+        fwrite(payload, 1, strlen(payload), g_server_http_log);
+        if (payload[strlen(payload) - 1] != '\n') fputc('\n', g_server_http_log);
+    }
+    fprintf(g_server_http_log, "\n");
+    fflush(g_server_http_log);
 }
 
 static volatile sig_atomic_t g_server_shutdown_signal = 0;
@@ -6636,6 +6681,10 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
+static long sse_created_timestamp(void) {
+    return (long)time(NULL);
+}
+
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
@@ -6654,21 +6703,25 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
         }
     }
     *w = '\0';
+    long created = sse_created_timestamp();
     int n = snprintf(chunk, sizeof(chunk),
-        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-        request_id, escaped);
+        request_id, created, kApiModelId, escaped);
+    server_http_log_block(request_id, "response", "sse chat.completion.chunk", chunk);
     ssize_t wr = write(fd, chunk, n);
     return (wr <= 0) ? -1 : 0;
 }
 
 static void sse_send_done(int fd, const char *request_id) {
     char chunk[1024];
+    long created = sse_created_timestamp();
     int n = snprintf(chunk, sizeof(chunk),
-        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
         "data: [DONE]\n\n",
-        request_id);
+        request_id, created, kApiModelId);
+    server_http_log_block(request_id, "response", "sse chat.completion.done", chunk);
     http_write(fd, chunk, n);
 }
 
@@ -6695,21 +6748,25 @@ static int sse_send_tool_calls(int fd, const char *request_id, const char *tool_
     *w = '\0';
     
     char chunk[12288];
+    long created = sse_created_timestamp();
     int n = snprintf(chunk, sizeof(chunk),
-        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\","
         "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
-        request_id, tool_call_id, escaped_name, escaped_args);
+        request_id, created, kApiModelId, tool_call_id, escaped_name, escaped_args);
+    server_http_log_block(request_id, "response", "sse chat.completion.tool_calls", chunk);
     
     ssize_t wr = write(fd, chunk, n);
     if (wr <= 0) return -1;
     
     // Send done after tool_calls
+    created = sse_created_timestamp();
     n = snprintf(chunk, sizeof(chunk),
-        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
         "data: [DONE]\n\n",
-        request_id);
+        request_id, created, kApiModelId);
+    server_http_log_block(request_id, "response", "sse chat.completion.tool_calls.done", chunk);
     wr = write(fd, chunk, n);
     return (wr <= 0) ? -1 : 0;
 }
@@ -6721,6 +6778,18 @@ static const char *SSE_HEADERS =
     "Connection: close\r\n"
     "Access-Control-Allow-Origin: *\r\n"
     "\r\n";
+
+static int sse_send_initial_role_chunk(int fd, const char *request_id) {
+    char chunk[1024];
+    long created = sse_created_timestamp();
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        request_id, created, kApiModelId);
+    server_http_log_block(request_id, "response", "sse chat.completion.initial_role", chunk);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
 
 static const char *CORS_RESPONSE =
     "HTTP/1.1 204 No Content\r\n"
@@ -6765,6 +6834,9 @@ static void send_json_error(int fd, int status_code, const char *type, const cha
              "Content-Length: %zu\r\n"
              "\r\n",
              status_code, status_text, strlen(body));
+    char full[6144];
+    snprintf(full, sizeof(full), "%s%s", header, body);
+    server_http_log_block(NULL, "response", "json error", full);
     http_write_str(fd, header);
     http_write_str(fd, body);
 }
@@ -6779,6 +6851,13 @@ static void send_json_ok(int fd, const char *body) {
              "Content-Length: %zu\r\n"
              "\r\n",
              strlen(body));
+    char *full = malloc(strlen(header) + strlen(body) + 1);
+    if (full) {
+        strcpy(full, header);
+        strcat(full, body);
+        server_http_log_block(NULL, "response", "json ok", full);
+        free(full);
+    }
     http_write_str(fd, header);
     http_write_str(fd, body);
 }
@@ -6843,6 +6922,7 @@ static int sse_send_response_text_delta(int fd, const char *response_id, const c
                      "event: response.output_text.delta\n"
                      "data: {\"type\":\"response.output_text.delta\",\"response_id\":\"%s\",\"delta\":\"%s\"}\n\n",
                      response_id, escaped);
+    server_http_log_block(response_id, "response", "sse response.output_text.delta", chunk);
     return write(fd, chunk, n) <= 0 ? -1 : 0;
 }
 
@@ -6856,11 +6936,13 @@ static int sse_send_response_tool_call(int fd, const char *response_id, const Pa
                      "event: response.function_call_arguments.delta\n"
                      "data: {\"type\":\"response.function_call_arguments.delta\",\"response_id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"delta\":\"%s\"}\n\n",
                      response_id, tool_call->id, escaped_name, escaped_args);
+    server_http_log_block(response_id, "response", "sse response.function_call_arguments.delta", chunk);
     if (write(fd, chunk, n) <= 0) return -1;
     n = snprintf(chunk, sizeof(chunk),
                  "event: response.output_item.done\n"
                  "data: {\"type\":\"response.output_item.done\",\"response_id\":\"%s\",\"item\":{\"type\":\"function_call\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"%s\"}}\n\n",
                  response_id, tool_call->id, escaped_name, escaped_args);
+    server_http_log_block(response_id, "response", "sse response.output_item.done", chunk);
     return write(fd, chunk, n) <= 0 ? -1 : 0;
 }
 
@@ -6872,6 +6954,7 @@ static void sse_send_response_done(int fd, const char *response_id, const char *
                      "data: [DONE]\n\n",
                      final_json);
     (void)response_id;
+    server_http_log_block(response_id, "response", "sse response.completed", chunk);
     http_write(fd, chunk, n);
 }
 
@@ -6988,26 +7071,24 @@ static char *build_tool_instructions(ToolDef *tools, int tool_count) {
     int pos = 0;
     
     pos += snprintf(instructions + pos, 65536 - pos,
-        "\n\n## Tools\n"
-        "You have access to functions. When you need a tool, emit exactly one tool block.\n\n"
-        "IMPORTANT - Use this EXACT format:\n"
-        "<tool_call>\n{\"name\":\"function_name\",\"arguments\":{\"key\":\"value\"}}\n</tool_call>\n\n"
-        "Do not describe the tool call in prose. Emit the tool block and wait for the tool result.\n\n"
-        "Available functions:\n");
+        "\nTools:\n"
+        "If a tool is needed, reply with only:\n"
+        "<tool_call>\n"
+        "{\"name\":\"tool_name\",\"arguments\":{...}}\n"
+        "</tool_call>\n"
+        "No prose before or after the tool call. After a tool result, continue normally.\n"
+        "Functions:\n");
     
     for (int i = 0; i < tool_count && pos < 60000; i++) {
-        pos += snprintf(instructions + pos, 65536 - pos,
-            "- %s: %s\n", tools[i].name, tools[i].description);
-        if (tools[i].has_parameters && tools[i].parameters[0]) {
-            pos += snprintf(instructions + pos, 65536 - pos,
-                "  parameters: %s\n", tools[i].parameters);
+        pos += snprintf(instructions + pos, 65536 - pos, "- %s", tools[i].name);
+        if (tools[i].description[0]) {
+            pos += snprintf(instructions + pos, 65536 - pos, ": %s", tools[i].description);
         }
+        if (tools[i].has_parameters && tools[i].parameters[0]) {
+            pos += snprintf(instructions + pos, 65536 - pos, " args=%s", tools[i].parameters);
+        }
+        pos += snprintf(instructions + pos, 65536 - pos, "\n");
     }
-    
-    pos += snprintf(instructions + pos, 65536 - pos,
-        "\nRemember: When you need to run a command, output:\n"
-        "<tool_call>\n{\"name\":\"your_function\",\"arguments\":{\"key\":\"value\"}}\n</tool_call>\n\n"
-        "Then wait for the result before responding to the user.\n");
     
     return instructions;
 }
@@ -7273,8 +7354,13 @@ static void serve_loop(
 
         char method[16] = {0}, path[256] = {0};
         sscanf(reqbuf, "%15s %255s", method, path);
+        uint64_t req_num = ++req_counter;
+        char early_request_id[64];
+        snprintf(early_request_id, sizeof(early_request_id), "conn-%llu", req_num);
+        server_http_log_block(early_request_id, "request", "raw http request", reqbuf);
 
         if (strcmp(method, "OPTIONS") == 0) {
+            server_http_log_block(early_request_id, "response", "cors preflight", CORS_RESPONSE);
             http_write_str(client_fd, CORS_RESPONSE);
             free(reqbuf); close(client_fd);
             continue;
@@ -7282,6 +7368,14 @@ static void serve_loop(
 
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
             send_json_ok(client_fd, "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\",\"ready\":true}\n");
+            free(reqbuf); close(client_fd);
+            continue;
+        }
+
+        if (strcmp(method, "GET") == 0 && strcmp(path, "/v1") == 0) {
+            send_json_ok(client_fd,
+                         "{\"object\":\"service\",\"id\":\"flashchat\",\"api\":\"openai-compatible\","
+                         "\"endpoints\":[\"/v1/chat/completions\",\"/v1/responses\",\"/v1/models\",\"/health\"]}\n");
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -7311,10 +7405,11 @@ static void serve_loop(
 
         char request_id[64];
         snprintf(request_id, sizeof(request_id),
-                 "%s-%llu", is_chat ? "chatcmpl" : "resp", ++req_counter);
+                 "%s-%llu", is_chat ? "chatcmpl" : "resp", req_num);
         if (g_server_debug_enabled) {
             server_debug_write_text(request_id, "request.json", body);
         }
+        server_http_log_block(request_id, "request", is_chat ? "chat body" : "responses body", body);
 
         NSError *json_error = nil;
         NSDictionary *root = parse_json_body(body, &json_error);
@@ -7338,6 +7433,17 @@ static void serve_loop(
             free(reqbuf);
             close(client_fd);
             continue;
+        }
+        if (req.stream) {
+            server_http_log_block(request_id, "response", "sse headers", SSE_HEADERS);
+            http_write_str(client_fd, SSE_HEADERS);
+            if (is_chat && sse_send_initial_role_chunk(client_fd, request_id) < 0) {
+                server_log_errorf("[serve] %s client disconnected before streaming began\n", request_id);
+                api_request_free(&req);
+                free(reqbuf);
+                close(client_fd);
+                continue;
+            }
         }
         server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f reasoning=%d snapshot=%d\n",
                           request_id, is_chat ? "chat" : "responses",
@@ -7393,10 +7499,6 @@ static void serve_loop(
             free(reqbuf);
             close(client_fd);
             continue;
-        }
-
-        if (req.stream) {
-            http_write_str(client_fd, SSE_HEADERS);
         }
 
         double t_prefill = now_ms();
