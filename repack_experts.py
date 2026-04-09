@@ -23,6 +23,7 @@ import json
 import os
 import time
 import sys
+import errno
 
 # Component order and expected sizes
 COMPONENTS = [
@@ -62,7 +63,11 @@ def load_index(index_path):
     """Load expert_index.json and return expert_reads dict + model_path."""
     with open(index_path) as f:
         idx = json.load(f)
-    return idx['expert_reads'], idx['model_path']
+    model_path_raw = idx['model_path']
+    model_path = os.path.abspath(os.path.expanduser(model_path_raw))
+    if model_path != model_path_raw:
+        print(f"Resolved model path: {model_path_raw} -> {model_path}")
+    return idx['expert_reads'], model_path
 
 
 def verify_component_sizes(expert_reads):
@@ -95,6 +100,12 @@ def open_source_files(expert_reads, model_path, layers):
     fds = {}
     for fname in sorted(needed_files):
         path = os.path.join(model_path, fname)
+        if not os.path.exists(path):
+            print("ERROR: source shard not found")
+            print(f"  shard: {fname}")
+            print(f"  attempted path: {path}")
+            print(f"  model_path: {model_path}")
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
         fds[fname] = os.open(path, os.O_RDONLY)
     print(f"Opened {len(fds)} source safetensors files")
     return fds

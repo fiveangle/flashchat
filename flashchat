@@ -961,13 +961,19 @@ prompt_extract_experts() {
         echo "Estimated time: 30-60 minutes."
         echo ""
         cd "$SCRIPT_DIR"
-        run_python repack_experts.py --index "$expert_index_path"
+        if ! run_python repack_experts.py --index "$expert_index_path"; then
+            echo "ERROR: 4-bit expert extraction failed."
+            return 1
+        fi
         echo "4-bit experts extracted successfully."
     elif [ "$extraction_mode" = "2bit" ]; then
         echo ""
         echo "First extracting 4-bit experts..."
         cd "$SCRIPT_DIR"
-        run_python repack_experts.py --index "$expert_index_path"
+        if ! run_python repack_experts.py --index "$expert_index_path"; then
+            echo "ERROR: 4-bit expert extraction failed."
+            return 1
+        fi
         
         echo ""
         echo "Requantizing to 2-bit..."
@@ -977,7 +983,10 @@ prompt_extract_experts() {
         num_workers=$(get_performance_cores)
         echo "Using $num_workers parallel workers..."
         cd "$SCRIPT_DIR/metal_infer"
-        run_python repack_experts_2bit.py --workers "$num_workers"
+        if ! run_python repack_experts_2bit.py --workers "$num_workers"; then
+            echo "ERROR: 2-bit requantization failed."
+            return 1
+        fi
         echo "2-bit experts created successfully."
     fi
 }
