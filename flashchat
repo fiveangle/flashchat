@@ -390,8 +390,10 @@ cmd_config() {
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
     echo ""
-    echo "Edit: flashchat config --reset | Delete all: flashchat config --full-reset"
     echo "File: $config_file"
+    echo ""
+    
+    cmd_config_interactive
 }
 
 # -----------------------------------------------------------------------------
@@ -1671,7 +1673,7 @@ cmd_chat() {
     cd "$SCRIPT_DIR/metal_infer"
     
     local chat_args=""
-    [ -n "$port" ] && chat_args="--port $port"
+    [ -n "$server_port" ] && chat_args="--port $server_port"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
     
     ./chat $chat_args
