@@ -621,6 +621,16 @@ prompt_config_interactive() {
 # Auto-setup functions
 # -----------------------------------------------------------------------------
 
+get_last_layer_index() {
+    local model_id
+    model_id=$(flashchat_get MODEL)
+    if [ -f "./model_configs.json" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "import json; data=json.load(open('model_configs.json')); layers=data.get('models',{}).get('$model_id',{}).get('num_hidden_layers',60); print(layers-1)" 2>/dev/null
+    else
+        echo "59"
+    fi
+}
+
 check_model_downloaded() {
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
@@ -640,14 +650,16 @@ check_model_downloaded() {
         return 1
     fi
     
+    local last_layer
+    last_layer=$(get_last_layer_index)
     if [ "$quantization" = "2bit" ]; then
         local experts_2bit_dir
         experts_2bit_dir=$(flashchat_get EXPERTS_2BIT_DIR)
-        [ -f "$experts_2bit_dir/layer_59.bin" ] && return 0
+        [ -f "$experts_2bit_dir/layer_${last_layer}.bin" ] && return 0
     else
         local experts_dir
         experts_dir=$(flashchat_get EXPERTS_DIR)
-        [ -f "$experts_dir/layer_59.bin" ] && return 0
+        [ -f "$experts_dir/layer_${last_layer}.bin" ] && return 0
     fi
     
     return 1
@@ -771,7 +783,9 @@ check_experts_extracted() {
         experts_dir="${experts_dir#./}"
         experts_dir="${SCRIPT_DIR}/$experts_dir"
     fi
-    [ -f "$experts_dir/layer_59.bin" ]
+    local last_layer
+    last_layer=$(get_last_layer_index)
+    [ -f "$experts_dir/layer_${last_layer}.bin" ]
     return $?
 }
 
@@ -782,7 +796,9 @@ check_experts_2bit_extracted() {
         experts_2bit_dir="${experts_2bit_dir#./}"
         experts_2bit_dir="${SCRIPT_DIR}/$experts_2bit_dir"
     fi
-    [ -f "$experts_2bit_dir/layer_59.bin" ]
+    local last_layer
+    last_layer=$(get_last_layer_index)
+    [ -f "$experts_2bit_dir/layer_${last_layer}.bin" ]
     return $?
 }
 
