@@ -74,6 +74,10 @@ parse_global_opts() {
                 CONFIG_FILE="$2"
                 shift 2
                 ;;
+            --model)
+                export FLASHCHAT_MODEL="$2"
+                shift 2
+                ;;
             -h|--help)
                 show_help
                 exit 0
@@ -125,7 +129,8 @@ Configuration:
     4. Hardcoded defaults
 
 Environment variables:
-  FLASHCHAT_MODEL_REPO      HuggingFace repo (default: mlx-community/Qwen3.5-397B-A17B-4bit)
+  FLASHCHAT_MODEL           Model ID (default: qwen3.5-397B-A17B)
+  FLASHCHAT_MODEL_REPO      HuggingFace repo (looked up from model_configs.json)
   FLASHCHAT_MODEL_PATH      Override model path
   FLASHCHAT_QUANTIZATION   4bit or 2bit
   FLASHCHAT_SERVER_PORT    Server port
@@ -933,9 +938,14 @@ prompt_extract_weights() {
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         cd "$SCRIPT_DIR/metal_infer"
-        run_python extract_weights.py --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir"
-        cd "$SCRIPT_DIR"
-        echo "Weights extracted successfully."
+        if run_python extract_weights.py --model-id "$(flashchat_get MODEL)" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir"; then
+            cd "$SCRIPT_DIR"
+            echo "Weights extracted successfully."
+        else
+            cd "$SCRIPT_DIR"
+            echo "ERROR: Weights extraction failed." >&2
+            exit 1
+        fi
     else
         echo "Extraction cancelled."
         exit 0
@@ -959,9 +969,14 @@ prompt_export_vocab() {
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         cd "$SCRIPT_DIR/metal_infer"
-        run_python export_tokenizer.py "$model_path/tokenizer.json" "$weights_dir/vocab.bin"
-        cd "$SCRIPT_DIR"
-        echo "Vocabulary exported successfully."
+        if run_python export_tokenizer.py "$model_path/tokenizer.json" "$weights_dir/vocab.bin"; then
+            cd "$SCRIPT_DIR"
+            echo "Vocabulary exported successfully."
+        else
+            cd "$SCRIPT_DIR"
+            echo "ERROR: Vocabulary export failed." >&2
+            exit 1
+        fi
     else
         echo "Export cancelled."
         exit 0
@@ -978,18 +993,20 @@ prompt_extract_experts() {
     model_repo=$(flashchat_get MODEL_REPO)
     
     # Check if model is supported
-    if [[ "$model_repo" != *"Qwen3.5-397B-A17B"* ]]; then
-        echo ""
-        echo "=== Model Not Supported ==="
-        echo ""
-        echo "Currently, only Qwen3.5-397B-A17B is supported."
-        echo "The selected model '$model_repo' has a different architecture"
-        echo "and is not compatible with this inference engine."
-        echo ""
-        echo "Supported model: mlx-community/Qwen3.5-397B-A17B-4bit"
-        echo ""
-        echo "Expert extraction cancelled."
-        exit 0
+    local model_id
+    model_id=$(flashchat_get MODEL)
+    if [ -f "./model_configs.json" ] && command -v python3 >/dev/null 2>&1; then
+        local in_registry
+        in_registry=$(python3 -c "import json; data=json.load(open('model_configs.json')); print('1' if '$model_id' in data.get('models',{}) else '0')" 2>/dev/null)
+        if [ "$in_registry" != "1" ]; then
+            echo ""
+            echo "=== Model Not Supported ==="
+            echo ""
+            echo "Model '$model_id' is not in model_configs.json."
+            echo ""
+            echo "Expert extraction cancelled."
+            exit 0
+        fi
     fi
     
     local expert_index_path=""
@@ -1054,7 +1071,7 @@ prompt_extract_experts() {
         echo "Estimated time: 30-60 minutes."
         echo ""
         cd "$SCRIPT_DIR"
-        if ! run_python repack_experts.py --index "$expert_index_path"; then
+        if ! run_python repack_experts.py --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
             echo "ERROR: 4-bit expert extraction failed."
             return 1
         fi
@@ -1063,7 +1080,7 @@ prompt_extract_experts() {
         echo ""
         echo "First extracting 4-bit experts..."
         cd "$SCRIPT_DIR"
-        if ! run_python repack_experts.py --index "$expert_index_path"; then
+        if ! run_python repack_experts.py --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
             echo "ERROR: 4-bit expert extraction failed."
             return 1
         fi
@@ -1188,7 +1205,9 @@ ensure_setup() {
     
     # Check model
     if ! check_model_downloaded; then
-        prompt_download_model
+        if ! check_model_extracted; then
+            prompt_download_model
+        fi
     fi
     
     # Re-load config after model download (path may have changed)
@@ -1586,6 +1605,7 @@ cmd_serve() {
     export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
     export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
+export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
@@ -1674,6 +1694,7 @@ cmd_chat() {
     
     local chat_args=""
     [ -n "$server_port" ] && chat_args="--port $server_port"
+export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
     
     ./chat $chat_args
@@ -1954,14 +1975,20 @@ cmd_clean() {
         blobs_size=$(get_model_blobs_size "$model_path")
         
         # Packed experts (4-bit)
-        local experts_dir="$model_path/packed_experts"
+        local experts_dir="$model_path/flashchat/packed_experts"
+        if [ ! -d "$experts_dir" ]; then
+            experts_dir="$model_path/packed_experts"
+        fi
         local experts_size=""
         if [ -d "$experts_dir" ]; then
             experts_size=$(du -sh "$experts_dir" 2>/dev/null | cut -f1)
         fi
         
         # Packed experts 2-bit
-        local experts_2bit_dir="$model_path/packed_experts_2bit"
+        local experts_2bit_dir="$model_path/flashchat/packed_experts_2bit"
+        if [ ! -d "$experts_2bit_dir" ]; then
+            experts_2bit_dir="$model_path/packed_experts_2bit"
+        fi
         local experts_2bit_size=""
         if [ -d "$experts_2bit_dir" ]; then
             experts_2bit_size=$(du -sh "$experts_2bit_dir" 2>/dev/null | cut -f1)

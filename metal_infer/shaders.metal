@@ -16,13 +16,11 @@
  *   - Dequantized value = uint4_val * scale + bias
  *   - Groups of 64 elements share one (scale, bias) pair
  *
- * Matrix layout for expert projections:
- *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
- *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
+ * Matrix layout for expert projections (dimensions are model-dependent):
+ *   gate_proj/up_proj: [moe_intermediate, hidden_dim/8] uint32
+ *   down_proj: [hidden_dim, moe_intermediate/8] uint32
  *
- *   Scales/biases: [out_dim, in_dim/group_size]
- *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
- *   down scales:    [4096, 16]   (1024/64 = 16 groups)
+ *   Scales/biases: [out_dim, in_dim/group_size] in bf16
  */
 
 #include <metal_stdlib>

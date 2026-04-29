@@ -19,7 +19,7 @@ FLASHCHAT_CONFIG_FILE=""
 FLASHCHAT_PROJECT_CONFIG="./flashchat.config"
 
 # Default configuration values
-FLASHCHAT_DEFAULT_MODEL_REPO="mlx-community/Qwen3.5-397B-A17B-4bit"
+FLASHCHAT_DEFAULT_MODEL="qwen3.5-397B-A17B"
 FLASHCHAT_DEFAULT_QUANTIZATION="4bit"
 FLASHCHAT_DEFAULT_MAX_TOKENS="8192"
 FLASHCHAT_DEFAULT_SERVER_PORT="8000"
@@ -33,6 +33,7 @@ FLASHCHAT_DEFAULT_TEMPERATURE="0.7"
 FLASHCHAT_DEFAULT_TOP_P="0.9"
 
 # Config values (set after loading)
+MODEL=""
 MODEL_REPO=""
 QUANTIZATION=""
 MAX_TOKENS=""
@@ -51,6 +52,26 @@ MODEL_PATH=""
 WEIGHTS_DIR=""
 EXPERTS_DIR=""
 EXPERTS_2BIT_DIR=""
+
+# -----------------------------------------------------------------------------
+# Look up model repo from model_configs.json
+# -----------------------------------------------------------------------------
+_flashchat_lookup_model_repo() {
+    local model_id="${1:-$FLASHCHAT_DEFAULT_MODEL}"
+    local config_file="${FLASHCHAT_CONFIG_JSON:-./model_configs.json}"
+    if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+try:
+    with open('$config_file') as f:
+        data = json.load(f)
+    model = data.get('models', {}).get('$model_id', {})
+    print(model.get('hf_repo', ''))
+except Exception:
+    pass
+" 2>/dev/null
+    fi
+}
 
 # -----------------------------------------------------------------------------
 # Detect the HuggingFace snapshot path from model repo
@@ -80,17 +101,18 @@ _flashchat_detect_model_path() {
 # Compute derived paths based on config
 # -----------------------------------------------------------------------------
 _flashchat_compute_paths() {
+    local model_id="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
     if [ -n "$MODEL_PATH" ]; then
-        WEIGHTS_DIR="${WEIGHTS_DIR:-./metal_infer}"
-        EXPERTS_DIR="${MODEL_PATH}/packed_experts"
-        EXPERTS_2BIT_DIR="${MODEL_PATH}/packed_experts_2bit"
+        WEIGHTS_DIR="${WEIGHTS_DIR:-${MODEL_PATH}/flashchat}"
+        EXPERTS_DIR="${MODEL_PATH}/flashchat/packed_experts"
+        EXPERTS_2BIT_DIR="${MODEL_PATH}/flashchat/packed_experts_2bit"
     else
         local detected_path
         detected_path=$(_flashchat_detect_model_path "$MODEL_REPO")
         MODEL_PATH="$detected_path"
-        WEIGHTS_DIR="${WEIGHTS_DIR:-./metal_infer}"
-        EXPERTS_DIR="${detected_path}/packed_experts"
-        EXPERTS_2BIT_DIR="${detected_path}/packed_experts_2bit"
+        WEIGHTS_DIR="${WEIGHTS_DIR:-${detected_path}/flashchat}"
+        EXPERTS_DIR="${detected_path}/flashchat/packed_experts"
+        EXPERTS_2BIT_DIR="${detected_path}/flashchat/packed_experts_2bit"
     fi
 }
 
@@ -125,6 +147,7 @@ flashchat_load_config() {
     fi
     
     # 3. Environment variables override
+    [ -n "$FLASHCHAT_MODEL" ] && MODEL="$FLASHCHAT_MODEL"
     [ -n "$FLASHCHAT_MODEL_REPO" ] && MODEL_REPO="$FLASHCHAT_MODEL_REPO"
     [ -n "$FLASHCHAT_MODEL_PATH" ] && MODEL_PATH="$FLASHCHAT_MODEL_PATH"
     [ -n "$FLASHCHAT_QUANTIZATION" ] && QUANTIZATION="$FLASHCHAT_QUANTIZATION"
@@ -142,7 +165,14 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
     # 4. Apply defaults for any missing values
-    MODEL_REPO="${MODEL_REPO:-$FLASHCHAT_DEFAULT_MODEL_REPO}"
+    MODEL="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
+    if [ -z "$MODEL_REPO" ]; then
+        local looked_up_repo
+        looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
+        if [ -n "$looked_up_repo" ]; then
+            MODEL_REPO="$looked_up_repo"
+        fi
+    fi
     QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
@@ -165,6 +195,7 @@ flashchat_load_config() {
 flashchat_get() {
     local key="$1"
     case "$key" in
+        MODEL) echo "$MODEL" ;;
         MODEL_REPO) echo "$MODEL_REPO" ;;
         QUANTIZATION) echo "$QUANTIZATION" ;;
         MAX_TOKENS) echo "$MAX_TOKENS" ;;
@@ -197,7 +228,7 @@ flashchat_create_default_config() {
 # Generated on $(date)
 
 # Model Settings
-MODEL_REPO="${FLASHCHAT_DEFAULT_MODEL_REPO}"
+MODEL="${FLASHCHAT_DEFAULT_MODEL}"
 
 # Quantization: 4bit or 2bit
 QUANTIZATION="${FLASHCHAT_DEFAULT_QUANTIZATION}"
@@ -250,3 +281,21 @@ export -f flashchat_create_default_config
 export -f flashchat_has_config
 export -f flashchat_get_pid_file
 export -f flashchat_get_sessions_dir
+
+# -----------------------------------------------------------------------------
+# Lookup model config from model_configs.json
+# -----------------------------------------------------------------------------
+_flashchat_lookup_model_config() {
+    local model_id="$1"
+    python3 -c "
+import json
+import sys
+with open('model_configs.json', 'r') as f:
+    data = json.load(f)
+model = data['models'].get('$model_id')
+if model:
+    print(model['hf_repo'])
+else:
+    sys.exit(1)
+"
+}

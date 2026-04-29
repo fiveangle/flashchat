@@ -45,15 +45,15 @@ static double now_ms(void) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model_path>\n", argv[0]);
-        fprintf(stderr, "  Reads:  <model_path>/packed_experts/layer_XX.bin\n");
-        fprintf(stderr, "  Writes: <model_path>/packed_experts_lz4/layer_XX.bin\n");
-        return 1;
-    }
+    fprintf(stderr, "  Reads:  <model_path>/flashchat/packed_experts/layer_XX.bin\n");
+    fprintf(stderr, "  Writes: <model_path>/flashchat/packed_experts_lz4/layer_XX.bin\n");
+    return 1;
+}
 
     const char *model_path = argv[1];
     char src_dir[1024], dst_dir[1024];
-    snprintf(src_dir, sizeof(src_dir), "%s/packed_experts", model_path);
-    snprintf(dst_dir, sizeof(dst_dir), "%s/packed_experts_lz4", model_path);
+    snprintf(src_dir, sizeof(src_dir), "%s/flashchat/packed_experts", model_path);
+    snprintf(dst_dir, sizeof(dst_dir), "%s/flashchat/packed_experts_lz4", model_path);
 
     /* Create output directory */
     mkdir(dst_dir, 0755);

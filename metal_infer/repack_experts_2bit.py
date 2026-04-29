@@ -491,8 +491,10 @@ def main():
     args = parser.parse_args()
 
     model_path = Path(args.model)
-    input_dir = model_path / 'packed_experts'
-    output_dir = Path(args.output) if args.output else model_path / 'packed_experts_2bit'
+    input_dir = model_path / 'flashchat' / 'packed_experts'
+    if not input_dir.exists():
+        input_dir = model_path / 'packed_experts'
+    output_dir = Path(args.output) if args.output else model_path / 'flashchat' / 'packed_experts_2bit'
 
     if not input_dir.exists():
         print(f"ERROR: {input_dir} not found", file=sys.stderr)

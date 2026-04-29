@@ -41,43 +41,13 @@
 #include <pthread.h>
 #include <errno.h>
 
-// ============================================================================
-// Constants matching the Qwen3.5-397B packed expert layout
-// ============================================================================
+#include "model_config.h"
 
-#define HIDDEN_DIM       4096
-#define INTERMEDIATE_DIM 1024
-#define GROUP_SIZE       64
-#define BITS             4
-#define NUM_EXPERTS      512
-#define NUM_LAYERS       60
+ModelConfig g_cfg;
+
 #define MAX_ACTIVE_EXPERTS 64
 
-// Expert component sizes (from layout.json)
-#define GATE_W_OFFSET    0
-#define GATE_W_SIZE      2097152   // [1024, 512] uint32
-#define GATE_S_OFFSET    2097152
-#define GATE_S_SIZE      131072    // [1024, 64] uint16 (bf16)
-#define GATE_B_OFFSET    2228224
-#define GATE_B_SIZE      131072
-
-#define UP_W_OFFSET      2359296
-#define UP_W_SIZE        2097152
-#define UP_S_OFFSET      4456448
-#define UP_S_SIZE        131072
-#define UP_B_OFFSET      4587520
-#define UP_B_SIZE        131072
-
-#define DOWN_W_OFFSET    4718592
-#define DOWN_W_SIZE      2097152   // [4096, 128] uint32
-#define DOWN_S_OFFSET    6815744
-#define DOWN_S_SIZE      131072    // [4096, 16] uint16 (bf16)
-#define DOWN_B_OFFSET    6946816
-#define DOWN_B_SIZE      131072
-
-#define EXPERT_SIZE      7077888   // Total bytes per expert
-
-// Default model path
+// Default model path (overridden by --model flag)
 #define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
@@ -470,31 +440,31 @@ static ExpertTiming run_expert_forward(
     MetalContext *ctx,
     int packed_fd,
     int expert_idx,
-    id<MTLBuffer> x_buf,       // [HIDDEN_DIM] float input
-    id<MTLBuffer> out_buf,     // [HIDDEN_DIM] float output
+    id<MTLBuffer> x_buf,       // [g_cfg.hidden_dim] float input
+    id<MTLBuffer> out_buf,     // [g_cfg.hidden_dim] float output
     int use_fast
 ) {
     ExpertTiming timing = {0};
     double t0 = now_ms();
 
     // ---- I/O: pread all 9 components for this expert ----
-    off_t expert_offset = (off_t)expert_idx * EXPERT_SIZE;
+    off_t expert_offset = (off_t)expert_idx * g_cfg.expert_size;
 
     double t_io_start = now_ms();
 
-    id<MTLBuffer> gate_w = metal_buf_pread(ctx, packed_fd, GATE_W_SIZE, expert_offset + GATE_W_OFFSET);
-    id<MTLBuffer> gate_s = metal_buf_pread(ctx, packed_fd, GATE_S_SIZE, expert_offset + GATE_S_OFFSET);
-    id<MTLBuffer> gate_b = metal_buf_pread(ctx, packed_fd, GATE_B_SIZE, expert_offset + GATE_B_OFFSET);
-    id<MTLBuffer> up_w   = metal_buf_pread(ctx, packed_fd, UP_W_SIZE,   expert_offset + UP_W_OFFSET);
-    id<MTLBuffer> up_s   = metal_buf_pread(ctx, packed_fd, UP_S_SIZE,   expert_offset + UP_S_OFFSET);
-    id<MTLBuffer> up_b   = metal_buf_pread(ctx, packed_fd, UP_B_SIZE,   expert_offset + UP_B_OFFSET);
-    id<MTLBuffer> down_w = metal_buf_pread(ctx, packed_fd, DOWN_W_SIZE, expert_offset + DOWN_W_OFFSET);
-    id<MTLBuffer> down_s = metal_buf_pread(ctx, packed_fd, DOWN_S_SIZE, expert_offset + DOWN_S_OFFSET);
-    id<MTLBuffer> down_b = metal_buf_pread(ctx, packed_fd, DOWN_B_SIZE, expert_offset + DOWN_B_OFFSET);
+    id<MTLBuffer> gate_w = metal_buf_pread(ctx, packed_fd, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off_2);
+    id<MTLBuffer> gate_s = metal_buf_pread(ctx, packed_fd, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off_2);
+    id<MTLBuffer> gate_b = metal_buf_pread(ctx, packed_fd, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off_2);
+    id<MTLBuffer> up_w   = metal_buf_pread(ctx, packed_fd, g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off_2);
+    id<MTLBuffer> up_s   = metal_buf_pread(ctx, packed_fd, g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off_2);
+    id<MTLBuffer> up_b   = metal_buf_pread(ctx, packed_fd, g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off_2);
+    id<MTLBuffer> down_w = metal_buf_pread(ctx, packed_fd, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off_2);
+    id<MTLBuffer> down_s = metal_buf_pread(ctx, packed_fd, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off_2);
+    id<MTLBuffer> down_b = metal_buf_pread(ctx, packed_fd, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off_2);
 
     double t_io_end = now_ms();
     timing.io_ms = t_io_end - t_io_start;
-    timing.io_bytes = EXPERT_SIZE;
+    timing.io_bytes = g_cfg.expert_size;
 
     if (!gate_w || !gate_s || !gate_b || !up_w || !up_s || !up_b ||
         !down_w || !down_s || !down_b) {
@@ -506,13 +476,13 @@ static ExpertTiming run_expert_forward(
     // ---- Compute: gate/up matvecs -> SwiGLU -> down matvec ----
 
     // Intermediate buffers
-    id<MTLBuffer> gate_out = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-    id<MTLBuffer> up_out   = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-    id<MTLBuffer> act_out  = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
+    id<MTLBuffer> gate_out = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+    id<MTLBuffer> up_out   = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+    id<MTLBuffer> act_out  = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
 
-    uint32_t hidden = HIDDEN_DIM;
-    uint32_t inter  = INTERMEDIATE_DIM;
-    uint32_t gs     = GROUP_SIZE;
+    uint32_t hidden = g_cfg.hidden_dim;
+    uint32_t inter  = g_cfg.moe_intermediate;
+    uint32_t gs     = g_cfg.group_size;
 
     double t_compute_start = now_ms();
 
@@ -555,56 +525,56 @@ static ExpertTiming run_expert_forward_fast(
     MetalContext *ctx,
     int packed_fd,
     int expert_idx,
-    id<MTLBuffer> expert_buf,  // Pre-allocated buffer for one expert (EXPERT_SIZE bytes)
-    id<MTLBuffer> x_buf,       // [HIDDEN_DIM] float input
-    id<MTLBuffer> gate_out,    // [INTERMEDIATE_DIM] float scratch
-    id<MTLBuffer> up_out,      // [INTERMEDIATE_DIM] float scratch
-    id<MTLBuffer> act_out,     // [INTERMEDIATE_DIM] float scratch
-    id<MTLBuffer> out_buf,     // [HIDDEN_DIM] float output
+    id<MTLBuffer> expert_buf,  // Pre-allocated buffer for one expert (g_cfg.expert_size bytes)
+    id<MTLBuffer> x_buf,       // [g_cfg.hidden_dim] float input
+    id<MTLBuffer> gate_out,    // [g_cfg.moe_intermediate] float scratch
+    id<MTLBuffer> up_out,      // [g_cfg.moe_intermediate] float scratch
+    id<MTLBuffer> act_out,     // [g_cfg.moe_intermediate] float scratch
+    id<MTLBuffer> out_buf,     // [g_cfg.hidden_dim] float output
     int use_fast
 ) {
     ExpertTiming timing = {0};
     double t0 = now_ms();
 
     // ---- I/O: single pread for the entire expert ----
-    off_t expert_offset = (off_t)expert_idx * EXPERT_SIZE;
+    off_t expert_offset = (off_t)expert_idx * g_cfg.expert_size;
 
     double t_io_start = now_ms();
-    ssize_t nread = pread(packed_fd, [expert_buf contents], EXPERT_SIZE, expert_offset);
+    ssize_t nread = pread(packed_fd, [expert_buf contents], g_cfg.expert_size, expert_offset);
     double t_io_end = now_ms();
 
     timing.io_ms = t_io_end - t_io_start;
-    timing.io_bytes = EXPERT_SIZE;
+    timing.io_bytes = g_cfg.expert_size;
 
-    if (nread != EXPERT_SIZE) {
+    if (nread != g_cfg.expert_size) {
         fprintf(stderr, "ERROR: pread expert %d: got %zd, expected %d\n",
-                expert_idx, nread, EXPERT_SIZE);
+                expert_idx, nread, g_cfg.expert_size);
         timing.total_ms = now_ms() - t0;
         return timing;
     }
 
     // ---- Compute using buffer offsets ----
-    uint32_t hidden = HIDDEN_DIM;
-    uint32_t inter  = INTERMEDIATE_DIM;
-    uint32_t gs     = GROUP_SIZE;
+    uint32_t hidden = g_cfg.hidden_dim;
+    uint32_t inter  = g_cfg.moe_intermediate;
+    uint32_t gs     = g_cfg.group_size;
 
     double t_compute_start = now_ms();
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
     // gate_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, GATE_W_OFFSET,
-        expert_buf, GATE_S_OFFSET,
-        expert_buf, GATE_B_OFFSET,
+        expert_buf, g_cfg.gate_w_off_2,
+        expert_buf, g_cfg.gate_s_off_2,
+        expert_buf, g_cfg.gate_b_off_2,
         x_buf, 0,
         gate_out, 0,
         inter, hidden, gs, use_fast);
 
     // up_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, UP_W_OFFSET,
-        expert_buf, UP_S_OFFSET,
-        expert_buf, UP_B_OFFSET,
+        expert_buf, g_cfg.up_w_off_2,
+        expert_buf, g_cfg.up_s_off_2,
+        expert_buf, g_cfg.up_b_off_2,
         x_buf, 0,
         up_out, 0,
         inter, hidden, gs, use_fast);
@@ -614,9 +584,9 @@ static ExpertTiming run_expert_forward_fast(
 
     // down_proj: [1024] -> [4096]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, DOWN_W_OFFSET,
-        expert_buf, DOWN_S_OFFSET,
-        expert_buf, DOWN_B_OFFSET,
+        expert_buf, g_cfg.down_w_off_2,
+        expert_buf, g_cfg.down_s_off_2,
+        expert_buf, g_cfg.down_b_off_2,
         act_out, 0,
         out_buf, 0,
         hidden, inter, gs, use_fast);
@@ -752,11 +722,11 @@ static MoETiming run_moe_forward_fused(
     id<MTLBuffer> act_outs[MAX_K_FUSED];
     id<MTLBuffer> expert_outs[MAX_K_FUSED];
     for (int k = 0; k < K_use; k++) {
-        expert_bufs[k] = metal_buf_shared(ctx, EXPERT_SIZE);
-        gate_outs[k]   = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        up_outs[k]     = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        act_outs[k]    = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        expert_outs[k] = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+        expert_bufs[k] = metal_buf_shared(ctx, g_cfg.expert_size);
+        gate_outs[k]   = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        up_outs[k]     = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        act_outs[k]    = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        expert_outs[k] = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
     }
 
     // ---- Parallel I/O: load all K experts concurrently ----
@@ -766,25 +736,25 @@ static MoETiming run_moe_forward_fused(
     for (int k = 0; k < K_use; k++) {
         io_tasks[k].fd = packed_fd;
         io_tasks[k].dst = [expert_bufs[k] contents];
-        io_tasks[k].size = EXPERT_SIZE;
-        io_tasks[k].offset = (off_t)expert_indices[k] * EXPERT_SIZE;
+        io_tasks[k].size = g_cfg.expert_size;
+        io_tasks[k].offset = (off_t)expert_indices[k] * g_cfg.expert_size;
         io_tasks[k].result = 0;
         pthread_create(&io_threads[k], NULL, fused_pread_fn, &io_tasks[k]);
     }
     for (int k = 0; k < K_use; k++) {
         pthread_join(io_threads[k], NULL);
-        if (io_tasks[k].result != EXPERT_SIZE) {
+        if (io_tasks[k].result != g_cfg.expert_size) {
             fprintf(stderr, "ERROR: fused pread expert %d: got %zd\n",
                     expert_indices[k], io_tasks[k].result);
         }
     }
     timing.io_ms = now_ms() - t_io_start;
-    timing.io_bytes = (size_t)K_use * EXPERT_SIZE;
+    timing.io_bytes = (size_t)K_use * g_cfg.expert_size;
 
     // ---- Single fused command buffer ----
-    uint32_t hidden = HIDDEN_DIM;
-    uint32_t inter  = INTERMEDIATE_DIM;
-    uint32_t gs     = GROUP_SIZE;
+    uint32_t hidden = g_cfg.hidden_dim;
+    uint32_t inter  = g_cfg.moe_intermediate;
+    uint32_t gs     = g_cfg.group_size;
 
     double t_compute_start = now_ms();
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
@@ -794,15 +764,15 @@ static MoETiming run_moe_forward_fused(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         for (int k = 0; k < K_use; k++) {
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], GATE_W_OFFSET,
-                expert_bufs[k], GATE_S_OFFSET,
-                expert_bufs[k], GATE_B_OFFSET,
+                expert_bufs[k], g_cfg.gate_w_off_2,
+                expert_bufs[k], g_cfg.gate_s_off_2,
+                expert_bufs[k], g_cfg.gate_b_off_2,
                 x_buf, 0, gate_outs[k], 0,
                 inter, hidden, gs);
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], UP_W_OFFSET,
-                expert_bufs[k], UP_S_OFFSET,
-                expert_bufs[k], UP_B_OFFSET,
+                expert_bufs[k], g_cfg.up_w_off_2,
+                expert_bufs[k], g_cfg.up_s_off_2,
+                expert_bufs[k], g_cfg.up_b_off_2,
                 x_buf, 0, up_outs[k], 0,
                 inter, hidden, gs);
         }
@@ -825,9 +795,9 @@ static MoETiming run_moe_forward_fused(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         for (int k = 0; k < K_use; k++) {
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], DOWN_W_OFFSET,
-                expert_bufs[k], DOWN_S_OFFSET,
-                expert_bufs[k], DOWN_B_OFFSET,
+                expert_bufs[k], g_cfg.down_w_off_2,
+                expert_bufs[k], g_cfg.down_s_off_2,
+                expert_bufs[k], g_cfg.down_b_off_2,
                 act_outs[k], 0, expert_outs[k], 0,
                 hidden, inter, gs);
         }
@@ -836,14 +806,14 @@ static MoETiming run_moe_forward_fused(
 
     // Phase 4: stack outputs via blit + weighted sum
     {
-        id<MTLBuffer> stacked = metal_buf_shared(ctx, K_use * HIDDEN_DIM * sizeof(float));
+        id<MTLBuffer> stacked = metal_buf_shared(ctx, K_use * g_cfg.hidden_dim * sizeof(float));
         id<MTLBlitCommandEncoder> blit = [cmdbuf blitCommandEncoder];
         for (int k = 0; k < K_use; k++) {
             [blit copyFromBuffer:expert_outs[k]
                     sourceOffset:0
                         toBuffer:stacked
-               destinationOffset:k * HIDDEN_DIM * sizeof(float)
-                            size:HIDDEN_DIM * sizeof(float)];
+               destinationOffset:k * g_cfg.hidden_dim * sizeof(float)
+                            size:g_cfg.hidden_dim * sizeof(float)];
         }
         [blit endEncoding];
 
@@ -851,7 +821,7 @@ static MoETiming run_moe_forward_fused(
         memcpy([w_buf contents], expert_weights, K_use * sizeof(float));
 
         uint32_t k_val = (uint32_t)K_use;
-        uint32_t dim_val = HIDDEN_DIM;
+        uint32_t dim_val = g_cfg.hidden_dim;
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:ctx->weighted_sum];
@@ -860,7 +830,7 @@ static MoETiming run_moe_forward_fused(
         [enc setBuffer:moe_out_buf offset:0 atIndex:2];
         [enc setBytes:&k_val   length:sizeof(uint32_t) atIndex:3];
         [enc setBytes:&dim_val length:sizeof(uint32_t) atIndex:4];
-        uint32_t num_tgs = (HIDDEN_DIM + 255) / 256;
+        uint32_t num_tgs = (g_cfg.hidden_dim + 255) / 256;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
@@ -881,22 +851,22 @@ static MoETiming run_moe_forward(
     const int *expert_indices,   // [K]
     const float *expert_weights, // [K]
     int K,
-    id<MTLBuffer> x_buf,        // [HIDDEN_DIM] input
-    id<MTLBuffer> moe_out_buf,  // [HIDDEN_DIM] output
+    id<MTLBuffer> x_buf,        // [g_cfg.hidden_dim] input
+    id<MTLBuffer> moe_out_buf,  // [g_cfg.hidden_dim] output
     int use_fast
 ) {
     MoETiming timing = {0};
     double t0 = now_ms();
 
     // Pre-allocate reusable buffers for optimized path
-    id<MTLBuffer> expert_buf = metal_buf_shared(ctx, EXPERT_SIZE);
-    id<MTLBuffer> gate_out = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-    id<MTLBuffer> up_out   = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-    id<MTLBuffer> act_out  = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
+    id<MTLBuffer> expert_buf = metal_buf_shared(ctx, g_cfg.expert_size);
+    id<MTLBuffer> gate_out = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+    id<MTLBuffer> up_out   = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+    id<MTLBuffer> act_out  = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
 
     // Stacked outputs for weighted combination
-    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * HIDDEN_DIM * sizeof(float));
-    id<MTLBuffer> expert_out = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * g_cfg.hidden_dim * sizeof(float));
+    id<MTLBuffer> expert_out = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
 
     // Run each expert using optimized single-pread path
     for (int k = 0; k < K; k++) {
@@ -909,9 +879,9 @@ static MoETiming run_moe_forward(
         timing.io_bytes += et.io_bytes;
 
         // Copy this expert's output into the stacked buffer
-        memcpy((float *)[stacked contents] + k * HIDDEN_DIM,
+        memcpy((float *)[stacked contents] + k * g_cfg.hidden_dim,
                [expert_out contents],
-               HIDDEN_DIM * sizeof(float));
+               g_cfg.hidden_dim * sizeof(float));
     }
 
     // Combine: out = sum(w[k] * expert_out[k])
@@ -923,7 +893,7 @@ static MoETiming run_moe_forward(
 
     // Run weighted sum kernel
     uint32_t k_val = (uint32_t)K;
-    uint32_t dim_val = HIDDEN_DIM;
+    uint32_t dim_val = g_cfg.hidden_dim;
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
@@ -935,7 +905,7 @@ static MoETiming run_moe_forward(
     [enc setBytes:&dim_val length:sizeof(uint32_t) atIndex:4];
 
     NSUInteger tg_size = MIN(256, [ctx->weighted_sum maxTotalThreadsPerThreadgroup]);
-    MTLSize numGroups = MTLSizeMake((HIDDEN_DIM + tg_size - 1) / tg_size, 1, 1);
+    MTLSize numGroups = MTLSizeMake((g_cfg.hidden_dim + tg_size - 1) / tg_size, 1, 1);
     [enc dispatchThreadgroups:numGroups threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     [enc endEncoding];
 
@@ -958,7 +928,7 @@ typedef struct {
     int fd;
     void *dst;           // destination buffer (expert_bufs[k] contents)
     off_t offset;        // file offset for this expert
-    size_t size;         // EXPERT_SIZE
+    size_t size;         // g_cfg.expert_size
     ssize_t result;      // bytes actually read
 } PreadTask;
 
@@ -995,7 +965,7 @@ static void build_io_plan(ExpertIOPlan *plan, int layer_fd,
     plan->K = K;
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [expert_bufs[k] contents];
-        plan->offset[k] = (off_t)expert_indices[k] * EXPERT_SIZE;
+        plan->offset[k] = (off_t)expert_indices[k] * g_cfg.expert_size;
     }
 }
 
@@ -1007,7 +977,7 @@ static double execute_io_plan(ExpertIOPlan *plan) {
         tasks[k].fd = plan->fd;
         tasks[k].dst = plan->dst[k];
         tasks[k].offset = plan->offset[k];
-        tasks[k].size = EXPERT_SIZE;
+        tasks[k].size = g_cfg.expert_size;
         tasks[k].result = 0;
     }
 
@@ -1028,9 +998,9 @@ static double execute_io_plan(ExpertIOPlan *plan) {
     double io_ms = now_ms() - t0;
 
     for (int k = 0; k < plan->K; k++) {
-        if (tasks[k].result != (ssize_t)EXPERT_SIZE) {
+        if (tasks[k].result != (ssize_t)g_cfg.expert_size) {
             fprintf(stderr, "ERROR: pread (offset=%lld): got %zd, expected %d (errno=%d)\n",
-                    (long long)tasks[k].offset, tasks[k].result, EXPERT_SIZE, errno);
+                    (long long)tasks[k].offset, tasks[k].result, g_cfg.expert_size, errno);
         }
     }
     return io_ms;
@@ -1045,30 +1015,30 @@ static void encode_expert_compute(
     MetalContext *ctx,
     id<MTLCommandBuffer> cmdbuf,
     id<MTLBuffer> expert_buf,      // one expert's packed weights
-    id<MTLBuffer> x_buf,           // [HIDDEN_DIM] input
-    id<MTLBuffer> gate_out,        // [INTERMEDIATE_DIM] scratch
-    id<MTLBuffer> up_out,          // [INTERMEDIATE_DIM] scratch
-    id<MTLBuffer> act_out,         // [INTERMEDIATE_DIM] scratch
-    id<MTLBuffer> out_buf,         // [HIDDEN_DIM] output
+    id<MTLBuffer> x_buf,           // [g_cfg.hidden_dim] input
+    id<MTLBuffer> gate_out,        // [g_cfg.moe_intermediate] scratch
+    id<MTLBuffer> up_out,          // [g_cfg.moe_intermediate] scratch
+    id<MTLBuffer> act_out,         // [g_cfg.moe_intermediate] scratch
+    id<MTLBuffer> out_buf,         // [g_cfg.hidden_dim] output
     int use_fast
 ) {
-    uint32_t hidden = HIDDEN_DIM;
-    uint32_t inter  = INTERMEDIATE_DIM;
-    uint32_t gs     = GROUP_SIZE;
+    uint32_t hidden = g_cfg.hidden_dim;
+    uint32_t inter  = g_cfg.moe_intermediate;
+    uint32_t gs     = g_cfg.group_size;
 
     // gate_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, GATE_W_OFFSET,
-        expert_buf, GATE_S_OFFSET,
-        expert_buf, GATE_B_OFFSET,
+        expert_buf, g_cfg.gate_w_off_2,
+        expert_buf, g_cfg.gate_s_off_2,
+        expert_buf, g_cfg.gate_b_off_2,
         x_buf, 0, gate_out, 0,
         inter, hidden, gs, use_fast);
 
     // up_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, UP_W_OFFSET,
-        expert_buf, UP_S_OFFSET,
-        expert_buf, UP_B_OFFSET,
+        expert_buf, g_cfg.up_w_off_2,
+        expert_buf, g_cfg.up_s_off_2,
+        expert_buf, g_cfg.up_b_off_2,
         x_buf, 0, up_out, 0,
         inter, hidden, gs, use_fast);
 
@@ -1077,9 +1047,9 @@ static void encode_expert_compute(
 
     // down_proj: [1024] -> [4096]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, DOWN_W_OFFSET,
-        expert_buf, DOWN_S_OFFSET,
-        expert_buf, DOWN_B_OFFSET,
+        expert_buf, g_cfg.down_w_off_2,
+        expert_buf, g_cfg.down_s_off_2,
+        expert_buf, g_cfg.down_b_off_2,
         act_out, 0, out_buf, 0,
         hidden, inter, gs, use_fast);
 }
@@ -1091,12 +1061,12 @@ static void encode_expert_compute(
 static void encode_weighted_sum(
     MetalContext *ctx,
     id<MTLCommandBuffer> cmdbuf,
-    id<MTLBuffer> stacked,         // [K * HIDDEN_DIM] expert outputs
+    id<MTLBuffer> stacked,         // [K * g_cfg.hidden_dim] expert outputs
     id<MTLBuffer> w_buf,           // [K] weights
-    id<MTLBuffer> out_buf,         // [HIDDEN_DIM] output
+    id<MTLBuffer> out_buf,         // [g_cfg.hidden_dim] output
     uint32_t K
 ) {
-    uint32_t dim_val = HIDDEN_DIM;
+    uint32_t dim_val = g_cfg.hidden_dim;
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     [enc setComputePipelineState:ctx->weighted_sum];
@@ -1107,7 +1077,7 @@ static void encode_weighted_sum(
     [enc setBytes:&dim_val length:sizeof(uint32_t) atIndex:4];
 
     NSUInteger tg_size = MIN(256, [ctx->weighted_sum maxTotalThreadsPerThreadgroup]);
-    MTLSize numGroups = MTLSizeMake((HIDDEN_DIM + tg_size - 1) / tg_size, 1, 1);
+    MTLSize numGroups = MTLSizeMake((g_cfg.hidden_dim + tg_size - 1) / tg_size, 1, 1);
     [enc dispatchThreadgroups:numGroups threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     [enc endEncoding];
 }
@@ -1198,7 +1168,7 @@ static double prefetch_wait(PrefetchCtx *pf) {
 
 static FullForwardTiming run_full_forward(
     MetalContext *ctx,
-    int *layer_fds,          // [NUM_LAYERS] open file descriptors
+    int *layer_fds,          // [g_cfg.num_layers] open file descriptors
     int K,                   // number of active experts per layer
     int use_fast,
     int verbose
@@ -1211,8 +1181,8 @@ static FullForwardTiming run_full_forward(
     id<MTLBuffer> expert_bufs_A[MAX_ACTIVE_EXPERTS];
     id<MTLBuffer> expert_bufs_B[MAX_ACTIVE_EXPERTS];
     for (int k = 0; k < K; k++) {
-        expert_bufs_A[k] = metal_buf_shared(ctx, EXPERT_SIZE);
-        expert_bufs_B[k] = metal_buf_shared(ctx, EXPERT_SIZE);
+        expert_bufs_A[k] = metal_buf_shared(ctx, g_cfg.expert_size);
+        expert_bufs_B[k] = metal_buf_shared(ctx, g_cfg.expert_size);
         if (!expert_bufs_A[k] || !expert_bufs_B[k]) {
             fprintf(stderr, "ERROR: Failed to allocate expert buffer %d\n", k);
             timing.total_ms = now_ms() - t0;
@@ -1226,10 +1196,10 @@ static FullForwardTiming run_full_forward(
     id<MTLBuffer> per_k_act[MAX_ACTIVE_EXPERTS];
     id<MTLBuffer> per_k_out[MAX_ACTIVE_EXPERTS];
     for (int k = 0; k < K; k++) {
-        per_k_gate[k] = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        per_k_up[k]   = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        per_k_act[k]  = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
-        per_k_out[k]  = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+        per_k_gate[k] = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        per_k_up[k]   = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        per_k_act[k]  = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
+        per_k_out[k]  = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
     }
     // Keep originals for compatibility
     id<MTLBuffer> gate_out = per_k_gate[0];
@@ -1237,20 +1207,20 @@ static FullForwardTiming run_full_forward(
     id<MTLBuffer> act_out  = per_k_act[0];
 
     // Stacked expert outputs for weighted combination
-    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * HIDDEN_DIM * sizeof(float));
+    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * g_cfg.hidden_dim * sizeof(float));
 
     // Per-expert output buffer (unused now — using per_k_out instead)
     id<MTLBuffer> expert_out = per_k_out[0];
 
     // Hidden state buffer (h): starts with input, accumulates residual per layer
-    id<MTLBuffer> h_buf = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+    id<MTLBuffer> h_buf = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
     float *h_data = (float *)[h_buf contents];
-    for (int i = 0; i < HIDDEN_DIM; i++) {
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
         h_data[i] = 0.1f * sinf((float)i * 0.1f + 0.3f);
     }
 
     // MoE output buffer per layer
-    id<MTLBuffer> moe_out = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+    id<MTLBuffer> moe_out = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
 
     // Expert routing weights (uniform for benchmarking)
     float expert_weights[MAX_ACTIVE_EXPERTS];
@@ -1267,11 +1237,11 @@ static FullForwardTiming run_full_forward(
 
     // Pre-generate deterministic expert indices for each layer
     // Uses a simple hash to spread across 512 experts
-    int layer_experts[NUM_LAYERS][MAX_ACTIVE_EXPERTS];
-    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+    int layer_experts[g_cfg.num_layers][MAX_ACTIVE_EXPERTS];
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
         for (int k = 0; k < K; k++) {
             // Deterministic spread: different experts per layer for realistic benchmark
-            layer_experts[layer][k] = ((layer * 7 + k * 31 + 13) % NUM_EXPERTS);
+            layer_experts[layer][k] = ((layer * 7 + k * 31 + 13) % g_cfg.num_experts);
         }
     }
 
@@ -1300,7 +1270,7 @@ static FullForwardTiming run_full_forward(
     }
 
     // ---- Main loop: process layer N, prefetch layer N+1 ----
-    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
         // Determine which buffer set has this layer's data
         // Use a flag instead of raw pointers to avoid ARC issues
         int cur_is_A = (layer % 2 == 0);
@@ -1308,7 +1278,7 @@ static FullForwardTiming run_full_forward(
         id<MTLBuffer> __strong *next_bufs = cur_is_A ? expert_bufs_B : expert_bufs_A;
 
         // Start prefetching next layer (if not the last)
-        if (layer + 1 < NUM_LAYERS) {
+        if (layer + 1 < g_cfg.num_layers) {
             prefetch_start_with_plan(&prefetch, layer_fds[layer + 1],
                                       layer_experts[layer + 1], next_bufs, K);
         }
@@ -1332,7 +1302,7 @@ static FullForwardTiming run_full_forward(
                                   stacked, use_fast);
             // Override the output offset to write into stacked[k*HIDDEN:]
             // Actually, encode_expert_compute writes to out_buf at offset 0.
-            // We need to write to stacked at offset k*HIDDEN_DIM*sizeof(float).
+            // We need to write to stacked at offset k*g_cfg.hidden_dim*sizeof(float).
             // Let me use expert_out per-k and then blit.
         }
 
@@ -1352,20 +1322,20 @@ static FullForwardTiming run_full_forward(
 
         // CPU memcpy into stacked (faster than GPU blit for 64KB)
         for (int k = 0; k < K; k++) {
-            memcpy((float *)[stacked contents] + k * HIDDEN_DIM,
+            memcpy((float *)[stacked contents] + k * g_cfg.hidden_dim,
                    [per_k_out[k] contents],
-                   HIDDEN_DIM * sizeof(float));
+                   g_cfg.hidden_dim * sizeof(float));
         }
 
         // Weighted sum on CPU (4 × 4096 floats = trivial, avoids extra cmd buffer)
         {
             float *moe = (float *)[moe_out contents];
             float *w = (float *)[w_buf contents];
-            memset(moe, 0, HIDDEN_DIM * sizeof(float));
+            memset(moe, 0, g_cfg.hidden_dim * sizeof(float));
             for (int k = 0; k < K; k++) {
                 float *ek = (float *)[per_k_out[k] contents];
                 float wk = w[k];
-                for (int d = 0; d < HIDDEN_DIM; d++) {
+                for (int d = 0; d < g_cfg.hidden_dim; d++) {
                     moe[d] += ek[d] * wk;
                 }
             }
@@ -1374,7 +1344,7 @@ static FullForwardTiming run_full_forward(
         // Accumulate residual: h = h + moe_out
         float *h = (float *)[h_buf contents];
         float *m = (float *)[moe_out contents];
-        for (int i = 0; i < HIDDEN_DIM; i++) {
+        for (int i = 0; i < g_cfg.hidden_dim; i++) {
             h[i] += m[i];
         }
 
@@ -1382,7 +1352,7 @@ static FullForwardTiming run_full_forward(
         compute_total += compute_ms;
 
         // Wait for prefetch of next layer to finish
-        if (layer + 1 < NUM_LAYERS) {
+        if (layer + 1 < g_cfg.num_layers) {
             double next_io_ms = prefetch_wait(&prefetch);
             io_total += next_io_ms;
             if (verbose) {
@@ -1413,7 +1383,7 @@ static FullForwardTiming run_full_forward(
     // Note: overhead_ms can be negative when I/O is fully overlapped with compute
     // (the I/O time is measured wall-clock on the prefetch thread, so it overlaps)
     // More accurate: overhead = total - max(io, compute) approximately
-    timing.io_bytes = (size_t)NUM_LAYERS * K * EXPERT_SIZE;
+    timing.io_bytes = (size_t)g_cfg.num_layers * K * g_cfg.expert_size;
 
     // Print final hidden state sample
     float *h_final = (float *)[h_buf contents];
@@ -1431,49 +1401,49 @@ static FullForwardTiming run_full_forward(
 static void cpu_expert_forward(
     int packed_fd,
     int expert_idx,
-    const float *x,     // [HIDDEN_DIM]
-    float *out          // [HIDDEN_DIM]
+    const float *x,     // [g_cfg.hidden_dim]
+    float *out          // [g_cfg.hidden_dim]
 ) {
-    off_t expert_offset = (off_t)expert_idx * EXPERT_SIZE;
+    off_t expert_offset = (off_t)expert_idx * g_cfg.expert_size;
 
     // Read all components
-    uint32_t gate_w[GATE_W_SIZE / 4];
-    uint16_t gate_s[GATE_S_SIZE / 2];
-    uint16_t gate_b[GATE_B_SIZE / 2];
-    uint32_t up_w[UP_W_SIZE / 4];
-    uint16_t up_s[UP_S_SIZE / 2];
-    uint16_t up_b[UP_B_SIZE / 2];
-    uint32_t down_w[DOWN_W_SIZE / 4];
-    uint16_t down_s[DOWN_S_SIZE / 2];
-    uint16_t down_b[DOWN_B_SIZE / 2];
+    uint32_t gate_w[g_cfg.gate_w_size / 4];
+    uint16_t gate_s[g_cfg.gate_s_size / 2];
+    uint16_t gate_b[g_cfg.gate_b_size / 2];
+    uint32_t up_w[g_cfg.up_w_size / 4];
+    uint16_t up_s[g_cfg.up_s_size / 2];
+    uint16_t up_b[g_cfg.up_b_size / 2];
+    uint32_t down_w[g_cfg.down_w_size / 4];
+    uint16_t down_s[g_cfg.down_s_size / 2];
+    uint16_t down_b[g_cfg.down_b_size / 2];
 
-    pread(packed_fd, gate_w, GATE_W_SIZE, expert_offset + GATE_W_OFFSET);
-    pread(packed_fd, gate_s, GATE_S_SIZE, expert_offset + GATE_S_OFFSET);
-    pread(packed_fd, gate_b, GATE_B_SIZE, expert_offset + GATE_B_OFFSET);
-    pread(packed_fd, up_w,   UP_W_SIZE,   expert_offset + UP_W_OFFSET);
-    pread(packed_fd, up_s,   UP_S_SIZE,   expert_offset + UP_S_OFFSET);
-    pread(packed_fd, up_b,   UP_B_SIZE,   expert_offset + UP_B_OFFSET);
-    pread(packed_fd, down_w, DOWN_W_SIZE, expert_offset + DOWN_W_OFFSET);
-    pread(packed_fd, down_s, DOWN_S_SIZE, expert_offset + DOWN_S_OFFSET);
-    pread(packed_fd, down_b, DOWN_B_SIZE, expert_offset + DOWN_B_OFFSET);
+    pread(packed_fd, gate_w, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off_2);
+    pread(packed_fd, gate_s, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off_2);
+    pread(packed_fd, gate_b, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off_2);
+    pread(packed_fd, up_w,   g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off_2);
+    pread(packed_fd, up_s,   g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off_2);
+    pread(packed_fd, up_b,   g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off_2);
+    pread(packed_fd, down_w, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off_2);
+    pread(packed_fd, down_s, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off_2);
+    pread(packed_fd, down_b, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off_2);
 
     // gate_proj: [4096] -> [1024]
-    float gate_out[INTERMEDIATE_DIM];
+    float gate_out[g_cfg.moe_intermediate];
     cpu_dequant_matvec_4bit(gate_w, gate_s, gate_b, x, gate_out,
-                            INTERMEDIATE_DIM, HIDDEN_DIM, GROUP_SIZE);
+                            g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
 
     // up_proj: [4096] -> [1024]
-    float up_out[INTERMEDIATE_DIM];
+    float up_out[g_cfg.moe_intermediate];
     cpu_dequant_matvec_4bit(up_w, up_s, up_b, x, up_out,
-                            INTERMEDIATE_DIM, HIDDEN_DIM, GROUP_SIZE);
+                            g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
 
     // SwiGLU
-    float act_out[INTERMEDIATE_DIM];
-    cpu_swiglu(gate_out, up_out, act_out, INTERMEDIATE_DIM);
+    float act_out[g_cfg.moe_intermediate];
+    cpu_swiglu(gate_out, up_out, act_out, g_cfg.moe_intermediate);
 
     // down_proj: [1024] -> [4096]
     cpu_dequant_matvec_4bit(down_w, down_s, down_b, act_out, out,
-                            HIDDEN_DIM, INTERMEDIATE_DIM, GROUP_SIZE);
+                            g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
 }
 
 // ============================================================================
@@ -1509,6 +1479,7 @@ int main(int argc, char **argv) {
         const char *model_path = env_model_path ? env_model_path : MODEL_PATH;
 
         static struct option long_options[] = {
+            {"model-id",  required_argument, 0, 'I'},
             {"layer",     required_argument, 0, 'l'},
             {"expert",    required_argument, 0, 'e'},
             {"benchmark", no_argument,       0, 'b'},
@@ -1523,8 +1494,10 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "l:e:bmFk:vfp:h", long_options, NULL)) != -1) {
+        const char *model_id = NULL;
+        while ((c = getopt_long(argc, argv, "I:l:e:bmFk:vfp:h", long_options, NULL)) != -1) {
             switch (c) {
+                case 'I': model_id = optarg; break;
                 case 'l': layer_idx = atoi(optarg); break;
                 case 'e': expert_idx = atoi(optarg); break;
                 case 'b': do_benchmark = 1; break;
@@ -1532,11 +1505,24 @@ int main(int argc, char **argv) {
                 case 'F': do_full = 1; break;
                 case 'k': num_active_experts = atoi(optarg); break;
                 case 'v': do_verify = 1; break;
-                case 'f': use_fast = 3; break;  // v3 tiled+SIMD shader
+                case 'f': use_fast = 3; break;
                 case 'p': model_path = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        // Load model configuration from registry
+        if (!model_id) {
+            model_id = getenv("FLASHCHAT_MODEL");
+        }
+        if (!model_id) {
+            model_id = "qwen3.5-397B-A17B";
+        }
+        const char *config_json_path = "model_configs.json";
+        if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {
+            fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
+            return 1;
         }
 
         // Clamp K to valid range
@@ -1546,7 +1532,7 @@ int main(int argc, char **argv) {
                     num_active_experts, MAX_ACTIVE_EXPERTS);
             num_active_experts = MAX_ACTIVE_EXPERTS;
         }
-        if (num_active_experts > NUM_EXPERTS) num_active_experts = NUM_EXPERTS;
+        if (num_active_experts > g_cfg.num_experts) num_active_experts = g_cfg.num_experts;
 
         const char *shader_name = (use_fast >= 3) ? "v3-tiled" :
                                   (use_fast >= 1) ? "fast-simd" : "naive";
@@ -1571,11 +1557,11 @@ int main(int argc, char **argv) {
         // ========== Full 60-layer forward pass mode ==========
         if (do_full) {
             // ---- Open ALL 60 packed layer files ----
-            int layer_fds[NUM_LAYERS];
+            int layer_fds[g_cfg.num_layers];
             int open_count = 0;
-            printf("\n[io] Opening all %d layer files...\n", NUM_LAYERS);
+            printf("\n[io] Opening all %d layer files...\n", g_cfg.num_layers);
             double t_open = now_ms();
-            for (int i = 0; i < NUM_LAYERS; i++) {
+            for (int i = 0; i < g_cfg.num_layers; i++) {
                 char path[1024];
                 snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
@@ -1592,10 +1578,10 @@ int main(int argc, char **argv) {
 
             // ---- Run full forward pass ----
             int K = num_active_experts;
-            size_t total_expert_bytes = (size_t)NUM_LAYERS * K * EXPERT_SIZE;
-            printf("\n=== Full %d-layer MoE forward (K=%d) ===\n", NUM_LAYERS, K);
+            size_t total_expert_bytes = (size_t)g_cfg.num_layers * K * g_cfg.expert_size;
+            printf("\n=== Full %d-layer MoE forward (K=%d) ===\n", g_cfg.num_layers, K);
             printf("[config] %d layers x %d experts x %.2f MB = %.1f MB total I/O\n",
-                   NUM_LAYERS, K, EXPERT_SIZE / (1024.0 * 1024.0),
+                   g_cfg.num_layers, K, g_cfg.expert_size / (1024.0 * 1024.0),
                    total_expert_bytes / (1024.0 * 1024.0));
             printf("[config] Double-buffered I/O + compute pipeline\n");
             printf("[config] %d pthreads for parallel pread\n", NUM_IO_THREADS);
@@ -1603,7 +1589,7 @@ int main(int argc, char **argv) {
             FullForwardTiming ft = run_full_forward(ctx, layer_fds, K, use_fast,
                                                      do_benchmark ? 0 : 1);
 
-            printf("\nFull %d-layer MoE (K=%d):\n", NUM_LAYERS, K);
+            printf("\nFull %d-layer MoE (K=%d):\n", g_cfg.num_layers, K);
             printf("  Total:   %.1f ms (%.2f tok/s)\n",
                    ft.total_ms, 1000.0 / ft.total_ms);
             printf("  I/O:     %.1f ms (%.1f GB/s)\n",
@@ -1646,7 +1632,7 @@ int main(int argc, char **argv) {
             }
 
             // Cleanup all fds
-            for (int i = 0; i < NUM_LAYERS; i++) close(layer_fds[i]);
+            for (int i = 0; i < g_cfg.num_layers; i++) close(layer_fds[i]);
             metal_destroy(ctx);
             printf("\nDone.\n");
             return 0;
@@ -1668,16 +1654,16 @@ int main(int argc, char **argv) {
 
         // ---- Create input vector with deterministic values ----
         // Use realistic magnitude (~1.0) to stress-test numerical accuracy
-        id<MTLBuffer> x_buf = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+        id<MTLBuffer> x_buf = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
         float *x_data = (float *)[x_buf contents];
-        for (int i = 0; i < HIDDEN_DIM; i++) {
+        for (int i = 0; i < g_cfg.hidden_dim; i++) {
             x_data[i] = 0.1f * sinf((float)i * 0.1f + 0.3f);
         }
         printf("[init] Input vector: x[0..3] = [%.6f, %.6f, %.6f, %.6f]\n",
                x_data[0], x_data[1], x_data[2], x_data[3]);
 
         // ---- Output buffer ----
-        id<MTLBuffer> out_buf = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+        id<MTLBuffer> out_buf = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
 
         // ========== Single expert forward ==========
         if (!do_moe) {
@@ -1697,7 +1683,7 @@ int main(int argc, char **argv) {
             // ---- Verify against CPU ----
             if (do_verify) {
                 printf("\n--- CPU verification ---\n");
-                float *cpu_out = calloc(HIDDEN_DIM, sizeof(float));
+                float *cpu_out = calloc(g_cfg.hidden_dim, sizeof(float));
                 double t_cpu = now_ms();
                 cpu_expert_forward(packed_fd, expert_idx, x_data, cpu_out);
                 double cpu_ms = now_ms() - t_cpu;
@@ -1711,7 +1697,7 @@ int main(int argc, char **argv) {
                 float max_diff = 0.0f;
                 float max_rel_diff = 0.0f;
                 int worst_idx = 0;
-                for (int i = 0; i < HIDDEN_DIM; i++) {
+                for (int i = 0; i < g_cfg.hidden_dim; i++) {
                     float diff = fabsf(out_data[i] - cpu_out[i]);
                     float rel = (fabsf(cpu_out[i]) > 1e-6f) ? diff / fabsf(cpu_out[i]) : diff;
                     if (diff > max_diff) {
@@ -1746,7 +1732,7 @@ int main(int argc, char **argv) {
                 printf("[bench] Average: io=%.2f ms, compute=%.2f ms, total=%.2f ms\n",
                        io_sum / N, compute_sum / N, total_sum / N);
                 printf("[bench] I/O throughput: %.1f GB/s\n",
-                       EXPERT_SIZE * N / (io_sum * 1e6));
+                       g_cfg.expert_size * N / (io_sum * 1e6));
             }
         }
 
@@ -1761,7 +1747,7 @@ int main(int argc, char **argv) {
             float moe_weights[MAX_ACTIVE_EXPERTS];
             float wsum = 0.0f;
             for (int k = 0; k < K; k++) {
-                moe_experts[k] = (k * (NUM_EXPERTS / K)) % NUM_EXPERTS;
+                moe_experts[k] = (k * (g_cfg.num_experts / K)) % g_cfg.num_experts;
                 moe_weights[k] = 1.0f / (float)(k + 1);
                 wsum += moe_weights[k];
             }
@@ -1773,7 +1759,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < K; k++) printf("%d(%.3f) ", moe_experts[k], moe_weights[k]);
             printf("\n");
 
-            id<MTLBuffer> moe_out = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+            id<MTLBuffer> moe_out = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
 
             // Use fused path when --fast (v3 shader)
             MoETiming mt;
@@ -1790,7 +1776,7 @@ int main(int argc, char **argv) {
                    moe_data[0], moe_data[1], moe_data[2], moe_data[3],
                    moe_data[4], moe_data[5], moe_data[6], moe_data[7]);
             printf("[timing] I/O: %.2f ms (%.1f GB/s)\n",
-                   mt.io_ms, (double)(EXPERT_SIZE * K) / (mt.io_ms * 1e6));
+                   mt.io_ms, (double)(g_cfg.expert_size * K) / (mt.io_ms * 1e6));
             printf("[timing] Compute: %.2f ms (all %d experts)\n", mt.compute_ms, K);
             printf("[timing] Total: %.2f ms\n", mt.total_ms);
             printf("[timing] Experts/sec: %.0f\n", K / (mt.total_ms / 1000.0));

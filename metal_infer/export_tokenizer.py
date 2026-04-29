@@ -41,7 +41,7 @@ def get_default_model_path():
 def main():
     # Allow env vars to override: FLASHCHAT_MODEL_PATH, FLASHCHAT_WEIGHTS_DIR
     default_model_path = os.environ.get('FLASHCHAT_MODEL_PATH') or get_default_model_path()
-    default_weights_dir = os.environ.get('FLASHCHAT_WEIGHTS_DIR') or '.'
+    default_weights_dir = os.environ.get('FLASHCHAT_WEIGHTS_DIR') or f"{default_model_path}/flashchat"
     
     tok_path = sys.argv[1] if len(sys.argv) > 1 else f"{default_model_path}/tokenizer.json"
     out_path = sys.argv[2] if len(sys.argv) > 2 else f"{default_weights_dir}/vocab.bin"
@@ -94,7 +94,6 @@ def main():
     print(f"  Merges: {len(merges)} rules")
     print(f"  Added tokens: {len(added)} entries")
 
-    import os
     sz = os.path.getsize(out_path)
     print(f"  File size: {sz / 1024 / 1024:.1f} MB")
 
