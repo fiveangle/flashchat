@@ -1635,7 +1635,6 @@ cmd_serve() {
     pid_file=$(flashchat_get_pid_file)
     
     ensure_binaries
-    cd "$SCRIPT_DIR/metal_infer"
     
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
@@ -1643,16 +1642,14 @@ cmd_serve() {
     export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
     export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
-export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
+    export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
     
-    # Start server (redirect output to avoid mixing with TUI)
-    ./infer --serve "$server_port" > /dev/null 2>&1 &
+    # Start server from project root so infer can find model_configs.json
+    "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" > /dev/null 2>&1 &
     local infer_pid=$!
-    
-    cd "$SCRIPT_DIR"
     
     # Wait for server to be ready
     echo "Starting server on port $server_port..."
