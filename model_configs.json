@@ -66,8 +66,7 @@
       },
       "scripts": {
         "extract_weights": "qwen3.6-35B-A3B-extract_weights.py",
-        "repack_experts": "qwen3.6-35B-A3B-repack_experts.py",
-        "repack_experts_2bit": "qwen3.6-35B-A3B-repack_experts_2bit.py"
+        "repack_experts": "qwen3.6-35B-A3B-repack_experts.py"
       },
       "special_tokens": {
         "eos_1": 248046,

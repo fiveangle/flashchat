@@ -1874,9 +1874,15 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = g_cfg.up_w_off_2;   up_s_off   = g_cfg.up_s_off_2;   up_b_off   = g_cfg.up_b_off_2;
         down_w_off = g_cfg.down_w_off_2; down_s_off = g_cfg.down_s_off_2; down_b_off = g_cfg.down_b_off_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;
+        gate_s_off = g_cfg.gate_w_size;
+        gate_b_off = gate_s_off + g_cfg.gate_s_size;
+        up_w_off   = gate_b_off + g_cfg.gate_b_size;
+        up_s_off   = up_w_off + g_cfg.up_w_size;
+        up_b_off   = up_s_off + g_cfg.up_s_size;
+        down_w_off = up_b_off + g_cfg.up_b_size;
+        down_s_off = down_w_off + g_cfg.down_w_size;
+        down_b_off = down_s_off + g_cfg.down_s_size;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1970,9 +1976,15 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = g_cfg.up_w_off_2;   up_s_off   = g_cfg.up_s_off_2;   up_b_off   = g_cfg.up_b_off_2;
         down_w_off = g_cfg.down_w_off_2; down_s_off = g_cfg.down_s_off_2; down_b_off = g_cfg.down_b_off_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;
+        gate_s_off = g_cfg.gate_w_size;
+        gate_b_off = gate_s_off + g_cfg.gate_s_size;
+        up_w_off   = gate_b_off + g_cfg.gate_b_size;
+        up_s_off   = up_w_off + g_cfg.up_w_size;
+        up_b_off   = up_s_off + g_cfg.up_s_size;
+        down_w_off = up_b_off + g_cfg.up_b_size;
+        down_s_off = down_w_off + g_cfg.down_w_size;
+        down_b_off = down_s_off + g_cfg.down_s_size;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2070,9 +2082,15 @@ static void gpu_encode_experts_batched(
         up_w_off   = g_cfg.up_w_off_2;   up_s_off   = g_cfg.up_s_off_2;   up_b_off   = g_cfg.up_b_off_2;
         down_w_off = g_cfg.down_w_off_2; down_s_off = g_cfg.down_s_off_2; down_b_off = g_cfg.down_b_off_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;
+        gate_s_off = g_cfg.gate_w_size;
+        gate_b_off = gate_s_off + g_cfg.gate_s_size;
+        up_w_off   = gate_b_off + g_cfg.gate_b_size;
+        up_s_off   = up_w_off + g_cfg.up_w_size;
+        up_b_off   = up_s_off + g_cfg.up_s_size;
+        down_w_off = up_b_off + g_cfg.up_b_size;
+        down_s_off = down_w_off + g_cfg.down_w_size;
+        down_b_off = down_s_off + g_cfg.down_s_size;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2156,14 +2174,14 @@ static void gpu_encode_expert_forward(
     id<MTLCommandBuffer> cmdbuf
 ) {
     NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_s_off = g_cfg.gate_w_size;
+    NSUInteger gate_b_off = gate_s_off + g_cfg.gate_s_size;
+    NSUInteger up_w_off   = gate_b_off + g_cfg.gate_b_size;
+    NSUInteger up_s_off   = up_w_off + g_cfg.up_w_size;
+    NSUInteger up_b_off   = up_s_off + g_cfg.up_s_size;
+    NSUInteger down_w_off = up_b_off + g_cfg.up_b_size;
+    NSUInteger down_s_off = down_w_off + g_cfg.down_w_size;
+    NSUInteger down_b_off = down_s_off + g_cfg.down_s_size;
 
     uint32_t gate_up_out = g_cfg.moe_intermediate;
     uint32_t gate_up_in  = g_cfg.hidden_dim;
@@ -2279,9 +2297,15 @@ static void gpu_expert_forward(
         up_w_off   = g_cfg.up_w_off_2;   up_s_off   = g_cfg.up_s_off_2;   up_b_off   = g_cfg.up_b_off_2;
         down_w_off = g_cfg.down_w_off_2; down_s_off = g_cfg.down_s_off_2; down_b_off = g_cfg.down_b_off_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;
+        gate_s_off = g_cfg.gate_w_size;
+        gate_b_off = gate_s_off + g_cfg.gate_s_size;
+        up_w_off   = gate_b_off + g_cfg.gate_b_size;
+        up_s_off   = up_w_off + g_cfg.up_w_size;
+        up_b_off   = up_s_off + g_cfg.up_s_size;
+        down_w_off = up_b_off + g_cfg.up_b_size;
+        down_s_off = down_w_off + g_cfg.down_w_size;
+        down_b_off = down_s_off + g_cfg.down_s_size;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -3118,14 +3142,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_s_off_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_b_off_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_w_off_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_s_off_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_b_off_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_w_off_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_s_off_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_b_off_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_s_off_2 : g_cfg.gate_w_size));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_w_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_s_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_w_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_s_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size));
 
                 float *gate_proj_out = malloc(g_cfg.moe_intermediate * sizeof(float));
                 float *up_proj_out = malloc(g_cfg.moe_intermediate * sizeof(float));
@@ -5843,14 +5867,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_s_off_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_b_off_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_w_off_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_s_off_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_b_off_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_w_off_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_s_off_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_b_off_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_s_off_2 : g_cfg.gate_w_size));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.gate_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_w_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_s_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.up_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_w_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_s_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? g_cfg.down_b_off_2 : g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size));
 
             float *gate_proj_out = malloc(g_cfg.moe_intermediate * sizeof(float));
             float *up_proj_out = malloc(g_cfg.moe_intermediate * sizeof(float));

@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""
-extract_weights.py — Extract all non-expert weights from Qwen3.6-35B-A3B-4bit
-into a single binary file that the C inference engine can mmap.
-
-Outputs:
-  - model_weights.bin: binary blob containing all non-expert weight tensors
-  - model_weights.json: manifest describing each tensor's location, shape, dtype
-
-The binary format is simple:
-  - Tensors are packed contiguously, 64-byte aligned
-  - Each tensor is stored in its native format (U32 packed, BF16 as uint16, F32)
-  - The JSON manifest maps tensor names to {offset, size, shape, dtype}
-
-Usage:
-    python extract_weights.py [--model PATH] [--output DIR]
-"""
+"""Extract all non-expert weights from Qwen3.6-35B-A3B-4bit into a single binary file."""
 
 import json
 import struct
@@ -25,11 +10,9 @@ import time
 from pathlib import Path
 from collections import defaultdict
 import re
-import numpy as np
 
 
 def parse_safetensors_header(filepath):
-    """Parse a safetensors file header. Returns (header_dict, data_start_offset)."""
     with open(filepath, 'rb') as f:
         header_len = struct.unpack('<Q', f.read(8))[0]
         header = json.loads(f.read(header_len))
@@ -38,19 +21,16 @@ def parse_safetensors_header(filepath):
 
 
 def get_default_model_path():
-    """Get default model path from environment or compute from MODEL_REPO."""
     model_repo = os.environ.get('FLASHCHAT_MODEL_REPO', 'mlx-community/Qwen3.6-35B-A3B-4bit')
     escaped_repo = model_repo.replace('/', '--')
     hf_cache = os.path.expanduser('~/.cache/huggingface/hub')
     snapshot_dir = f"{hf_cache}/models--{escaped_repo}/snapshots"
     
-    # Try to find latest snapshot
     if os.path.isdir(snapshot_dir):
         snapshots = sorted(os.listdir(snapshot_dir))
         if snapshots:
             return f"{snapshot_dir}/{snapshots[-1]}"
     
-    # Fallback to expected path
     return os.path.expanduser(f'~/.cache/huggingface/hub/models--{escaped_repo}/snapshots/<snapshot>')
 
 
@@ -73,7 +53,6 @@ def main():
         output_dir = model_path / 'flashchat'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load the weight index
     index_path = model_path / 'model.safetensors.index.json'
     if not index_path.exists():
         print(f"ERROR: {index_path} not found", file=sys.stderr)
@@ -84,13 +63,10 @@ def main():
 
     weight_map = idx['weight_map']
 
-    # Filter: keep only language_model weights, skip vision_tower
-    # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
-    # unless --include-experts is set
     expert_pattern = re.compile(r'\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$')
     vision_pattern = re.compile(r'^(vision_tower|model\.visual)')
 
-    tensors_to_extract = {}  # name -> filename
+    tensors_to_extract = {}
     skipped_expert = 0
     skipped_vision = 0
 
@@ -109,38 +85,31 @@ def main():
     print(f"Skipped expert: {skipped_expert}")
     print(f"Extracting: {len(tensors_to_extract)} tensors")
 
-    # Group by shard file for sequential I/O
     by_file = defaultdict(list)
     for name, filename in tensors_to_extract.items():
         by_file[filename].append(name)
 
-    # Parse headers and plan layout
     print("\nParsing safetensors headers...")
     header_cache = {}
     for filename in sorted(by_file.keys()):
         filepath = model_path / filename
         header_cache[filename] = parse_safetensors_header(str(filepath))
 
-    # Sanitize tensor names: remove "language_model." prefix for the C engine
     def sanitize_name(name):
         if name.startswith("language_model."):
             return name[len("language_model."):]
         return name
 
-    # Plan the output layout
-    # Sort tensors for deterministic output
-    all_tensors = []  # (sanitized_name, original_name, filename)
+    all_tensors = []
     for name in sorted(tensors_to_extract.keys()):
         san_name = sanitize_name(name)
         all_tensors.append((san_name, name, tensors_to_extract[name]))
 
-    # Write binary file
     bin_path = output_dir / 'model_weights.bin'
     manifest = {
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
         "config": {
             "hidden_size": 2048,
             "num_hidden_layers": 40,
@@ -164,7 +133,6 @@ def main():
         }
     }
 
-    # Layer type map
     layer_types = []
     for i in range(40):
         if (i + 1) % 4 == 0:
@@ -178,7 +146,7 @@ def main():
     offset = 0
     total_bytes = 0
 
-    ALIGN = 64  # 64-byte alignment for Metal buffers
+    ALIGN = 64
 
     with open(bin_path, 'wb') as out_f:
         for i, (san_name, orig_name, filename) in enumerate(all_tensors):
@@ -195,13 +163,11 @@ def main():
             shape = meta['shape']
             dtype = meta['dtype']
 
-            # Align offset
             if offset % ALIGN != 0:
                 pad = ALIGN - (offset % ALIGN)
                 out_f.write(b'\x00' * pad)
                 offset += pad
 
-            # Read tensor data from safetensors
             with open(filepath, 'rb') as sf:
                 sf.seek(data_start + tensor_offsets[0])
                 data = sf.read(byte_len)
@@ -227,13 +193,11 @@ def main():
     print(f"\nDone: {total_bytes / 1e9:.2f} GB in {elapsed:.1f}s ({throughput:.1f} GB/s)")
     print(f"Binary: {bin_path} ({os.path.getsize(bin_path) / 1e9:.2f} GB)")
 
-    # Write manifest
     json_path = output_dir / 'model_weights.json'
     with open(json_path, 'w') as f:
         json.dump(manifest, f, indent=2)
     print(f"Manifest: {json_path}")
 
-    # Print summary by category
     categories = defaultdict(lambda: {"count": 0, "bytes": 0})
     for san_name, info in manifest["tensors"].items():
         if "embed_tokens" in san_name:

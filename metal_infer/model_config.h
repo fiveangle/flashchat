@@ -265,24 +265,24 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     cfg->num_linear_layers    = cfg->num_layers - cfg->num_full_attn_layers;
 
     int gs = cfg->group_size;
-    int gate_w = (cfg->moe_intermediate * cfg->hidden_dim) / 8;
+    int gate_w = (cfg->moe_intermediate * cfg->hidden_dim) / 2;
     int gate_s = cfg->moe_intermediate * (cfg->hidden_dim / gs) * 2;
     int gate_b = gate_s;
     int up_w   = gate_w;
     int up_s   = gate_s;
     int up_b   = gate_s;
-    int down_w = (cfg->hidden_dim * cfg->moe_intermediate) / 8;
+    int down_w = (cfg->hidden_dim * cfg->moe_intermediate) / 2;
     int down_s = cfg->hidden_dim * (cfg->moe_intermediate / gs) * 2;
     int down_b = down_s;
     cfg->expert_size = gate_w + gate_s + gate_b + up_w + up_s + up_b + down_w + down_s + down_b;
 
-    int gate_w_2 = (cfg->moe_intermediate * cfg->hidden_dim) / 16;
+    int gate_w_2 = (cfg->moe_intermediate * cfg->hidden_dim) / 4;
     int gate_s_2 = gate_s;
     int gate_b_2 = gate_b;
     int up_w_2   = gate_w_2;
     int up_s_2   = gate_s;
     int up_b_2   = gate_b;
-    int down_w_2 = (cfg->hidden_dim * cfg->moe_intermediate) / 16;
+    int down_w_2 = (cfg->hidden_dim * cfg->moe_intermediate) / 4;
     int down_s_2 = down_s;
     int down_b_2 = down_b;
     cfg->expert_size_2bit = gate_w_2 + gate_s_2 + gate_b_2 + up_w_2 + up_s_2 + up_b_2 + down_w_2 + down_s_2 + down_b_2;

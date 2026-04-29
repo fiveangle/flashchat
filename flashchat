@@ -656,12 +656,14 @@ check_model_downloaded() {
 check_model_extracted() {
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
-    
+
     # Check if original HuggingFace model exists (safetensors)
-    [ -f "$model_path/model-00001-of-00046.safetensors" ] || \
-    [ -f "$model_path/model.safetensors" ] || \
-    [ -f "$model_path/config.json" ]
-    return $?
+    # Use glob to match any shard pattern (e.g., model-00001-of-00004, model-00001-of-00046)
+    for f in "$model_path"/model-*.safetensors "$model_path"/model.safetensors; do
+        [ -f "$f" ] && return 0
+    done
+    [ -f "$model_path/config.json" ] && return 0
+    return 1
 }
 
 prompt_extract_setup() {
@@ -905,7 +907,7 @@ prompt_download_model() {
         
         if check_hf_cli; then
             echo "Using Homebrew hf CLI..."
-            hf model download "$model_repo"
+            hf download "$model_repo"
         else
             echo "Installing huggingface-hub in temporary venv..."
             HF_VENV="/tmp/hf_$$"
@@ -914,8 +916,19 @@ prompt_download_model() {
             "$HF_VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model_repo')"
             rm -rf "$HF_VENV"
         fi
-        
-        echo "Download complete."
+
+        # Verify the download actually succeeded
+        flashchat_load_config
+        if check_model_extracted; then
+            echo "Download complete."
+        else
+            echo ""
+            echo "WARNING: Download command finished but model files were not found."
+            echo "The client may have updated itself and requested a re-run."
+            echo ""
+            echo "Please re-run: ./flashchat"
+            exit 1
+        fi
     else
         echo "Download cancelled. Run 'flashchat' again when ready."
         exit 0
@@ -1009,13 +1022,13 @@ prompt_extract_experts() {
         fi
     fi
     
-    local expert_index_path=""
-    if [ -f "$model_path/expert_index.json" ]; then
-        expert_index_path="$model_path/expert_index.json"
+    local expert_index_path="$model_path/flashchat/expert_index.json"
+    if [ -f "$expert_index_path" ]; then
         echo "Using model-specific expert index: $expert_index_path"
     else
-        expert_index_path="./expert_index.json"
-        echo "Using local expert index: $expert_index_path"
+        echo "Expert index not found: $expert_index_path"
+        echo "Run expert index generation first."
+        exit 1
     fi
     
     echo ""
@@ -1106,7 +1119,14 @@ prompt_save_config() {
     config_file=$(flashchat_get CONFIG_FILE)
     
     if [ -n "$config_file" ] && [ -f "$config_file" ]; then
-        return  # Already has config
+        # Check if existing config is missing MODEL (old format)
+        if ! grep -q '^MODEL=' "$config_file" 2>/dev/null; then
+            echo ""
+            echo "Updating config to include model ID..."
+            flashchat_create_default_config
+            echo "Config updated."
+        fi
+        return
     fi
     
     echo ""
@@ -1203,13 +1223,15 @@ ensure_setup() {
         prompt_install_xcode_cli
     fi
     
-    # Check model
-    if ! check_model_downloaded; then
-        if ! check_model_extracted; then
-            prompt_download_model
+    # Check model - loop until model is available or user cancels
+    while ! check_model_downloaded; do
+        if check_model_extracted; then
+            break
         fi
-    fi
-    
+        prompt_download_model
+        flashchat_load_config
+    done
+
     # Re-load config after model download (path may have changed)
     flashchat_load_config
     

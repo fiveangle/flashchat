@@ -2,8 +2,8 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 256 experts x 589,824 bytes = ~151 MB
-Expert E starts at byte offset E * 589,824
+Each file = 256 experts x 1,769,472 bytes = ~452 MB
+Expert E starts at byte offset E * 1,769,472
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -27,21 +27,21 @@ import errno
 
 # Component order and expected sizes
 COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 131072, "dtype": "U32", "shape": [512, 2048]},
-    {"name": "gate_proj.scales",  "offset": 131072,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
-    {"name": "gate_proj.biases",  "offset": 163840,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
-    {"name": "up_proj.weight",    "offset": 196608,  "size": 131072, "dtype": "U32", "shape": [512, 2048]},
-    {"name": "up_proj.scales",    "offset": 327680,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
-    {"name": "up_proj.biases",    "offset": 360448,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
-    {"name": "down_proj.weight",  "offset": 393216,  "size": 131072, "dtype": "U32", "shape": [2048, 512]},
-    {"name": "down_proj.scales",  "offset": 524288,  "size": 32768,  "dtype": "BF16", "shape": [2048, 16]},
-    {"name": "down_proj.biases",  "offset": 557056,  "size": 32768,  "dtype": "BF16", "shape": [2048, 16]},
+    {"name": "gate_proj.weight",  "offset": 0,        "size": 524288, "dtype": "U32", "shape": [512, 2048]},
+    {"name": "gate_proj.scales",  "offset": 524288,   "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
+    {"name": "gate_proj.biases",  "offset": 557056,   "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
+    {"name": "up_proj.weight",    "offset": 589824,   "size": 524288, "dtype": "U32", "shape": [512, 2048]},
+    {"name": "up_proj.scales",    "offset": 1114112,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
+    {"name": "up_proj.biases",    "offset": 1146880,  "size": 32768,  "dtype": "BF16", "shape": [512, 64]},
+    {"name": "down_proj.weight",  "offset": 1179648,  "size": 524288, "dtype": "U32", "shape": [2048, 512]},
+    {"name": "down_proj.scales",  "offset": 1703936,  "size": 32768,  "dtype": "BF16", "shape": [2048, 16]},
+    {"name": "down_proj.biases",  "offset": 1736704,  "size": 32768,  "dtype": "BF16", "shape": [2048, 16]},
 ]
 
-EXPERT_SIZE = 589824   # bytes per expert
+EXPERT_SIZE = 1769472   # bytes per expert
 NUM_EXPERTS = 256
 NUM_LAYERS = 40
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 452,984,832 bytes (~453 MB)
 
 
 def parse_layers(spec):
@@ -184,7 +184,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     fd_packed = os.open(out_path, os.O_RDONLY)
 
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    for expert_idx in [0, 1, NUM_EXPERTS - 1]:  # spot check several experts
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -201,7 +201,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     os.close(fd_packed)
 
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, {NUM_EXPERTS - 1})")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
@@ -223,21 +223,17 @@ def write_layout(output_dir):
 
 
 def get_default_index_path():
-    """Get default index path. Check common locations."""
-    candidates = [
-        './expert_index.json',
-        os.path.expanduser('~/Workspace/ane-research/expert_index.json'),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return candidates[0]
+    env_path = os.environ.get('FLASHCHAT_EXPERT_INDEX')
+    if env_path:
+        return env_path
+    return None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', 
-                        default=os.environ.get('FLASHCHAT_EXPERT_INDEX') or get_default_index_path(),
+    parser.add_argument('--index',
+                        default=get_default_index_path(),
+                        required=get_default_index_path() is None,
                         help='Path to expert_index.json (or set FLASHCHAT_EXPERT_INDEX)')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')

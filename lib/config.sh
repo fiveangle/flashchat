@@ -74,6 +74,28 @@ except Exception:
 }
 
 # -----------------------------------------------------------------------------
+# Reverse-lookup model ID from repo in model_configs.json
+# -----------------------------------------------------------------------------
+_flashchat_lookup_model_id() {
+    local repo="$1"
+    local config_file="${FLASHCHAT_CONFIG_JSON:-./model_configs.json}"
+    if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+try:
+    with open('$config_file') as f:
+        data = json.load(f)
+    for mid, info in data.get('models', {}).items():
+        if info.get('hf_repo') == '$repo':
+            print(mid)
+            break
+except Exception:
+    pass
+" 2>/dev/null
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Detect the HuggingFace snapshot path from model repo
 # -----------------------------------------------------------------------------
 _flashchat_detect_model_path() {
@@ -165,7 +187,17 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
     # 4. Apply defaults for any missing values
-    MODEL="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
+    if [ -z "$MODEL" ] && [ -n "$MODEL_REPO" ]; then
+        local looked_up_id
+        looked_up_id=$(_flashchat_lookup_model_id "$MODEL_REPO")
+        if [ -n "$looked_up_id" ]; then
+            MODEL="$looked_up_id"
+        else
+            MODEL="$FLASHCHAT_DEFAULT_MODEL"
+        fi
+    elif [ -z "$MODEL" ]; then
+        MODEL="$FLASHCHAT_DEFAULT_MODEL"
+    fi
     if [ -z "$MODEL_REPO" ]; then
         local looked_up_repo
         looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
@@ -228,26 +260,26 @@ flashchat_create_default_config() {
 # Generated on $(date)
 
 # Model Settings
-MODEL="${FLASHCHAT_DEFAULT_MODEL}"
+MODEL="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
 
 # Quantization: 4bit or 2bit
-QUANTIZATION="${FLASHCHAT_DEFAULT_QUANTIZATION}"
+QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
 
 # Generation Defaults
-MAX_TOKENS="${FLASHCHAT_DEFAULT_MAX_TOKENS}"
-TEMPERATURE="${FLASHCHAT_DEFAULT_TEMPERATURE}"
-TOP_P="${FLASHCHAT_DEFAULT_TOP_P}"
+MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
+TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
+TOP_P="${TOP_P:-$FLASHCHAT_DEFAULT_TOP_P}"
 
 # Server Settings
-SERVER_PORT="${FLASHCHAT_DEFAULT_SERVER_PORT}"
-SERVER_HOST="${FLASHCHAT_DEFAULT_SERVER_HOST}"
-SERVER_LOG_PATH="${FLASHCHAT_DEFAULT_SERVER_LOG_PATH}"
-SERVER_DEBUG="${FLASHCHAT_DEFAULT_SERVER_DEBUG}"
-SERVER_HTTP_LOG="${FLASHCHAT_DEFAULT_SERVER_HTTP_LOG}"
+SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
+SERVER_HOST="${SERVER_HOST:-$FLASHCHAT_DEFAULT_SERVER_HOST}"
+SERVER_LOG_PATH="${SERVER_LOG_PATH:-$FLASHCHAT_DEFAULT_SERVER_LOG_PATH}"
+SERVER_DEBUG="${SERVER_DEBUG:-$FLASHCHAT_DEFAULT_SERVER_DEBUG}"
+SERVER_HTTP_LOG="${SERVER_HTTP_LOG:-$FLASHCHAT_DEFAULT_SERVER_HTTP_LOG}"
 
 # UI Settings
-SHOW_THINKING="${FLASHCHAT_DEFAULT_SHOW_THINKING}"
-COLOR_OUTPUT="${FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
+SHOW_THINKING="${SHOW_THINKING:-$FLASHCHAT_DEFAULT_SHOW_THINKING}"
+COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
 EOF
     FLASHCHAT_CONFIG_FILE="${FLASHCHAT_CONFIG_DIR}/config"
 }

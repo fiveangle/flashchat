@@ -223,21 +223,17 @@ def write_layout(output_dir):
 
 
 def get_default_index_path():
-    """Get default index path. Check common locations."""
-    candidates = [
-        './expert_index.json',
-        os.path.expanduser('~/Workspace/ane-research/expert_index.json'),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return candidates[0]
+    env_path = os.environ.get('FLASHCHAT_EXPERT_INDEX')
+    if env_path:
+        return env_path
+    return None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', 
-                        default=os.environ.get('FLASHCHAT_EXPERT_INDEX') or get_default_index_path(),
+    parser.add_argument('--index',
+                        default=get_default_index_path(),
+                        required=get_default_index_path() is None,
                         help='Path to expert_index.json (or set FLASHCHAT_EXPERT_INDEX)')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
