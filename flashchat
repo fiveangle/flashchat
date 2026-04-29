@@ -1043,8 +1043,13 @@ prompt_extract_experts() {
         echo "Using model-specific expert index: $expert_index_path"
     else
         echo "Expert index not found: $expert_index_path"
-        echo "Run expert index generation first."
-        exit 1
+        echo "Generating expert index from model safetensors..."
+        cd "$SCRIPT_DIR"
+        if ! run_python generate_expert_index.py --model "$model_path" --output "$model_path/flashchat"; then
+            echo "ERROR: Expert index generation failed."
+            return 1
+        fi
+        echo "Expert index generated successfully."
     fi
     
     echo ""
