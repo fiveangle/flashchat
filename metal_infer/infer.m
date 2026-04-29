@@ -373,6 +373,18 @@ static int g_default_reasoning_enabled = 1;
 
 static const char *kApiModelId = NULL;
 
+// ============================================================================
+// System prompt hash for KV-cache snapshot deduplication
+// ============================================================================
+
+static uint64_t hash_string_djb2(const char *str) {
+    uint64_t hash = 5381;
+    int c;
+    while ((c = *str++))
+        hash = ((hash << 5) + hash) + c;
+    return hash;
+}
+
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [g_cfg.num_layers] cold fds (set in main)
 static uint8_t g_expert_seen[MAX_NUM_LAYERS][MAX_NUM_EXPERTS / 8];  // bitset: seen before?
@@ -6338,6 +6350,19 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
     return dup_nsstring(final);
 }
 
+static int count_sys_prompt_tokens(const char *sys_prompt) {
+    size_t len = strlen(sys_prompt);
+    size_t total = len + 64;
+    char *prefix = malloc(total);
+    if (!prefix) return 0;
+    snprintf(prefix, total, "<|im_start|>system\n%s<|im_end|>\n", sys_prompt);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prefix);
+    free(prefix);
+    int count = pt ? pt->count : 0;
+    if (pt) { free(pt->ids); free(pt); }
+    return count;
+}
+
 static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *request_id) {
     if (!req || !req->conversation_text) return NULL;
     size_t conv_len = strlen(req->conversation_text);
@@ -6437,8 +6462,7 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     [conversation appendString:@"<|im_start|>assistant\n"];
     req->system_prompt = dup_nsstring(system_prompt);
     req->conversation_text = dup_nsstring(conversation);
-    req->used_snapshot = (req->tool_count == 0 && req->reasoning_enabled &&
-                          (!req->system_prompt || req->system_prompt[0] == '\0'));
+    req->used_snapshot = 0;
     return 0;
 }
 
@@ -7212,73 +7236,12 @@ static void serve_loop(
 
     static uint64_t req_counter = 0;
 
-    // ---- System prompt cache: prefill system prompt once at startup ----
-    // Tokenize the system prompt and run it through all 60 layers.
-    // Save the resulting KV cache + linear attention state as a snapshot.
-    // On each request, restore the snapshot instead of re-prefilling.
-    server_log_errorf("[serve] Pre-caching system prompt...\n");
-    PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
-    int sys_pos = 0;
-    if (sys_pt && sys_pt->count > 0) {
-        // Pre-embed all system prompt tokens
-        float *sys_embed_batch = NULL;
-        if (sys_pt->count > 1) {
-            sys_embed_batch = malloc((size_t)sys_pt->count * g_cfg.hidden_dim * sizeof(float));
-            for (int i = 0; i < sys_pt->count; i++) {
-                embed_lookup(wf, sys_pt->ids[i], sys_embed_batch + (size_t)i * g_cfg.hidden_dim);
-            }
-        }
-        // Intermediate system prompt tokens: discard last-layer expert output
-        for (int i = 0; i < sys_pt->count - 1; i++) {
-            cache_telemetry_note_token();
-            if (sys_embed_batch) {
-                memcpy(hidden, sys_embed_batch + (size_t)i * g_cfg.hidden_dim,
-                       g_cfg.hidden_dim * sizeof(float));
-            } else {
-                embed_lookup(wf, sys_pt->ids[i], hidden);
-            }
-            for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    sys_pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
-            }
-            discard_deferred_experts();
-            sys_pos++;
-        }
-        // Last system prompt token: full completion
-        {
-            cache_telemetry_note_token();
-            if (sys_embed_batch) {
-                memcpy(hidden, sys_embed_batch + (size_t)(sys_pt->count - 1) * g_cfg.hidden_dim,
-                       g_cfg.hidden_dim * sizeof(float));
-            } else {
-                embed_lookup(wf, sys_pt->ids[0], hidden);
-            }
-            for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    sys_pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
-            }
-            complete_deferred_experts();
-            sys_pos++;
-        }
-        if (sys_embed_batch) { free(sys_embed_batch); sys_embed_batch = NULL; }
-        // Sync CPU state → GPU for delta-net
-        sync_cpu_to_gpu_delta_state_serve(layer_states);
-        server_log_errorf("[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
-    }
-    free(sys_pt);
+    // ---- Lazy system prompt cache: snapshot keyed by system prompt hash ----
+    // On first request with a given system prompt, prefill it and save state.
+    // On subsequent requests with the same hash, restore the snapshot.
+    uint64_t cached_sys_hash = 0;
+    int cached_sys_token_count = 0;
 
-    // Save snapshot of KV caches + linear attention state after system prompt
-    // These are restored at the start of each request instead of resetting to zero
     typedef struct {
         float *k_snapshot;
         float *v_snapshot;
@@ -7287,53 +7250,19 @@ static void serve_loop(
     KVSnapshot kv_snapshots[g_cfg.num_layers];
     memset(kv_snapshots, 0, sizeof(kv_snapshots));
 
-    // Linear attention snapshots
     float *la_conv_snapshots[g_cfg.num_layers];
     float *la_ssm_snapshots[g_cfg.num_layers];
     memset(la_conv_snapshots, 0, sizeof(la_conv_snapshots));
     memset(la_ssm_snapshots, 0, sizeof(la_ssm_snapshots));
 
-    size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
-    size_t ssm_state_size = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
-
-    for (int i = 0; i < g_cfg.num_layers; i++) {
-        if (kv_caches[i]) {
-            size_t sz = sys_pos * kv_dim * sizeof(float);
-            kv_snapshots[i].k_snapshot = malloc(sz);
-            kv_snapshots[i].v_snapshot = malloc(sz);
-            memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
-            memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
-            kv_snapshots[i].len = kv_caches[i]->len;
-        }
-        if (layer_states[i]) {
-            LinearAttnState *s = (LinearAttnState *)layer_states[i];
-            la_conv_snapshots[i] = malloc(conv_state_size);
-            la_ssm_snapshots[i] = malloc(ssm_state_size);
-            memcpy(la_conv_snapshots[i], s->conv_state, conv_state_size);
-            memcpy(la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
-        }
-    }
-    // Also snapshot GPU delta-net state
     void *gpu_delta_snapshots[MAX_LINEAR_LAYERS];
     void *gpu_conv_snapshots[MAX_LINEAR_LAYERS];
     memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
     memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
-    if (g_metal && g_metal->delta_net_step) {
-        for (int i = 0; i < g_cfg.num_linear_layers; i++) {
-            if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
-                gpu_delta_snapshots[i] = malloc(sz);
-                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
-            }
-            if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
-                gpu_conv_snapshots[i] = malloc(sz);
-                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
-            }
-        }
-    }
-    int sys_prompt_len = sys_pos;
+
+    size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
+    size_t ssm_state_size = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
 
     for (;;) {
         if (g_server_shutdown_signal) {
@@ -7459,11 +7388,20 @@ static void serve_loop(
                           req.tool_count, req.stream, req.temperature, req.top_p,
                           req.reasoning_enabled, req.used_snapshot);
 
+        // Build system prompt and hash it for cache lookup
+        char *req_sys_prompt = build_system_prompt_for_request(&req, NULL);
+        uint64_t req_sys_hash = hash_string_djb2(req_sys_prompt);
+        int sys_prompt_token_count = count_sys_prompt_tokens(req_sys_prompt);
+        int snapshot_restored = 0;
         int pos = 0;
-        if (req.used_snapshot) {
+
+        if (cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
+            // Cache hit: restore snapshot
+            server_log_errorf("[serve] %s sys_prompt_cache hit hash=%llu tokens=%d\n",
+                              request_id, req_sys_hash, cached_sys_token_count);
             for (int i = 0; i < g_cfg.num_layers; i++) {
                 if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
-                    size_t sz = sys_prompt_len * kv_dim * sizeof(float);
+                    size_t sz = cached_sys_token_count * kv_dim * sizeof(float);
                     memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
                     memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                     kv_caches[i]->len = kv_snapshots[i].len;
@@ -7493,9 +7431,20 @@ static void serve_loop(
             } else {
                 reset_delta_net_state();
             }
-            pos = sys_prompt_len;
+            pos = cached_sys_token_count;
+            snapshot_restored = 1;
+            req.used_snapshot = 1;
         } else {
+            // Cache miss: clear state and run full prefill
+            if (cached_sys_hash != 0) {
+                server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%llu new_hash=%llu\n",
+                                  request_id, cached_sys_hash, req_sys_hash);
+            } else {
+                server_log_errorf("[serve] %s sys_prompt_cache miss new_hash=%llu tokens=%d\n",
+                                  request_id, req_sys_hash, sys_prompt_token_count);
+            }
             clear_runtime_state_serve(layer_states, kv_caches);
+            req.used_snapshot = 0;
         }
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
@@ -7517,7 +7466,78 @@ static void serve_loop(
                 embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * g_cfg.hidden_dim);
             }
         }
-        for (int i = 0; i < pt->count; i++) {
+
+        // Split prefill: system prompt first, then conversation
+        int sys_token_end = req.used_snapshot ? 0 : sys_prompt_token_count;
+        if (!snapshot_restored && sys_token_end > 0) {
+            // Prefill system prompt tokens
+            for (int i = 0; i < sys_token_end; i++) {
+                cache_telemetry_note_token();
+                if (serve_embed_batch) {
+                    memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[i], hidden);
+                }
+                for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                    int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                if (i == pt->count - 1) complete_deferred_experts();
+                else discard_deferred_experts();
+                pos++;
+            }
+            // Save snapshot at system prompt boundary
+            for (int i = 0; i < g_cfg.num_layers; i++) {
+                if (kv_caches[i]) {
+                    size_t sz = sys_token_end * kv_dim * sizeof(float);
+                    if (kv_snapshots[i].k_snapshot) free(kv_snapshots[i].k_snapshot);
+                    if (kv_snapshots[i].v_snapshot) free(kv_snapshots[i].v_snapshot);
+                    kv_snapshots[i].k_snapshot = malloc(sz);
+                    kv_snapshots[i].v_snapshot = malloc(sz);
+                    memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
+                    memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
+                    kv_snapshots[i].len = kv_caches[i]->len;
+                }
+                if (layer_states[i]) {
+                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                    if (la_conv_snapshots[i]) free(la_conv_snapshots[i]);
+                    if (la_ssm_snapshots[i]) free(la_ssm_snapshots[i]);
+                    la_conv_snapshots[i] = malloc(conv_state_size);
+                    la_ssm_snapshots[i] = malloc(ssm_state_size);
+                    memcpy(la_conv_snapshots[i], s->conv_state, conv_state_size);
+                    memcpy(la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
+                }
+            }
+            if (g_metal && g_metal->delta_net_step) {
+                for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+                    if (g_metal->buf_delta_state[i]) {
+                        size_t sz = 64*128*128*sizeof(float);
+                        if (gpu_delta_snapshots[i]) free(gpu_delta_snapshots[i]);
+                        gpu_delta_snapshots[i] = malloc(sz);
+                        memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
+                    }
+                    if (g_metal->buf_conv_state[i]) {
+                        size_t sz = 3*12288*sizeof(float);
+                        if (gpu_conv_snapshots[i]) free(gpu_conv_snapshots[i]);
+                        gpu_conv_snapshots[i] = malloc(sz);
+                        memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
+                    }
+                }
+            }
+            cached_sys_hash = req_sys_hash;
+            cached_sys_token_count = sys_token_end;
+            server_log_errorf("[serve] %s sys_prompt_cache saved hash=%llu tokens=%d\n",
+                              request_id, cached_sys_hash, cached_sys_token_count);
+        }
+
+        // Prefill remaining tokens (conversation, or all tokens if snapshot restored)
+        int prefill_start = sys_token_end;
+        for (int i = prefill_start; i < pt->count; i++) {
             cache_telemetry_note_token();
             if (serve_embed_batch) {
                 memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
@@ -7538,6 +7558,7 @@ static void serve_loop(
             pos++;
         }
         free(serve_embed_batch);
+        free(req_sys_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
 
         if (final_norm_w) {
