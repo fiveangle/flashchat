@@ -8030,12 +8030,20 @@ int main(int argc, char **argv) {
         // ---- Auto-detect 2-bit experts ----
         if (!g_use_2bit) {
             char probe[1024];
-            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            snprintf(probe, sizeof(probe), "%s/flashchat/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
+            if (pfd < 0) {
+                snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
+                pfd = open(probe, O_RDONLY);
+            }
             if (pfd >= 0) {
                 close(pfd);
-                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+                snprintf(probe, sizeof(probe), "%s/flashchat/packed_experts/layer_00.bin", model_path);
                 int pfd4 = open(probe, O_RDONLY);
+                if (pfd4 < 0) {
+                    snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+                    pfd4 = open(probe, O_RDONLY);
+                }
                 if (pfd4 < 0) {
                     g_use_2bit = 1;
                     printf("[auto] Using 2-bit experts (4-bit not found)\n");
@@ -8063,9 +8071,14 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < g_cfg.num_layers; i++) {
             char path[1024];
-            snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
+            snprintf(path, sizeof(path), "%s/flashchat/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
+            if (layer_fds[i] < 0) {
+                snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
+                         g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
+                layer_fds[i] = open(path, O_RDONLY);
+            }
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
@@ -8093,12 +8106,18 @@ int main(int argc, char **argv) {
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
             char lz4_probe[1024];
-            snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
+            snprintf(lz4_probe, sizeof(lz4_probe), "%s/flashchat/packed_experts_lz4/layer_00.bin", model_path);
+            if (!g_use_2bit && access(lz4_probe, R_OK) != 0) {
+                snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
+            }
             if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < g_cfg.num_layers; i++) {
                     char lz4_path[1024];
-                    snprintf(lz4_path, sizeof(lz4_path), "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
+                    snprintf(lz4_path, sizeof(lz4_path), "%s/flashchat/packed_experts_lz4/layer_%02d.bin", model_path, i);
+                    if (access(lz4_path, R_OK) != 0) {
+                        snprintf(lz4_path, sizeof(lz4_path), "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
+                    }
                     int lz4_fd = open(lz4_path, O_RDONLY);
                     if (lz4_fd >= 0) {
                         // Load index header (512 entries × 16 bytes = 8KB)

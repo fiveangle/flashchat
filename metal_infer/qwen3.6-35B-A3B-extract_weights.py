@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from collections import defaultdict
 import re
+import numpy as np
 
 
 def parse_safetensors_header(filepath):
@@ -32,6 +33,81 @@ def get_default_model_path():
             return f"{snapshot_dir}/{snapshots[-1]}"
     
     return os.path.expanduser(f'~/.cache/huggingface/hub/models--{escaped_repo}/snapshots/<snapshot>')
+
+
+def bf16_to_f32(bf16_bytes):
+    u16 = np.frombuffer(bf16_bytes, dtype=np.uint16)
+    u32 = u16.astype(np.uint32) << 16
+    return u32.view(np.float32)
+
+
+def f32_to_bf16(f32_arr):
+    u32 = f32_arr.astype(np.float32).view(np.uint32)
+    u16 = (u32 >> 16).astype(np.uint16)
+    return u16.tobytes()
+
+
+def convert_8bit_to_4bit(weight_u32, scales_bf16, biases_bf16, out_dim, in_dim, group_size=64):
+    num_groups = in_dim // group_size
+    scales_f32 = bf16_to_f32(scales_bf16).reshape(out_dim, num_groups)
+    biases_f32 = bf16_to_f32(biases_bf16).reshape(out_dim, num_groups)
+    
+    u8_vals = np.zeros((out_dim, in_dim), dtype=np.uint8)
+    for i in range(4):
+        u8_vals[:, i::4] = (weight_u32[:, :in_dim // 4] >> (8 * i)) & 0xFF
+    
+    f32_vals = np.zeros((out_dim, in_dim), dtype=np.float32)
+    for g in range(num_groups):
+        start = g * group_size
+        end = start + group_size
+        f32_vals[:, start:end] = (u8_vals[:, start:end].astype(np.float32) * 
+                                   scales_f32[:, g:g+1] + biases_f32[:, g:g+1])
+    
+    new_scales_f32 = np.zeros((out_dim, num_groups), dtype=np.float32)
+    new_biases_f32 = np.zeros((out_dim, num_groups), dtype=np.float32)
+    u4_vals = np.zeros((out_dim, in_dim), dtype=np.uint8)
+    
+    for g in range(num_groups):
+        start = g * group_size
+        end = start + group_size
+        group_data = f32_vals[:, start:end]
+        min_vals = group_data.min(axis=1, keepdims=True)
+        max_vals = group_data.max(axis=1, keepdims=True)
+        
+        ranges = np.where(max_vals - min_vals < 1e-8, 1e-8, max_vals - min_vals)
+        new_scales_f32[:, g:g+1] = ranges / 15.0
+        new_biases_f32[:, g:g+1] = min_vals
+        
+        u4 = np.clip(np.round((group_data - min_vals) / new_scales_f32[:, g:g+1]), 0, 15).astype(np.uint8)
+        u4_vals[:, start:end] = u4
+    
+    new_weight_u32 = np.zeros((out_dim, in_dim // 8), dtype=np.uint32)
+    for i in range(8):
+        new_weight_u32 |= (u4_vals[:, i::8].astype(np.uint32) << (4 * i))
+    
+    new_scales_bf16 = f32_to_bf16(new_scales_f32.flatten())
+    new_biases_bf16 = f32_to_bf16(new_biases_f32.flatten())
+    
+    return new_weight_u32, new_scales_bf16, new_biases_bf16
+
+
+def load_8bit_tensor_overrides(config_path):
+    overrides = {}
+    if not config_path.exists():
+        return overrides
+    
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    quant_config = config.get('quantization') or config.get('quantization_config', {})
+    
+    for key, qinfo in quant_config.items():
+        if isinstance(qinfo, dict) and qinfo.get('bits') == 8:
+            if key.startswith('language_model.'):
+                key = key[len('language_model.'):]
+            overrides[key] = qinfo
+    
+    return overrides
 
 
 def main():
@@ -84,6 +160,10 @@ def main():
     print(f"Skipped vision: {skipped_vision}")
     print(f"Skipped expert: {skipped_expert}")
     print(f"Extracting: {len(tensors_to_extract)} tensors")
+
+    eight_bit_overrides = load_8bit_tensor_overrides(model_path / 'config.json')
+    if eight_bit_overrides:
+        print(f"Found {len(eight_bit_overrides)} 8-bit quantization overrides (will convert to 4-bit)")
 
     by_file = defaultdict(list)
     for name, filename in tensors_to_extract.items():
@@ -145,11 +225,15 @@ def main():
     t0 = time.time()
     offset = 0
     total_bytes = 0
+    skipped_8bit_components = set()
 
     ALIGN = 64
 
     with open(bin_path, 'wb') as out_f:
         for i, (san_name, orig_name, filename) in enumerate(all_tensors):
+            if orig_name in skipped_8bit_components:
+                continue
+
             filepath = model_path / filename
             header, data_start = header_cache[filename]
 
@@ -162,6 +246,95 @@ def main():
             byte_len = tensor_offsets[1] - tensor_offsets[0]
             shape = meta['shape']
             dtype = meta['dtype']
+
+            is_8bit_prefix = None
+            for prefix in eight_bit_overrides:
+                if san_name.startswith(prefix + '.'):
+                    is_8bit_prefix = prefix
+                    break
+
+            if is_8bit_prefix and orig_name.endswith('.weight'):
+                base_name = orig_name[:-len('.weight')]
+                scales_name = base_name + '.scales'
+                biases_name = base_name + '.biases'
+
+                scales_meta = header[scales_name]
+                biases_meta = header[biases_name]
+
+                with open(filepath, 'rb') as sf:
+                    sf.seek(data_start + tensor_offsets[0])
+                    weight_data = sf.read(byte_len)
+                    sf.seek(data_start + scales_meta['data_offsets'][0])
+                    scales_data = sf.read(scales_meta['data_offsets'][1] - scales_meta['data_offsets'][0])
+                    sf.seek(data_start + biases_meta['data_offsets'][0])
+                    biases_data = sf.read(biases_meta['data_offsets'][1] - biases_meta['data_offsets'][0])
+
+                weight_u32 = np.frombuffer(weight_data, dtype=np.uint32).reshape(shape)
+                out_dim = shape[0]
+                in_dim = out_dim
+                if 'gate' in orig_name and 'shared_expert_gate' not in orig_name:
+                    in_dim = manifest['config']['hidden_size']
+                else:
+                    in_dim = manifest['config']['hidden_size']
+
+                new_w_u32, new_s_bf16, new_b_bf16 = convert_8bit_to_4bit(
+                    weight_u32, scales_data, biases_data, out_dim, in_dim, group_size=64
+                )
+
+                weight_data = new_w_u32.tobytes()
+                scales_data = new_s_bf16
+                biases_data = new_b_bf16
+
+                if offset % ALIGN != 0:
+                    pad = ALIGN - (offset % ALIGN)
+                    out_f.write(b'\x00' * pad)
+                    offset += pad
+
+                out_f.write(weight_data)
+                manifest["tensors"][san_name] = {
+                    "offset": offset,
+                    "size": len(weight_data),
+                    "shape": [out_dim, in_dim // 8],
+                    "dtype": dtype,
+                }
+                offset += len(weight_data)
+                total_bytes += len(weight_data)
+
+                if offset % ALIGN != 0:
+                    pad = ALIGN - (offset % ALIGN)
+                    out_f.write(b'\x00' * pad)
+                    offset += pad
+
+                san_scales = sanitize_name(scales_name)
+                out_f.write(scales_data)
+                manifest["tensors"][san_scales] = {
+                    "offset": offset,
+                    "size": len(scales_data),
+                    "shape": scales_meta['shape'],
+                    "dtype": scales_meta['dtype'],
+                }
+                offset += len(scales_data)
+                total_bytes += len(scales_data)
+
+                if offset % ALIGN != 0:
+                    pad = ALIGN - (offset % ALIGN)
+                    out_f.write(b'\x00' * pad)
+                    offset += pad
+
+                san_biases = sanitize_name(biases_name)
+                out_f.write(biases_data)
+                manifest["tensors"][san_biases] = {
+                    "offset": offset,
+                    "size": len(biases_data),
+                    "shape": biases_meta['shape'],
+                    "dtype": biases_meta['dtype'],
+                }
+                offset += len(biases_data)
+                total_bytes += len(biases_data)
+
+                skipped_8bit_components.add(scales_name)
+                skipped_8bit_components.add(biases_name)
+                continue
 
             if offset % ALIGN != 0:
                 pad = ALIGN - (offset % ALIGN)
