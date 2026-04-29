@@ -371,7 +371,7 @@ static float g_default_temperature = 0.7f;
 static float g_default_top_p = 0.9f;
 static int g_default_reasoning_enabled = 1;
 
-static const char *kApiModelId = "qwen3.5-397b-a17b";
+static const char *kApiModelId = NULL;
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [g_cfg.num_layers] cold fds (set in main)
@@ -7370,7 +7370,10 @@ static void serve_loop(
         }
 
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            send_json_ok(client_fd, "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\",\"ready\":true}\n");
+            char health_json[256];
+            snprintf(health_json, sizeof(health_json),
+                     "{\"status\":\"ok\",\"model\":\"%s\",\"ready\":true}\n", g_cfg.model_id);
+            send_json_ok(client_fd, health_json);
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -7384,8 +7387,10 @@ static void serve_loop(
         }
 
         if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-            send_json_ok(client_fd,
-                         "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\",\"object\":\"model\",\"owned_by\":\"local\"}]}\n");
+            char models_json[256];
+            snprintf(models_json, sizeof(models_json),
+                     "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"local\"}]}\n", g_cfg.model_id);
+            send_json_ok(client_fd, models_json);
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -7871,6 +7876,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;
         }
+        kApiModelId = g_cfg.model_id;
 
         // Build default paths (flashchat/ subdir first, then legacy fallbacks)
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
