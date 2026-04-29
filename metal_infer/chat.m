@@ -538,8 +538,9 @@ int main(int argc, char **argv) {
         generate_session_id(session_id, sizeof(session_id));
     }
 
+    const char *model_name = getenv("FLASHCHAT_MODEL");
     printf("==================================================\n");
-    printf("  Qwen3.5-397B-A17B Chat (Flashchat)\n");
+    printf("  %s Chat (Flashchat)\n", model_name ? model_name : "Qwen3.5-397B-A17B");
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");
