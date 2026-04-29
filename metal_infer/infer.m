@@ -917,7 +917,18 @@ static int g_tokenizer_loaded = 0;
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
+    
+    const char *env_model_path = getenv("FLASHCHAT_MODEL_PATH");
+    char model_vocab_fc[1024];
+    char model_vocab[1024];
+    if (env_model_path) {
+        snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/vocab.bin", env_model_path);
+        snprintf(model_vocab, sizeof(model_vocab), "%s/vocab.bin", env_model_path);
+    }
+    
     const char *paths[] = {
+        env_model_path ? model_vocab_fc : NULL,
+        env_model_path ? model_vocab : NULL,
         "tokenizer.bin",
         "metal_infer/tokenizer.bin",
         "vocab.bin",
