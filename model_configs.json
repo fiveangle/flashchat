@@ -76,5 +76,5 @@
       }
     }
   },
-  "default_model": "qwen3.5-397B-A17B"
+  "default_model": "qwen3.6-35B-A3B"
 }

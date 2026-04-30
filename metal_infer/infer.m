@@ -7712,7 +7712,7 @@ static void serve_loop(
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  --model-id ID        Model ID from model_configs.json (default: qwen3.5-397B-A17B)\n");
+    printf("  --model-id ID        Model ID from model_configs.json (default: qwen3.6-35B-A3B)\n");
     printf("  --model PATH         Model path\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
@@ -7890,7 +7890,7 @@ int main(int argc, char **argv) {
             model_id = getenv("FLASHCHAT_MODEL");
         }
         if (!model_id) {
-            model_id = "qwen3.5-397B-A17B";
+            model_id = "qwen3.6-35B-A3B";
         }
         const char *config_json_path = "model_configs.json";
         if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {

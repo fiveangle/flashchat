@@ -2,13 +2,42 @@
 set -euo pipefail
 
 HOST="127.0.0.1"
-PORT="8000"
+PORT="9999"
 START_SERVER=1
 STARTED_SERVER=0
 SERVER_PID=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-MODEL_ID="qwen3.5-397b-a17b"
+
+CONFIG_FILE="${HOME}/.config/flashchat/config"
+
+MODEL_ID=""
+default_model_id() {
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        local from_config
+        from_config="$(grep '^MODEL=' "${CONFIG_FILE}" 2>/dev/null | cut -d'"' -f2)"
+        if [[ -n "${from_config}" ]]; then
+            echo "${from_config}"
+            return 0
+        fi
+    fi
+
+    local config="${REPO_ROOT}/model_configs.json"
+    if [[ -f "$config" ]]; then
+        python3 -c "
+import json, sys
+try:
+    with open('$config') as f:
+        data = json.load(f)
+    print(data.get('default_model', 'qwen3.6-35B-A3B'))
+except Exception:
+    print('qwen3.6-35B-A3B')
+" 2>/dev/null || echo "qwen3.6-35B-A3B"
+    else
+        echo "qwen3.6-35B-A3B"
+    fi
+}
+MODEL_ID="$(default_model_id)"
 PERF_LOG_ENABLED=1
 PERF_LOG_PATH="${SCRIPT_DIR}/api_perf_log.tsv"
 SERVER_MODE="reused"
@@ -46,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --host)
             HOST="$2"
+            shift 2
+            ;;
+        --model-id)
+            MODEL_ID="$2"
             shift 2
             ;;
         --no-start)
@@ -327,7 +360,7 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
     echo "--- Starting local server ---"
     (
         cd "${SCRIPT_DIR}"
-        ./infer --serve "${PORT}" >"${TMPDIR}/server.log" 2>&1
+        ./infer --serve "${PORT}" --model-id "${MODEL_ID}" >"${TMPDIR}/server.log" 2>&1
     ) &
     SERVER_PID="$!"
     STARTED_SERVER=1
@@ -363,7 +396,7 @@ echo "--- GET /v1/models ---"
 measure_request_to_file "${TMPDIR}/models.json" curl -fsS "${BASE_URL}/v1/models"
 cat "${TMPDIR}/models.json"
 echo ""
-assert_contains "${TMPDIR}/models.json" '"qwen3.5-397b-a17b"' "models lists expected id"
+assert_contains "${TMPDIR}/models.json" "\"${MODEL_ID}\"" "models lists expected id"
 log_perf_row "models" "/v1/models" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
 
 echo ""
@@ -371,7 +404,7 @@ echo "--- POST /v1/chat/completions (stream=false) ---"
 measure_request_to_file "${TMPDIR}/chat.json" curl -fsS -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "messages": [{"role":"user","content":"Reply with exactly: smoke ok"}],
       "stream": false,
       "max_tokens": 32,
@@ -388,7 +421,7 @@ echo "--- POST /v1/chat/completions (stream=true) ---"
 measure_request_to_file "${TMPDIR}/chat_stream.txt" curl -fsS -N -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "messages": [{"role":"user","content":"Repeat the word benchmark 24 times separated by spaces and nothing else."}],
       "stream": true,
       "max_tokens": 96,
@@ -404,7 +437,7 @@ echo "--- POST /v1/chat/completions tool-call round trip ---"
 measure_request_to_file "${TMPDIR}/chat_tool_call.json" curl -fsS -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "messages": [{"role":"user","content":"Use the provided tool before answering."}],
       "stream": false,
       "max_tokens": 96,
@@ -438,7 +471,7 @@ log_perf_row "chat_tool_call" "/v1/chat/completions" "false" "forced" "default" 
 measure_request_to_file "${TMPDIR}/chat_tool_followup.json" curl -fsS -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "messages": [
         {"role":"user","content":"Use the provided tool before answering."},
         {"role":"assistant","content":"","tool_calls":[{"id":"call_test","type":"function","function":{"name":"record_result","arguments":"{\"result\":\"tool smoke ok\"}"}}]},
@@ -474,7 +507,7 @@ echo "--- POST /v1/responses (stream=false) ---"
 measure_request_to_file "${TMPDIR}/responses.json" curl -fsS -X POST "${BASE_URL}/v1/responses" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "input": "Reply with exactly: responses ok",
       "stream": false,
       "max_output_tokens": 32,
@@ -491,7 +524,7 @@ echo "--- POST /v1/responses (stream=true) ---"
 measure_request_to_file "${TMPDIR}/responses_stream.txt" curl -fsS -N -X POST "${BASE_URL}/v1/responses" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "input": "Repeat the word benchmark 24 times separated by spaces and nothing else.",
       "stream": true,
       "max_output_tokens": 96,
@@ -507,7 +540,7 @@ echo "--- POST /v1/responses tool-call round trip ---"
 measure_request_to_file "${TMPDIR}/responses_tool_call.json" curl -fsS -X POST "${BASE_URL}/v1/responses" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "input": "Use the provided tool before answering.",
       "stream": false,
       "max_output_tokens": 96,
@@ -540,7 +573,7 @@ log_perf_row "responses_tool_call" "/v1/responses" "false" "forced" "default" "0
 measure_request_to_file "${TMPDIR}/responses_tool_followup.json" curl -fsS -X POST "${BASE_URL}/v1/responses" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "qwen3.5-397b-a17b",
+      "model": "${MODEL_ID}",
       "input": [
         {"type":"message","role":"user","content":"Use the provided tool before answering."},
         {"type":"function_call","call_id":"call_resp","name":"record_result","arguments":"{\"result\":\"responses tool smoke ok\"}"},
