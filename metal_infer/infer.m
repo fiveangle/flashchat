@@ -7388,6 +7388,38 @@ static void serve_loop(
                           req.tool_count, req.stream, req.temperature, req.top_p,
                           req.reasoning_enabled, req.used_snapshot);
 
+        // Workaround: opencode fires a "title generator" request before every chat.
+        // The 35B model loops on this prompt (degenerate \n / token spam) and blocks
+        // the real request behind it for minutes. Until the EOS / chat-template bug
+        // is diagnosed, short-circuit any request whose system prompt begins with
+        // the unmistakable opencode title-gen signature and return a fixed string.
+        if (is_chat && req.system_prompt &&
+            strncmp(req.system_prompt, "You are a title generator", 25) == 0) {
+            const char *fixed_title = "New conversation";
+            server_log_errorf("[serve] %s title_gen_shortcut active; returning fixed string \"%s\"\n",
+                              request_id, fixed_title);
+            if (req.stream) {
+                sse_send_delta(client_fd, request_id, fixed_title);
+                sse_send_done(client_fd, request_id);
+            } else {
+                char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL);
+                if (final_json) {
+                    send_json_ok(client_fd, final_json);
+                    free(final_json);
+                } else {
+                    send_json_error(client_fd, 500, "server_error", "title shortcut alloc failed");
+                }
+            }
+            api_request_free(&req);
+            free(reqbuf);
+            close(client_fd);
+            if (g_server_shutdown_signal) {
+                server_log_errorf("[serve] Shutdown requested by signal %d after request drain\n", g_server_shutdown_signal);
+                break;
+            }
+            continue;
+        }
+
         // Build system prompt and hash it for cache lookup
         char *req_sys_prompt = build_system_prompt_for_request(&req, NULL);
         uint64_t req_sys_hash = hash_string_djb2(req_sys_prompt);
