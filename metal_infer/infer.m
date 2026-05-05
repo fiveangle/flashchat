@@ -6201,32 +6201,71 @@ static void append_chat_turn(NSMutableString *dst, NSString *role, NSString *con
     [dst appendString:@"<|im_end|>\n"];
 }
 
+// Render assistant tool_calls in the native Qwen3 XML form, matching the
+// model's chat_template:
+//   <tool_call>
+//   <function=NAME>
+//   <parameter=KEY>
+//   {value}
+//   </parameter>
+//   </function>
+//   </tool_call>
+// Parameter values are emitted as raw text for strings and JSON-encoded for
+// anything else (matching the template's `string if string else tojson|safe`).
 static void append_assistant_tool_calls(NSMutableString *dst, NSArray *tool_calls) {
     if (!tool_calls || ![tool_calls isKindOfClass:[NSArray class]]) return;
+    BOOL prefix_with_separator = ([dst length] > 0);
     for (NSDictionary *tool_call in tool_calls) {
         if (![tool_call isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *function = tool_call[@"function"];
+        NSDictionary *function = tool_call[@"function"] ?: tool_call;
         NSString *name = function[@"name"] ?: tool_call[@"name"] ?: @"bash";
-        id arguments_obj = function[@"arguments"] ?: tool_call[@"arguments"] ?: @"{}";
-        NSString *arguments = flatten_content_value(arguments_obj);
-        if (![arguments hasPrefix:@"{"] && ![arguments hasPrefix:@"["]) {
-            arguments = json_stringify_obj(@{@"command": arguments ?: @""});
+        id arguments_obj = function[@"arguments"] ?: tool_call[@"arguments"];
+
+        // arguments may arrive as a JSON-encoded string (OpenAI form) or a dict.
+        NSDictionary *args_dict = nil;
+        if ([arguments_obj isKindOfClass:[NSString class]]) {
+            NSData *data = [(NSString *)arguments_obj dataUsingEncoding:NSUTF8StringEncoding];
+            id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            if ([parsed isKindOfClass:[NSDictionary class]]) args_dict = parsed;
+        } else if ([arguments_obj isKindOfClass:[NSDictionary class]]) {
+            args_dict = arguments_obj;
         }
-        [dst appendString:@"<tool_call>\n"];
-        [dst appendFormat:@"{\"name\":\"%@\",\"arguments\":%@}\n", name, arguments];
-        [dst appendString:@"</tool_call>\n"];
+        if (!args_dict) args_dict = @{};
+
+        if (prefix_with_separator) [dst appendString:@"\n\n"];
+        prefix_with_separator = NO;
+        [dst appendFormat:@"<tool_call>\n<function=%@>\n", name];
+        for (NSString *key in args_dict) {
+            id value = args_dict[key];
+            NSString *value_str;
+            if ([value isKindOfClass:[NSString class]]) {
+                value_str = (NSString *)value;
+            } else {
+                NSData *data = [NSJSONSerialization dataWithJSONObject:@[value] options:0 error:NULL];
+                NSString *wrapped = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if ([wrapped length] >= 2) {
+                    value_str = [wrapped substringWithRange:NSMakeRange(1, [wrapped length] - 2)];
+                } else {
+                    value_str = @"";
+                }
+            }
+            [dst appendFormat:@"<parameter=%@>\n%@\n</parameter>\n", key, value_str];
+        }
+        [dst appendString:@"</function>\n</tool_call>"];
+        prefix_with_separator = YES;
     }
 }
 
+// Render a `role=tool` message body for the native template. Combined with
+// `append_chat_turn`'s "<|im_start|>user\n" header and "<|im_end|>\n" footer,
+// this produces:
+//   <|im_start|>user
+//   <tool_response>
+//   {content}
+//   </tool_response><|im_end|>
 static NSString *normalized_tool_response(NSDictionary *msg) {
     NSString *content = flatten_content_value(msg[@"content"]);
     if (!content) content = @"";
-    NSString *name = msg[@"name"] ?: @"";
-    NSString *tool_call_id = msg[@"tool_call_id"] ?: @"";
-    if ([name length] > 0 || [tool_call_id length] > 0) {
-        return [NSString stringWithFormat:@"<tool_response name=\"%@\" tool_call_id=\"%@\">\n%@\n</tool_response>",
-                name, tool_call_id, content];
-    }
     return [NSString stringWithFormat:@"<tool_response>\n%@\n</tool_response>", content];
 }
 
@@ -6318,33 +6357,53 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
+// Assemble the system block in native Qwen3 order: when tools are present,
+// the tool-instruction block (`# Tools` ... `</IMPORTANT>`) comes FIRST and
+// the user's system content is appended after a `\n\n` separator, exactly
+// matching the model's chat_template. Without tools, just the user system
+// content.
+//
+// The returned string is the body of the <|im_start|>system ... <|im_end|>
+// block; callers wrap it. Trailing newline is intentionally NOT included so
+// the wrapping is symmetric with the template.
 static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *info) {
     if (info) memset(info, 0, sizeof(*info));
     char *base_c = load_system_prompt();
     NSString *base = [NSString stringWithUTF8String:base_c ?: "You are a helpful assistant. /think"];
     free(base_c);
-    NSString *system = req->system_prompt && req->system_prompt[0]
+    NSString *user_sys = req->system_prompt && req->system_prompt[0]
         ? [NSString stringWithUTF8String:req->system_prompt]
         : base;
     if (info) {
         info->default_system_chars = strlen([base UTF8String] ?: "");
         info->upstream_system_chars = req->system_prompt ? strlen(req->system_prompt) : 0;
     }
+    NSString *user_sys_norm = req->reasoning_enabled ? user_sys : strip_think_directive(user_sys);
+
+    int has_tools = (req->tool_count > 0 && req->tool_choice_mode != TOOL_CHOICE_NONE);
     NSMutableString *final = [NSMutableString string];
-    [final appendString:req->reasoning_enabled ? system : strip_think_directive(system)];
-    if (req->tool_count > 0 && req->tool_choice_mode != TOOL_CHOICE_NONE) {
-        char *tool_instr = build_tool_instructions(req->tools, req->tool_count);
-        if (info) info->tool_instruction_chars = tool_instr ? strlen(tool_instr) : 0;
-        if (tool_instr && tool_instr[0]) {
-            [final appendString:@"\n"];
-            [final appendString:[NSString stringWithUTF8String:tool_instr]];
+
+    if (has_tools) {
+        char *tool_block = build_tool_instructions(req->tools, req->tool_count);
+        if (info) info->tool_instruction_chars = tool_block ? strlen(tool_block) : 0;
+        [final appendString:[NSString stringWithUTF8String:tool_block ?: ""]];
+        free(tool_block);
+        NSString *trimmed = [user_sys_norm stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed length] > 0) {
+            [final appendString:@"\n\n"];
+            [final appendString:trimmed];
         }
-        free(tool_instr);
-        if (req->tool_choice_mode == TOOL_CHOICE_FORCED && req->forced_tool_name[0]) {
-            [final appendFormat:@"\nYou must call the function named '%s' before replying.\n", req->forced_tool_name];
+        // tool_choice=forced: do NOT inject prose. The forcing happens at the
+        // assistant-turn prefix (see fill_request_from_chat_json), which
+        // prefills <tool_call><function=NAME> so the model has no degree of
+        // freedom about whether to call. Imperative prose (we tried "You
+        // must call the function named X") drives the 35B-A3B model out of
+        // distribution and produces malformed XML — verified empirically.
+    } else {
+        [final appendString:user_sys_norm];
+        if (req->tool_choice_mode == TOOL_CHOICE_NONE) {
+            [final appendString:@"\n\nDo not call tools. Respond directly to the user."];
         }
-    } else if (req->tool_choice_mode == TOOL_CHOICE_NONE) {
-        [final appendString:@"\nDo not call tools. Respond directly to the user.\n"];
     }
     if (info) info->final_system_chars = strlen([final UTF8String] ?: "");
     return dup_nsstring(final);
@@ -6459,7 +6518,31 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
         }
         append_chat_turn(conversation, @"user", content ?: @"");
     }
-    [conversation appendString:@"<|im_start|>assistant\n"];
+    // Native Qwen3 generation prompt: open the assistant turn with <think>\n
+    // for reasoning-on (model generates content INSIDE the think block first),
+    // or inject an empty <think>...</think> block for reasoning-off.
+    if (req->reasoning_enabled) {
+        [conversation appendString:@"<|im_start|>assistant\n<think>\n"];
+    } else {
+        [conversation appendString:@"<|im_start|>assistant\n<think>\n\n</think>\n\n"];
+    }
+    // When tool_choice forces a specific function, prefill the assistant turn
+    // with the canonical XML opener. This bypasses thinking entirely (empty
+    // <think></think>) and starts the model inside <tool_call><function=NAME>
+    // so it can only emit parameter blocks and the closing tags. This is far
+    // more reliable than imperative prose, which drives the model out of
+    // distribution.
+    if (req->tool_choice_mode == TOOL_CHOICE_FORCED && req->forced_tool_name[0]) {
+        if (req->reasoning_enabled) {
+            // Replace the open <think>\n we just appended with an empty think
+            // block so the model jumps straight into the tool call.
+            NSRange last_open_think = [conversation rangeOfString:@"<think>\n" options:NSBackwardsSearch];
+            if (last_open_think.location != NSNotFound) {
+                [conversation replaceCharactersInRange:last_open_think withString:@"<think>\n\n</think>\n\n"];
+            }
+        }
+        [conversation appendFormat:@"<tool_call>\n<function=%s>\n", req->forced_tool_name];
+    }
     req->system_prompt = dup_nsstring(system_prompt);
     req->conversation_text = dup_nsstring(conversation);
     req->used_snapshot = 0;
@@ -6889,54 +6972,102 @@ static void send_json_ok(int fd, const char *body) {
     http_write_str(fd, body);
 }
 
+// Convert a parameter value emitted by the model into the right JSON type.
+// Native Qwen3 tool calls render values as raw text for strings and as
+// JSON literals for everything else (`tojson | safe`). On the way back, we
+// try JSON.parse first; if it succeeds and yields a non-string, we trust
+// it. Otherwise we treat the value as a string.
+static id native_param_value_to_json_type(NSString *raw) {
+    NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([trimmed length] == 0) return @"";
+    NSData *data = [trimmed dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:data
+                                                options:NSJSONReadingFragmentsAllowed
+                                                  error:&err];
+    if (parsed && ![parsed isKindOfClass:[NSString class]]) {
+        // Numbers, booleans, null, objects, arrays — trust the model's typing.
+        return parsed;
+    }
+    // Strings and parse failures: keep raw (un-trimmed for fidelity).
+    return raw;
+}
+
+// Parse the native Qwen3 XML tool-call form from the streaming output buffer:
+//
+//   <tool_call>
+//   <function=NAME>
+//   <parameter=KEY1>
+//   value...
+//   </parameter>
+//   <parameter=KEY2>
+//   value...
+//   </parameter>
+//   </function>
+//   </tool_call>
+//
+// Strings come through raw, non-strings come through JSON-encoded — see
+// `native_param_value_to_json_type`. Returns 1 only when the FULL block has
+// arrived (closing `</tool_call>` present) so the caller can break out of
+// the generation loop.
 static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall *parsed) {
     memset(parsed, 0, sizeof(*parsed));
     const char *tc_start = strstr(tool_call_buf, "<tool_call>");
-    if (!tc_start) tc_start = strstr(tool_call_buf, "<tool_call");
-    const char *tc_end = strstr(tool_call_buf, "</tool_call>");
-    if (!tc_end) tc_end = strstr(tool_call_buf, "</tool_call");
-    if (!tc_start || !tc_end || tc_end <= tc_start) return 0;
-    tc_start += 11;
-    size_t body_len = (size_t)(tc_end - tc_start);
-    if (body_len == 0 || body_len >= 8192) return 0;
-    char tc_body[8192];
-    memcpy(tc_body, tc_start, body_len);
-    tc_body[body_len] = '\0';
+    if (!tc_start) return 0;
+    const char *tc_end = strstr(tc_start, "</tool_call>");
+    if (!tc_end) return 0;
 
-    NSError *error = nil;
-    NSDictionary *obj = parse_json_body(tc_body, &error);
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSString *name = obj[@"name"] ?: @"";
-        id arguments_obj = obj[@"arguments"];
-        if (![name length] && obj[@"command"]) {
-            name = @"bash";
-            arguments_obj = @{@"command": obj[@"command"], @"description": obj[@"description"] ?: @""};
+    const char *body = tc_start + strlen("<tool_call>");
+    const char *fn_open = strstr(body, "<function=");
+    if (!fn_open || fn_open >= tc_end) return 0;
+    fn_open += strlen("<function=");
+    const char *fn_name_end = strchr(fn_open, '>');
+    if (!fn_name_end || fn_name_end >= tc_end) return 0;
+    size_t name_len = (size_t)(fn_name_end - fn_open);
+    if (name_len == 0 || name_len >= sizeof(parsed->name)) return 0;
+    char name_buf[sizeof(parsed->name)];
+    memcpy(name_buf, fn_open, name_len);
+    name_buf[name_len] = '\0';
+
+    NSMutableDictionary *args = [NSMutableDictionary dictionary];
+    const char *cursor = fn_name_end + 1;
+    const char *fn_close = strstr(cursor, "</function>");
+    if (!fn_close || fn_close > tc_end) fn_close = tc_end;
+
+    while (cursor < fn_close) {
+        const char *p_open = strstr(cursor, "<parameter=");
+        if (!p_open || p_open >= fn_close) break;
+        p_open += strlen("<parameter=");
+        const char *p_key_end = strchr(p_open, '>');
+        if (!p_key_end || p_key_end >= fn_close) break;
+        size_t key_len = (size_t)(p_key_end - p_open);
+        if (key_len == 0 || key_len > 128) { cursor = p_key_end + 1; continue; }
+
+        // Value begins right after the '>'; the template emits a leading
+        // newline before the value, so skip exactly one if present.
+        const char *val_start = p_key_end + 1;
+        if (*val_start == '\n') val_start++;
+
+        // The closing tag is `\n</parameter>` (template puts \n before it),
+        // but be lenient and accept either form.
+        const char *p_close = strstr(val_start, "</parameter>");
+        if (!p_close || p_close > fn_close) break;
+        const char *val_end = p_close;
+        if (val_end > val_start && val_end[-1] == '\n') val_end--;
+
+        NSString *key = [[NSString alloc] initWithBytes:p_open length:key_len encoding:NSUTF8StringEncoding];
+        NSString *raw_value = [[NSString alloc] initWithBytes:val_start
+                                                        length:(NSUInteger)(val_end - val_start)
+                                                      encoding:NSUTF8StringEncoding];
+        if (key) {
+            args[key] = native_param_value_to_json_type(raw_value ?: @"");
         }
-        if ([name length]) {
-            strncpy(parsed->name, [name UTF8String], sizeof(parsed->name) - 1);
-            NSString *args = json_stringify_obj(arguments_obj ?: @{});
-            strncpy(parsed->arguments, [args UTF8String], sizeof(parsed->arguments) - 1);
-            parsed->is_tool_call = 1;
-            return 1;
-        }
+        cursor = p_close + strlen("</parameter>");
     }
 
-    char command[4096] = {0};
-    const char *cmd = strstr(tc_body, "\"command\"");
-    if (cmd) {
-        cmd = strchr(cmd + 9, '"');
-        if (cmd) {
-            cmd++;
-            int j = 0;
-            while (*cmd && *cmd != '"' && j < (int)sizeof(command) - 1) {
-                command[j++] = *cmd++;
-            }
-            command[j] = '\0';
-        }
-    }
-    if (!command[0]) return 0;
-    strncpy(parsed->name, "bash", sizeof(parsed->name) - 1);
-    snprintf(parsed->arguments, sizeof(parsed->arguments), "{\"command\":\"%s\"}", command);
+    strncpy(parsed->name, name_buf, sizeof(parsed->name) - 1);
+    NSString *args_json = json_stringify_obj(args);
+    strncpy(parsed->arguments, [args_json UTF8String], sizeof(parsed->arguments) - 1);
     parsed->is_tool_call = 1;
     return 1;
 }
@@ -7090,34 +7221,56 @@ static char *load_system_prompt(void) {
     return strdup("You are a helpful assistant. /think");
 }
 
-// Build tool instructions to prepend to system prompt
+// Build the native Qwen3 tool-block exactly as the model's chat_template
+// emits it: a `# Tools` header, a `<tools>...</tools>` block containing one
+// full OpenAI tool JSON object per line, the canonical `<tool_call>` example,
+// and the `<IMPORTANT>` reminder paragraph. The model was post-trained on
+// these exact strings; do not paraphrase.
+//
+// Emitted text starts on its own line and DOES NOT have a trailing newline,
+// so the caller can append "\n\n{user_system_content}" or close the
+// <|im_start|>system block directly after.
 static char *build_tool_instructions(ToolDef *tools, int tool_count) {
     if (tool_count == 0) return strdup("");
-    
-    char *instructions = malloc(65536);
-    int pos = 0;
-    
-    pos += snprintf(instructions + pos, 65536 - pos,
-        "\nTools:\n"
-        "If a tool is needed, reply with only:\n"
-        "<tool_call>\n"
-        "{\"name\":\"tool_name\",\"arguments\":{...}}\n"
-        "</tool_call>\n"
-        "No prose before or after the tool call. After a tool result, continue normally.\n"
-        "Functions:\n");
-    
-    for (int i = 0; i < tool_count && pos < 60000; i++) {
-        pos += snprintf(instructions + pos, 65536 - pos, "- %s", tools[i].name);
-        if (tools[i].description[0]) {
-            pos += snprintf(instructions + pos, 65536 - pos, ": %s", tools[i].description);
-        }
-        if (tools[i].has_parameters && tools[i].parameters[0]) {
-            pos += snprintf(instructions + pos, 65536 - pos, " args=%s", tools[i].parameters);
-        }
-        pos += snprintf(instructions + pos, 65536 - pos, "\n");
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"# Tools\n\nYou have access to the following functions:\n\n<tools>"];
+    for (int i = 0; i < tool_count; i++) {
+        char name_esc[MAX_TOOL_NAME * 2];
+        char desc_esc[MAX_TOOL_DESC * 2];
+        json_escape_cstr(tools[i].name, name_esc, sizeof(name_esc));
+        json_escape_cstr(tools[i].description, desc_esc, sizeof(desc_esc));
+        const char *params = (tools[i].has_parameters && tools[i].parameters[0])
+            ? tools[i].parameters
+            : "{}";
+        // Match the template's tojson key order (function before type) — not
+        // load-bearing for the model but easier to diff against LMStudio.
+        [out appendFormat:@"\n{\"function\": {\"description\": \"%s\", \"name\": \"%s\", \"parameters\": %s}, \"type\": \"function\"}",
+                          desc_esc, name_esc, params];
     }
-    
-    return instructions;
+    [out appendString:@"\n</tools>\n\n"];
+    [out appendString:
+        @"If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        @"<tool_call>\n"
+        @"<function=example_function_name>\n"
+        @"<parameter=example_parameter_1>\n"
+        @"value_1\n"
+        @"</parameter>\n"
+        @"<parameter=example_parameter_2>\n"
+        @"This is the value for the second parameter\n"
+        @"that can span\n"
+        @"multiple lines\n"
+        @"</parameter>\n"
+        @"</function>\n"
+        @"</tool_call>\n\n"
+        @"<IMPORTANT>\n"
+        @"Reminder:\n"
+        @"- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        @"- Required parameters MUST be specified\n"
+        @"- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+        @"- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+        @"</IMPORTANT>"];
+    return dup_nsstring(out);
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -7616,7 +7769,23 @@ static void serve_loop(
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
         double t_gen = now_ms();
-        int in_think = 0;
+        // Native Qwen3 generation prompt opens with <think>\n when reasoning
+        // is on, so the model starts INSIDE the think block — generation will
+        // emit content tokens, then </think>, then the actual response.
+        // For reasoning off, the prompt closed the think block already.
+        // Forced tool_choice also prepares the prompt with an empty <think></think>
+        // block, so generation begins post-think.
+        int in_think = (req.reasoning_enabled &&
+                        !(req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]))
+                       ? 1 : 0;
+        // When tool_choice forces a specific function, the prompt was prefilled
+        // with `<tool_call>\n<function=NAME>\n`. Mirror that prefix into the
+        // parser's buffer so it can match `<tool_call>` and extract NAME the
+        // moment the model emits a closing `</tool_call>`.
+        if (req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]) {
+            tool_call_len = snprintf(tool_call_buf, sizeof(tool_call_buf),
+                                     "<tool_call>\n<function=%s>\n", req.forced_tool_name);
+        }
         int think_tokens = 0;
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
@@ -7638,7 +7807,8 @@ static void serve_loop(
                 send_as_delta = 0;
             }
 
-            if (!in_think && tok_str) {
+            int is_think_marker = (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token);
+            if (!in_think && !is_think_marker && tok_str) {
                 int tlen = (int)strlen(tok_str);
                 if (gen_resp_len + tlen < 262143) {
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
@@ -7653,6 +7823,9 @@ static void serve_loop(
                     if (parse_tool_call_from_buffer(tool_call_buf, &parsed_tool_call)) {
                         static int tool_call_counter = 0;
                         snprintf(parsed_tool_call.id, sizeof(parsed_tool_call.id), "call_%d", ++tool_call_counter);
+                        if (g_server_debug_enabled) {
+                            server_debug_write_text(request_id, "tool_call_buf.txt", tool_call_buf);
+                        }
                         break;
                     }
                 }
