@@ -163,6 +163,8 @@ Environment variables:
   FLASHCHAT_TOP_P          Default nucleus sampling value
   FLASHCHAT_TOP_K          Default candidate limit
   FLASHCHAT_MIN_P          Default minimum probability filter
+  FLASHCHAT_SAMPLING_PROFILE  Default sampling profile ID
+  FLASHCHAT_REASONING      Enable default reasoning mode (0/1)
   FLASHCHAT_PRESENCE_PENALTY    Default presence penalty
   FLASHCHAT_REPETITION_PENALTY  Default repetition penalty
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
@@ -284,6 +286,8 @@ cmd_status() {
     echo ""
     echo "Model: $(flashchat_get MODEL) ($(flashchat_get MODEL_REPO))"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
+    echo "Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
+    echo "Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
     echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P)"
@@ -447,7 +451,8 @@ cmd_config() {
     echo ""
     echo "Model: $(flashchat_get MODEL)"
     echo "Repository: $(flashchat_get MODEL_REPO)"
-    echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
+    echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Sampling profile: $(flashchat_get SAMPLING_PROFILE) | Reasoning: $(flashchat_get REASONING)"
+    echo "Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P) | Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
@@ -472,6 +477,8 @@ cmd_config_interactive() {
     echo "  -Model: $(flashchat_get MODEL)"
     echo "  -Repository: $(flashchat_get MODEL_REPO)"
     echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
+    echo "  -Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
+    echo "  -Reasoning enabled (0/1): $(flashchat_get REASONING)"
     echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "  -Top-p (0.0-1.0): $(flashchat_get TOP_P) (nucleus sampling - controls output diversity)"
     echo "  -Top-k (0 uses the legacy candidate cap): $(flashchat_get TOP_K)"
@@ -595,6 +602,91 @@ select_model_from_registry() {
         fi
         echo "Please choose one of the listed models." >&2
     done
+}
+
+print_sampling_profile_list() {
+    local model_id="$1"
+    local current_profile="$2"
+    local profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning
+    local i=0
+
+    while IFS=$'\t' read -r profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning; do
+        [ -n "$profile_id" ] || continue
+        i=$((i + 1))
+        local marker=" "
+        [ "$profile_id" = "$current_profile" ] && marker="*"
+        printf "  [%d]%s %s\n" "$i" "$marker" "$label"
+        printf "      ID: %s\n" "$profile_id"
+        printf "      %s\n" "$description"
+        printf "      reasoning: %s | temp: %s | top-p: %s | top-k: %s | min-p: %s | presence: %s | repetition: %s\n" \
+            "$reasoning" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
+    done < <(flashchat_model_sampling_profiles "$model_id")
+    i=$((i + 1))
+    local marker=" "
+    [ "$current_profile" = "custom" ] && marker="*"
+    printf "  [%d]%s Custom\n" "$i" "$marker"
+    printf "      ID: custom\n"
+    printf "      Manually choose every sampling value.\n"
+}
+
+select_sampling_profile_from_registry() {
+    local model_id="$1"
+    local default_profile="$2"
+    local profile_ids=()
+    local profile_id label description rest
+    local i=0
+
+    [ -n "$default_profile" ] || default_profile=$(flashchat_model_default_sampling_profile "$model_id")
+    [ -n "$default_profile" ] || default_profile="custom"
+
+    echo "Sampling profiles:" >&2
+    echo "" >&2
+    print_sampling_profile_list "$model_id" "$default_profile" >&2
+    echo "" >&2
+
+    while IFS=$'\t' read -r profile_id label description rest; do
+        [ -n "$profile_id" ] || continue
+        profile_ids+=("$profile_id")
+    done < <(flashchat_model_sampling_profiles "$model_id")
+    profile_ids+=("custom")
+
+    while true; do
+        printf "Select sampling profile number or ID [%s]: " "$default_profile" >&2
+        read -r REPLY
+        echo "" >&2
+        if [ -z "$REPLY" ]; then
+            echo "$default_profile"
+            return
+        fi
+        if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+            i=$((REPLY - 1))
+            if [ "$i" -ge 0 ] && [ "$i" -lt ${#profile_ids[@]} ]; then
+                echo "${profile_ids[$i]}"
+                return
+            fi
+        else
+            for profile_id in "${profile_ids[@]}"; do
+                if [ "$REPLY" = "$profile_id" ]; then
+                    echo "$REPLY"
+                    return
+                fi
+            done
+        fi
+        echo "Please choose one of the listed sampling profiles." >&2
+    done
+}
+
+write_sampling_profile_config() {
+    local model_id="$1"
+    local profile_id="$2"
+    echo "SAMPLING_PROFILE=\"$profile_id\"" >> /tmp/flashchat_new_config
+    echo "REASONING=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "reasoning")\"" >> /tmp/flashchat_new_config
+    echo "TEMPERATURE=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "temperature")\"" >> /tmp/flashchat_new_config
+    echo "TOP_P=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "top_p")\"" >> /tmp/flashchat_new_config
+    echo "TOP_K=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "top_k")\"" >> /tmp/flashchat_new_config
+    echo "MIN_P=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "min_p")\"" >> /tmp/flashchat_new_config
+    echo "PRESENCE_PENALTY=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "presence_penalty")\"" >> /tmp/flashchat_new_config
+    echo "REPETITION_PENALTY=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "repetition_penalty")\"" >> /tmp/flashchat_new_config
 }
 
 cmd_models() {
@@ -1115,54 +1207,77 @@ prompt_config_interactive() {
     read -r REPLY
     echo ""
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashchat_new_config
-    
-    # Temperature
-    local default_temp
-    default_temp=$(flashchat_get TEMPERATURE)
-    printf "Temperature (0.0-2.0) [randomness - higher=creative, lower=focused] [%s]: " "$default_temp"
-    read -r REPLY
-    echo ""
-    echo "TEMPERATURE=\"${REPLY:-$default_temp}\"" >> /tmp/flashchat_new_config
-    
-    # Top P
-    local default_top_p
-    default_top_p=$(flashchat_get TOP_P)
-    printf "Top-p (0.0-1.0) [nucleus sampling - lower=focused, higher=diverse] [%s]: " "$default_top_p"
-    read -r REPLY
-    echo ""
-    echo "TOP_P=\"${REPLY:-$default_top_p}\"" >> /tmp/flashchat_new_config
 
-    # Top K
-    local default_top_k
-    default_top_k=$(flashchat_get TOP_K)
-    printf "Top-k [candidate limit; 20 is typical, 0 uses the legacy cap] [%s]: " "$default_top_k"
-    read -r REPLY
-    echo ""
-    echo "TOP_K=\"${REPLY:-$default_top_k}\"" >> /tmp/flashchat_new_config
+    # Sampling Profile
+    local default_profile
+    default_profile=$(flashchat_get SAMPLING_PROFILE)
+    if [ "$selected_model" != "$default_model" ] && [ "$default_profile" != "custom" ]; then
+        default_profile=$(flashchat_model_default_sampling_profile "$selected_model")
+    fi
+    local selected_profile
+    selected_profile=$(select_sampling_profile_from_registry "$selected_model" "$default_profile")
+    if [ "$selected_profile" != "custom" ]; then
+        write_sampling_profile_config "$selected_model" "$selected_profile"
+        echo ""
+    else
+        echo "SAMPLING_PROFILE=\"custom\"" >> /tmp/flashchat_new_config
 
-    # Min P
-    local default_min_p
-    default_min_p=$(flashchat_get MIN_P)
-    printf "Min-p (0.0-1.0) [filters very unlikely tokens; 0 disables] [%s]: " "$default_min_p"
-    read -r REPLY
-    echo ""
-    echo "MIN_P=\"${REPLY:-$default_min_p}\"" >> /tmp/flashchat_new_config
+        # Reasoning
+        local default_reasoning
+        default_reasoning=$(flashchat_get REASONING)
+        printf "Reasoning enabled (0/1) [%s]: " "$default_reasoning"
+        read -r REPLY
+        echo ""
+        echo "REASONING=\"${REPLY:-$default_reasoning}\"" >> /tmp/flashchat_new_config
 
-    # Presence Penalty
-    local default_presence_penalty
-    default_presence_penalty=$(flashchat_get PRESENCE_PENALTY)
-    printf "Presence penalty [discourages reusing prior tokens] [%s]: " "$default_presence_penalty"
-    read -r REPLY
-    echo ""
-    echo "PRESENCE_PENALTY=\"${REPLY:-$default_presence_penalty}\"" >> /tmp/flashchat_new_config
+        # Temperature
+        local default_temp
+        default_temp=$(flashchat_get TEMPERATURE)
+        printf "Temperature (0.0-2.0) [randomness - higher=creative, lower=focused] [%s]: " "$default_temp"
+        read -r REPLY
+        echo ""
+        echo "TEMPERATURE=\"${REPLY:-$default_temp}\"" >> /tmp/flashchat_new_config
 
-    # Repetition Penalty
-    local default_repetition_penalty
-    default_repetition_penalty=$(flashchat_get REPETITION_PENALTY)
-    printf "Repetition penalty [1.0 disables] [%s]: " "$default_repetition_penalty"
-    read -r REPLY
-    echo ""
-    echo "REPETITION_PENALTY=\"${REPLY:-$default_repetition_penalty}\"" >> /tmp/flashchat_new_config
+        # Top P
+        local default_top_p
+        default_top_p=$(flashchat_get TOP_P)
+        printf "Top-p (0.0-1.0) [nucleus sampling - lower=focused, higher=diverse] [%s]: " "$default_top_p"
+        read -r REPLY
+        echo ""
+        echo "TOP_P=\"${REPLY:-$default_top_p}\"" >> /tmp/flashchat_new_config
+
+        # Top K
+        local default_top_k
+        default_top_k=$(flashchat_get TOP_K)
+        printf "Top-k [candidate limit; 20 is typical, 0 uses the legacy cap] [%s]: " "$default_top_k"
+        read -r REPLY
+        echo ""
+        echo "TOP_K=\"${REPLY:-$default_top_k}\"" >> /tmp/flashchat_new_config
+
+        # Min P
+        local default_min_p
+        default_min_p=$(flashchat_get MIN_P)
+        printf "Min-p (0.0-1.0) [filters very unlikely tokens; 0 disables] [%s]: " "$default_min_p"
+        read -r REPLY
+        echo ""
+        echo "MIN_P=\"${REPLY:-$default_min_p}\"" >> /tmp/flashchat_new_config
+
+        # Presence Penalty
+        local default_presence_penalty
+        default_presence_penalty=$(flashchat_get PRESENCE_PENALTY)
+        printf "Presence penalty [discourages reusing prior tokens] [%s]: " "$default_presence_penalty"
+        read -r REPLY
+        echo ""
+        echo "PRESENCE_PENALTY=\"${REPLY:-$default_presence_penalty}\"" >> /tmp/flashchat_new_config
+
+        # Repetition Penalty
+        local default_repetition_penalty
+        default_repetition_penalty=$(flashchat_get REPETITION_PENALTY)
+        printf "Repetition penalty [1.0 disables] [%s]: " "$default_repetition_penalty"
+        read -r REPLY
+        echo ""
+        echo "REPETITION_PENALTY=\"${REPLY:-$default_repetition_penalty}\"" >> /tmp/flashchat_new_config
+    fi
     
     # Server Port
     local default_port
@@ -1931,6 +2046,8 @@ server_runtime_signature() {
         echo "MODEL_CONFIG=$(file_signature_part "$(flashchat_get MODEL_CONFIG)")"
         echo "SERVER_PORT=$effective_port"
         echo "TEMPERATURE=$(flashchat_get TEMPERATURE)"
+        echo "SAMPLING_PROFILE=$(flashchat_get SAMPLING_PROFILE)"
+        echo "REASONING=$(flashchat_get REASONING)"
         echo "TOP_P=$(flashchat_get TOP_P)"
         echo "TOP_K=$(flashchat_get TOP_K)"
         echo "MIN_P=$(flashchat_get MIN_P)"
@@ -2371,6 +2488,7 @@ cmd_serve() {
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
     export FLASHCHAT_SERVER_PORT="$server_port"
+    export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
     export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
     export FLASHCHAT_TOP_K="$(flashchat_get TOP_K)"
@@ -2543,7 +2661,7 @@ cmd_prompt() {
     # Send request
     curl -s -N -X POST "http://$server_host:$server_port/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":$(flashchat_get MAX_TOKENS),\"temperature\":$(flashchat_get TEMPERATURE),\"top_p\":$(flashchat_get TOP_P),\"top_k\":$(flashchat_get TOP_K),\"min_p\":$(flashchat_get MIN_P),\"presence_penalty\":$(flashchat_get PRESENCE_PENALTY),\"repetition_penalty\":$(flashchat_get REPETITION_PENALTY)}"
+        -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":$(flashchat_get MAX_TOKENS),\"reasoning\":$(flashchat_get REASONING),\"temperature\":$(flashchat_get TEMPERATURE),\"top_p\":$(flashchat_get TOP_P),\"top_k\":$(flashchat_get TOP_K),\"min_p\":$(flashchat_get MIN_P),\"presence_penalty\":$(flashchat_get PRESENCE_PENALTY),\"repetition_penalty\":$(flashchat_get REPETITION_PENALTY)}"
     echo ""
 }
 

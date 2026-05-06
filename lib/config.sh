@@ -32,6 +32,8 @@ FLASHCHAT_DEFAULT_SERVER_HTTP_LOG="0"
 FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE="1"
 FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
 FLASHCHAT_DEFAULT_COLOR_OUTPUT="1"
+FLASHCHAT_DEFAULT_SAMPLING_PROFILE=""
+FLASHCHAT_DEFAULT_REASONING="0"
 FLASHCHAT_DEFAULT_TEMPERATURE="0.7"
 FLASHCHAT_DEFAULT_TOP_P="0.8"
 FLASHCHAT_DEFAULT_TOP_K="20"
@@ -53,6 +55,8 @@ SERVER_HTTP_LOG=""
 SYSTEM_PROMPT_CACHE=""
 SYSTEM_PROMPT_CACHE_MAX_ENTRIES=""
 COLOR_OUTPUT=""
+SAMPLING_PROFILE=""
+REASONING=""
 TEMPERATURE=""
 TOP_P=""
 TOP_K=""
@@ -150,6 +154,55 @@ flashchat_model_layers() {
     echo "${layers:-60}"
 }
 
+flashchat_model_default_sampling_profile() {
+    flashchat_model_field "$1" "default_sampling_profile"
+}
+
+flashchat_model_sampling_profile_field() {
+    local model_id="$1"
+    local profile_id="$2"
+    local field="$3"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -n "$profile_id" ] || return 1
+    [ -n "$field" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+profile = data.get('models', {}).get(sys.argv[2], {}).get('sampling_profiles', {}).get(sys.argv[3], {})
+value = profile.get(sys.argv[4], '')
+print(value if value is not None else '')
+" "$config_file" "$model_id" "$profile_id" "$field" 2>/dev/null
+}
+
+flashchat_model_sampling_profiles() {
+    local model_id="$1"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+profiles = data.get('models', {}).get(sys.argv[2], {}).get('sampling_profiles', {})
+for profile_id, profile in profiles.items():
+    print('\\t'.join([
+        profile_id,
+        str(profile.get('label', profile_id)),
+        str(profile.get('description', '')),
+        str(profile.get('temperature', '')),
+        str(profile.get('top_p', '')),
+        str(profile.get('top_k', '')),
+        str(profile.get('min_p', '')),
+        str(profile.get('presence_penalty', '')),
+        str(profile.get('repetition_penalty', '')),
+        str(profile.get('reasoning', '')),
+    ]))
+" "$config_file" "$model_id" 2>/dev/null
+}
+
 flashchat_model_path_for_id() {
     local repo
     repo=$(flashchat_model_repo "$1")
@@ -241,6 +294,8 @@ flashchat_load_config() {
     SYSTEM_PROMPT_CACHE=""
     SYSTEM_PROMPT_CACHE_MAX_ENTRIES=""
     COLOR_OUTPUT=""
+    SAMPLING_PROFILE=""
+    REASONING=""
     TEMPERATURE=""
     TOP_P=""
     TOP_K=""
@@ -277,12 +332,7 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_SYSTEM_PROMPT_CACHE" ] && SYSTEM_PROMPT_CACHE="$FLASHCHAT_SYSTEM_PROMPT_CACHE"
     [ -n "$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES" ] && SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES"
     [ -n "$FLASHCHAT_COLOR_OUTPUT" ] && COLOR_OUTPUT="$FLASHCHAT_COLOR_OUTPUT"
-    [ -n "$FLASHCHAT_TEMPERATURE" ] && TEMPERATURE="$FLASHCHAT_TEMPERATURE"
-    [ -n "$FLASHCHAT_TOP_P" ] && TOP_P="$FLASHCHAT_TOP_P"
-    [ -n "$FLASHCHAT_TOP_K" ] && TOP_K="$FLASHCHAT_TOP_K"
-    [ -n "$FLASHCHAT_MIN_P" ] && MIN_P="$FLASHCHAT_MIN_P"
-    [ -n "$FLASHCHAT_PRESENCE_PENALTY" ] && PRESENCE_PENALTY="$FLASHCHAT_PRESENCE_PENALTY"
-    [ -n "$FLASHCHAT_REPETITION_PENALTY" ] && REPETITION_PENALTY="$FLASHCHAT_REPETITION_PENALTY"
+    [ -n "$FLASHCHAT_SAMPLING_PROFILE" ] && SAMPLING_PROFILE="$FLASHCHAT_SAMPLING_PROFILE"
     [ -n "$FLASHCHAT_OFFLOAD_DIR" ] && OFFLOAD_DIR="$FLASHCHAT_OFFLOAD_DIR"
     [ -n "$FLASHCHAT_WEIGHTS_DIR" ] && WEIGHTS_DIR="$FLASHCHAT_WEIGHTS_DIR"
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
@@ -301,6 +351,26 @@ flashchat_load_config() {
     if [ -n "$looked_up_repo" ]; then
         MODEL_REPO="$looked_up_repo"
     fi
+    local default_profile
+    default_profile=$(flashchat_model_default_sampling_profile "$MODEL")
+    SAMPLING_PROFILE="${SAMPLING_PROFILE:-${default_profile:-$FLASHCHAT_DEFAULT_SAMPLING_PROFILE}}"
+    if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ]; then
+        local profile_temperature profile_top_p profile_top_k profile_min_p profile_presence_penalty profile_repetition_penalty profile_reasoning
+        profile_temperature=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")
+        profile_top_p=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_p")
+        profile_top_k=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_k")
+        profile_min_p=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "min_p")
+        profile_presence_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "presence_penalty")
+        profile_repetition_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "repetition_penalty")
+        profile_reasoning=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "reasoning")
+        [ -n "$profile_temperature" ] && TEMPERATURE="$profile_temperature"
+        [ -n "$profile_top_p" ] && TOP_P="$profile_top_p"
+        [ -n "$profile_top_k" ] && TOP_K="$profile_top_k"
+        [ -n "$profile_min_p" ] && MIN_P="$profile_min_p"
+        [ -n "$profile_presence_penalty" ] && PRESENCE_PENALTY="$profile_presence_penalty"
+        [ -n "$profile_repetition_penalty" ] && REPETITION_PENALTY="$profile_repetition_penalty"
+        [ -n "$profile_reasoning" ] && REASONING="$profile_reasoning"
+    fi
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
     SERVER_HOST="${SERVER_HOST:-$FLASHCHAT_DEFAULT_SERVER_HOST}"
@@ -311,6 +381,7 @@ flashchat_load_config() {
     SYSTEM_PROMPT_CACHE="${SYSTEM_PROMPT_CACHE:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE}"
     SYSTEM_PROMPT_CACHE_MAX_ENTRIES="${SYSTEM_PROMPT_CACHE_MAX_ENTRIES:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}"
     COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
+    REASONING="${REASONING:-$FLASHCHAT_DEFAULT_REASONING}"
     TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
     TOP_P="${TOP_P:-$FLASHCHAT_DEFAULT_TOP_P}"
     TOP_K="${TOP_K:-$FLASHCHAT_DEFAULT_TOP_K}"
@@ -318,6 +389,14 @@ flashchat_load_config() {
     PRESENCE_PENALTY="${PRESENCE_PENALTY:-$FLASHCHAT_DEFAULT_PRESENCE_PENALTY}"
     REPETITION_PENALTY="${REPETITION_PENALTY:-$FLASHCHAT_DEFAULT_REPETITION_PENALTY}"
     OFFLOAD_DIR="${OFFLOAD_DIR:-$FLASHCHAT_DEFAULT_OFFLOAD_DIR}"
+
+    [ -n "$FLASHCHAT_REASONING" ] && REASONING="$FLASHCHAT_REASONING"
+    [ -n "$FLASHCHAT_TEMPERATURE" ] && TEMPERATURE="$FLASHCHAT_TEMPERATURE"
+    [ -n "$FLASHCHAT_TOP_P" ] && TOP_P="$FLASHCHAT_TOP_P"
+    [ -n "$FLASHCHAT_TOP_K" ] && TOP_K="$FLASHCHAT_TOP_K"
+    [ -n "$FLASHCHAT_MIN_P" ] && MIN_P="$FLASHCHAT_MIN_P"
+    [ -n "$FLASHCHAT_PRESENCE_PENALTY" ] && PRESENCE_PENALTY="$FLASHCHAT_PRESENCE_PENALTY"
+    [ -n "$FLASHCHAT_REPETITION_PENALTY" ] && REPETITION_PENALTY="$FLASHCHAT_REPETITION_PENALTY"
     
     # Compute derived paths
     _flashchat_compute_paths
@@ -341,6 +420,8 @@ flashchat_get() {
         SYSTEM_PROMPT_CACHE) echo "$SYSTEM_PROMPT_CACHE" ;;
         SYSTEM_PROMPT_CACHE_MAX_ENTRIES) echo "$SYSTEM_PROMPT_CACHE_MAX_ENTRIES" ;;
         COLOR_OUTPUT) echo "$COLOR_OUTPUT" ;;
+        SAMPLING_PROFILE) echo "$SAMPLING_PROFILE" ;;
+        REASONING) echo "$REASONING" ;;
         TEMPERATURE) echo "$TEMPERATURE" ;;
         TOP_P) echo "$TOP_P" ;;
         TOP_K) echo "$TOP_K" ;;
@@ -376,6 +457,8 @@ OFFLOAD_DIR="${OFFLOAD_DIR:-$FLASHCHAT_DEFAULT_OFFLOAD_DIR}"
 
 # Generation Defaults
 MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
+SAMPLING_PROFILE="${SAMPLING_PROFILE:-${FLASHCHAT_DEFAULT_SAMPLING_PROFILE:-$(flashchat_model_default_sampling_profile "${MODEL:-$(flashchat_default_model)}")}}"
+REASONING="${REASONING:-$FLASHCHAT_DEFAULT_REASONING}"
 TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
 TOP_P="${TOP_P:-$FLASHCHAT_DEFAULT_TOP_P}"
 TOP_K="${TOP_K:-$FLASHCHAT_DEFAULT_TOP_K}"
@@ -458,5 +541,8 @@ export -f flashchat_model_field
 export -f flashchat_model_name
 export -f flashchat_model_repo
 export -f flashchat_model_layers
+export -f flashchat_model_default_sampling_profile
+export -f flashchat_model_sampling_profile_field
+export -f flashchat_model_sampling_profiles
 export -f flashchat_model_path_for_id
 export -f flashchat_list_models

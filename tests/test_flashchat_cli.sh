@@ -175,6 +175,8 @@ TMP_CONFIG="${TMPDIR}/.config/flashchat/config"
 cat > "$TMP_CONFIG" <<EOF
 MODEL="qwen3.6-35B-A3B"
 MAX_TOKENS="1"
+SAMPLING_PROFILE="custom"
+REASONING="0"
 TEMPERATURE="0.1"
 TOP_P="0.8"
 TOP_K="20"
@@ -288,6 +290,7 @@ run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $F
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config sampling profile" "Sampling profile:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config sampling knobs" "Top-k:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config system prompt cache" "System prompt cache:" bash -c "echo 'n' | $FLASHCHAT  config"
 
