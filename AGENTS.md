@@ -50,8 +50,8 @@ metal_infer/
   chat.m            # Interactive chat TUI (~760 lines)
   main.m            # MoE-only benchmark
   tokenizer.h       # Single-header C BPE tokenizer
-  Makefile          # Build system
   linenoise.c/h     # Line editing library
+  discarded/        # Historical optimization experiments not in active testing
 
 scripts/
   extract_weights.py        # Dispatch to model-specific non-expert extraction
@@ -60,7 +60,12 @@ scripts/
   export_tokenizer.py       # Export tokenizer vocabulary
   models/                   # Model-specific extraction/repack implementations
 
+tests/
+  test_flashchat_cli.sh     # CLI regression test
+  test_api_smoke.sh         # HTTP API smoke test
+
 root/
+  Makefile          # Project build/test surface
   progress.py       # Results visualization
   assets/*.tsv      # Durable experiment/API metric logs
 ```
@@ -68,10 +73,13 @@ root/
 ## Build Commands
 
 ```bash
-# From metal_infer/ directory
+# From the project root
 
 # Build all targets
 make
+
+# List available Make targets
+make help
 
 # Build specific binaries
 make metal_infer    # Main benchmark
@@ -85,17 +93,20 @@ make verify         # Metal vs CPU reference verify
 make bench          # Benchmark single expert (10 iterations)
 make moe            # Full MoE forward (K experts, single layer)
 make moebench       # Benchmark MoE (10 iterations)
-make full           # Full 60-layer forward (K=4)
+make full           # Full model forward (K=4)
 make fullbench      # Full forward benchmark (3 iterations)
 
 # Inference engine (full model)
-./infer --prompt "Hello" --tokens 100
+./metal_infer/infer --prompt "Hello" --tokens 100
 
 # With timing breakdown
-./infer --prompt "Hello" --tokens 20 --timing
+./metal_infer/infer --prompt "Hello" --tokens 20 --timing
 
-# Single test files
-clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
+# Framework regression tests
+./tests/test_flashchat_cli.sh
+make cli-smoke
+make api-smoke
+make test
 ```
 
 ## Code Style
@@ -114,6 +125,7 @@ clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 - **Setup/dependency installs must start with one explicit consent screen (`Y/x`) before any download/install work begins.** `X` must cancel cleanly with a clear "User cancelled" style message and instructions to re-run `flashchat` later.
 - **When the user gives specific instructions for moving forward, ask if you should update the AGENTS.md file to ensure the instruction is adhered to.**
 - **When testing interactive scripts (especially with piped input), if output is confusing or unreadable, improve the output formatting for clarity before continuing**
+- **Fresh-install/setup testing must use isolated timestamped `HOME` directories under the project, such as `debug/fresh-envs/YYYYMMDD-HHMMSS/home`. Do not test setup flows by toggling, renaming, or moving the user's real `~/.config/flashchat` or model cache.**
 - **Never assume the user has knowledge of the system, commands, or syntax. Always provide instruction that is atomic and self-explanatory.**
 - **Use user-friendly terminology, not technical precision.** For example, use "context window" instead of "max tokens" since that's what users expect in modern LLM interfaces, even though the technical term is different.
 - **When making user-facing changes (especially output/UX), look for similar patterns elsewhere in the project.** For example, if you consolidate section headers in one command, check other commands for the same issue and apply the same fix.

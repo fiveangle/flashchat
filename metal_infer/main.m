@@ -4,12 +4,12 @@
  * Standalone benchmark of 4-bit dequant matvec via Metal compute shaders.
  * Loads expert weights from packed binary files, runs the Metal shader, verifies output.
  *
- * Supports single-layer mode (original) and full 60-layer forward pass (--full).
+ * Supports single-layer mode (original) and full model forward pass (--full).
  *
  * This is the foundation for a full llama.cpp-style inference engine for
- * Qwen3.5-397B-A17B running on Apple Silicon with SSD-streamed expert weights.
+ * Registry-backed MoE models running on Apple Silicon with SSD-streamed expert weights.
  *
- * Build: make
+ * Build: make metal_infer (from repo root)
  * Run:   ./metal_infer [--layer N] [--expert E] [--benchmark]
  *        ./metal_infer --model <path> --full --k 4 --benchmark
  *
@@ -46,9 +46,6 @@
 ModelConfig g_cfg;
 
 #define MAX_ACTIVE_EXPERTS 64
-
-// Default model path (overridden by --model flag)
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
 // Timing helper
@@ -1083,11 +1080,11 @@ static void encode_weighted_sum(
 }
 
 // ============================================================================
-// Full 60-layer MoE forward pass with double-buffered I/O + compute pipeline
+// Full model MoE forward pass with double-buffered I/O + compute pipeline
 // ============================================================================
 //
 // Architecture:
-//   - Opens all 60 layer files at startup
+//   - Opens all model layer files at startup
 //   - For each layer: picks K experts, preads them in parallel, runs GPU compute
 //   - Double buffering: while GPU computes layer N, pread layer N+1 into buffer set B
 //   - Single command buffer per layer (all K expert computes + weighted sum)
@@ -1456,11 +1453,11 @@ static void print_usage(const char *prog) {
     printf("  --expert E       Expert index (default: 0)\n");
     printf("  --benchmark      Run timing benchmark (10 iterations)\n");
     printf("  --moe            Run full MoE with K experts on one layer\n");
-    printf("  --full           Run full 60-layer MoE forward pass\n");
+    printf("  --full           Run full model MoE forward pass\n");
     printf("  --k N            Number of active experts per layer (default: 4)\n");
     printf("  --verify         Verify Metal output against CPU reference\n");
     printf("  --fast           Use threadgroup-optimized shader\n");
-    printf("  --model PATH     Model path (default: built-in)\n");
+    printf("  --model PATH     Model path (or set FLASHCHAT_MODEL_PATH)\n");
     printf("  --help           This message\n");
 }
 
@@ -1474,9 +1471,8 @@ int main(int argc, char **argv) {
         int num_active_experts = 4;  // --k flag
         int do_verify = 0;
         int use_fast = 0;
-        // Support FLASHCHAT_MODEL_PATH environment variable
         const char *env_model_path = getenv("FLASHCHAT_MODEL_PATH");
-        const char *model_path = env_model_path ? env_model_path : MODEL_PATH;
+        const char *model_path = env_model_path && env_model_path[0] ? env_model_path : NULL;
 
         static struct option long_options[] = {
             {"model-id",  required_argument, 0, 'I'},
@@ -1524,6 +1520,24 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;
         }
+        fflush(stdout);
+
+        if (!model_path || !model_path[0]) {
+            fprintf(stderr, "ERROR: No model path configured for engine benchmark.\n");
+            fprintf(stderr, "Set FLASHCHAT_MODEL_PATH, pass --model PATH, or run through root make targets after configuring Flashchat.\n");
+            return 1;
+        }
+        if (strstr(model_path, "<snapshot>") != NULL) {
+            fprintf(stderr, "ERROR: Model '%s' is not downloaded yet.\n", model_id);
+            fprintf(stderr, "Expected model snapshot path is unresolved: %s\n", model_path);
+            fprintf(stderr, "Run ./flashchat setup first, or select a configured model with downloaded weights.\n");
+            return 1;
+        }
+        if (access(model_path, R_OK) != 0) {
+            fprintf(stderr, "ERROR: Model path is not readable: %s\n", model_path);
+            fprintf(stderr, "Run ./flashchat setup first, or set FLASHCHAT_MODEL_PATH/--model to a valid snapshot.\n");
+            return 1;
+        }
 
         // Clamp K to valid range
         if (num_active_experts < 1) num_active_experts = 1;
@@ -1538,12 +1552,41 @@ int main(int argc, char **argv) {
         char experts_base[1024];
         snprintf(experts_base, sizeof(experts_base), "%s/flashchat/packed_experts", model_path);
 
+        if (layer_idx < 0 || layer_idx >= g_cfg.num_layers) {
+            fprintf(stderr, "ERROR: Layer %d is out of range for %s (valid: 0-%d)\n",
+                    layer_idx, model_id, g_cfg.num_layers - 1);
+            return 1;
+        }
+        if (expert_idx < 0 || expert_idx >= g_cfg.num_experts) {
+            fprintf(stderr, "ERROR: Expert %d is out of range for %s (valid: 0-%d)\n",
+                    expert_idx, model_id, g_cfg.num_experts - 1);
+            return 1;
+        }
+        if (access(experts_base, R_OK) != 0) {
+            fprintf(stderr, "ERROR: Engine benchmark artifacts are not available for %s.\n", model_id);
+            fprintf(stderr, "Expected: %s\n", experts_base);
+            fprintf(stderr, "Run ./flashchat setup first, or select a configured model with packed experts.\n");
+            return 1;
+        }
+
+        char packed_path[1024] = {0};
+        if (!do_full) {
+            snprintf(packed_path, sizeof(packed_path),
+                     "%s/layer_%02d.bin", experts_base, layer_idx);
+            if (access(packed_path, R_OK) != 0) {
+                fprintf(stderr, "ERROR: Engine benchmark artifacts are not available for %s.\n", model_id);
+                fprintf(stderr, "Expected: %s\n", packed_path);
+                fprintf(stderr, "Run ./flashchat setup first, or select a configured model with packed experts.\n");
+                return 1;
+            }
+        }
+
         const char *shader_name = (use_fast >= 3) ? "v3-tiled" :
                                   (use_fast >= 1) ? "fast-simd" : "naive";
 
         printf("=== metal_infer: 4-bit dequant MoE engine (v3 optimized) ===\n");
         if (do_full) {
-            printf("Mode: FULL 60-layer forward, K=%d, Shader: %s, Benchmark: %s\n",
+            printf("Mode: FULL model forward, K=%d, Shader: %s, Benchmark: %s\n",
                    num_active_experts, shader_name,
                    do_benchmark ? "YES" : "NO");
         } else {
@@ -1553,12 +1596,13 @@ int main(int argc, char **argv) {
                    do_moe ? "YES" : "NO",
                    do_verify ? "YES" : "NO");
         }
+        fflush(stdout);
 
         // ---- Initialize Metal ----
         MetalContext *ctx = metal_init();
         if (!ctx) return 1;
 
-        // ========== Full 60-layer forward pass mode ==========
+        // ========== Full model forward pass mode ==========
         if (do_full) {
             // ---- Open ALL 60 packed layer files ----
             int layer_fds[g_cfg.num_layers];
@@ -1643,10 +1687,6 @@ int main(int argc, char **argv) {
         }
 
         // ---- Open single packed expert file (original single-layer modes) ----
-        char packed_path[1024];
-        snprintf(packed_path, sizeof(packed_path),
-                 "%s/layer_%02d.bin", experts_base, layer_idx);
-
         printf("[io] Opening: %s\n", packed_path);
         int packed_fd = open(packed_path, O_RDONLY);
         if (packed_fd < 0) {

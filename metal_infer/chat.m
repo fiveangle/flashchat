@@ -5,7 +5,7 @@
  * Conversations saved to ~/.config/flashchat/sessions/<session_id>.jsonl
  * Resume with: ./chat --resume <session_id>
  *
- * Build:  make chat
+ * Build:  make chat (from repo root)
  * Run:    ./chat [--port 8000] [--show-think] [--resume <id>]
  */
 

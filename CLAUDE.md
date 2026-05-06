@@ -65,22 +65,21 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 ## Quick Start
 
 ```bash
-cd metal_infer
 make
 
 # First-time setup is normally handled by ./flashchat.
 # Direct setup scripts live under scripts/.
-python3 ../scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path/to/model --output /path/to/model/flashchat
-python3 ../scripts/export_tokenizer.py /path/to/model/tokenizer.json /path/to/model/flashchat/vocab.bin
-python3 ../scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/to/model/flashchat/expert_index.json
+python3 scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path/to/model --output /path/to/model/flashchat
+python3 scripts/export_tokenizer.py /path/to/model/tokenizer.json /path/to/model/flashchat/vocab.bin
+python3 scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/to/model/flashchat/expert_index.json
 
-./infer --prompt "Explain quantum computing" --tokens 100
+./metal_infer/infer --prompt "Explain quantum computing" --tokens 100
 
 # Interactive chat with tool calling
-./chat
+./metal_infer/chat
 
 # Per-layer timing breakdown
-./infer --prompt "Hello" --tokens 20 --timing
+./metal_infer/infer --prompt "Hello" --tokens 20 --timing
 ```
 
 ## Project Structure
@@ -92,7 +91,6 @@ metal_infer/
   chat.m               # Interactive chat TUI with tool calling
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
-  Makefile             # Build system
 
 scripts/
   extract_weights.py        # Dispatches non-expert extraction by model ID
@@ -102,6 +100,7 @@ scripts/
   models/                   # Model-specific setup implementations
 
 progress.py            # Results visualization (Q2/Q4 tracks)
+Makefile               # Project build/test surface
 results.tsv            # Experiment log (58 experiments)
 
 <model_dir>/

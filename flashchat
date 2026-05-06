@@ -806,11 +806,7 @@ ensure_binaries() {
     fi
     
     echo "Binaries not found. Building..."
-    local old_pwd
-    old_pwd="$(pwd)"
-    cd "$SCRIPT_DIR/metal_infer"
-    make all chat
-    cd "$old_pwd"
+    make -C "$SCRIPT_DIR" all chat
     
     if check_binaries; then
         echo "Build complete."
@@ -1706,6 +1702,8 @@ cmd_chat() {
     
     # Launch chat
     ensure_binaries
+    local old_pwd
+    old_pwd="$(pwd)"
     cd "$SCRIPT_DIR/metal_infer"
     
     local chat_args=""
@@ -1717,7 +1715,7 @@ cmd_chat() {
     
     ./chat $chat_args
     
-    cd "$SCRIPT_DIR"
+    cd "$old_pwd"
 }
 
 cmd_prompt() {
@@ -2077,7 +2075,7 @@ cmd_benchmark() {
         echo "  bench       - Benchmark single expert (10 iterations)"
         echo "  moe         - Full MoE forward (K experts, single layer)"
         echo "  moebench    - Benchmark MoE (10 iterations)"
-        echo "  full        - Full 60-layer forward (K=4)"
+        echo "  full        - Full model forward (K=4)"
         echo "  fullbench   - Benchmark full forward (3 iterations)"
         echo ""
         echo "Usage: flashchat benchmark <target>"
@@ -2096,45 +2094,42 @@ cmd_benchmark() {
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     
-    cd "$SCRIPT_DIR/metal_infer"
     ensure_binaries
     
     case "$target" in
         run)
             echo "Running: single expert forward pass..."
-            make run
+            make -C "$SCRIPT_DIR" run
             ;;
         verify)
             echo "Running: Metal vs CPU verification..."
-            make verify
+            make -C "$SCRIPT_DIR" verify
             ;;
         bench)
             echo "Running: single expert benchmark (10 iterations)..."
-            make bench
+            make -C "$SCRIPT_DIR" bench
             ;;
         moe)
             echo "Running: MoE forward (K experts, single layer)..."
-            make moe
+            make -C "$SCRIPT_DIR" moe
             ;;
         moebench)
             echo "Running: MoE benchmark (10 iterations)..."
-            make moebench
+            make -C "$SCRIPT_DIR" moebench
             ;;
         full)
-            echo "Running: Full 60-layer forward (K=4)..."
-            make full
+            echo "Running: Full model forward (K=4)..."
+            make -C "$SCRIPT_DIR" full
             ;;
         fullbench)
             echo "Running: Full benchmark (3 iterations)..."
-            make fullbench
+            make -C "$SCRIPT_DIR" fullbench
             ;;
         *)
             echo "Unknown benchmark: $target"
             echo "Run 'flashchat benchmark' to see available targets."
             ;;
     esac
-    
-    cd "$SCRIPT_DIR"
 }
 
 # -----------------------------------------------------------------------------

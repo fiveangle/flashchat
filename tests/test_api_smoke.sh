@@ -62,7 +62,7 @@ Smoke-tests the local Flashchat HTTP API:
   - POST /v1/responses (stream=true)
   - POST /v1/responses tool-call round trip
 
-By default, starts ./infer --serve if nothing is already listening.
+By default, starts metal_infer/infer --serve if nothing is already listening.
 When perf logging is enabled, appends timing rows to a local TSV.
 EOF
 }
@@ -359,7 +359,7 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
     echo ""
     echo "--- Starting local server ---"
     (
-        cd "${SCRIPT_DIR}"
+        cd "${REPO_ROOT}/metal_infer"
         ./infer --serve "${PORT}" --model-id "${MODEL_ID}" >"${TMPDIR}/server.log" 2>&1
     ) &
     SERVER_PID="$!"

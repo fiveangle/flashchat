@@ -120,7 +120,7 @@ Runs a single prompt and prints the response.
 ./flashchat benchmark bench        # Single expert benchmark (10 iterations)
 ./flashchat benchmark moe          # MoE forward (K experts, single layer)
 ./flashchat benchmark moebench     # MoE benchmark (10 iterations)
-./flashchat benchmark full         # Full 60-layer forward (K=4)
+./flashchat benchmark full         # Full model forward (K=4)
 ./flashchat benchmark fullbench   # Full benchmark (3 iterations)
 ```
 
@@ -259,13 +259,17 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## API Smoke Test
 
-From `metal_infer/`:
+From the project root:
 
 ```bash
+make cli-smoke
 make api-smoke
+make test
 ```
 
-This checks:
+`make cli-smoke` runs the Flashchat CLI smoke test.
+
+`make api-smoke` checks:
 - `GET /health`
 - `GET /v1`
 - `GET /v1/models`
@@ -273,7 +277,9 @@ This checks:
 - `POST /v1/responses` with and without streaming
 - tool-call round trips for both endpoints
 
-If nothing is already listening on the configured port, the script starts `./infer --serve` automatically.
+`make test` runs both smoke tests.
+
+If nothing is already listening on the configured port, the script starts `metal_infer/infer --serve` automatically.
 
 When enabled, it also appends lightweight timing rows to:
 
