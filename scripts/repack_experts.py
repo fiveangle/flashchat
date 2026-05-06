@@ -29,7 +29,7 @@ def main():
         print("ERROR: No model-id specified. Use --model-id or set FLASHCHAT_MODEL", file=sys.stderr)
         sys.exit(1)
 
-    repo_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
     config_path = Path(os.environ.get('FLASHCHAT_MODEL_CONFIG', repo_root / 'assets' / 'model_configs.json'))
     with open(config_path) as f:
         configs = json.load(f)

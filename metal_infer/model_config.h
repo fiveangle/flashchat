@@ -98,9 +98,9 @@ typedef struct {
     int think_start_token;
     int think_end_token;
 
-    char extract_weights_script[64];
-    char repack_experts_script[64];
-    char repack_experts_2bit_script[64];
+    char extract_weights_script[128];
+    char repack_experts_script[128];
+    char repack_experts_2bit_script[128];
 } ModelConfig;
 
 // ============================================================================

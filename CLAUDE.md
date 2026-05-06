@@ -72,13 +72,11 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 cd metal_infer
 make
 
-# First-time setup: extract non-expert weights and vocabulary
-python3 extract_weights.py --output .
-python3 export_tokenizer.py tokenizer.json vocab.bin
-
-# First-time setup: extract expert weights (~218GB, one-time operation)
-# This is required for BOTH 2-bit and 4-bit inference modes
-python3 ../repack_experts.py
+# First-time setup is normally handled by ./flashchat.
+# Direct setup scripts live under scripts/.
+python3 ../scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path/to/model --output /path/to/model/flashchat
+python3 ../scripts/export_tokenizer.py /path/to/model/tokenizer.json /path/to/model/flashchat/vocab.bin
+python3 ../scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/to/model/flashchat/expert_index.json
 
 # 4-bit inference (full quality, production use)
 ./infer --prompt "Explain quantum computing" --tokens 100
@@ -103,19 +101,23 @@ metal_infer/
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
   Makefile             # Build system
-  extract_weights.py   # Creates model_weights.bin from safetensors
-  export_tokenizer.py  # Creates vocab.bin from tokenizer.json
-  repack_experts.py    # Extracts expert weights to packed_experts/ (4-bit)
-  model_weights.bin    # Non-expert weights (5.5GB, extracted from safetensors)
-  model_weights.json   # Tensor manifest
-  vocab.bin            # Vocabulary (8MB, extracted from tokenizer.json)
 
-repack_experts.py      # 4-bit expert packing from safetensors (root level)
+scripts/
+  extract_weights.py        # Dispatches non-expert extraction by model ID
+  repack_experts.py         # Dispatches 4-bit expert packing by model ID
+  generate_expert_index.py  # Creates expert_index.json from safetensors
+  export_tokenizer.py       # Creates vocab.bin from tokenizer.json
+  models/                   # Model-specific setup implementations
+
 progress.py            # Results visualization (Q2/Q4 tracks)
 results.tsv            # Experiment log (58 experiments)
 
 <model_dir>/
-  packed_experts/      # Expert weights (~218GB, extracted from safetensors)
+  flashchat/
+    model_weights.bin  # Non-expert weights (5.5GB, extracted from safetensors)
+    model_weights.json # Tensor manifest
+    vocab.bin          # Vocabulary (8MB, extracted from tokenizer.json)
+    packed_experts/    # Expert weights (~218GB, extracted from safetensors)
 ```
 
 ## What We Tried (and What Worked)

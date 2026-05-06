@@ -517,9 +517,7 @@ prompt_config_interactive() {
                 local num_workers
                 num_workers=$(get_performance_cores)
                 echo "Extracting 2-bit experts using $num_workers parallel workers..."
-                cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
-                cd "$SCRIPT_DIR"
+                run_python "$SCRIPT_DIR/scripts/repack_experts_2bit.py" --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
                 
                 if check_experts_2bit_extracted; then
                     echo "2-bit experts extracted successfully."
@@ -972,12 +970,9 @@ prompt_extract_weights() {
     echo ""
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
-        cd "$SCRIPT_DIR/metal_infer"
-        if run_python extract_weights.py --model-id "$(flashchat_get MODEL)" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir"; then
-            cd "$SCRIPT_DIR"
+        if run_python "$SCRIPT_DIR/scripts/extract_weights.py" --model-id "$(flashchat_get MODEL)" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir"; then
             echo "Weights extracted successfully."
         else
-            cd "$SCRIPT_DIR"
             echo "ERROR: Weights extraction failed." >&2
             exit 1
         fi
@@ -1003,12 +998,9 @@ prompt_export_vocab() {
     echo ""
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
-        cd "$SCRIPT_DIR/metal_infer"
-        if run_python export_tokenizer.py "$model_path/tokenizer.json" "$weights_dir/vocab.bin"; then
-            cd "$SCRIPT_DIR"
+        if run_python "$SCRIPT_DIR/scripts/export_tokenizer.py" "$model_path/tokenizer.json" "$weights_dir/vocab.bin"; then
             echo "Vocabulary exported successfully."
         else
-            cd "$SCRIPT_DIR"
             echo "ERROR: Vocabulary export failed." >&2
             exit 1
         fi
@@ -1052,8 +1044,7 @@ prompt_extract_experts() {
     else
         echo "Expert index not found: $expert_index_path"
         echo "Generating expert index from model safetensors..."
-        cd "$SCRIPT_DIR"
-        if ! run_python generate_expert_index.py --model "$model_path" --output "$model_path/flashchat"; then
+        if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$model_path/flashchat"; then
             echo "ERROR: Expert index generation failed."
             return 1
         fi
@@ -1112,8 +1103,7 @@ prompt_extract_experts() {
         echo "Extracting 4-bit experts..."
         echo "Estimated time: 30-60 minutes."
         echo ""
-        cd "$SCRIPT_DIR"
-        if ! run_python repack_experts.py --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
+        if ! run_python "$SCRIPT_DIR/scripts/repack_experts.py" --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
             echo "ERROR: 4-bit expert extraction failed."
             return 1
         fi
@@ -1121,8 +1111,7 @@ prompt_extract_experts() {
     elif [ "$extraction_mode" = "2bit" ]; then
         echo ""
         echo "First extracting 4-bit experts..."
-        cd "$SCRIPT_DIR"
-        if ! run_python repack_experts.py --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
+        if ! run_python "$SCRIPT_DIR/scripts/repack_experts.py" --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
             echo "ERROR: 4-bit expert extraction failed."
             return 1
         fi
@@ -1134,8 +1123,7 @@ prompt_extract_experts() {
         local num_workers
         num_workers=$(get_performance_cores)
         echo "Using $num_workers parallel workers..."
-        cd "$SCRIPT_DIR/metal_infer"
-        if ! run_python repack_experts_2bit.py --model "$model_path" --workers "$num_workers"; then
+        if ! run_python "$SCRIPT_DIR/scripts/repack_experts_2bit.py" --model "$model_path" --workers "$num_workers"; then
             echo "ERROR: 2-bit requantization failed."
             return 1
         fi
@@ -1315,9 +1303,7 @@ ensure_setup() {
                 # 4bit exists, just need 2bit
                 local num_workers
                 num_workers=$(get_performance_cores)
-                cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
-                cd "$SCRIPT_DIR"
+                run_python "$SCRIPT_DIR/scripts/repack_experts_2bit.py" --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
             fi
         fi
     else

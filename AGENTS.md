@@ -53,8 +53,14 @@ metal_infer/
   Makefile          # Build system
   linenoise.c/h     # Line editing library
 
+scripts/
+  extract_weights.py        # Dispatch to model-specific non-expert extraction
+  repack_experts.py         # Dispatch to model-specific expert repacking
+  generate_expert_index.py  # Generate per-model expert_index.json
+  export_tokenizer.py       # Export tokenizer vocabulary
+  models/                   # Model-specific extraction/repack implementations
+
 root/
-  repack_experts.py # Repack safetensors to binary
   progress.py       # Results visualization
   assets/*.tsv      # Durable experiment/API metric logs
 ```

@@ -40,14 +40,14 @@ def main():
         sys.exit(1)
 
     script_name = configs['models'][args.model_id]['scripts']['extract_weights']
-    script_path = os.path.join(os.path.dirname(__file__), script_name)
+    script_path = repo_root / script_name
 
     if not os.path.exists(script_path):
         print(f"ERROR: Script {script_path} not found", file=sys.stderr)
         sys.exit(1)
 
     print(f"Running {script_name} for model {args.model_id}")
-    script_args = [script_path]
+    script_args = [str(script_path)]
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '--model-id':
