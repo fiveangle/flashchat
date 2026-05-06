@@ -238,6 +238,8 @@ TOP_P="0.9"
 SERVER_PORT="8000"
 SERVER_HOST="127.0.0.1"
 SERVER_LOG_PATH="$HOME/.config/flashchat/logs/server.log"
+SYSTEM_PROMPT_CACHE="1"
+SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
 
 # UI Settings
 SHOW_THINKING="0"
@@ -245,6 +247,10 @@ COLOR_OUTPUT="1"
 ```
 
 `SERVER_LOG_PATH` may be a `.log` file or a directory. Extensionless paths entered in the configuration wizard are treated as directories and will receive `server.log` plus debug artifacts when debug logging is enabled.
+
+`SYSTEM_PROMPT_CACHE` stores compressed, model-local snapshots under `<model>/flashchat/system_prompt_cache/` so repeated server runs with the same harness/system prompt can skip the expensive system prompt prefill. The cache is bounded by `SYSTEM_PROMPT_CACHE_MAX_ENTRIES`.
+
+Flashchat records a runtime signature for servers it starts. If model selection, model registry data, server-affecting settings, or infer source/binary state changes while the server is running, the next Flashchat-managed server use restarts the owned server before reuse.
 
 ## API Endpoints
 

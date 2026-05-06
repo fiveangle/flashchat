@@ -114,3 +114,14 @@ timestamp	branch	commit	hostname	hw_model	ram_gib	cpu_summary	model	server_mode	
 2026-05-06T13:27:22Z	tool-calling	54fdcca	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_text_stream	/v1/responses	true	none	default	0		14472	stream_deltas	192	13.267	pass	repeat benchmark x24
 2026-05-06T13:28:00Z	tool-calling	54fdcca	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_tool_call	/v1/responses	false	forced	default	0		38228	tool_calls	1		pass	forced record_result
 2026-05-06T13:28:19Z	tool-calling	54fdcca	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_tool_followup	/v1/responses	false	followup	default	0		18112	text_chars	0		pass	tool_choice none
+2026-05-06T22:44:25Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	health	/health	false	none				39	none			pass	
+2026-05-06T22:44:25Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	v1_root	/v1	false	none				38	none			pass	
+2026-05-06T22:44:25Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	models	/v1/models	false	none				38	none			pass	
+2026-05-06T22:44:30Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	chat_text_nonstream	/v1/chat/completions	false	none	default	0		4883	text_chars	0		pass	
+2026-05-06T22:44:38Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	chat_text_stream	/v1/chat/completions	true	none	default	0		7603	stream_deltas	96	12.627	pass	repeat benchmark x24
+2026-05-06T22:45:01Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	chat_tool_call	/v1/chat/completions	false	forced	default	0		22529	tool_calls	1		pass	forced record_result
+2026-05-06T22:45:09Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	chat_tool_followup	/v1/chat/completions	false	followup	default	0		8602	text_chars	100		pass	tool_choice none
+2026-05-06T22:45:14Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_text_nonstream	/v1/responses	false	none	default	0		4053	text_chars	0		pass	
+2026-05-06T22:45:21Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_text_stream	/v1/responses	true	none	default	0		7043	stream_deltas	192	27.261	pass	repeat benchmark x24
+2026-05-06T22:45:25Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_tool_call	/v1/responses	false	forced	default	0		4467	tool_calls	1		pass	forced record_result
+2026-05-06T22:45:32Z	persistent-prompt-caching	bfd12b9	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	fresh	responses_tool_followup	/v1/responses	false	followup	default	0		6479	text_chars	181		pass	tool_choice none

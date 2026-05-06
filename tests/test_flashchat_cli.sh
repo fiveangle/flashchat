@@ -183,6 +183,8 @@ SERVER_LOG_PATH="${TMPDIR}/logs"
 OFFLOAD_DIR="${TMPDIR}/offload"
 SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
+SYSTEM_PROMPT_CACHE="1"
+SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
 SHOW_THINKING="0"
 COLOR_OUTPUT="0"
 EOF
@@ -282,6 +284,7 @@ run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $F
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config system prompt cache" "System prompt cache:" bash -c "echo 'n' | $FLASHCHAT  config"
 
 # Config --reset and --full-reset: test in isolated temp config
 reset_config="${TMPDIR}/reset_config"
@@ -356,12 +359,22 @@ else
         assert_fail "api models endpoint" "unexpected response: $output"
     fi
 
+    old_pid=$(cat "${TMPDIR}/.config/flashchat/server.pid")
+    echo 'SYSTEM_PROMPT_CACHE_MAX_ENTRIES="3"' >> "$TMP_CONFIG"
+    output=$("$FLASHCHAT" serve --port "$TEST_PORT" 2>/dev/null)
+    new_pid=$(cat "${TMPDIR}/.config/flashchat/server.pid")
+    if [[ "$output" == *"stale runtime settings"* && "$old_pid" != "$new_pid" ]]; then
+        assert_pass "serve restarts stale runtime"
+    else
+        assert_fail "serve restarts stale runtime" "old_pid=$old_pid new_pid=$new_pid output=$output"
+    fi
+
     # Test flashchat prompt (now that server is running)
     output=$("$FLASHCHAT" prompt "Say hello" 2>/dev/null)
-    if [[ "$output" == *'"content":'* ]]; then
+    if [[ "$output" == *'"choices":'* ]]; then
         assert_pass "prompt with running server"
     else
-        assert_fail "prompt with running server" "no content in response"
+        assert_fail "prompt with running server" "no completion response"
     fi
 fi
 

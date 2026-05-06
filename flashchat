@@ -159,6 +159,7 @@ Environment variables:
   FLASHCHAT_OFFLOAD_DIR     Unified model offload directory
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_SERVER_HOST    Server host clients connect to
+  FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
 
@@ -258,7 +259,11 @@ cmd_status() {
         local pid
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Server status: Running (PID: $pid)"
+            if server_signature_matches_config "$server_port"; then
+                echo "Server status: Running (PID: $pid)"
+            else
+                echo "Server status: Running with stale runtime settings (PID: $pid)"
+            fi
         else
             echo "Server status: Not running (stale PID file)"
         fi
@@ -276,6 +281,7 @@ cmd_status() {
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
+    echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
@@ -436,6 +442,7 @@ cmd_config() {
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
+    echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
     echo ""
@@ -464,6 +471,8 @@ cmd_config_interactive() {
     echo "  -Model offload directory: $(flashchat_get OFFLOAD_DIR)"
     echo "  -Server debug logging artifacts (0/1): $(flashchat_get SERVER_DEBUG)"
     echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
+    echo "  -Persistent system prompt cache (0/1): $(flashchat_get SYSTEM_PROMPT_CACHE)"
+    echo "  -Persistent system prompt cache entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
     echo "  -Show thinking tokens (0/1): $(flashchat_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashchat_get COLOR_OUTPUT)"
     unset REPLY
@@ -1042,7 +1051,7 @@ prompt_config_options() {
         echo ""
         
         local default_model default_tokens default_temp
-        local default_top_p default_port default_host default_log_path default_offload_dir default_debug default_http_log default_think default_color
+        local default_top_p default_port default_host default_log_path default_offload_dir default_debug default_http_log default_sys_cache default_sys_cache_entries default_think default_color
         
         default_model=$(flashchat_get MODEL)
         default_tokens=$(flashchat_get MAX_TOKENS)
@@ -1054,6 +1063,8 @@ prompt_config_options() {
         default_offload_dir=$(flashchat_get OFFLOAD_DIR)
         default_debug=$(flashchat_get SERVER_DEBUG)
         default_http_log=$(flashchat_get SERVER_HTTP_LOG)
+        default_sys_cache=$(flashchat_get SYSTEM_PROMPT_CACHE)
+        default_sys_cache_entries=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)
         default_think=$(flashchat_get SHOW_THINKING)
         default_color=$(flashchat_get COLOR_OUTPUT)
         
@@ -1159,6 +1170,22 @@ prompt_config_interactive() {
     echo ""
     echo "SERVER_HTTP_LOG=\"${REPLY:-$default_http_log}\"" >> /tmp/flashchat_new_config
 
+    # Persistent System Prompt Cache
+    local default_sys_cache
+    default_sys_cache=$(flashchat_get SYSTEM_PROMPT_CACHE)
+    printf "Persistent system prompt cache (0/1) [%s]: " "$default_sys_cache"
+    read -r REPLY
+    echo ""
+    echo "SYSTEM_PROMPT_CACHE=\"${REPLY:-$default_sys_cache}\"" >> /tmp/flashchat_new_config
+
+    # Persistent System Prompt Cache Entries
+    local default_sys_cache_entries
+    default_sys_cache_entries=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)
+    printf "Persistent system prompt cache entries [%s]: " "$default_sys_cache_entries"
+    read -r REPLY
+    echo ""
+    echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=\"${REPLY:-$default_sys_cache_entries}\"" >> /tmp/flashchat_new_config
+
     # Show Thinking
     local default_think
     default_think=$(flashchat_get SHOW_THINKING)
@@ -1187,6 +1214,10 @@ prompt_config_interactive() {
     else
         echo "$new_config" > "$(flashchat_get CONFIG_FILE)"
         echo "Configuration updated."
+        flashchat_load_config
+        if is_server_running && ! server_signature_matches_config; then
+            echo "The running server will restart automatically the next time Flashchat uses it."
+        fi
     fi
 }
 
@@ -1300,15 +1331,33 @@ check_binaries() {
     return $?
 }
 
+file_newer_than() {
+    local src="$1"
+    local dst="$2"
+    [ -f "$src" ] || return 1
+    [ -f "$dst" ] || return 0
+    [ "$(stat -f %m "$src" 2>/dev/null || echo 0)" -gt "$(stat -f %m "$dst" 2>/dev/null || echo 0)" ]
+}
+
+check_binaries_current() {
+    check_binaries || return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/infer.m" "$SCRIPT_DIR/metal_infer/infer" && return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/model_config.h" "$SCRIPT_DIR/metal_infer/infer" && return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/shaders.metal" "$SCRIPT_DIR/metal_infer/infer" && return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/chat.m" "$SCRIPT_DIR/metal_infer/chat" && return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/linenoise.c" "$SCRIPT_DIR/metal_infer/chat" && return 1
+    return 0
+}
+
 ensure_binaries() {
-    if check_binaries; then
+    if check_binaries_current; then
         return 0
     fi
     
-    echo "Binaries not found. Building..."
+    echo "Binaries missing or stale. Building..."
     make -C "$SCRIPT_DIR" all chat
     
-    if check_binaries; then
+    if check_binaries_current; then
         echo "Build complete."
     else
         echo "ERROR: Build failed."
@@ -1814,6 +1863,69 @@ is_server_running() {
     return 1
 }
 
+file_signature_part() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        printf "%s:%s:%s" "$path" "$(stat -f %m "$path" 2>/dev/null || echo 0)" "$(cksum "$path" 2>/dev/null | awk '{print $1 ":" $2}')"
+    else
+        printf "%s:missing" "$path"
+    fi
+}
+
+server_runtime_signature() {
+    local effective_port="${1:-$(flashchat_get SERVER_PORT)}"
+    {
+        echo "MODEL=$(flashchat_get MODEL)"
+        echo "MODEL_REPO=$(flashchat_get MODEL_REPO)"
+        echo "MODEL_PATH=$(flashchat_get MODEL_PATH)"
+        echo "MODEL_CONFIG=$(file_signature_part "$(flashchat_get MODEL_CONFIG)")"
+        echo "SERVER_PORT=$effective_port"
+        echo "TEMPERATURE=$(flashchat_get TEMPERATURE)"
+        echo "TOP_P=$(flashchat_get TOP_P)"
+        echo "SERVER_LOG_PATH=$(flashchat_get SERVER_LOG_PATH)"
+        echo "SERVER_DEBUG=$(flashchat_get SERVER_DEBUG)"
+        echo "SERVER_HTTP_LOG=$(flashchat_get SERVER_HTTP_LOG)"
+        echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
+        echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
+        echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+        echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
+        echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"
+        echo "MODEL_CONFIG_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/model_config.h")"
+        echo "SHADERS_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/shaders.metal")"
+    } | cksum | awk '{print $1 ":" $2}'
+}
+
+server_signature_matches_config() {
+    local effective_port="${1:-$(flashchat_get SERVER_PORT)}"
+    local signature_file
+    signature_file=$(flashchat_get_server_signature_file)
+    [ -f "$signature_file" ] || return 1
+    [ "$(cat "$signature_file" 2>/dev/null)" = "$(server_runtime_signature "$effective_port")" ]
+}
+
+write_server_signature() {
+    local effective_port="${1:-$(flashchat_get SERVER_PORT)}"
+    local signature_file
+    signature_file=$(flashchat_get_server_signature_file)
+    mkdir -p "$(dirname "$signature_file")"
+    server_runtime_signature "$effective_port" > "$signature_file"
+}
+
+clear_server_signature() {
+    rm -f "$(flashchat_get_server_signature_file)"
+}
+
+restart_stale_owned_server() {
+    local port="$1"
+    if is_server_running && ! server_signature_matches_config "$port"; then
+        echo "Configured runtime changed; restarting Flashchat server..."
+        cmd_serve --stop --port "$port"
+        cmd_serve --port "$port"
+        return $?
+    fi
+    return 0
+}
+
 is_server_healthy() {
     local port="$1"
     local host
@@ -2098,12 +2210,14 @@ cmd_serve() {
                 kill "$pid" 2>/dev/null
                 if wait_for_pid_exit "$pid" 10 && wait_for_port_clear "$server_port" 10; then
                     rm -f "$pid_file"
+                    clear_server_signature
                     echo "Server stopped."
                 elif [ "$force" -eq 1 ]; then
                     echo "Server did not exit after waiting. Sending SIGKILL..."
                     kill -9 "$pid" 2>/dev/null || true
                     if wait_for_pid_exit "$pid" 5 && wait_for_port_clear "$server_port" 5; then
                         rm -f "$pid_file"
+                        clear_server_signature
                         echo "Server force-stopped."
                     else
                         error "Server process $pid is still present after SIGKILL"
@@ -2116,6 +2230,7 @@ cmd_serve() {
             else
                 echo "Server not running (stale PID file)."
                 rm -f "$pid_file"
+                clear_server_signature
             fi
         elif is_port_listening "$server_port"; then
             if [ "$external" -eq 1 ]; then
@@ -2162,7 +2277,21 @@ cmd_serve() {
     
     # Check if WE already started the server
     if is_server_running; then
-        echo "Server is already running (PID: $(cat $(flashchat_get_pid_file))."
+        if server_signature_matches_config; then
+            echo "Server is already running (PID: $(cat "$(flashchat_get_pid_file)"))."
+            return
+        fi
+        echo "Server is running with stale runtime settings."
+        echo "Restarting server to apply the current configuration..."
+        cmd_serve --stop --port "$server_port"
+    fi
+
+    # Rebuild after any stale server has stopped, so source/config changes are reflected.
+    ensure_binaries
+
+    # Check again in case stop failed or an external process took the port.
+    if is_server_running; then
+        echo "Server is already running (PID: $(cat "$(flashchat_get_pid_file)"))."
         return
     fi
     
@@ -2185,8 +2314,6 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashchat_get_pid_file)
     
-    ensure_binaries
-    
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
     export FLASHCHAT_SERVER_PORT="$server_port"
@@ -2197,6 +2324,8 @@ cmd_serve() {
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
     export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
+    export FLASHCHAT_SYSTEM_PROMPT_CACHE="$(flashchat_get SYSTEM_PROMPT_CACHE)"
+    export FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
@@ -2208,6 +2337,7 @@ cmd_serve() {
     echo "Starting server on port $server_port..."
     if wait_for_server "$server_port"; then
         echo "$infer_pid" > "$pid_file"
+        write_server_signature "$server_port"
         echo "Server running (PID: $infer_pid)"
         echo "API available at http://$server_host:$server_port"
         echo ""
@@ -2219,6 +2349,8 @@ cmd_serve() {
         echo ""
         echo "To stop: flashchat serve --stop"
     else
+        rm -f "$pid_file"
+        clear_server_signature
         error "Server failed to start"
     fi
 }
@@ -2271,6 +2403,8 @@ cmd_chat() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
     
+    restart_stale_owned_server "$server_port"
+
     # Start server if not running
     if ! is_port_listening "$server_port"; then
         echo "Starting server..."
@@ -2334,6 +2468,8 @@ cmd_prompt() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
     
+    restart_stale_owned_server "$server_port"
+
     # Start server if not running
     if ! is_port_listening "$server_port"; then
         echo "Starting server..."
@@ -2378,6 +2514,8 @@ cmd_opencode() {
     server_port="${port:-$(flashchat_get SERVER_PORT)}"
     local server_host
     server_host="$(flashchat_server_connect_host)"
+
+    restart_stale_owned_server "$server_port"
 
     if ! is_port_listening "$server_port"; then
         echo "Starting server..."
@@ -2436,7 +2574,11 @@ interactive_menu() {
         
         local server_status="Not running"
         if is_server_running; then
-            server_status="Running"
+            if server_signature_matches_config; then
+                server_status="Running"
+            else
+                server_status="Running (restart needed)"
+            fi
         elif is_port_listening "$(flashchat_get SERVER_PORT)"; then
             server_status="Running (external)"
         fi
@@ -2450,7 +2592,7 @@ interactive_menu() {
         local server_url="http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)/v1"
         
         local server_line="Server: $server_status"
-        if [ "$server_status" = "Running" ] || [ "$server_status" = "Running (external)" ]; then
+        if [ "$server_status" = "Running" ] || [ "$server_status" = "Running (external)" ] || [ "$server_status" = "Running (restart needed)" ]; then
             server_line="$server_line   API: $server_url"
         fi
         
