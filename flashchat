@@ -23,7 +23,7 @@
 #
 # Configuration:
 #   Config is loaded from (priority highest to lowest):
-#     1. ./flashchat.config (project-local)
+#     1. --config FILE (explicit override)
 #     2. ~/.config/flashchat/config (user)
 #     3. Environment variables (FLASHCHAT_*)
 #     4. Hardcoded defaults
@@ -72,6 +72,8 @@ parse_global_opts() {
                 ;;
             --config)
                 CONFIG_FILE="$2"
+                FLASHCHAT_CONFIG_FILE_OVERRIDE="$2"
+                export FLASHCHAT_CONFIG_FILE_OVERRIDE
                 shift 2
                 ;;
             --model)
@@ -123,15 +125,15 @@ Options:
 
 Configuration:
   Config is loaded from (priority highest to lowest):
-    1. ./flashchat.config (project-local)
+    1. --config FILE (explicit override)
     2. ~/.config/flashchat/config (user)
     3. Environment variables (FLASHCHAT_*)
     4. Hardcoded defaults
 
 Environment variables:
   FLASHCHAT_MODEL           Model ID (default: qwen3.6-35B-A3B)
-  FLASHCHAT_MODEL_REPO      HuggingFace repo (looked up from model_configs.json)
   FLASHCHAT_MODEL_PATH      Override model path
+  FLASHCHAT_MODEL_CONFIG    Override bundled model registry path
   FLASHCHAT_QUANTIZATION   4bit or 2bit
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
@@ -231,7 +233,7 @@ cmd_status() {
     echo "    GET  /v1/models            (list models)"
     echo "    GET  /health               (health check)"
     echo ""
-    echo "Model: $(flashchat_get MODEL_REPO)"
+    echo "Model: $(flashchat_get MODEL) ($(flashchat_get MODEL_REPO))"
     echo "Experts quantization: $(flashchat_get QUANTIZATION)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
@@ -389,7 +391,8 @@ cmd_config() {
     
     echo "=== Flashchat Configuration ==="
     echo ""
-    echo "Model: $(flashchat_get MODEL_REPO) ($(flashchat_get QUANTIZATION))"
+    echo "Model: $(flashchat_get MODEL) ($(flashchat_get QUANTIZATION))"
+    echo "Repository: $(flashchat_get MODEL_REPO)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
@@ -409,7 +412,8 @@ cmd_config_interactive() {
     
     echo ""
     echo "=== Configuration Settings ==="
-    echo "  -Model: $(flashchat_get MODEL_REPO)"
+    echo "  -Model: $(flashchat_get MODEL)"
+    echo "  -Repository: $(flashchat_get MODEL_REPO)"
     echo "  -Experts quantization (4bit/2bit): $(flashchat_get QUANTIZATION)"
     echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
@@ -446,10 +450,10 @@ prompt_config_options() {
         echo "(Running in non-interactive mode - using defaults)"
         echo ""
         
-        local default_repo default_quant default_tokens default_temp
+        local default_model default_quant default_tokens default_temp
         local default_top_p default_port default_host default_log_path default_debug default_http_log default_think default_color
         
-        default_repo=$(flashchat_get MODEL_REPO)
+        default_model=$(flashchat_get MODEL)
         default_quant=$(flashchat_get QUANTIZATION)
         default_tokens=$(flashchat_get MAX_TOKENS)
         default_temp=$(flashchat_get TEMPERATURE)
@@ -476,12 +480,12 @@ prompt_config_interactive() {
     echo "(Press Enter to accept default)"
     echo ""
     
-    # Model Repository
-    local default_repo
-    default_repo=$(flashchat_get MODEL_REPO)
-    printf "Model repository [%s]: " "$default_repo"
+    # Model
+    local default_model
+    default_model=$(flashchat_get MODEL)
+    printf "Model ID [%s]: " "$default_model"
     read -r REPLY
-    echo "MODEL_REPO=\"${REPLY:-$default_repo}\"" >> /tmp/flashchat_new_config
+    echo "MODEL=\"${REPLY:-$default_model}\"" >> /tmp/flashchat_new_config
     
     # Experts quantization
     local default_quant
@@ -514,7 +518,7 @@ prompt_config_interactive() {
                 num_workers=$(get_performance_cores)
                 echo "Extracting 2-bit experts using $num_workers parallel workers..."
                 cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py --workers "$num_workers"
+                run_python repack_experts_2bit.py --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
                 cd "$SCRIPT_DIR"
                 
                 if check_experts_2bit_extracted; then
@@ -624,8 +628,10 @@ prompt_config_interactive() {
 get_last_layer_index() {
     local model_id
     model_id=$(flashchat_get MODEL)
-    if [ -f "./model_configs.json" ] && command -v python3 >/dev/null 2>&1; then
-        python3 -c "import json; data=json.load(open('model_configs.json')); layers=data.get('models',{}).get('$model_id',{}).get('num_hidden_layers',60); print(layers-1)" 2>/dev/null
+    local model_config
+    model_config=$(flashchat_get MODEL_CONFIG)
+    if [ -f "$model_config" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "import json; data=json.load(open('$model_config')); layers=data.get('models',{}).get('$model_id',{}).get('num_hidden_layers',60); print(layers-1)" 2>/dev/null
     else
         echo "59"
     fi
@@ -1024,14 +1030,16 @@ prompt_extract_experts() {
     # Check if model is supported
     local model_id
     model_id=$(flashchat_get MODEL)
-    if [ -f "./model_configs.json" ] && command -v python3 >/dev/null 2>&1; then
+    local model_config
+    model_config=$(flashchat_get MODEL_CONFIG)
+    if [ -f "$model_config" ] && command -v python3 >/dev/null 2>&1; then
         local in_registry
-        in_registry=$(python3 -c "import json; data=json.load(open('model_configs.json')); print('1' if '$model_id' in data.get('models',{}) else '0')" 2>/dev/null)
+        in_registry=$(python3 -c "import json; data=json.load(open('$model_config')); print('1' if '$model_id' in data.get('models',{}) else '0')" 2>/dev/null)
         if [ "$in_registry" != "1" ]; then
             echo ""
             echo "=== Model Not Supported ==="
             echo ""
-            echo "Model '$model_id' is not in model_configs.json."
+            echo "Model '$model_id' is not in $(flashchat_get MODEL_CONFIG)."
             echo ""
             echo "Expert extraction cancelled."
             exit 0
@@ -1127,7 +1135,7 @@ prompt_extract_experts() {
         num_workers=$(get_performance_cores)
         echo "Using $num_workers parallel workers..."
         cd "$SCRIPT_DIR/metal_infer"
-        if ! run_python repack_experts_2bit.py --workers "$num_workers"; then
+        if ! run_python repack_experts_2bit.py --model "$model_path" --workers "$num_workers"; then
             echo "ERROR: 2-bit requantization failed."
             return 1
         fi
@@ -1140,10 +1148,9 @@ prompt_save_config() {
     config_file=$(flashchat_get CONFIG_FILE)
     
     if [ -n "$config_file" ] && [ -f "$config_file" ]; then
-        # Check if existing config is missing MODEL (old format)
         if ! grep -q '^MODEL=' "$config_file" 2>/dev/null; then
             echo ""
-            echo "Updating config to include model ID..."
+            echo "Configuration is missing MODEL. Rewriting with current defaults..."
             flashchat_create_default_config
             echo "Config updated."
         fi
@@ -1309,7 +1316,7 @@ ensure_setup() {
                 local num_workers
                 num_workers=$(get_performance_cores)
                 cd "$SCRIPT_DIR/metal_infer"
-                run_python repack_experts_2bit.py --workers "$num_workers"
+                run_python repack_experts_2bit.py --model "$(flashchat_get MODEL_PATH)" --workers "$num_workers"
                 cd "$SCRIPT_DIR"
             fi
         fi
@@ -1652,7 +1659,8 @@ cmd_serve() {
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
     
-    # Start server from project root so infer can find model_configs.json
+    export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+
     "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" > /dev/null 2>&1 &
     local infer_pid=$!
     
@@ -1899,7 +1907,7 @@ interactive_menu() {
         echo "           Flashchat Management"
         echo "=================================================="
         echo "Status: $setup_status at $server_url"
-        echo "Model: $(flashchat_get MODEL_REPO) ($(flashchat_get QUANTIZATION))"
+        echo "Model: $(flashchat_get MODEL) ($(flashchat_get QUANTIZATION))"
         echo "$server_line"
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]odels, [Q]uit"
         read -p "> " -n 1 -r
@@ -2007,7 +2015,7 @@ cmd_clean() {
     while true; do
         echo "=== Clean Model Files ==="
         echo ""
-        echo "Current model: $(flashchat_get MODEL_REPO)"
+        echo "Current model: $(flashchat_get MODEL)"
         echo ""
         
         # Original Hugging Face model shards
@@ -2157,12 +2165,9 @@ cmd_benchmark() {
     export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
+    export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
     
     cd "$SCRIPT_DIR/metal_infer"
-    # Ensure model_configs.json is accessible when running from metal_infer/
-    if [ ! -f "model_configs.json" ] && [ -f "../model_configs.json" ]; then
-        ln -sf "../model_configs.json" "model_configs.json"
-    fi
     ensure_binaries
     
     case "$target" in
@@ -2219,6 +2224,8 @@ main() {
                 ;;
             --config)
                 CONFIG_FILE="$2"
+                FLASHCHAT_CONFIG_FILE_OVERRIDE="$2"
+                export FLASHCHAT_CONFIG_FILE_OVERRIDE
                 shift 2
                 ;;
             --model)

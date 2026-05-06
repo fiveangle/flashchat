@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 // ============================================================================
 // Compile-time maximums
@@ -153,6 +154,13 @@ static int json_parse_string(const char *p, char *out, size_t out_len) {
 // ============================================================================
 // Config loader
 // ============================================================================
+
+static const char *resolve_model_config_path(void) {
+    const char *env_path = getenv("FLASHCHAT_MODEL_CONFIG");
+    if (env_path && env_path[0]) return env_path;
+    if (access("assets/model_configs.json", R_OK) == 0) return "assets/model_configs.json";
+    return "../assets/model_configs.json";
+}
 
 static int load_model_config(const char *json_path, const char *model_id, ModelConfig *cfg) {
     FILE *f = fopen(json_path, "rb");

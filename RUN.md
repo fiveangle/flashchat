@@ -152,7 +152,7 @@ Manage chat sessions.
 
 Configuration is loaded from (priority highest to lowest):
 
-1. `./flashchat.config` (project-local)
+1. `--config FILE` (explicit override)
 2. `~/.config/flashchat/config` (user)
 3. Environment variables (`FLASHCHAT_*`)
 4. Hardcoded defaults
@@ -161,12 +161,13 @@ Configuration is loaded from (priority highest to lowest):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `FLASHCHAT_MODEL_REPO` | HuggingFace repo | `mlx-community/Qwen3.5-397B-A17B-4bit` |
+| `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
+| `FLASHCHAT_MODEL_CONFIG` | Model registry path | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
 | `FLASHCHAT_QUANTIZATION` | 4bit or 2bit | `4bit` |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
-| `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `./metal_infer` |
-| `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/packed_experts` |
+| `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `<model>/flashchat` |
+| `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/flashchat/packed_experts` |
 
 ### Example Config File
 
@@ -174,7 +175,7 @@ Configuration is loaded from (priority highest to lowest):
 # ~/.config/flashchat/config
 
 # Model Settings
-MODEL_REPO="mlx-community/Qwen3.5-397B-A17B-4bit"
+MODEL="qwen3.6-35B-A3B"
 
 # Quantization: 4bit or 2bit
 QUANTIZATION="4bit"
@@ -305,10 +306,11 @@ For OpenCode, a working provider entry looks like:
 
 | File | Size | Description |
 |------|------|-------------|
-| `metal_infer/model_weights.bin` | 5.5GB | Non-expert weights (mmap'd) |
-| `metal_infer/model_weights.json` | 371KB | Manifest for weight loading |
-| `metal_infer/vocab.bin` | 7.8MB | Tokenizer vocabulary |
-| `<model>/packed_experts/` | 218GB | 4-bit expert weights |
-| `<model>/packed_experts_2bit/` | 120GB | 2-bit expert weights |
+| `<model>/flashchat/model_weights.bin` | 5.5GB | Non-expert weights (mmap'd) |
+| `<model>/flashchat/model_weights.json` | 371KB | Manifest for weight loading |
+| `<model>/flashchat/vocab.bin` | 7.8MB | Tokenizer vocabulary |
+| `<model>/flashchat/expert_index.json` | - | Safetensors expert lookup index |
+| `<model>/flashchat/packed_experts/` | 218GB | 4-bit expert weights |
+| `<model>/flashchat/packed_experts_2bit/` | 120GB | 2-bit expert weights |
 | `~/.config/flashchat/config` | - | User configuration |
 | `~/.flashchat/sessions/` | - | Chat session history |

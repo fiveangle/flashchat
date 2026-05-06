@@ -2,7 +2,7 @@
 """
 repack_experts.py — Dispatcher for model-specific repack_experts scripts.
 
-Reads model_configs.json to determine which model-specific script to run.
+Reads assets/model_configs.json to determine which model-specific script to run.
 Supports --model-id flag or FLASHCHAT_MODEL environment variable.
 All other arguments are passed through to the model-specific script.
 
@@ -14,12 +14,13 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description='Repack experts dispatcher')
     parser.add_argument('--model-id', type=str,
                         default=os.environ.get('FLASHCHAT_MODEL'),
-                        help='Model ID from model_configs.json (or set FLASHCHAT_MODEL)')
+                        help='Model ID from assets/model_configs.json (or set FLASHCHAT_MODEL)')
     parser.add_argument('--model', type=str,
                         help='Path to model directory (passed through to model-specific script)')
     args, remaining = parser.parse_known_args()
@@ -28,7 +29,8 @@ def main():
         print("ERROR: No model-id specified. Use --model-id or set FLASHCHAT_MODEL", file=sys.stderr)
         sys.exit(1)
 
-    config_path = 'model_configs.json'
+    repo_root = Path(__file__).resolve().parent
+    config_path = Path(os.environ.get('FLASHCHAT_MODEL_CONFIG', repo_root / 'assets' / 'model_configs.json'))
     with open(config_path) as f:
         configs = json.load(f)
 
@@ -38,14 +40,14 @@ def main():
         sys.exit(1)
 
     script_name = configs['models'][args.model_id]['scripts']['repack_experts']
-    script_path = script_name
+    script_path = repo_root / script_name
 
     if not os.path.exists(script_path):
         print(f"ERROR: Script {script_path} not found", file=sys.stderr)
         sys.exit(1)
 
     print(f"Running {script_name} for model {args.model_id}")
-    script_args = [script_path]
+    script_args = [str(script_path)]
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '--model-id':

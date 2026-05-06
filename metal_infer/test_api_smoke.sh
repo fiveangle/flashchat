@@ -22,7 +22,7 @@ default_model_id() {
         fi
     fi
 
-    local config="${REPO_ROOT}/model_configs.json"
+    local config="${REPO_ROOT}/assets/model_configs.json"
     if [[ -f "$config" ]]; then
         python3 -c "
 import json, sys

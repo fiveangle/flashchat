@@ -1519,7 +1519,7 @@ int main(int argc, char **argv) {
         if (!model_id) {
             model_id = "qwen3.6-35B-A3B";
         }
-        const char *config_json_path = "model_configs.json";
+        const char *config_json_path = resolve_model_config_path();
         if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;
@@ -1534,19 +1534,9 @@ int main(int argc, char **argv) {
         }
         if (num_active_experts > g_cfg.num_experts) num_active_experts = g_cfg.num_experts;
 
-        // Determine experts base path (flashchat/ subdirectory or direct)
+        // Determine experts base path under the per-model Flashchat artifact directory.
         char experts_base[1024];
         snprintf(experts_base, sizeof(experts_base), "%s/flashchat/packed_experts", model_path);
-        {
-            char probe[1024];
-            snprintf(probe, sizeof(probe), "%s/layer_00.bin", experts_base);
-            int pfd = open(probe, O_RDONLY);
-            if (pfd < 0) {
-                snprintf(experts_base, sizeof(experts_base), "%s/packed_experts", model_path);
-            } else {
-                close(pfd);
-            }
-        }
 
         const char *shader_name = (use_fast >= 3) ? "v3-tiled" :
                                   (use_fast >= 1) ? "fast-simd" : "naive";

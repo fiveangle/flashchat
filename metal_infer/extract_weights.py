@@ -2,7 +2,7 @@
 """
 extract_weights.py — Dispatcher for model-specific extract_weights scripts.
 
-Reads model_configs.json to determine which model-specific script to run.
+Reads assets/model_configs.json to determine which model-specific script to run.
 Supports --model-id flag or FLASHCHAT_MODEL environment variable.
 All other arguments (including --model PATH) are passed through to the model-specific script.
 
@@ -14,12 +14,13 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description='Extract weights dispatcher')
     parser.add_argument('--model-id', type=str,
                         default=os.environ.get('FLASHCHAT_MODEL'),
-                        help='Model ID from model_configs.json (or set FLASHCHAT_MODEL)')
+                        help='Model ID from assets/model_configs.json (or set FLASHCHAT_MODEL)')
     parser.add_argument('--model', type=str,
                         help='Path to model directory (passed through to model-specific script)')
     args, remaining = parser.parse_known_args()
@@ -28,7 +29,8 @@ def main():
         print("ERROR: No model-id specified. Use --model-id or set FLASHCHAT_MODEL", file=sys.stderr)
         sys.exit(1)
 
-    config_path = os.path.join(os.path.dirname(__file__), '..', 'model_configs.json')
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = Path(os.environ.get('FLASHCHAT_MODEL_CONFIG', repo_root / 'assets' / 'model_configs.json'))
     with open(config_path) as f:
         configs = json.load(f)
 

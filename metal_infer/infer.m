@@ -74,7 +74,7 @@
 ModelConfig g_cfg;
 
 // ============================================================================
-// Runtime constants (loaded from model_configs.json into g_cfg)
+// Runtime constants (loaded from assets/model_configs.json into g_cfg)
 // ============================================================================
 
 // Pipeline and cache limits (not model-dependent)
@@ -7917,7 +7917,7 @@ static void serve_loop(
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  --model-id ID        Model ID from model_configs.json (default: qwen3.6-35B-A3B)\n");
+    printf("  --model-id ID        Model ID from assets/model_configs.json (default: qwen3.6-35B-A3B)\n");
     printf("  --model PATH         Model path\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
@@ -7951,6 +7951,8 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        const char *env_model_id = getenv("FLASHCHAT_MODEL");
+        const char *model_id = (env_model_id && env_model_id[0]) ? env_model_id : NULL;
         int max_tokens = 20;
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -7986,6 +7988,15 @@ int main(int argc, char **argv) {
             if (cfg) {
                 char line[512];
                 while (fgets(line, sizeof(line), cfg)) {
+                    if (!env_model_id && strncmp(line, "MODEL=", 6) == 0) {
+                        char *val = line + 6;
+                        char *quote = strchr(val, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            model_id = strdup(quote + 1);
+                        }
+                    }
                     // Parse QUANTIZATION from config file
                     if (strncmp(line, "QUANTIZATION=", 13) == 0) {
                         char *val = line + 13;
@@ -8054,7 +8065,6 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        const char *model_id = NULL;
         while ((c = getopt_long(argc, argv, "I:m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'I': model_id = optarg; break;
@@ -8092,82 +8102,31 @@ int main(int argc, char **argv) {
 
         // Load model configuration from registry
         if (!model_id) {
-            model_id = getenv("FLASHCHAT_MODEL");
-        }
-        if (!model_id) {
             model_id = "qwen3.6-35B-A3B";
         }
-        const char *config_json_path = "model_configs.json";
+        const char *config_json_path = resolve_model_config_path();
         if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;
         }
         kApiModelId = g_cfg.model_id;
 
-        // Build default paths (flashchat/ subdir first, then legacy fallbacks)
+        // Build default paths under the per-model Flashchat artifact directory.
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
         if (!weights_path) {
             snprintf(default_weights, sizeof(default_weights),
                      "%s/flashchat/model_weights.bin", model_path);
-            if (access(default_weights, R_OK) != 0) {
-                snprintf(default_weights, sizeof(default_weights),
-                         "%s/model_weights.bin", model_path);
-                if (access(default_weights, R_OK) != 0) {
-                    snprintf(default_weights, sizeof(default_weights),
-                             "metal_infer/%s/model_weights.bin", g_cfg.model_id);
-                    if (access(default_weights, R_OK) != 0) {
-                        snprintf(default_weights, sizeof(default_weights),
-                                 "metal_infer/model_weights.bin");
-                        if (access(default_weights, R_OK) != 0) {
-                            snprintf(default_weights, sizeof(default_weights),
-                                     "model_weights.bin");
-                        }
-                    }
-                }
-            }
             weights_path = default_weights;
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
                      "%s/flashchat/model_weights.json", model_path);
-            if (access(default_manifest, R_OK) != 0) {
-                snprintf(default_manifest, sizeof(default_manifest),
-                         "%s/model_weights.json", model_path);
-                if (access(default_manifest, R_OK) != 0) {
-                    snprintf(default_manifest, sizeof(default_manifest),
-                             "metal_infer/%s/model_weights.json", g_cfg.model_id);
-                    if (access(default_manifest, R_OK) != 0) {
-                        snprintf(default_manifest, sizeof(default_manifest),
-                                 "metal_infer/model_weights.json");
-                        if (access(default_manifest, R_OK) != 0) {
-                            snprintf(default_manifest, sizeof(default_manifest),
-                                     "model_weights.json");
-                        }
-                    }
-                }
-            }
             manifest_path = default_manifest;
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
                      "%s/flashchat/vocab.bin", model_path);
-            if (access(default_vocab, R_OK) != 0) {
-                snprintf(default_vocab, sizeof(default_vocab),
-                         "%s/vocab.bin", model_path);
-                if (access(default_vocab, R_OK) != 0) {
-                    snprintf(default_vocab, sizeof(default_vocab),
-                             "metal_infer/%s/vocab.bin", g_cfg.model_id);
-                    if (access(default_vocab, R_OK) != 0) {
-                        snprintf(default_vocab, sizeof(default_vocab),
-                                 "metal_infer/vocab.bin");
-                        if (access(default_vocab, R_OK) != 0) {
-                            snprintf(default_vocab, sizeof(default_vocab),
-                                     "vocab.bin");
-                        }
-                    }
-                }
-            }
             vocab_path = default_vocab;
         }
 
@@ -8264,18 +8223,10 @@ int main(int argc, char **argv) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/flashchat/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
-            if (pfd < 0) {
-                snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
-                pfd = open(probe, O_RDONLY);
-            }
             if (pfd >= 0) {
                 close(pfd);
                 snprintf(probe, sizeof(probe), "%s/flashchat/packed_experts/layer_00.bin", model_path);
                 int pfd4 = open(probe, O_RDONLY);
-                if (pfd4 < 0) {
-                    snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
-                    pfd4 = open(probe, O_RDONLY);
-                }
                 if (pfd4 < 0) {
                     g_use_2bit = 1;
                     printf("[auto] Using 2-bit experts (4-bit not found)\n");
@@ -8306,11 +8257,6 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/flashchat/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
-            if (layer_fds[i] < 0) {
-                snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                         g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
-                layer_fds[i] = open(path, O_RDONLY);
-            }
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
@@ -8339,17 +8285,11 @@ int main(int argc, char **argv) {
         {
             char lz4_probe[1024];
             snprintf(lz4_probe, sizeof(lz4_probe), "%s/flashchat/packed_experts_lz4/layer_00.bin", model_path);
-            if (!g_use_2bit && access(lz4_probe, R_OK) != 0) {
-                snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
-            }
             if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < g_cfg.num_layers; i++) {
                     char lz4_path[1024];
                     snprintf(lz4_path, sizeof(lz4_path), "%s/flashchat/packed_experts_lz4/layer_%02d.bin", model_path, i);
-                    if (access(lz4_path, R_OK) != 0) {
-                        snprintf(lz4_path, sizeof(lz4_path), "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
-                    }
                     int lz4_fd = open(lz4_path, O_RDONLY);
                     if (lz4_fd >= 0) {
                         // Load index header (512 entries × 16 bytes = 8KB)

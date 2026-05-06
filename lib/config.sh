@@ -2,7 +2,7 @@
 # config.sh — Flashchat Configuration Loader
 #
 # Loads configuration with the following priority (highest to lowest):
-#   1. ./flashchat.config (project-local)
+#   1. --config FILE (explicit override)
 #   2. ~/.config/flashchat/config (user)
 #   3. Environment variables (FLASHCHAT_*)
 #   4. Hardcoded defaults
@@ -14,9 +14,11 @@
 
 set -e
 
+FLASHCHAT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLASHCHAT_REPO_ROOT="$(cd "${FLASHCHAT_LIB_DIR}/.." && pwd)"
 FLASHCHAT_CONFIG_DIR="${HOME}/.config/flashchat"
 FLASHCHAT_CONFIG_FILE=""
-FLASHCHAT_PROJECT_CONFIG="./flashchat.config"
+FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG:-${FLASHCHAT_REPO_ROOT}/assets/model_configs.json}"
 
 # Default configuration values
 FLASHCHAT_DEFAULT_MODEL="qwen3.6-35B-A3B"
@@ -54,11 +56,11 @@ EXPERTS_DIR=""
 EXPERTS_2BIT_DIR=""
 
 # -----------------------------------------------------------------------------
-# Look up model repo from model_configs.json
+# Look up model repo from the bundled model registry.
 # -----------------------------------------------------------------------------
 _flashchat_lookup_model_repo() {
     local model_id="${1:-$FLASHCHAT_DEFAULT_MODEL}"
-    local config_file="${FLASHCHAT_CONFIG_JSON:-./model_configs.json}"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
     if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
         python3 -c "
 import json, sys
@@ -67,28 +69,6 @@ try:
         data = json.load(f)
     model = data.get('models', {}).get('$model_id', {})
     print(model.get('hf_repo', ''))
-except Exception:
-    pass
-" 2>/dev/null
-    fi
-}
-
-# -----------------------------------------------------------------------------
-# Reverse-lookup model ID from repo in model_configs.json
-# -----------------------------------------------------------------------------
-_flashchat_lookup_model_id() {
-    local repo="$1"
-    local config_file="${FLASHCHAT_CONFIG_JSON:-./model_configs.json}"
-    if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
-        python3 -c "
-import json, sys
-try:
-    with open('$config_file') as f:
-        data = json.load(f)
-    for mid, info in data.get('models', {}).items():
-        if info.get('hf_repo') == '$repo':
-            print(mid)
-            break
 except Exception:
     pass
 " 2>/dev/null
@@ -123,7 +103,6 @@ _flashchat_detect_model_path() {
 # Compute derived paths based on config
 # -----------------------------------------------------------------------------
 _flashchat_compute_paths() {
-    local model_id="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
     if [ -n "$MODEL_PATH" ]; then
         WEIGHTS_DIR="${WEIGHTS_DIR:-${MODEL_PATH}/flashchat}"
         EXPERTS_DIR="${MODEL_PATH}/flashchat/packed_experts"
@@ -152,25 +131,40 @@ _flashchat_source_config() {
 # Load configuration with priority
 # -----------------------------------------------------------------------------
 flashchat_load_config() {
-    # Ensure config directory exists
     mkdir -p "$FLASHCHAT_CONFIG_DIR"
-    
-    # 1. Project-local config (highest priority)
-    if [ -f "$FLASHCHAT_PROJECT_CONFIG" ]; then
-        FLASHCHAT_CONFIG_FILE="$FLASHCHAT_PROJECT_CONFIG"
-        _flashchat_source_config "$FLASHCHAT_PROJECT_CONFIG"
-    # 2. User config
+
+    MODEL=""
+    MODEL_REPO=""
+    QUANTIZATION=""
+    MAX_TOKENS=""
+    SERVER_PORT=""
+    SERVER_HOST=""
+    SERVER_LOG_PATH=""
+    SHOW_THINKING=""
+    SERVER_DEBUG=""
+    SERVER_HTTP_LOG=""
+    COLOR_OUTPUT=""
+    TEMPERATURE=""
+    TOP_P=""
+    MODEL_PATH=""
+    WEIGHTS_DIR=""
+    EXPERTS_DIR=""
+    EXPERTS_2BIT_DIR=""
+
+    local override_config="${FLASHCHAT_CONFIG_FILE_OVERRIDE:-${CONFIG_FILE:-}}"
+
+    if [ -n "$override_config" ]; then
+        FLASHCHAT_CONFIG_FILE="$override_config"
+        _flashchat_source_config "$override_config"
     elif [ -f "${FLASHCHAT_CONFIG_DIR}/config" ]; then
         FLASHCHAT_CONFIG_FILE="${FLASHCHAT_CONFIG_DIR}/config"
         _flashchat_source_config "${FLASHCHAT_CONFIG_DIR}/config"
-    # 3. No config file - use default path
     else
         FLASHCHAT_CONFIG_FILE="${FLASHCHAT_CONFIG_DIR}/config"
     fi
     
     # 3. Environment variables override
     [ -n "$FLASHCHAT_MODEL" ] && MODEL="$FLASHCHAT_MODEL"
-    [ -n "$FLASHCHAT_MODEL_REPO" ] && MODEL_REPO="$FLASHCHAT_MODEL_REPO"
     [ -n "$FLASHCHAT_MODEL_PATH" ] && MODEL_PATH="$FLASHCHAT_MODEL_PATH"
     [ -n "$FLASHCHAT_QUANTIZATION" ] && QUANTIZATION="$FLASHCHAT_QUANTIZATION"
     [ -n "$FLASHCHAT_MAX_TOKENS" ] && MAX_TOKENS="$FLASHCHAT_MAX_TOKENS"
@@ -186,24 +180,13 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_WEIGHTS_DIR" ] && WEIGHTS_DIR="$FLASHCHAT_WEIGHTS_DIR"
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
-    # 4. Apply defaults for any missing values
-    if [ -z "$MODEL" ] && [ -n "$MODEL_REPO" ]; then
-        local looked_up_id
-        looked_up_id=$(_flashchat_lookup_model_id "$MODEL_REPO")
-        if [ -n "$looked_up_id" ]; then
-            MODEL="$looked_up_id"
-        else
-            MODEL="$FLASHCHAT_DEFAULT_MODEL"
-        fi
-    elif [ -z "$MODEL" ]; then
+    if [ -z "$MODEL" ]; then
         MODEL="$FLASHCHAT_DEFAULT_MODEL"
     fi
-    if [ -z "$MODEL_REPO" ]; then
-        local looked_up_repo
-        looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
-        if [ -n "$looked_up_repo" ]; then
-            MODEL_REPO="$looked_up_repo"
-        fi
+    local looked_up_repo
+    looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
+    if [ -n "$looked_up_repo" ]; then
+        MODEL_REPO="$looked_up_repo"
     fi
     QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
@@ -246,6 +229,7 @@ flashchat_get() {
         EXPERTS_2BIT_DIR) echo "$EXPERTS_2BIT_DIR" ;;
         CONFIG_FILE) echo "$FLASHCHAT_CONFIG_FILE" ;;
         CONFIG_DIR) echo "$FLASHCHAT_CONFIG_DIR" ;;
+        MODEL_CONFIG) echo "$FLASHCHAT_MODEL_CONFIG" ;;
         *) echo "" ;;
     esac
 }
@@ -254,8 +238,9 @@ flashchat_get() {
 # Create default config file
 # -----------------------------------------------------------------------------
 flashchat_create_default_config() {
-    mkdir -p "$FLASHCHAT_CONFIG_DIR"
-    cat > "${FLASHCHAT_CONFIG_DIR}/config" << EOF
+    local config_file="${FLASHCHAT_CONFIG_FILE:-${FLASHCHAT_CONFIG_DIR}/config}"
+    mkdir -p "$(dirname "$config_file")"
+    cat > "$config_file" << EOF
 # Flashchat Configuration
 # Generated on $(date)
 
@@ -281,14 +266,19 @@ SERVER_HTTP_LOG="${SERVER_HTTP_LOG:-$FLASHCHAT_DEFAULT_SERVER_HTTP_LOG}"
 SHOW_THINKING="${SHOW_THINKING:-$FLASHCHAT_DEFAULT_SHOW_THINKING}"
 COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
 EOF
-    FLASHCHAT_CONFIG_FILE="${FLASHCHAT_CONFIG_DIR}/config"
+    FLASHCHAT_CONFIG_FILE="$config_file"
 }
 
 # -----------------------------------------------------------------------------
 # Check if config exists
 # -----------------------------------------------------------------------------
 flashchat_has_config() {
-    [ -f "$FLASHCHAT_PROJECT_CONFIG" ] || [ -f "${FLASHCHAT_CONFIG_DIR}/config" ]
+    local override_config="${FLASHCHAT_CONFIG_FILE_OVERRIDE:-${CONFIG_FILE:-}}"
+    if [ -n "$override_config" ]; then
+        [ -f "$override_config" ]
+    else
+        [ -f "${FLASHCHAT_CONFIG_DIR}/config" ]
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -315,14 +305,14 @@ export -f flashchat_get_pid_file
 export -f flashchat_get_sessions_dir
 
 # -----------------------------------------------------------------------------
-# Lookup model config from model_configs.json
+# Lookup model config from the bundled model registry.
 # -----------------------------------------------------------------------------
 _flashchat_lookup_model_config() {
     local model_id="$1"
     python3 -c "
 import json
 import sys
-with open('model_configs.json', 'r') as f:
+with open('$FLASHCHAT_MODEL_CONFIG', 'r') as f:
     data = json.load(f)
 model = data['models'].get('$model_id')
 if model:

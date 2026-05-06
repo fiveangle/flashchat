@@ -20,7 +20,7 @@ def parse_safetensors_header(filepath):
 
 
 def get_default_model_path():
-    model_repo = os.environ.get('FLASHCHAT_MODEL_REPO', 'Qwen/Qwen3.6-35B-A3B')
+    model_repo = 'mlx-community/Qwen3.6-35B-A3B-4bit'
     escaped_repo = model_repo.replace('/', '--')
     hf_cache = os.path.expanduser('~/.cache/huggingface/hub')
     snapshot_dir = f"{hf_cache}/models--{escaped_repo}/snapshots"
