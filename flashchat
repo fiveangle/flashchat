@@ -27,7 +27,7 @@
 #     1. --config FILE (explicit override)
 #     2. ~/.config/flashchat/config (user)
 #     3. Environment variables (FLASHCHAT_*)
-#     4. Hardcoded defaults
+#     4. Registry/default values
 
 set -e
 set +m  # Disable job control messages
@@ -130,7 +130,7 @@ Configuration:
     1. --config FILE (explicit override)
     2. ~/.config/flashchat/config (user)
     3. Environment variables (FLASHCHAT_*)
-    4. Hardcoded defaults
+    4. Registry/default values
 
 Environment variables:
   FLASHCHAT_MODEL           Model ID (default: qwen3.6-35B-A3B)

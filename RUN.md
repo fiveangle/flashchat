@@ -170,14 +170,14 @@ Configuration is loaded from (priority highest to lowest):
 1. `--config FILE` (explicit override)
 2. `~/.config/flashchat/config` (user)
 3. Environment variables (`FLASHCHAT_*`)
-4. Hardcoded defaults
+4. Registry/default values
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
-| `FLASHCHAT_MODEL_CONFIG` | Model registry path | `assets/model_configs.json` |
+| `FLASHCHAT_MODEL_CONFIG` | Model registry path, including the default model and active setup scripts | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
 | `FLASHCHAT_QUANTIZATION` | Expert quantization. `2bit` is deprecated. | `4bit` |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |

@@ -11,10 +11,10 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import sys
-from pathlib import Path
+
+from flashchat_registry import load_registry, model_ids, model_script_path, registry_path, repo_root
 
 def main():
     parser = argparse.ArgumentParser(description='Repack experts dispatcher')
@@ -29,24 +29,21 @@ def main():
         print("ERROR: No model-id specified. Use --model-id or set FLASHCHAT_MODEL", file=sys.stderr)
         sys.exit(1)
 
-    repo_root = Path(__file__).resolve().parents[1]
-    config_path = Path(os.environ.get('FLASHCHAT_MODEL_CONFIG', repo_root / 'assets' / 'model_configs.json'))
-    with open(config_path) as f:
-        configs = json.load(f)
+    configs = load_registry()
+    config_path = registry_path()
 
     if args.model_id not in configs['models']:
         print(f"ERROR: Model '{args.model_id}' not found in {config_path}", file=sys.stderr)
-        print(f"Available models: {list(configs['models'].keys())}", file=sys.stderr)
+        print(f"Available models: {model_ids(configs)}", file=sys.stderr)
         sys.exit(1)
 
-    script_name = configs['models'][args.model_id]['scripts']['repack_experts']
-    script_path = repo_root / script_name
+    script_path = model_script_path(args.model_id, 'repack_experts', configs)
 
-    if not os.path.exists(script_path):
+    if not script_path or not os.path.exists(script_path):
         print(f"ERROR: Script {script_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Running {script_name} for model {args.model_id}")
+    print(f"Running {script_path.relative_to(repo_root())} for model {args.model_id}")
     script_args = [str(script_path)]
     i = 1
     while i < len(sys.argv):

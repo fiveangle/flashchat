@@ -220,6 +220,8 @@ echo ""
 echo "=== Models Command ==="
 echo ""
 
+run_test "model registry json valid" python3 -m json.tool "${REPO_ROOT}/assets/model_configs.json"
+run_test "model registry omits deprecated 2bit scripts" python3 -c "import json, sys; data=json.load(open('${REPO_ROOT}/assets/model_configs.json')); sys.exit(any('repack_experts_2bit' in model.get('scripts', {}) for model in data.get('models', {}).values()))"
 run_test_contains "models basic" "Flashchat Models" "$FLASHCHAT" models
 run_test_contains "models current marker" "* Current model" "$FLASHCHAT" models
 run_test_contains "models artifact status" "4-bit experts:" "$FLASHCHAT" models

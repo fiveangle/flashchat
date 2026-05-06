@@ -7917,7 +7917,7 @@ static void serve_loop(
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  --model-id ID        Model ID from assets/model_configs.json (default: qwen3.6-35B-A3B)\n");
+    printf("  --model-id ID        Model ID from assets/model_configs.json (default from registry)\n");
     printf("  --model PATH         Model path\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
@@ -7932,7 +7932,7 @@ static void print_usage(const char *prog) {
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
-    printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --2bit               Use deprecated 2-bit experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -8100,11 +8100,17 @@ int main(int argc, char **argv) {
             }
         }
 
+        const char *config_json_path = resolve_model_config_path();
+
         // Load model configuration from registry
         if (!model_id) {
-            model_id = "qwen3.6-35B-A3B";
+            static char default_model_id[64];
+            if (load_default_model_id(config_json_path, default_model_id, sizeof(default_model_id)) == 0) {
+                model_id = default_model_id;
+            } else {
+                model_id = "qwen3.6-35B-A3B";
+            }
         }
-        const char *config_json_path = resolve_model_config_path();
         if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;

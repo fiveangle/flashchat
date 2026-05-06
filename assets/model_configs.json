@@ -28,8 +28,7 @@
       },
       "scripts": {
         "extract_weights": "scripts/models/qwen3.5-397B-A17B-extract_weights.py",
-        "repack_experts": "scripts/models/qwen3.5-397B-A17B-repack_experts.py",
-        "repack_experts_2bit": "scripts/repack_experts_2bit.py"
+        "repack_experts": "scripts/models/qwen3.5-397B-A17B-repack_experts.py"
       },
       "special_tokens": {
         "eos_1": 248046,
@@ -66,8 +65,7 @@
       },
       "scripts": {
         "extract_weights": "scripts/models/qwen3.6-35B-A3B-extract_weights.py",
-        "repack_experts": "scripts/models/qwen3.6-35B-A3B-repack_experts.py",
-        "repack_experts_2bit": "scripts/repack_experts_2bit.py"
+        "repack_experts": "scripts/models/qwen3.6-35B-A3B-repack_experts.py"
       },
       "special_tokens": {
         "eos_1": 248046,

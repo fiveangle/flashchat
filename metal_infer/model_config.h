@@ -100,7 +100,6 @@ typedef struct {
 
     char extract_weights_script[128];
     char repack_experts_script[128];
-    char repack_experts_2bit_script[128];
 } ModelConfig;
 
 // ============================================================================
@@ -160,6 +159,28 @@ static const char *resolve_model_config_path(void) {
     if (env_path && env_path[0]) return env_path;
     if (access("assets/model_configs.json", R_OK) == 0) return "assets/model_configs.json";
     return "../assets/model_configs.json";
+}
+
+static int load_default_model_id(const char *json_path, char *out, size_t out_len) {
+    FILE *f = fopen(json_path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *json = malloc(size + 1);
+    if (!json) { fclose(f); return -1; }
+    fread(json, 1, size, f);
+    json[size] = '\0';
+    fclose(f);
+
+    const char *p = json_find_key(json, "default_model");
+    int rc = -1;
+    if (p && json_parse_string(p, out, out_len) == 0 && out[0]) {
+        rc = 0;
+    }
+    free(json);
+    return rc;
 }
 
 static int load_model_config(const char *json_path, const char *model_id, ModelConfig *cfg) {
@@ -256,7 +277,6 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
         const char *sp;
         sp = json_find_key(p, "extract_weights"); if (sp) json_parse_string(sp, cfg->extract_weights_script, sizeof(cfg->extract_weights_script));
         sp = json_find_key(p, "repack_experts"); if (sp) json_parse_string(sp, cfg->repack_experts_script, sizeof(cfg->repack_experts_script));
-        sp = json_find_key(p, "repack_experts_2bit"); if (sp) json_parse_string(sp, cfg->repack_experts_2bit_script, sizeof(cfg->repack_experts_2bit_script));
     }
 
 #undef CFG_INT

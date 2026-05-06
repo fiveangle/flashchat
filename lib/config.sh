@@ -5,7 +5,7 @@
 #   1. --config FILE (explicit override)
 #   2. ~/.config/flashchat/config (user)
 #   3. Environment variables (FLASHCHAT_*)
-#   4. Hardcoded defaults
+#   4. Registry/default values
 #
 # Usage:
 #   source lib/config.sh          # Load config
@@ -56,22 +56,39 @@ EXPERTS_DIR=""
 EXPERTS_2BIT_DIR=""
 
 # -----------------------------------------------------------------------------
-# Look up model repo from the bundled model registry.
+# Look up model defaults from the bundled model registry.
 # -----------------------------------------------------------------------------
-_flashchat_lookup_model_repo() {
-    local model_id="${1:-$FLASHCHAT_DEFAULT_MODEL}"
+flashchat_default_model() {
     local config_file="$FLASHCHAT_MODEL_CONFIG"
     if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
         python3 -c "
 import json, sys
 try:
-    with open('$config_file') as f:
+    with open(sys.argv[1]) as f:
         data = json.load(f)
-    model = data.get('models', {}).get('$model_id', {})
+    print(data.get('default_model') or sys.argv[2])
+except Exception:
+    print(sys.argv[2])
+" "$config_file" "$FLASHCHAT_DEFAULT_MODEL" 2>/dev/null
+    else
+        echo "$FLASHCHAT_DEFAULT_MODEL"
+    fi
+}
+
+_flashchat_lookup_model_repo() {
+    local model_id="${1:-$(flashchat_default_model)}"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    if [ -f "$config_file" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    model = data.get('models', {}).get(sys.argv[2], {})
     print(model.get('hf_repo', ''))
 except Exception:
     pass
-" 2>/dev/null
+" "$config_file" "$model_id" 2>/dev/null
     fi
 }
 
@@ -250,12 +267,14 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_WEIGHTS_DIR" ] && WEIGHTS_DIR="$FLASHCHAT_WEIGHTS_DIR"
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
+    local default_model
+    default_model=$(flashchat_default_model)
     if [ -z "$MODEL" ]; then
-        MODEL="$FLASHCHAT_DEFAULT_MODEL"
+        MODEL="$default_model"
     fi
     if ! flashchat_model_exists "$MODEL"; then
-        echo "WARNING: configured model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG; using $FLASHCHAT_DEFAULT_MODEL" >&2
-        MODEL="$FLASHCHAT_DEFAULT_MODEL"
+        echo "WARNING: configured model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG; using $default_model" >&2
+        MODEL="$default_model"
     fi
     local looked_up_repo
     looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
@@ -322,9 +341,9 @@ flashchat_create_default_config() {
 # Generated on $(date)
 
 # Model Settings
-MODEL="${MODEL:-$FLASHCHAT_DEFAULT_MODEL}"
+MODEL="${MODEL:-$(flashchat_default_model)}"
 
-# Quantization: 4bit or 2bit
+# Quantization: 4bit. 2bit is deprecated.
 QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
 
 # Generation Defaults
@@ -380,6 +399,7 @@ export -f flashchat_create_default_config
 export -f flashchat_has_config
 export -f flashchat_get_pid_file
 export -f flashchat_get_sessions_dir
+export -f flashchat_default_model
 export -f flashchat_model_exists
 export -f flashchat_model_field
 export -f flashchat_model_name
@@ -387,21 +407,3 @@ export -f flashchat_model_repo
 export -f flashchat_model_layers
 export -f flashchat_model_path_for_id
 export -f flashchat_list_models
-
-# -----------------------------------------------------------------------------
-# Lookup model config from the bundled model registry.
-# -----------------------------------------------------------------------------
-_flashchat_lookup_model_config() {
-    local model_id="$1"
-    python3 -c "
-import json
-import sys
-with open('$FLASHCHAT_MODEL_CONFIG', 'r') as f:
-    data = json.load(f)
-model = data['models'].get('$model_id')
-if model:
-    print(model['hf_repo'])
-else:
-    sys.exit(1)
-"
-}
