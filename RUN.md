@@ -328,4 +328,6 @@ For OpenCode, a working provider entry looks like:
 | `<model>/flashchat/packed_experts/` | 218GB | 4-bit expert weights |
 | `<model>/flashchat/packed_experts_2bit/` | 120GB | Deprecated 2-bit expert weights |
 | `~/.config/flashchat/config` | - | User configuration |
-| `~/.flashchat/sessions/` | - | Chat session history |
+| `~/.config/flashchat/sessions/` | - | Chat session history |
+| `~/.config/flashchat/history` | - | Interactive prompt history |
+| `~/.config/flashchat/system.md` | - | Optional custom system prompt |

@@ -2,7 +2,7 @@
  * chat.m — Interactive TUI chat client for Flashchat inference server
  *
  * Thin HTTP/SSE client with session persistence.
- * Conversations saved to ~/.flashchat/sessions/<session_id>.jsonl
+ * Conversations saved to ~/.config/flashchat/sessions/<session_id>.jsonl
  * Resume with: ./chat --resume <session_id>
  *
  * Build:  make chat
@@ -25,7 +25,7 @@
 
 #define MAX_INPUT_LINE 4096
 #define MAX_RESPONSE (1024 * 1024)
-#define SESSIONS_DIR_BASE ".flashchat/sessions"
+#define FLASHCHAT_CONFIG_BASE ".config/flashchat"
 
 static double now_ms(void) {
     struct timeval tv;
@@ -54,16 +54,38 @@ static int json_escape(const char *src, char *buf, int bufsize) {
 // ============================================================================
 
 static char g_sessions_dir[1024];
+static char g_history_path[1024];
+
+static void init_app_state_paths(void) {
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+
+    const char *sessions_env = getenv("FLASHCHAT_SESSIONS_DIR");
+    if (sessions_env && sessions_env[0]) {
+        snprintf(g_sessions_dir, sizeof(g_sessions_dir), "%s", sessions_env);
+    } else {
+        snprintf(g_sessions_dir, sizeof(g_sessions_dir), "%s/%s/sessions", home, FLASHCHAT_CONFIG_BASE);
+    }
+
+    const char *history_env = getenv("FLASHCHAT_HISTORY_FILE");
+    if (history_env && history_env[0]) {
+        snprintf(g_history_path, sizeof(g_history_path), "%s", history_env);
+    } else {
+        snprintf(g_history_path, sizeof(g_history_path), "%s/%s/history", home, FLASHCHAT_CONFIG_BASE);
+    }
+}
 
 static void init_sessions_dir(void) {
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
-    snprintf(g_sessions_dir, sizeof(g_sessions_dir), "%s/%s", home, SESSIONS_DIR_BASE);
-    mkdir(g_sessions_dir, 0755);
-    // Also create parent
-    char parent[1024];
-    snprintf(parent, sizeof(parent), "%s/.flashchat", home);
-    mkdir(parent, 0755);
+    init_app_state_paths();
+    mkdir(home, 0755);
+    char config_parent[1024];
+    snprintf(config_parent, sizeof(config_parent), "%s/.config", home);
+    mkdir(config_parent, 0755);
+    char app_parent[1024];
+    snprintf(app_parent, sizeof(app_parent), "%s/%s", home, FLASHCHAT_CONFIG_BASE);
+    mkdir(app_parent, 0755);
     mkdir(g_sessions_dir, 0755);
 }
 
@@ -576,9 +598,7 @@ int main(int argc, char **argv) {
 
     // Set up linenoise: history, hints
     linenoiseSetMultiLine(1);  // allow multi-line input with arrow keys
-    char history_path[1024];
-    snprintf(history_path, sizeof(history_path), "%s/.flashchat/history", getenv("HOME") ?: "/tmp");
-    linenoiseHistoryLoad(history_path);
+    linenoiseHistoryLoad(g_history_path);
     linenoiseHistorySetMaxLen(500);
 
     for (;;) {
@@ -593,7 +613,7 @@ int main(int argc, char **argv) {
 
         // Add to history
         linenoiseHistoryAdd(line);
-        linenoiseHistorySave(history_path);
+        linenoiseHistorySave(g_history_path);
 
         char input_line[MAX_INPUT_LINE];
         strncpy(input_line, line, MAX_INPUT_LINE - 1);

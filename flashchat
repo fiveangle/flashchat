@@ -242,6 +242,7 @@ cmd_status() {
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
+    echo "User state: $(flashchat_get CONFIG_DIR)"
 }
 
 # -----------------------------------------------------------------------------
@@ -358,6 +359,7 @@ cmd_config() {
             if [[ $REPLY =~ ^[Yy]$ ]]; then
                 rm -f "$config_file"
                 rm -rf "$(flashchat_get_sessions_dir)"
+                rm -f "$(flashchat_get_history_file)" "$(flashchat_get_system_prompt_file)"
                 echo "Full reset complete. All data deleted."
             else
                 echo "Cancelled."
@@ -1716,7 +1718,8 @@ cmd_serve() {
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
-    
+    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
+    export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
 
     "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" > /dev/null 2>&1 &
@@ -1800,7 +1803,9 @@ cmd_chat() {
     
     local chat_args=""
     [ -n "$server_port" ] && chat_args="--port $server_port"
-export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
+    export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
+    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
+    export FLASHCHAT_HISTORY_FILE="$(flashchat_get_history_file)"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
     
     ./chat $chat_args
@@ -2212,6 +2217,8 @@ cmd_benchmark() {
     export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
+    export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     
     cd "$SCRIPT_DIR/metal_infer"
     ensure_binaries

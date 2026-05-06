@@ -385,11 +385,22 @@ flashchat_get_pid_file() {
 }
 
 # -----------------------------------------------------------------------------
-# Get sessions directory
-# Note: Uses ~/.flashchat/sessions for compatibility with existing chat.m
+# Get Flashchat user/app state paths
 # -----------------------------------------------------------------------------
+flashchat_get_data_dir() {
+    echo "$FLASHCHAT_CONFIG_DIR"
+}
+
 flashchat_get_sessions_dir() {
-    echo "${HOME}/.flashchat/sessions"
+    echo "${FLASHCHAT_CONFIG_DIR}/sessions"
+}
+
+flashchat_get_history_file() {
+    echo "${FLASHCHAT_CONFIG_DIR}/history"
+}
+
+flashchat_get_system_prompt_file() {
+    echo "${FLASHCHAT_CONFIG_DIR}/system.md"
 }
 
 # Export functions for use in subshells
@@ -397,8 +408,11 @@ export -f flashchat_load_config
 export -f flashchat_get
 export -f flashchat_create_default_config
 export -f flashchat_has_config
+export -f flashchat_get_data_dir
 export -f flashchat_get_pid_file
 export -f flashchat_get_sessions_dir
+export -f flashchat_get_history_file
+export -f flashchat_get_system_prompt_file
 export -f flashchat_default_model
 export -f flashchat_model_exists
 export -f flashchat_model_field

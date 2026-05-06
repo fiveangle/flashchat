@@ -239,15 +239,15 @@ run_test_contains "sessions list empty" "Chat Sessions" "$FLASHCHAT"  sessions
 run_test_contains "sessions list no sessions" "(no sessions)" "$FLASHCHAT"  sessions
 
 # Create a fake session for testing
-mkdir -p "${TMPDIR}/.flashchat/sessions"
-echo '{"role":"user","content":"test"}' > "${TMPDIR}/.flashchat/sessions/test_session.jsonl"
+mkdir -p "${TMPDIR}/.config/flashchat/sessions"
+echo '{"role":"user","content":"test"}' > "${TMPDIR}/.config/flashchat/sessions/test_session.jsonl"
 
 run_test_contains "sessions list with session" "test_session" "$FLASHCHAT"  sessions
 
-echo '{"role":"user","content":"delete me"}' > "${TMPDIR}/.flashchat/sessions/delete_me.jsonl"
+echo '{"role":"user","content":"delete me"}' > "${TMPDIR}/.config/flashchat/sessions/delete_me.jsonl"
 run_test_contains "sessions delete list before" "delete_me" "$FLASHCHAT"  sessions
 run_test "sessions delete command" "$FLASHCHAT"  sessions --delete delete_me
-if [[ -f "${TMPDIR}/.flashchat/sessions/delete_me.jsonl" ]]; then
+if [[ -f "${TMPDIR}/.config/flashchat/sessions/delete_me.jsonl" ]]; then
     assert_fail "sessions delete verify file removed" "session file still exists"
 else
     assert_pass "sessions delete verify file removed"

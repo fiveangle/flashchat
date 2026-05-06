@@ -6619,18 +6619,26 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     }, req, err_msg);
 }
 
-// Save a conversation turn to ~/.flashchat/sessions/<session_id>.jsonl
+// Save a conversation turn to ~/.config/flashchat/sessions/<session_id>.jsonl
 // Shared data store with the chat client.
 static void server_save_turn(const char *session_id, const char *role, const char *content) {
     if (!session_id || !session_id[0] || !content) return;
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     char dir[1024], path[1024];
-    snprintf(dir, sizeof(dir), "%s/.flashchat/sessions", home);
-    mkdir(dir, 0755);
-    char parent[1024];
-    snprintf(parent, sizeof(parent), "%s/.flashchat", home);
-    mkdir(parent, 0755);
+    const char *sessions_env = getenv("FLASHCHAT_SESSIONS_DIR");
+    if (sessions_env && sessions_env[0]) {
+        snprintf(dir, sizeof(dir), "%s", sessions_env);
+    } else {
+        snprintf(dir, sizeof(dir), "%s/.config/flashchat/sessions", home);
+    }
+    char config_parent[1024];
+    mkdir(home, 0755);
+    snprintf(config_parent, sizeof(config_parent), "%s/.config", home);
+    mkdir(config_parent, 0755);
+    char app_parent[1024];
+    snprintf(app_parent, sizeof(app_parent), "%s/.config/flashchat", home);
+    mkdir(app_parent, 0755);
     mkdir(dir, 0755);
     snprintf(path, sizeof(path), "%s/%s.jsonl", dir, session_id);
     FILE *f = fopen(path, "a");
@@ -7199,24 +7207,28 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     return pt;
 }
 
-// Load custom system prompt from ~/.flashchat/system.md, or use default
+// Load custom system prompt from ~/.config/flashchat/system.md, or use default
 static char *load_system_prompt(void) {
     const char *home = getenv("HOME");
-    if (home) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/.flashchat/system.md", home);
+    char path[1024] = {0};
+    const char *prompt_env = getenv("FLASHCHAT_SYSTEM_PROMPT");
+    if (prompt_env && prompt_env[0]) {
+        snprintf(path, sizeof(path), "%s", prompt_env);
+    } else if (home) {
+        snprintf(path, sizeof(path), "%s/.config/flashchat/system.md", home);
+    }
+    if (path[0]) {
         FILE *f = fopen(path, "r");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long sz = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            char *buf = malloc(sz + 1);
-            size_t n = fread(buf, 1, sz, f);
-            buf[n] = 0;
-            fclose(f);
-            fprintf(stderr, "[serve] Loaded custom system prompt from %s (%ld bytes)\n", path, sz);
-            return buf;
-        }
+        if (!f) return strdup("You are a helpful assistant. /think");
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = malloc(sz + 1);
+        size_t n = fread(buf, 1, sz, f);
+        buf[n] = 0;
+        fclose(f);
+        fprintf(stderr, "[serve] Loaded custom system prompt from %s (%ld bytes)\n", path, sz);
+        return buf;
     }
     return strdup("You are a helpful assistant. /think");
 }

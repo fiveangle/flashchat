@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 FLASHCHAT_CONFIG_DIR="${HOME}/.config/flashchat"
-FLASHCHAT_SESSIONS_DIR="${HOME}/.flashchat/sessions"
+FLASHCHAT_SESSIONS_DIR="${HOME}/.config/flashchat/sessions"
 HF_CACHE_DIR="${HOME}/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit"
 SUFFIX=".live"
 

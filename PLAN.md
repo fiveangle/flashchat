@@ -25,7 +25,7 @@ This document captures the implementation plan for the Flashchat unified managem
 | Config location | `~/.config/flashchat/config` |
 | Config created | Automatically on first run |
 | PID file | `~/.config/flashchat/server.pid` |
-| Sessions | `~/.flashchat/sessions/` |
+| Sessions | `~/.config/flashchat/sessions/` |
 | Reset | `flashchat config` → re-run setup wizard (retains sessions) |
 
 ### Command Interface
