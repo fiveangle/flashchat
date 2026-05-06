@@ -24,6 +24,14 @@ HOSTNAME_VALUE=""
 HW_MODEL_VALUE=""
 RAM_GIB_VALUE=""
 CPU_SUMMARY_VALUE=""
+PASSED=0
+FAILED=0
+SKIPPED=0
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
 usage() {
     cat <<EOF
@@ -122,18 +130,24 @@ require_file() {
     local path="$1"
     local label="$2"
     if [[ ! -f "${path}" ]]; then
+        FAILED=$((FAILED + 1))
+        echo -e "${RED}FAIL${NC}  ${label} preflight" >&2
         echo "ERROR: ${label} is not available for ${MODEL_ID}." >&2
         echo "Expected: ${path}" >&2
         echo "Run ./flashchat setup first, or select a configured model with completed runtime artifacts." >&2
+        print_summary
         exit 1
     fi
 }
 
 preflight_model_artifacts() {
     if [[ -z "${MODEL_PATH}" || "${MODEL_PATH}" == *"<snapshot>"* || ! -d "${MODEL_PATH}" ]]; then
+        FAILED=$((FAILED + 1))
+        echo -e "${RED}FAIL${NC}  model snapshot preflight" >&2
         echo "ERROR: Model is not downloaded for ${MODEL_ID}." >&2
         echo "Expected model snapshot: ${MODEL_PATH}" >&2
         echo "Run ./flashchat setup first, or select a configured model with downloaded weights." >&2
+        print_summary
         exit 1
     fi
 
@@ -356,11 +370,15 @@ assert_contains() {
     local pattern="$2"
     local label="$3"
     if ! grep -q "$pattern" "$file"; then
-        echo "FAIL: ${label}" >&2
+        FAILED=$((FAILED + 1))
+        echo -e "${RED}FAIL${NC}  ${label}" >&2
         echo "--- ${file} ---" >&2
         cat "$file" >&2
+        print_summary
         exit 1
     fi
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}PASS${NC}  ${label}"
 }
 
 assert_not_contains() {
@@ -368,10 +386,30 @@ assert_not_contains() {
     local pattern="$2"
     local label="$3"
     if grep -q "$pattern" "$file"; then
-        echo "FAIL: ${label}" >&2
+        FAILED=$((FAILED + 1))
+        echo -e "${RED}FAIL${NC}  ${label}" >&2
         echo "--- ${file} ---" >&2
         cat "$file" >&2
+        print_summary
         exit 1
+    fi
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}PASS${NC}  ${label}"
+}
+
+print_summary() {
+    echo ""
+    echo "========================================"
+    echo "Flashchat API Smoke Test Summary"
+    echo "========================================"
+    echo -e "${GREEN}Passed:${NC}  $PASSED"
+    echo -e "${RED}Failed:${NC}  $FAILED"
+    echo -e "${YELLOW}Skipped:${NC} $SKIPPED"
+    echo ""
+    if [[ $FAILED -gt 0 ]]; then
+        echo -e "${RED}Some tests failed.${NC}"
+    else
+        echo -e "${GREEN}All tests passed!${NC}"
     fi
 }
 
@@ -398,8 +436,11 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
     STARTED_SERVER=1
     SERVER_MODE="fresh"
     if ! wait_for_server; then
+        FAILED=$((FAILED + 1))
+        echo -e "${RED}FAIL${NC}  server became ready" >&2
         echo "ERROR: server did not become ready" >&2
         [[ -f "${TMPDIR}/server.log" ]] && cat "${TMPDIR}/server.log" >&2
+        print_summary
         exit 1
     fi
 else
@@ -640,5 +681,4 @@ echo ""
 if [[ $PERF_LOG_ENABLED -eq 1 ]]; then
     echo "Perf log: ${PERF_LOG_PATH}"
 fi
-echo ""
-echo "PASS: API smoke test completed successfully."
+print_summary

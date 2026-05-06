@@ -427,7 +427,7 @@ fi
 
 echo ""
 echo "========================================"
-echo "Test Summary"
+echo "Flashchat CLI Smoke Test Summary"
 echo "========================================"
 echo -e "${GREEN}Passed:${NC}  $PASSED"
 echo -e "${RED}Failed:${NC}  $FAILED"
