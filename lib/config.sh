@@ -22,7 +22,6 @@ FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG:-${FLASHCHAT_REPO_ROOT}/assets/
 
 # Default configuration values
 FLASHCHAT_DEFAULT_MODEL="qwen3.6-35B-A3B"
-FLASHCHAT_DEFAULT_QUANTIZATION="4bit"
 FLASHCHAT_DEFAULT_MAX_TOKENS="8192"
 FLASHCHAT_DEFAULT_SERVER_PORT="8000"
 FLASHCHAT_DEFAULT_SERVER_HOST="127.0.0.1"
@@ -37,7 +36,6 @@ FLASHCHAT_DEFAULT_TOP_P="0.9"
 # Config values (set after loading)
 MODEL=""
 MODEL_REPO=""
-QUANTIZATION=""
 MAX_TOKENS=""
 SERVER_PORT=""
 SERVER_HOST=""
@@ -53,7 +51,6 @@ TOP_P=""
 MODEL_PATH=""
 WEIGHTS_DIR=""
 EXPERTS_DIR=""
-EXPERTS_2BIT_DIR=""
 
 # -----------------------------------------------------------------------------
 # Look up model defaults from the bundled model registry.
@@ -193,14 +190,12 @@ _flashchat_compute_paths() {
     if [ -n "$MODEL_PATH" ]; then
         WEIGHTS_DIR="${WEIGHTS_DIR:-${MODEL_PATH}/flashchat}"
         EXPERTS_DIR="${MODEL_PATH}/flashchat/packed_experts"
-        EXPERTS_2BIT_DIR="${MODEL_PATH}/flashchat/packed_experts_2bit"
     else
         local detected_path
         detected_path=$(_flashchat_detect_model_path "$MODEL_REPO")
         MODEL_PATH="$detected_path"
         WEIGHTS_DIR="${WEIGHTS_DIR:-${detected_path}/flashchat}"
         EXPERTS_DIR="${detected_path}/flashchat/packed_experts"
-        EXPERTS_2BIT_DIR="${detected_path}/flashchat/packed_experts_2bit"
     fi
 }
 
@@ -222,7 +217,6 @@ flashchat_load_config() {
 
     MODEL=""
     MODEL_REPO=""
-    QUANTIZATION=""
     MAX_TOKENS=""
     SERVER_PORT=""
     SERVER_HOST=""
@@ -236,7 +230,6 @@ flashchat_load_config() {
     MODEL_PATH=""
     WEIGHTS_DIR=""
     EXPERTS_DIR=""
-    EXPERTS_2BIT_DIR=""
 
     local override_config="${FLASHCHAT_CONFIG_FILE_OVERRIDE:-${CONFIG_FILE:-}}"
 
@@ -253,7 +246,6 @@ flashchat_load_config() {
     # 3. Environment variables override
     [ -n "$FLASHCHAT_MODEL" ] && MODEL="$FLASHCHAT_MODEL"
     [ -n "$FLASHCHAT_MODEL_PATH" ] && MODEL_PATH="$FLASHCHAT_MODEL_PATH"
-    [ -n "$FLASHCHAT_QUANTIZATION" ] && QUANTIZATION="$FLASHCHAT_QUANTIZATION"
     [ -n "$FLASHCHAT_MAX_TOKENS" ] && MAX_TOKENS="$FLASHCHAT_MAX_TOKENS"
     [ -n "$FLASHCHAT_SERVER_PORT" ] && SERVER_PORT="$FLASHCHAT_SERVER_PORT"
     [ -n "$FLASHCHAT_SERVER_HOST" ] && SERVER_HOST="$FLASHCHAT_SERVER_HOST"
@@ -281,10 +273,6 @@ flashchat_load_config() {
     if [ -n "$looked_up_repo" ]; then
         MODEL_REPO="$looked_up_repo"
     fi
-    QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
-    if [ "$QUANTIZATION" = "2bit" ]; then
-        QUANTIZATION="4bit"
-    fi
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
     SERVER_HOST="${SERVER_HOST:-$FLASHCHAT_DEFAULT_SERVER_HOST}"
@@ -308,7 +296,6 @@ flashchat_get() {
     case "$key" in
         MODEL) echo "$MODEL" ;;
         MODEL_REPO) echo "$MODEL_REPO" ;;
-        QUANTIZATION) echo "$QUANTIZATION" ;;
         MAX_TOKENS) echo "$MAX_TOKENS" ;;
         SERVER_PORT) echo "$SERVER_PORT" ;;
         SERVER_HOST) echo "$SERVER_HOST" ;;
@@ -322,7 +309,6 @@ flashchat_get() {
         MODEL_PATH) echo "$MODEL_PATH" ;;
         WEIGHTS_DIR) echo "$WEIGHTS_DIR" ;;
         EXPERTS_DIR) echo "$EXPERTS_DIR" ;;
-        EXPERTS_2BIT_DIR) echo "$EXPERTS_2BIT_DIR" ;;
         CONFIG_FILE) echo "$FLASHCHAT_CONFIG_FILE" ;;
         CONFIG_DIR) echo "$FLASHCHAT_CONFIG_DIR" ;;
         MODEL_CONFIG) echo "$FLASHCHAT_MODEL_CONFIG" ;;
@@ -342,9 +328,6 @@ flashchat_create_default_config() {
 
 # Model Settings
 MODEL="${MODEL:-$(flashchat_default_model)}"
-
-# Quantization: 4bit. 2bit is deprecated.
-QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
 
 # Generation Defaults
 MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"

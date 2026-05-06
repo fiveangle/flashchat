@@ -136,7 +136,6 @@ Environment variables:
   FLASHCHAT_MODEL           Model ID (default: qwen3.6-35B-A3B)
   FLASHCHAT_MODEL_PATH      Override model path
   FLASHCHAT_MODEL_CONFIG    Override bundled model registry path
-  FLASHCHAT_QUANTIZATION   4bit (2bit is deprecated)
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
@@ -236,7 +235,6 @@ cmd_status() {
     echo "    GET  /health               (health check)"
     echo ""
     echo "Model: $(flashchat_get MODEL) ($(flashchat_get MODEL_REPO))"
-    echo "Experts quantization: $(flashchat_get QUANTIZATION)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
@@ -395,7 +393,7 @@ cmd_config() {
     
     echo "=== Flashchat Configuration ==="
     echo ""
-    echo "Model: $(flashchat_get MODEL) ($(flashchat_get QUANTIZATION))"
+    echo "Model: $(flashchat_get MODEL)"
     echo "Repository: $(flashchat_get MODEL_REPO)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
@@ -418,7 +416,6 @@ cmd_config_interactive() {
     echo "=== Configuration Settings ==="
     echo "  -Model: $(flashchat_get MODEL)"
     echo "  -Repository: $(flashchat_get MODEL_REPO)"
-    echo "  -Experts quantization: $(flashchat_get QUANTIZATION) (2bit is deprecated)"
     echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "  -Top-p (0.0-1.0): $(flashchat_get TOP_P) (nucleus sampling - controls output diversity)"
@@ -465,17 +462,15 @@ model_artifact_status() {
     local last_layer=$((layers - 1))
     local runtime_dir="${model_path}/flashchat"
     local experts_dir="${runtime_dir}/packed_experts"
-    local experts_2bit_dir="${runtime_dir}/packed_experts_2bit"
 
-    local downloaded weights vocab index experts experts_2bit
+    local downloaded weights vocab index experts
     downloaded=$(model_status_value model_has_hf_files "$model_path")
     weights=$(model_status_value test -f "${runtime_dir}/model_weights.bin" -a -f "${runtime_dir}/model_weights.json")
     vocab=$(model_status_value test -f "${runtime_dir}/vocab.bin")
     index=$(model_status_value test -f "${runtime_dir}/expert_index.json")
     experts=$(model_status_value test -f "${experts_dir}/layer_$(printf "%02d" "$last_layer").bin")
-    experts_2bit=$(model_status_value test -f "${experts_2bit_dir}/layer_$(printf "%02d" "$last_layer").bin")
 
-    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | 4-bit experts: $experts | 2-bit deprecated: $experts_2bit"
+    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts"
 }
 
 print_model_status_list() {
@@ -507,9 +502,6 @@ select_model_from_registry() {
     echo "" >&2
     print_model_status_list >&2
     echo "" >&2
-    echo "2-bit expert packs are shown only as deprecated existing artifacts." >&2
-    echo "" >&2
-
     while IFS=$'\t' read -r model_id name repo; do
         [ -n "$model_id" ] || continue
         model_ids+=("$model_id")
@@ -550,7 +542,6 @@ cmd_models() {
     print_model_status_list
     echo ""
     echo "* Current model"
-    echo "2-bit expert packs are deprecated and not recommended for normal use."
 }
 
 # -----------------------------------------------------------------------------
@@ -567,11 +558,10 @@ prompt_config_options() {
         echo "(Running in non-interactive mode - using defaults)"
         echo ""
         
-        local default_model default_quant default_tokens default_temp
+        local default_model default_tokens default_temp
         local default_top_p default_port default_host default_log_path default_debug default_http_log default_think default_color
         
         default_model=$(flashchat_get MODEL)
-        default_quant=$(flashchat_get QUANTIZATION)
         default_tokens=$(flashchat_get MAX_TOKENS)
         default_temp=$(flashchat_get TEMPERATURE)
         default_top_p=$(flashchat_get TOP_P)
@@ -604,38 +594,6 @@ prompt_config_interactive() {
     selected_model=$(select_model_from_registry "$default_model")
     echo "MODEL=\"$selected_model\"" >> /tmp/flashchat_new_config
     echo ""
-    
-    # Experts quantization
-    local default_quant
-    default_quant=$(flashchat_get QUANTIZATION)
-    if [ "$default_quant" = "2bit" ]; then
-        echo "2-bit mode is deprecated because output quality is poor outside narrow creative prompts."
-        echo "Defaulting this wizard to 4-bit."
-        default_quant="4bit"
-    fi
-    local selected_quant=""
-    printf "Experts quantization [%s]: " "$default_quant"
-    read -r selected_quant
-    echo ""
-    selected_quant="${selected_quant:-$default_quant}"
-    # Convert shortcuts: 2 -> 2bit, 4 -> 4bit
-    if [ "$selected_quant" = "2" ]; then
-        selected_quant="2bit"
-    elif [ "$selected_quant" = "4" ]; then
-        selected_quant="4bit"
-    fi
-    
-    if [ "$selected_quant" = "2bit" ]; then
-        echo ""
-        echo "2-bit mode is deprecated. It is faster, but output quality is poor and tool calling is unreliable."
-        echo "Using 4bit instead."
-        selected_quant="4bit"
-    elif [ "$selected_quant" != "4bit" ]; then
-        echo "Invalid quantization. Using 4bit."
-        selected_quant="4bit"
-    fi
-    
-    echo "QUANTIZATION=\"$selected_quant\"" >> /tmp/flashchat_new_config
     
     # Max Tokens
     local default_tokens
@@ -753,9 +711,6 @@ check_model_downloaded() {
     model_path=$(flashchat_get MODEL_PATH)
     local weights_dir
     weights_dir=$(flashchat_get WEIGHTS_DIR)
-    local quantization
-    quantization=$(flashchat_get QUANTIZATION)
-    
     if [[ "$weights_dir" != /* ]]; then
         weights_dir="${weights_dir#./}"
         weights_dir="${SCRIPT_DIR}/$weights_dir"
@@ -769,15 +724,9 @@ check_model_downloaded() {
     
     local last_layer
     last_layer=$(get_last_layer_index)
-    if [ "$quantization" = "2bit" ]; then
-        local experts_2bit_dir
-        experts_2bit_dir=$(flashchat_get EXPERTS_2BIT_DIR)
-        [ -f "$experts_2bit_dir/layer_${last_layer}.bin" ] && return 0
-    else
-        local experts_dir
-        experts_dir=$(flashchat_get EXPERTS_DIR)
-        [ -f "$experts_dir/layer_${last_layer}.bin" ] && return 0
-    fi
+    local experts_dir
+    experts_dir=$(flashchat_get EXPERTS_DIR)
+    [ -f "$experts_dir/layer_${last_layer}.bin" ] && return 0
     
     return 1
 }
@@ -903,19 +852,6 @@ check_experts_extracted() {
     local last_layer
     last_layer=$(get_last_layer_index)
     [ -f "$experts_dir/layer_${last_layer}.bin" ]
-    return $?
-}
-
-check_experts_2bit_extracted() {
-    local experts_2bit_dir
-    experts_2bit_dir=$(flashchat_get EXPERTS_2BIT_DIR)
-    if [[ "$experts_2bit_dir" != /* ]]; then
-        experts_2bit_dir="${experts_2bit_dir#./}"
-        experts_2bit_dir="${SCRIPT_DIR}/$experts_2bit_dir"
-    fi
-    local last_layer
-    last_layer=$(get_last_layer_index)
-    [ -f "$experts_2bit_dir/layer_${last_layer}.bin" ]
     return $?
 }
 
@@ -1124,9 +1060,6 @@ prompt_export_vocab() {
 }
 
 prompt_extract_experts() {
-    local quantization
-    quantization=$(flashchat_get QUANTIZATION)
-    
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
     
@@ -1185,9 +1118,8 @@ prompt_extract_experts() {
     read -r REPLY
     echo ""
     
-    local extraction_mode=""
     if [[ "$REPLY" =~ ^[4]$ ]]; then
-        extraction_mode="4bit"
+        :
     elif [[ $REPLY =~ ^[Qq]$ ]]; then
         echo "Run './flashchat' again when ready to extract expert weights."
         exit 0
@@ -1195,14 +1127,6 @@ prompt_extract_experts() {
         echo "Invalid option."
         exit 1
     fi
-    
-    # Update config with selection
-    local config_file
-    config_file=$(flashchat_get CONFIG_FILE)
-    if [ -n "$config_file" ] && [ -f "$config_file" ]; then
-        sed -i '' "s/QUANTIZATION=.*/QUANTIZATION=\"$extraction_mode\"/" "$config_file"
-    fi
-    export FLASHCHAT_QUANTIZATION="$extraction_mode"
     
     echo ""
     echo "Extracting 4-bit experts..."
@@ -1346,31 +1270,15 @@ ensure_setup() {
     fi
     
     # Check experts - always prompt if force mode, or if not extracted
-    local quantization
-    quantization=$(flashchat_get QUANTIZATION)
-    if [ "$quantization" = "2bit" ]; then
-        echo ""
-        echo "2-bit mode is deprecated because output quality is poor and tool calling is unreliable."
-        echo "Continuing setup in 4-bit mode."
-        quantization="4bit"
-        export FLASHCHAT_QUANTIZATION="4bit"
-    fi
-    
     if [ "$force" = "1" ]; then
         # Force mode: show current status and offer to re-extract
         echo ""
         echo "=== Expert Weights Status ==="
         echo ""
-        echo "Current quantization: $quantization"
-        echo ""
-        
         if check_experts_extracted; then
-            echo "4-bit experts: extracted"
+            echo "Experts: extracted"
         else
-            echo "4-bit experts: NOT extracted"
-        fi
-        if check_experts_2bit_extracted; then
-            echo "2-bit experts: extracted (deprecated)"
+            echo "Experts: NOT extracted"
         fi
         
         echo ""
@@ -1711,7 +1619,6 @@ cmd_serve() {
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
     export FLASHCHAT_SERVER_PORT="$server_port"
-    export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
     export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
@@ -1970,7 +1877,7 @@ interactive_menu() {
         echo "           Flashchat Management"
         echo "=================================================="
         echo "Status: $setup_status at $server_url"
-        echo "Model: $(flashchat_get MODEL) ($(flashchat_get QUANTIZATION))"
+        echo "Model: $(flashchat_get MODEL)"
         echo "$server_line"
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]odels, [Q]uit"
         read -p "> " -n 1 -r
@@ -2072,9 +1979,6 @@ cmd_clean() {
     
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
-    local quantization
-    quantization=$(flashchat_get QUANTIZATION)
-    
     while true; do
         echo "=== Clean Model Files ==="
         echo ""
@@ -2095,40 +1999,24 @@ cmd_clean() {
             experts_size=$(du -sh "$experts_dir" 2>/dev/null | cut -f1)
         fi
         
-        # Packed experts 2-bit
-        local experts_2bit_dir="$model_path/flashchat/packed_experts_2bit"
-        if [ ! -d "$experts_2bit_dir" ]; then
-            experts_2bit_dir="$model_path/packed_experts_2bit"
-        fi
-        local experts_2bit_size=""
-        if [ -d "$experts_2bit_dir" ]; then
-            experts_2bit_size=$(du -sh "$experts_2bit_dir" 2>/dev/null | cut -f1)
-        fi
-        
         echo "Removable directories:"
         echo ""
         
         # Show numbered list with descriptions
         if [ -n "$blobs_size" ]; then
-            echo "  [1] $blobs_size - model blobs (needed only to extract 4bit quants)"
+            echo "  [1] $blobs_size - model blobs (needed only to extract experts)"
         else
             echo "  [1] (empty) - model blobs"
         fi
         
         if [ -n "$experts_size" ]; then
-            echo "  [2] $experts_size - packed_experts (needed to run 4bit quant)"
+            echo "  [2] $experts_size - packed_experts (needed to run the model)"
         else
             echo "  [2] (empty) - packed_experts"
         fi
         
-        if [ -n "$experts_2bit_size" ]; then
-            echo "  [3] $experts_2bit_size - packed_experts_2bit (deprecated)"
-        else
-            echo "  [3] (empty) - packed_experts_2bit"
-        fi
-        
         echo ""
-        echo "Enter numbers to delete (e.g., 1,3), [Q]uit to exit: "
+        echo "Enter numbers to delete (e.g., 1,2), [Q]uit to exit: "
         read -r REPLY
         
         if [[ "$REPLY" =~ ^[Qq]$ ]] || [ -z "$REPLY" ]; then
@@ -2151,27 +2039,16 @@ cmd_clean() {
                     ;;
                 2)
                     if [ -n "$experts_size" ]; then
-                        # Warn if current quant is 4bit
-                        if [ "$quantization" = "4bit" ]; then
-                            echo ""
-                            echo "WARNING: Your config currently uses 4bit quantization."
-                            echo "Deleting packed_experts will prevent the server from running."
-                            read -p "Delete anyway? [y/N] " -n 1 -r
-                            echo ""
-                            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                                echo "Skipped."
-                                continue
-                            fi
+                        echo ""
+                        echo "WARNING: Deleting packed_experts will prevent the server from running."
+                        read -p "Delete anyway? [y/N] " -n 1 -r
+                        echo ""
+                        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                            echo "Skipped."
+                            continue
                         fi
                         rm -rf "$experts_dir"
                         echo "Deleted packed_experts."
-                        deleted=1
-                    fi
-                    ;;
-                3)
-                    if [ -n "$experts_2bit_size" ]; then
-                        rm -rf "$experts_2bit_dir"
-                        echo "Deleted packed_experts_2bit."
                         deleted=1
                     fi
                     ;;
@@ -2215,7 +2092,6 @@ cmd_benchmark() {
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
     export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
-    export FLASHCHAT_QUANTIZATION="$(flashchat_get QUANTIZATION)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"

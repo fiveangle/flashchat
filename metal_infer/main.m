@@ -452,15 +452,15 @@ static ExpertTiming run_expert_forward(
 
     double t_io_start = now_ms();
 
-    id<MTLBuffer> gate_w = metal_buf_pread(ctx, packed_fd, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off_2);
-    id<MTLBuffer> gate_s = metal_buf_pread(ctx, packed_fd, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off_2);
-    id<MTLBuffer> gate_b = metal_buf_pread(ctx, packed_fd, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off_2);
-    id<MTLBuffer> up_w   = metal_buf_pread(ctx, packed_fd, g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off_2);
-    id<MTLBuffer> up_s   = metal_buf_pread(ctx, packed_fd, g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off_2);
-    id<MTLBuffer> up_b   = metal_buf_pread(ctx, packed_fd, g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off_2);
-    id<MTLBuffer> down_w = metal_buf_pread(ctx, packed_fd, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off_2);
-    id<MTLBuffer> down_s = metal_buf_pread(ctx, packed_fd, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off_2);
-    id<MTLBuffer> down_b = metal_buf_pread(ctx, packed_fd, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off_2);
+    id<MTLBuffer> gate_w = metal_buf_pread(ctx, packed_fd, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off);
+    id<MTLBuffer> gate_s = metal_buf_pread(ctx, packed_fd, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off);
+    id<MTLBuffer> gate_b = metal_buf_pread(ctx, packed_fd, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off);
+    id<MTLBuffer> up_w   = metal_buf_pread(ctx, packed_fd, g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off);
+    id<MTLBuffer> up_s   = metal_buf_pread(ctx, packed_fd, g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off);
+    id<MTLBuffer> up_b   = metal_buf_pread(ctx, packed_fd, g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off);
+    id<MTLBuffer> down_w = metal_buf_pread(ctx, packed_fd, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off);
+    id<MTLBuffer> down_s = metal_buf_pread(ctx, packed_fd, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off);
+    id<MTLBuffer> down_b = metal_buf_pread(ctx, packed_fd, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off);
 
     double t_io_end = now_ms();
     timing.io_ms = t_io_end - t_io_start;
@@ -563,18 +563,18 @@ static ExpertTiming run_expert_forward_fast(
 
     // gate_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.gate_w_off_2,
-        expert_buf, g_cfg.gate_s_off_2,
-        expert_buf, g_cfg.gate_b_off_2,
+        expert_buf, g_cfg.gate_w_off,
+        expert_buf, g_cfg.gate_s_off,
+        expert_buf, g_cfg.gate_b_off,
         x_buf, 0,
         gate_out, 0,
         inter, hidden, gs, use_fast);
 
     // up_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.up_w_off_2,
-        expert_buf, g_cfg.up_s_off_2,
-        expert_buf, g_cfg.up_b_off_2,
+        expert_buf, g_cfg.up_w_off,
+        expert_buf, g_cfg.up_s_off,
+        expert_buf, g_cfg.up_b_off,
         x_buf, 0,
         up_out, 0,
         inter, hidden, gs, use_fast);
@@ -584,9 +584,9 @@ static ExpertTiming run_expert_forward_fast(
 
     // down_proj: [1024] -> [4096]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.down_w_off_2,
-        expert_buf, g_cfg.down_s_off_2,
-        expert_buf, g_cfg.down_b_off_2,
+        expert_buf, g_cfg.down_w_off,
+        expert_buf, g_cfg.down_s_off,
+        expert_buf, g_cfg.down_b_off,
         act_out, 0,
         out_buf, 0,
         hidden, inter, gs, use_fast);
@@ -764,15 +764,15 @@ static MoETiming run_moe_forward_fused(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         for (int k = 0; k < K_use; k++) {
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], g_cfg.gate_w_off_2,
-                expert_bufs[k], g_cfg.gate_s_off_2,
-                expert_bufs[k], g_cfg.gate_b_off_2,
+                expert_bufs[k], g_cfg.gate_w_off,
+                expert_bufs[k], g_cfg.gate_s_off,
+                expert_bufs[k], g_cfg.gate_b_off,
                 x_buf, 0, gate_outs[k], 0,
                 inter, hidden, gs);
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], g_cfg.up_w_off_2,
-                expert_bufs[k], g_cfg.up_s_off_2,
-                expert_bufs[k], g_cfg.up_b_off_2,
+                expert_bufs[k], g_cfg.up_w_off,
+                expert_bufs[k], g_cfg.up_s_off,
+                expert_bufs[k], g_cfg.up_b_off,
                 x_buf, 0, up_outs[k], 0,
                 inter, hidden, gs);
         }
@@ -795,9 +795,9 @@ static MoETiming run_moe_forward_fused(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         for (int k = 0; k < K_use; k++) {
             encode_matvec_v3(ctx, enc,
-                expert_bufs[k], g_cfg.down_w_off_2,
-                expert_bufs[k], g_cfg.down_s_off_2,
-                expert_bufs[k], g_cfg.down_b_off_2,
+                expert_bufs[k], g_cfg.down_w_off,
+                expert_bufs[k], g_cfg.down_s_off,
+                expert_bufs[k], g_cfg.down_b_off,
                 act_outs[k], 0, expert_outs[k], 0,
                 hidden, inter, gs);
         }
@@ -1028,17 +1028,17 @@ static void encode_expert_compute(
 
     // gate_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.gate_w_off_2,
-        expert_buf, g_cfg.gate_s_off_2,
-        expert_buf, g_cfg.gate_b_off_2,
+        expert_buf, g_cfg.gate_w_off,
+        expert_buf, g_cfg.gate_s_off,
+        expert_buf, g_cfg.gate_b_off,
         x_buf, 0, gate_out, 0,
         inter, hidden, gs, use_fast);
 
     // up_proj: [4096] -> [1024]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.up_w_off_2,
-        expert_buf, g_cfg.up_s_off_2,
-        expert_buf, g_cfg.up_b_off_2,
+        expert_buf, g_cfg.up_w_off,
+        expert_buf, g_cfg.up_s_off,
+        expert_buf, g_cfg.up_b_off,
         x_buf, 0, up_out, 0,
         inter, hidden, gs, use_fast);
 
@@ -1047,9 +1047,9 @@ static void encode_expert_compute(
 
     // down_proj: [1024] -> [4096]
     metal_dequant_matvec_offset(ctx, cmdbuf,
-        expert_buf, g_cfg.down_w_off_2,
-        expert_buf, g_cfg.down_s_off_2,
-        expert_buf, g_cfg.down_b_off_2,
+        expert_buf, g_cfg.down_w_off,
+        expert_buf, g_cfg.down_s_off,
+        expert_buf, g_cfg.down_b_off,
         act_out, 0, out_buf, 0,
         hidden, inter, gs, use_fast);
 }
@@ -1417,15 +1417,15 @@ static void cpu_expert_forward(
     uint16_t down_s[g_cfg.down_s_size / 2];
     uint16_t down_b[g_cfg.down_b_size / 2];
 
-    pread(packed_fd, gate_w, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off_2);
-    pread(packed_fd, gate_s, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off_2);
-    pread(packed_fd, gate_b, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off_2);
-    pread(packed_fd, up_w,   g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off_2);
-    pread(packed_fd, up_s,   g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off_2);
-    pread(packed_fd, up_b,   g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off_2);
-    pread(packed_fd, down_w, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off_2);
-    pread(packed_fd, down_s, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off_2);
-    pread(packed_fd, down_b, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off_2);
+    pread(packed_fd, gate_w, g_cfg.gate_w_size, expert_offset + g_cfg.gate_w_off);
+    pread(packed_fd, gate_s, g_cfg.gate_s_size, expert_offset + g_cfg.gate_s_off);
+    pread(packed_fd, gate_b, g_cfg.gate_b_size, expert_offset + g_cfg.gate_b_off);
+    pread(packed_fd, up_w,   g_cfg.up_w_size,   expert_offset + g_cfg.up_w_off);
+    pread(packed_fd, up_s,   g_cfg.up_s_size,   expert_offset + g_cfg.up_s_off);
+    pread(packed_fd, up_b,   g_cfg.up_b_size,   expert_offset + g_cfg.up_b_off);
+    pread(packed_fd, down_w, g_cfg.down_w_size, expert_offset + g_cfg.down_w_off);
+    pread(packed_fd, down_s, g_cfg.down_s_size, expert_offset + g_cfg.down_s_off);
+    pread(packed_fd, down_b, g_cfg.down_b_size, expert_offset + g_cfg.down_b_off);
 
     // gate_proj: [4096] -> [1024]
     float gate_out[g_cfg.moe_intermediate];

@@ -144,7 +144,7 @@ The configuration wizard selects from the models in `assets/model_configs.json` 
 ./flashchat models
 ```
 
-Lists supported models and their local setup status. Existing 2-bit expert packs are shown as deprecated artifacts.
+Lists supported models and their local setup status.
 
 ### Status
 
@@ -179,7 +179,6 @@ Configuration is loaded from (priority highest to lowest):
 | `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
 | `FLASHCHAT_MODEL_CONFIG` | Model registry path, including the default model and active setup scripts | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
-| `FLASHCHAT_QUANTIZATION` | Expert quantization. `2bit` is deprecated. | `4bit` |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
 | `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `<model>/flashchat` |
 | `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/flashchat/packed_experts` |
@@ -191,9 +190,6 @@ Configuration is loaded from (priority highest to lowest):
 
 # Model Settings
 MODEL="qwen3.6-35B-A3B"
-
-# Quantization: 4bit. 2bit is deprecated.
-QUANTIZATION="4bit"
 
 # Generation Defaults
 MAX_TOKENS="8192"
@@ -325,8 +321,7 @@ For OpenCode, a working provider entry looks like:
 | `<model>/flashchat/model_weights.json` | 371KB | Manifest for weight loading |
 | `<model>/flashchat/vocab.bin` | 7.8MB | Tokenizer vocabulary |
 | `<model>/flashchat/expert_index.json` | - | Safetensors expert lookup index |
-| `<model>/flashchat/packed_experts/` | 218GB | 4-bit expert weights |
-| `<model>/flashchat/packed_experts_2bit/` | 120GB | Deprecated 2-bit expert weights |
+| `<model>/flashchat/packed_experts/` | 218GB | Expert weights |
 | `~/.config/flashchat/config` | - | User configuration |
 | `~/.config/flashchat/sessions/` | - | Chat session history |
 | `~/.config/flashchat/history` | - | Interactive prompt history |

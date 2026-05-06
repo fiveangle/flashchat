@@ -93,7 +93,6 @@ Options:
 - `metal_infer/extract_weights.py` - Added env var support
 - `metal_infer/export_tokenizer.py` - Added env var support
 - `repack_experts.py` - Added env var support
-- `metal_infer/repack_experts_2bit.py` - Added env var support
 - `RUN.md` - Updated documentation
 
 ---
@@ -105,18 +104,14 @@ Options:
 1. **Config reset via `flashchat config`** ✅ IMPLEMENTED
    - Added `--reset` to re-run setup wizard (preserves sessions)
    - Added `--full-reset` to delete all data
-   - Added full config prompts: model repo, quantization, max tokens,
+   - Added full config prompts: model repo, max tokens,
      temperature, top-p, server port, server host, show thinking, color output
    - Interactive prompts when run from terminal, defaults when piped
 
 2. **Remove streamchat** ✅ COMPLETED
    - streamchat has been removed
 
-3. **2-bit expert extraction wizard** ⏸ DEFERRED
-   - Currently prompts for quantization, code logic is correct
-   - Full testing deferred to fresh "out of the box" test at end
-
-4. **Server persistence validation** ✅ COMPLETED
+3. **Server persistence validation** ✅ COMPLETED
    - Server starts and stops correctly
    - Status shows running with PID
    - Verified serve --stop functionality

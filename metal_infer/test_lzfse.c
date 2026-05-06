@@ -3,7 +3,7 @@
  * on 4-bit quantized expert weight data.
  *
  * Tests the hypothesis: if 4-bit weights only carry ~1.5 bits of entropy,
- * LZFSE compresses them to ~2 bits/weight, giving 2-bit I/O savings with
+ * LZFSE compresses them aggressively, giving low-bit I/O savings with
  * 4-bit quality. Apple Silicon has HW-accelerated LZFSE decompression.
  *
  * Build: clang -O2 -o test_lzfse test_lzfse.c -lcompression

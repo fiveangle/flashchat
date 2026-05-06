@@ -94,9 +94,6 @@ make fullbench      # Full forward benchmark (3 iterations)
 # With timing breakdown
 ./infer --prompt "Hello" --tokens 20 --timing
 
-# Deprecated 2-bit mode (poor output quality; do not promote in new UX)
-./infer --prompt "Hello" --tokens 50 --2bit
-
 # Single test files
 clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 ```
@@ -112,8 +109,7 @@ clang -O2 test_lzfse.c -lcompression -o test_lzfse && ./test_lzfse
 - **User/app state policy:** Flashchat-owned user state belongs under `~/.config/flashchat/`, including sessions, prompt history, server logs, pid files, and optional `system.md`.
 - **Do not add implicit config fallbacks.** Use `--config FILE` only as an explicit override, otherwise use `~/.config/flashchat/config`, environment overrides, and defaults derived from the bundled model registry.
 - **Do not rely on current working directory for model registry lookup.** Shell, Python, and C/Objective-C callers should resolve the registry via `FLASHCHAT_MODEL_CONFIG` or the repo-root `assets/model_configs.json` path.
-- **Keep the model registry focused on active setup paths.** Deprecated utilities such as 2-bit repacking may remain as manual scripts, but should not be advertised as normal per-model setup metadata.
-- **2-bit quantization is deprecated.** It may remain detectable for existing artifacts, but new user-facing UX should not promote it as a normal option because output quality is poor and tool calling is unreliable.
+- **Only the registry-backed production expert format is supported in active code.** Old low-precision experiments may remain in historical results/paper artifacts, but do not reintroduce alternate runtime paths, setup scripts, config settings, or user-facing UX.
 - **Always ask the user before modifying their system** (e.g., installing packages, changing config files, running system commands)
 - **Setup/dependency installs must start with one explicit consent screen (`Y/x`) before any download/install work begins.** `X` must cancel cleanly with a clear "User cancelled" style message and instructions to re-run `flashchat` later.
 - **When the user gives specific instructions for moving forward, ask if you should update the AGENTS.md file to ensure the instruction is adhered to.**

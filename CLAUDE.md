@@ -14,10 +14,6 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 |--------------|-------|---------|-------|
 | 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. Requires packed_experts/. |
 | 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
-| 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. Requires packed_experts_2bit/. |
-| 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
-
-*2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
 
 ## Hardware
 
@@ -38,7 +34,7 @@ The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 st
 2. **FMA-Optimized Dequant Kernel** — The inner loop of the 4-bit dequantized matrix-vector multiply rearranges the math from `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`. Pre-computing `scale*x` and `bias*x` lets the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than the naive formulation.
 
 3. **Metal Compute Shaders** — Hand-written Metal kernels for:
-   - 4-bit and 2-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache, FMA-optimized)
+   - 4-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache, FMA-optimized)
    - Fused SwiGLU activation
    - RMS normalization (two-pass: sum-of-squares reduction + apply)
    - Batched GPU attention (Q@K^T, softmax, scores@V) for full attention layers
@@ -78,11 +74,7 @@ python3 ../scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path/t
 python3 ../scripts/export_tokenizer.py /path/to/model/tokenizer.json /path/to/model/flashchat/vocab.bin
 python3 ../scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/to/model/flashchat/expert_index.json
 
-# 4-bit inference (full quality, production use)
 ./infer --prompt "Explain quantum computing" --tokens 100
-
-# 2-bit inference (faster but breaks tool calling)
-./infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
 # Interactive chat with tool calling
 ./chat
@@ -129,7 +121,6 @@ results.tsv            # Experiment log (58 experiments)
 | Trust OS page cache | Deleted Metal LRU → +38% | **Foundational** |
 | GPU combine+norm in CMD3 | Eliminates CPU round-trip | **Pipeline** |
 | BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **+64% attn** |
-| F_NOCACHE for 2-bit | +3% from avoiding page thrash | **2-bit only** |
 | GPU fused attention (RoPE) | +2% for full-attn layers | **Small** |
 | C BPE tokenizer | 180ms vs 3500ms startup | **20x startup** |
 | Deferred CMD3 execution | GPU/CPU overlap | **Pipeline** |

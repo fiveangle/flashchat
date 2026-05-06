@@ -71,17 +71,15 @@ typedef struct {
     int rotary_dim;
 
     int expert_size;
-    int expert_size_2bit;
-
-    int gate_w_off_2;
-    int gate_s_off_2;
-    int gate_b_off_2;
-    int up_w_off_2;
-    int up_s_off_2;
-    int up_b_off_2;
-    int down_w_off_2;
-    int down_s_off_2;
-    int down_b_off_2;
+    int gate_w_off;
+    int gate_s_off;
+    int gate_b_off;
+    int up_w_off;
+    int up_s_off;
+    int up_b_off;
+    int down_w_off;
+    int down_s_off;
+    int down_b_off;
 
     int gate_w_size;
     int gate_s_size;
@@ -303,27 +301,15 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     int down_s = cfg->hidden_dim * (cfg->moe_intermediate / gs) * 2;
     int down_b = down_s;
     cfg->expert_size = gate_w + gate_s + gate_b + up_w + up_s + up_b + down_w + down_s + down_b;
-
-    int gate_w_2 = (cfg->moe_intermediate * cfg->hidden_dim) / 4;
-    int gate_s_2 = gate_s;
-    int gate_b_2 = gate_b;
-    int up_w_2   = gate_w_2;
-    int up_s_2   = gate_s;
-    int up_b_2   = gate_b;
-    int down_w_2 = (cfg->hidden_dim * cfg->moe_intermediate) / 4;
-    int down_s_2 = down_s;
-    int down_b_2 = down_b;
-    cfg->expert_size_2bit = gate_w_2 + gate_s_2 + gate_b_2 + up_w_2 + up_s_2 + up_b_2 + down_w_2 + down_s_2 + down_b_2;
-
-    cfg->gate_w_off_2 = 0;
-    cfg->gate_s_off_2 = gate_w_2;
-    cfg->gate_b_off_2 = gate_w_2 + gate_s_2;
-    cfg->up_w_off_2   = gate_w_2 + gate_s_2 + gate_b_2;
-    cfg->up_s_off_2   = cfg->up_w_off_2 + up_w_2;
-    cfg->up_b_off_2   = cfg->up_s_off_2 + up_s_2;
-    cfg->down_w_off_2 = cfg->up_b_off_2 + up_b_2;
-    cfg->down_s_off_2 = cfg->down_w_off_2 + down_w_2;
-    cfg->down_b_off_2 = cfg->down_s_off_2 + down_s_2;
+    cfg->gate_w_off = 0;
+    cfg->gate_s_off = gate_w;
+    cfg->gate_b_off = gate_w + gate_s;
+    cfg->up_w_off   = gate_w + gate_s + gate_b;
+    cfg->up_s_off   = cfg->up_w_off + up_w;
+    cfg->up_b_off   = cfg->up_s_off + up_s;
+    cfg->down_w_off = cfg->up_b_off + up_b;
+    cfg->down_s_off = cfg->down_w_off + down_w;
+    cfg->down_b_off = cfg->down_s_off + down_s;
 
     cfg->gate_w_size = gate_w;
     cfg->gate_s_size = gate_s;
@@ -363,8 +349,7 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     printf("[config] Loaded model: %s (%s)\n", cfg->model_name, cfg->model_id);
     printf("[config]  hidden_dim=%d, layers=%d, experts=%d, vocab=%d\n",
            cfg->hidden_dim, cfg->num_layers, cfg->num_experts, cfg->vocab_size);
-    printf("[config]  expert_size=%d bytes (4-bit), %d bytes (2-bit)\n",
-           cfg->expert_size, cfg->expert_size_2bit);
+    printf("[config]  expert_size=%d bytes\n", cfg->expert_size);
     return 0;
 }
 
