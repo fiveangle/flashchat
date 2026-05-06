@@ -39,7 +39,7 @@ except Exception:
 }
 MODEL_ID="$(default_model_id)"
 PERF_LOG_ENABLED=1
-PERF_LOG_PATH="${SCRIPT_DIR}/api_perf_log.tsv"
+PERF_LOG_PATH="${REPO_ROOT}/assets/api_perf_log.tsv"
 SERVER_MODE="reused"
 LAST_DURATION_MS=""
 HOSTNAME_VALUE=""

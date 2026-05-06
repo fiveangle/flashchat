@@ -267,7 +267,7 @@ If nothing is already listening on the configured port, the script starts `./inf
 When enabled, it also appends lightweight timing rows to:
 
 ```bash
-metal_infer/api_perf_log.tsv
+assets/api_perf_log.tsv
 ```
 
 Each row records the date, branch, commit, endpoint scenario, request mode, duration, and derived stream tok/s when available. This is meant for spotting regressions over time, not for scientific benchmarking.

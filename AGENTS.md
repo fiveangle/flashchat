@@ -56,7 +56,7 @@ metal_infer/
 root/
   repack_experts.py # Repack safetensors to binary
   progress.py       # Results visualization
-  results.tsv       # Experiment log
+  assets/*.tsv      # Durable experiment/API metric logs
 ```
 
 ## Build Commands
