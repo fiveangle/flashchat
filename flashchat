@@ -10,9 +10,11 @@
 #   opencode          Launch OpenCode against the local Flashchat server
 #   serve             Start API server (auto-sets up if missing)
 #   serve --stop      Stop running server
+#   serve --stop --external  Stop external Flashchat server on configured port
 #   prompt "..."      Single prompt (auto-sets up if missing)
 #   config            Edit/show configuration
 #   models            List supported models and setup status
+#   manage            Manage local/offloaded model storage
 #   status            Show system status
 #   sessions          List sessions
 #   help              Show this help
@@ -111,11 +113,13 @@ Commands:
   opencode          Launch OpenCode with the local Flashchat server
   serve             Start API server
   serve --stop      Stop running API server
+  serve --stop --external  Stop external Flashchat server on configured port
   serve --stop --force  Force-stop running API server
   prompt "..."      Run single prompt and exit
   benchmark         Run benchmarks (run, verify, bench, moe, moebench, full, fullbench)
   config            Edit configuration settings
   models            List supported models and local setup status
+  manage            Manage local/offloaded model storage
   status            Show system status
   sessions          List chat sessions
   help              Show this help
@@ -136,6 +140,7 @@ Environment variables:
   FLASHCHAT_MODEL           Model ID (default: qwen3.6-35B-A3B)
   FLASHCHAT_MODEL_PATH      Override model path
   FLASHCHAT_MODEL_CONFIG    Override bundled model registry path
+  FLASHCHAT_OFFLOAD_DIR     Unified model offload directory
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_SERVER_HOST    Server host clients connect to
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
@@ -257,6 +262,7 @@ cmd_status() {
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
+    echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
 }
 
 # -----------------------------------------------------------------------------
@@ -415,6 +421,7 @@ cmd_config() {
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
+    echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
     echo ""
     echo "File: $config_file"
     echo ""
@@ -438,6 +445,7 @@ cmd_config_interactive() {
     echo "  -Server API publishing port: $(flashchat_get SERVER_PORT)"
     echo "  -Chat client API host IP: $(flashchat_get SERVER_HOST)"
     echo "  -Server log path (file or directory): $(flashchat_get SERVER_LOG_PATH)"
+    echo "  -Model offload directory: $(flashchat_get OFFLOAD_DIR)"
     echo "  -Server debug logging artifacts (0/1): $(flashchat_get SERVER_DEBUG)"
     echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
     echo "  -Show thinking tokens (0/1): $(flashchat_get SHOW_THINKING)"
@@ -560,6 +568,449 @@ cmd_models() {
     echo "* Current model"
 }
 
+hf_repo_dir_name() {
+    local repo="$1"
+    printf "models--%s\n" "${repo//\//--}"
+}
+
+flashchat_hf_cache_dir() {
+    printf "%s/.cache/huggingface/hub\n" "$HOME"
+}
+
+model_local_repo_dir() {
+    local model_id="$1"
+    local repo
+    repo=$(flashchat_model_repo "$model_id")
+    [ -n "$repo" ] || return 1
+    printf "%s/%s\n" "$(flashchat_hf_cache_dir)" "$(hf_repo_dir_name "$repo")"
+}
+
+model_offloaded_repo_dir() {
+    local model_id="$1"
+    local offload_dir
+    local repo
+    offload_dir="$(flashchat_get OFFLOAD_DIR)"
+    repo=$(flashchat_model_repo "$model_id")
+    [ -n "$offload_dir" ] || return 1
+    [ -n "$repo" ] || return 1
+    printf "%s/%s\n" "$offload_dir" "$(hf_repo_dir_name "$repo")"
+}
+
+latest_snapshot_in_repo() {
+    local repo_dir="$1"
+    local snapshot_dir="${repo_dir}/snapshots"
+    [ -d "$snapshot_dir" ] || return 1
+    local latest
+    latest=$(ls -1 "$snapshot_dir" 2>/dev/null | sort | tail -1)
+    [ -n "$latest" ] || return 1
+    printf "%s/%s\n" "$snapshot_dir" "$latest"
+}
+
+dir_size_human() {
+    local path="$1"
+    if [ -e "$path" ]; then
+        du -sh "$path" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+model_runtime_ready_for_snapshot() {
+    local model_id="$1"
+    local snapshot="$2"
+    local runtime_dir="${snapshot}/flashchat"
+    local experts_dir="${runtime_dir}/packed_experts"
+    local layers
+    local i
+
+    [ -d "$runtime_dir" ] || return 1
+    [ -f "${runtime_dir}/model_weights.bin" ] || return 1
+    [ -f "${runtime_dir}/model_weights.json" ] || return 1
+    [ -f "${runtime_dir}/vocab.bin" ] || return 1
+    [ -f "${runtime_dir}/expert_index.json" ] || return 1
+
+    layers=$(flashchat_model_layers "$model_id")
+    i=0
+    while [ "$i" -lt "$layers" ]; do
+        [ -f "${experts_dir}/layer_$(printf "%02d" "$i").bin" ] || return 1
+        i=$((i + 1))
+    done
+}
+
+model_runtime_status_for_repo() {
+    local model_id="$1"
+    local repo_dir="$2"
+    local snapshot
+    snapshot=$(latest_snapshot_in_repo "$repo_dir" 2>/dev/null || true)
+    if [ -n "$snapshot" ] && model_runtime_ready_for_snapshot "$model_id" "$snapshot"; then
+        echo "ready"
+    else
+        echo "not ready"
+    fi
+}
+
+model_original_blob_size_for_repo() {
+    local repo_dir="$1"
+    local snapshot
+    snapshot=$(latest_snapshot_in_repo "$repo_dir" 2>/dev/null || true)
+    if [ -n "$snapshot" ]; then
+        get_model_blobs_size "$snapshot"
+    fi
+}
+
+confirm_exact_model_id() {
+    local model_id="$1"
+    local prompt="${2:-Type the exact model ID to continue}"
+    echo "$prompt"
+    printf "Model ID: "
+    read -r REPLY
+    if [ "$REPLY" = "$model_id" ]; then
+        return 0
+    fi
+    echo "Cancelled. Confirmation did not match '$model_id'."
+    return 1
+}
+
+ensure_offload_dir() {
+    local offload_dir
+    offload_dir="$(flashchat_get OFFLOAD_DIR)"
+    if [ -z "$offload_dir" ]; then
+        echo "No OFFLOAD_DIR is configured. Set it with './flashchat config' before using offload storage."
+        return 1
+    fi
+    if [[ "$offload_dir" != /* ]]; then
+        echo "OFFLOAD_DIR must be an absolute path: $offload_dir"
+        return 1
+    fi
+    if ! mkdir -p "$offload_dir"; then
+        echo "Unable to create OFFLOAD_DIR: $offload_dir"
+        return 1
+    fi
+    if [ ! -w "$offload_dir" ]; then
+        echo "OFFLOAD_DIR is not writable: $offload_dir"
+        return 1
+    fi
+}
+
+current_model_server_running() {
+    local model_id="$1"
+    [ "$model_id" = "$(flashchat_get MODEL)" ] || return 1
+    if is_server_running; then
+        return 0
+    fi
+    is_port_listening "$(flashchat_get SERVER_PORT)"
+}
+
+print_manage_model_status_list() {
+    local current_model
+    current_model="$(flashchat_get MODEL)"
+    local offload_dir
+    offload_dir="$(flashchat_get OFFLOAD_DIR)"
+    local i=0
+    local model_id name repo marker local_repo offloaded_repo
+    local local_state offloaded_state runtime_state offloaded_runtime blobs_size local_size offloaded_size
+
+    if [ -n "$offload_dir" ]; then
+        echo "Offload directory: $offload_dir"
+    else
+        echo "Offload directory: (not configured)"
+    fi
+    echo ""
+
+    while IFS=$'\t' read -r model_id name repo; do
+        [ -n "$model_id" ] || continue
+        i=$((i + 1))
+        marker=" "
+        [ "$model_id" = "$current_model" ] && marker="*"
+        local_repo=$(model_local_repo_dir "$model_id")
+        offloaded_repo=$(model_offloaded_repo_dir "$model_id" 2>/dev/null || true)
+
+        local_state="no"
+        runtime_state="not ready"
+        blobs_size=""
+        local_size=""
+        if [ -d "$local_repo" ]; then
+            local_state="yes"
+            local_size=$(dir_size_human "$local_repo")
+            runtime_state=$(model_runtime_status_for_repo "$model_id" "$local_repo")
+            blobs_size=$(model_original_blob_size_for_repo "$local_repo")
+        fi
+
+        offloaded_state="no"
+        offloaded_runtime="not ready"
+        offloaded_size=""
+        if [ -n "$offloaded_repo" ] && [ -d "$offloaded_repo" ]; then
+            offloaded_state="yes"
+            offloaded_size=$(dir_size_human "$offloaded_repo")
+            offloaded_runtime=$(model_runtime_status_for_repo "$model_id" "$offloaded_repo")
+        fi
+
+        printf "  [%d]%s %s\n" "$i" "$marker" "$name"
+        printf "      ID: %s\n" "$model_id"
+        printf "      Repo: %s\n" "$repo"
+        printf "      Local: %s | runtime: %s | original blobs: %s | total: %s\n" "$local_state" "$runtime_state" "${blobs_size:-absent}" "${local_size:-absent}"
+        printf "      Offloaded: %s | runtime: %s | total: %s\n" "$offloaded_state" "$offloaded_runtime" "${offloaded_size:-absent}"
+    done < <(flashchat_list_models)
+    echo ""
+    echo "* Current model"
+}
+
+select_manage_model() {
+    local model_ids=()
+    local model_id name repo
+    local i=0
+
+    while IFS=$'\t' read -r model_id name repo; do
+        [ -n "$model_id" ] || continue
+        model_ids+=("$model_id")
+    done < <(flashchat_list_models)
+
+    if [ ${#model_ids[@]} -eq 0 ]; then
+        echo "No model registry entries found." >&2
+        return 1
+    fi
+
+    while true; do
+        printf "Select model number or ID, [Q]uit: " >&2
+        read -r REPLY
+        if [[ "$REPLY" =~ ^[Qq]$ ]] || [ -z "$REPLY" ]; then
+            return 1
+        fi
+        if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+            i=$((REPLY - 1))
+            if [ "$i" -ge 0 ] && [ "$i" -lt ${#model_ids[@]} ]; then
+                echo "${model_ids[$i]}"
+                return 0
+            fi
+        elif flashchat_model_exists "$REPLY"; then
+            echo "$REPLY"
+            return 0
+        fi
+        echo "Please choose one of the listed models." >&2
+    done
+}
+
+manage_remove_original_blobs() {
+    local model_id="$1"
+    local local_repo snapshot blobs_size
+    local_repo=$(model_local_repo_dir "$model_id")
+    if [ ! -d "$local_repo" ]; then
+        echo "Local model is not present."
+        return 1
+    fi
+    snapshot=$(latest_snapshot_in_repo "$local_repo" 2>/dev/null || true)
+    if [ -z "$snapshot" ]; then
+        echo "Local model has no snapshot directory."
+        return 1
+    fi
+    if ! model_runtime_ready_for_snapshot "$model_id" "$snapshot"; then
+        echo "Original blobs can only be removed after the runtime artifacts are complete."
+        echo "Expected model_weights.bin, model_weights.json, vocab.bin, expert_index.json, and all packed expert layers."
+        return 1
+    fi
+    blobs_size=$(get_model_blobs_size "$snapshot")
+    if [ -z "$blobs_size" ]; then
+        echo "No original safetensors blobs found."
+        return 0
+    fi
+    echo "This will remove $blobs_size of original safetensors blobs from the local model."
+    confirm_exact_model_id "$model_id" "Type the exact model ID to remove original blobs:" || return 1
+    if delete_model_blobs "$snapshot"; then
+        echo "Original blobs removed."
+    else
+        echo "No original blobs were removed."
+    fi
+}
+
+manage_delete_local_model() {
+    local model_id="$1"
+    local local_repo
+    local_repo=$(model_local_repo_dir "$model_id")
+    if [ ! -d "$local_repo" ]; then
+        echo "Local model is not present."
+        return 0
+    fi
+    if current_model_server_running "$model_id"; then
+        echo "Refusing to delete the configured model while the Flashchat server is running."
+        return 1
+    fi
+    echo "This will delete the entire local HuggingFace cache repo:"
+    echo "$local_repo"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to delete the local model:" || return 1
+    if ! rm -rf "$local_repo"; then
+        echo "Unable to delete local model: $local_repo"
+        return 1
+    fi
+    echo "Local model deleted."
+}
+
+manage_offload_model() {
+    local model_id="$1"
+    local local_repo offloaded_repo
+    ensure_offload_dir || return 1
+    local_repo=$(model_local_repo_dir "$model_id")
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    if [ ! -d "$local_repo" ]; then
+        echo "Local model is not present."
+        return 1
+    fi
+    if [ -e "$offloaded_repo" ]; then
+        echo "Refusing to overwrite existing offloaded model:"
+        echo "$offloaded_repo"
+        return 1
+    fi
+    if current_model_server_running "$model_id"; then
+        echo "Refusing to offload the configured model while the Flashchat server is running."
+        return 1
+    fi
+    echo "This will move the entire local model repo to:"
+    echo "$offloaded_repo"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to offload this model:" || return 1
+    if ! mkdir -p "$(dirname "$offloaded_repo")"; then
+        echo "Unable to create offload destination parent."
+        return 1
+    fi
+    if ! mv "$local_repo" "$offloaded_repo"; then
+        echo "Unable to offload model."
+        return 1
+    fi
+    echo "Model offloaded."
+}
+
+manage_full_reload_model() {
+    local model_id="$1"
+    local local_repo offloaded_repo
+    ensure_offload_dir || return 1
+    local_repo=$(model_local_repo_dir "$model_id")
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    if [ ! -d "$offloaded_repo" ]; then
+        echo "Offloaded model is not present."
+        return 1
+    fi
+    if [ -e "$local_repo" ]; then
+        echo "Refusing to overwrite existing local model:"
+        echo "$local_repo"
+        return 1
+    fi
+    echo "This will move the entire offloaded model repo back to local HuggingFace cache:"
+    echo "$local_repo"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to fully reload this model:" || return 1
+    if ! mkdir -p "$(dirname "$local_repo")"; then
+        echo "Unable to create local HuggingFace cache parent."
+        return 1
+    fi
+    if ! mv "$offloaded_repo" "$local_repo"; then
+        echo "Unable to reload model."
+        return 1
+    fi
+    echo "Model fully reloaded."
+}
+
+manage_restore_runtime_only() {
+    local model_id="$1"
+    local local_repo offloaded_repo source_snapshot source_runtime local_snapshot local_runtime
+    ensure_offload_dir || return 1
+    local_repo=$(model_local_repo_dir "$model_id")
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    if [ ! -d "$offloaded_repo" ]; then
+        echo "Offloaded model is not present."
+        return 1
+    fi
+    source_snapshot=$(latest_snapshot_in_repo "$offloaded_repo" 2>/dev/null || true)
+    if [ -z "$source_snapshot" ]; then
+        echo "Offloaded model has no snapshot directory."
+        return 1
+    fi
+    if ! model_runtime_ready_for_snapshot "$model_id" "$source_snapshot"; then
+        echo "Offloaded model does not have complete runtime artifacts."
+        return 1
+    fi
+    source_runtime="${source_snapshot}/flashchat"
+    local_snapshot="${local_repo}/snapshots/$(basename "$source_snapshot")"
+    local_runtime="${local_snapshot}/flashchat"
+
+    if [ -e "$local_runtime" ]; then
+        echo "Local runtime artifacts already exist:"
+        echo "$local_runtime"
+        confirm_exact_model_id "$model_id" "Type the exact model ID to overwrite the local runtime artifacts:" || return 1
+        if ! rm -rf "$local_runtime"; then
+            echo "Unable to remove existing local runtime artifacts."
+            return 1
+        fi
+    fi
+
+    if ! mkdir -p "$local_snapshot"; then
+        echo "Unable to create local snapshot directory."
+        return 1
+    fi
+    if ! cp -R "$source_runtime" "$local_snapshot/"; then
+        echo "Unable to restore runtime artifacts."
+        return 1
+    fi
+    echo "Runtime artifacts restored without copying original safetensors blobs."
+}
+
+manage_model_menu() {
+    local model_id="$1"
+    local name
+    name=$(flashchat_model_name "$model_id")
+    while true; do
+        echo ""
+        echo "=== Manage ${name:-$model_id} ==="
+        echo "Model ID: $model_id"
+        echo ""
+        echo "  [1] Remove original blobs"
+        echo "  [2] Delete local model"
+        echo "  [3] Offload local model"
+        echo "  [4] Full reload from offload"
+        echo "  [5] Restore runtime only from offload"
+        echo "  [Q] Back"
+        printf "> "
+        read -r REPLY
+        case "$REPLY" in
+            1) manage_remove_original_blobs "$model_id" || true ;;
+            2) manage_delete_local_model "$model_id" || true ;;
+            3) manage_offload_model "$model_id" || true ;;
+            4) manage_full_reload_model "$model_id" || true ;;
+            5) manage_restore_runtime_only "$model_id" || true ;;
+            q|Q|"") return ;;
+            *) echo "Please choose one of the listed actions." ;;
+        esac
+    done
+}
+
+cmd_manage() {
+    local list_only=0
+    local force_interactive=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --list|-l)
+                list_only=1
+                shift
+                ;;
+            --interactive)
+                force_interactive=1
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    flashchat_load_config
+    echo "=== Flashchat Manage Models ==="
+    echo ""
+    print_manage_model_status_list
+
+    if [ "$list_only" -eq 1 ] || { [ "$force_interactive" -eq 0 ] && [ ! -t 0 ]; }; then
+        return
+    fi
+
+    local model_id
+    if model_id=$(select_manage_model); then
+        manage_model_menu "$model_id"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Prompt for all config options
 # -----------------------------------------------------------------------------
@@ -575,7 +1026,7 @@ prompt_config_options() {
         echo ""
         
         local default_model default_tokens default_temp
-        local default_top_p default_port default_host default_log_path default_debug default_http_log default_think default_color
+        local default_top_p default_port default_host default_log_path default_offload_dir default_debug default_http_log default_think default_color
         
         default_model=$(flashchat_get MODEL)
         default_tokens=$(flashchat_get MAX_TOKENS)
@@ -584,6 +1035,7 @@ prompt_config_options() {
         default_port=$(flashchat_get SERVER_PORT)
         default_host=$(flashchat_get SERVER_HOST)
         default_log_path=$(flashchat_get SERVER_LOG_PATH)
+        default_offload_dir=$(flashchat_get OFFLOAD_DIR)
         default_debug=$(flashchat_get SERVER_DEBUG)
         default_http_log=$(flashchat_get SERVER_HTTP_LOG)
         default_think=$(flashchat_get SHOW_THINKING)
@@ -658,6 +1110,20 @@ prompt_config_interactive() {
     read -r REPLY
     echo ""
     echo "SERVER_LOG_PATH=\"${REPLY:-$default_log_path}\"" >> /tmp/flashchat_new_config
+
+    # Model Offload Directory
+    local default_offload_dir
+    default_offload_dir=$(flashchat_get OFFLOAD_DIR)
+    printf "Model offload directory (absolute path, '-' = disabled) [%s]: " "${default_offload_dir:-disabled}"
+    read -r REPLY
+    echo ""
+    if [ "$REPLY" = "-" ]; then
+        echo "OFFLOAD_DIR=\"\"" >> /tmp/flashchat_new_config
+    elif [ -z "$REPLY" ] && [ -z "$default_offload_dir" ]; then
+        echo "OFFLOAD_DIR=\"\"" >> /tmp/flashchat_new_config
+    else
+        echo "OFFLOAD_DIR=\"${REPLY:-$default_offload_dir}\"" >> /tmp/flashchat_new_config
+    fi
 
     # Server Debug
     local default_debug
@@ -1377,12 +1843,84 @@ wait_for_port_clear() {
     local waited=0
 
     while [ "$waited" -lt "$timeout" ]; do
-        if ! nc -z "$host" "$port" 2>/dev/null; then
+        if ! is_port_listening "$port"; then
             return 0
         fi
         sleep 1
         waited=$((waited + 1))
     done
+    return 1
+}
+
+get_port_listener_pid() {
+    local port="$1"
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fp 2>/dev/null | awk '/^p/ { print substr($0, 2); exit }'
+}
+
+get_port_listener_command() {
+    local port="$1"
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fc 2>/dev/null | awk '/^c/ { print substr($0, 2); exit }'
+}
+
+is_port_listening() {
+    local port="$1"
+    local host
+    host="$(flashchat_server_connect_host)"
+    if nc -z "$host" "$port" 2>/dev/null; then
+        return 0
+    fi
+    [ -n "$(get_port_listener_pid "$port")" ]
+}
+
+is_flashchat_infer_command() {
+    local command_name="$1"
+    case "$command_name" in
+        infer|metal_infer/infer|*/metal_infer/infer|*/infer)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+stop_external_server() {
+    local server_port="$1"
+    local force="$2"
+    local pid command_name
+
+    pid=$(get_port_listener_pid "$server_port")
+    command_name=$(get_port_listener_command "$server_port")
+
+    if [ -z "$pid" ]; then
+        echo "Server port $server_port is in use but the owning process could not be found."
+        echo "Use 'lsof -i :$server_port' to inspect it manually."
+        return 1
+    fi
+
+    if ! is_flashchat_infer_command "$command_name"; then
+        echo "Refusing to stop the process listening on port $server_port."
+        echo "It does not look like Flashchat's infer server: ${command_name:-unknown} (PID: $pid)"
+        return 1
+    fi
+
+    echo "Stopping external Flashchat server (PID: $pid, command: $command_name)..."
+    kill "$pid" 2>/dev/null || true
+    if wait_for_pid_exit "$pid" 10 && wait_for_port_clear "$server_port" 10; then
+        echo "External server stopped."
+        return 0
+    fi
+
+    if [ "$force" -eq 1 ]; then
+        echo "External server did not exit after waiting. Sending SIGKILL..."
+        kill -9 "$pid" 2>/dev/null || true
+        if wait_for_pid_exit "$pid" 5 && wait_for_port_clear "$server_port" 5; then
+            echo "External server force-stopped."
+            return 0
+        fi
+        error "External server process $pid is still present after SIGKILL"
+    fi
+
+    echo "External server is still running after SIGTERM."
+    echo "Try: flashchat serve --stop --external --force"
     return 1
 }
 
@@ -1393,7 +1931,7 @@ find_available_port() {
     host="$(flashchat_server_connect_host)"
     
     while [ $port -lt $((start_port + 10)) ]; do
-        if ! nc -z "$host" "$port" 2>/dev/null; then
+        if ! is_port_listening "$port"; then
             echo "$port"
             return 0
         fi
@@ -1494,12 +2032,22 @@ delete_model_blobs() {
 cmd_serve() {
     local stop=0
     local force=0
+    local external=0
     local port=""
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --stop)
                 stop=1
+                shift
+                ;;
+            --stop-external)
+                stop=1
+                external=1
+                shift
+                ;;
+            --external)
+                external=1
                 shift
                 ;;
             --force)
@@ -1551,30 +2099,13 @@ cmd_serve() {
                 echo "Server not running (stale PID file)."
                 rm -f "$pid_file"
             fi
-        elif nc -z "$(flashchat_server_connect_host)" "$server_port" 2>/dev/null; then
-            local pid
-            pid=$(lsof -ti:"$server_port" 2>/dev/null | head -1)
-            if [ -n "$pid" ]; then
-                echo "Stopping external server (PID: $pid)..."
-                kill "$pid" 2>/dev/null
-                if wait_for_pid_exit "$pid" 10 && wait_for_port_clear "$server_port" 10; then
-                    echo "External server stopped."
-                elif [ "$force" -eq 1 ]; then
-                    echo "External server did not exit after waiting. Sending SIGKILL..."
-                    kill -9 "$pid" 2>/dev/null || true
-                    if wait_for_pid_exit "$pid" 5 && wait_for_port_clear "$server_port" 5; then
-                        echo "External server force-stopped."
-                    else
-                        error "External server process $pid is still present after SIGKILL"
-                    fi
-                else
-                    echo "External server is still running after SIGTERM."
-                    echo "Try: flashchat serve --stop --force"
-                    return 1
-                fi
+        elif is_port_listening "$server_port"; then
+            if [ "$external" -eq 1 ]; then
+                stop_external_server "$server_port" "$force"
             else
-                echo "Server port $server_port is in use but the owning process could not be found."
-                echo "Use 'lsof -i :$server_port' to inspect it manually."
+                echo "An external server is listening on port $server_port."
+                echo "Use 'flashchat serve --stop --external' to stop it after confirming it is Flashchat's infer server."
+                return 1
             fi
         else
             echo "No server running."
@@ -1618,7 +2149,7 @@ cmd_serve() {
     fi
     
     # Check if port is available (may be used by another process)
-    if nc -z "$server_host" "$server_port" 2>/dev/null; then
+    if is_port_listening "$server_port"; then
         echo "Port $server_port is in use by another process."
         local suggested
         suggested=$(find_available_port $((server_port + 1)))
@@ -1722,7 +2253,7 @@ cmd_chat() {
     server_host="$(flashchat_server_connect_host)"
     
     # Start server if not running
-    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
+    if ! is_port_listening "$server_port"; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1785,7 +2316,7 @@ cmd_prompt() {
     server_host="$(flashchat_server_connect_host)"
     
     # Start server if not running
-    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
+    if ! is_port_listening "$server_port"; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1829,7 +2360,7 @@ cmd_opencode() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
 
-    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
+    if ! is_port_listening "$server_port"; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1887,7 +2418,7 @@ interactive_menu() {
         local server_status="Not running"
         if is_server_running; then
             server_status="Running"
-        elif nc -z "$(flashchat_server_connect_host)" "$(flashchat_get SERVER_PORT)" 2>/dev/null; then
+        elif is_port_listening "$(flashchat_get SERVER_PORT)"; then
             server_status="Running (external)"
         fi
         
@@ -1911,7 +2442,7 @@ interactive_menu() {
         echo "Status: $setup_status at $server_url"
         echo "Model: $(flashchat_get MODEL)"
         echo "$server_line"
-        echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]odels, [Q]uit"
+        echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]anage, [Q]uit"
         read -p "> " -n 1 -r
         
         case "$REPLY" in
@@ -1980,6 +2511,19 @@ interactive_menu() {
                             cmd_serve --stop --force
                         fi
                     fi
+                elif [ "$server_status" = "Running (external)" ]; then
+                    echo "A server is already listening at $(flashchat_server_connect_host):$(flashchat_get SERVER_PORT), but Flashchat does not own its pid file."
+                    read -p "Stop this external Flashchat server? [y/N] " -n 1 -r
+                    echo ""
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        if ! cmd_serve --stop --external; then
+                            read -p "External server did not stop cleanly. Force stop it? [y/N] " -n 1 -r
+                            echo ""
+                            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                                cmd_serve --stop --external --force
+                            fi
+                        fi
+                    fi
                 else
                     cmd_serve
                 fi
@@ -1989,7 +2533,7 @@ interactive_menu() {
                 ;;
             m|M)
                 echo ""
-                cmd_models
+                cmd_manage
                 ;;
             q|Q)
                 echo ""
@@ -2223,6 +2767,9 @@ main() {
             ;;
         models)
             cmd_models "$@"
+            ;;
+        manage)
+            cmd_manage "$@"
             ;;
         config)
             cmd_config "$@"

@@ -104,7 +104,9 @@ make fullbench      # Full forward benchmark (3 iterations)
 
 # Framework regression tests
 ./tests/test_flashchat_cli.sh
+./tests/test_flashchat_manage.sh
 make cli-smoke
+make manage-smoke
 make api-smoke
 make test
 ```
@@ -116,11 +118,12 @@ make test
 - Write self-documenting code with clear naming
 - Prefer early returns for error conditions
 - Keep functions focused and single-purpose
-- **Configuration policy:** shipped model metadata belongs in `assets/model_configs.json`; user settings belong in `~/.config/flashchat/config` and should select models by `MODEL` ID; generated per-model runtime artifacts belong in `<model>/flashchat/` so entire model snapshots can be moved or restored as a unit.
+- **Configuration policy:** shipped model metadata belongs in `assets/model_configs.json`; user settings belong in `~/.config/flashchat/config` and should select models by `MODEL` ID; generated per-model runtime artifacts belong in `<model>/flashchat/` so entire model snapshots can be moved or restored as a unit. Model offload storage is one global `OFFLOAD_DIR`, never a per-model config path.
 - **User/app state policy:** Flashchat-owned user state belongs under `~/.config/flashchat/`, including sessions, prompt history, server logs, pid files, and optional `system.md`.
 - **Do not add implicit config fallbacks.** Use `--config FILE` only as an explicit override, otherwise use `~/.config/flashchat/config`, environment overrides, and defaults derived from the bundled model registry.
 - **Do not rely on current working directory for model registry lookup.** Shell, Python, and C/Objective-C callers should resolve the registry via `FLASHCHAT_MODEL_CONFIG` or the repo-root `assets/model_configs.json` path.
 - **Only the registry-backed production expert format is supported in active code.** Old low-precision experiments may remain in historical results/paper artifacts, but do not reintroduce alternate runtime paths, setup scripts, config settings, or user-facing UX.
+- **Model storage management must be registry-aware and confirmation-gated.** Whole-model offload/reload operates on HuggingFace cache repo directories, runtime-only restore copies only `<model>/flashchat/`, and destructive model actions require typing the exact model ID.
 - **Always ask the user before modifying their system** (e.g., installing packages, changing config files, running system commands)
 - **Setup/dependency installs must start with one explicit consent screen (`Y/x`) before any download/install work begins.** `X` must cancel cleanly with a clear "User cancelled" style message and instructions to re-run `flashchat` later.
 - **When the user gives specific instructions for moving forward, ask if you should update the AGENTS.md file to ensure the instruction is adhered to.**

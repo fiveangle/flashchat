@@ -13,6 +13,7 @@ Running `flashchat` with no arguments launches an interactive menu where you can
 - Resume an existing session
 - Start the API server
 - Configure settings
+- Manage model storage
 - View status
 
 ## Installation
@@ -66,10 +67,13 @@ Starts the local Flashchat server if needed, checks for an OpenCode config at `~
 ```bash
 ./flashchat serve                  # Start API server
 ./flashchat serve --stop           # Stop running server
+./flashchat serve --stop --external # Stop an external Flashchat infer server on the configured port
 ./flashchat serve --port 8080      # Start on specific port
 ```
 
 Starts the OpenAI-compatible HTTP server. Server runs persistently until stopped.
+
+If the interactive menu shows `Running (external)`, Flashchat sees a listener on the configured server port but does not have a pid file for it. The `[O]n/[O]ff` menu option can offer to stop it, defaulting to no. The CLI equivalent is `./flashchat serve --stop --external`, which refuses to stop processes that do not look like Flashchat's `infer` server.
 
 When `infer` runs in server mode, it also appends timestamped server activity to:
 
@@ -144,7 +148,26 @@ The configuration wizard selects from the models in `assets/model_configs.json` 
 ./flashchat models
 ```
 
-Lists supported models and their local setup status.
+Lists supported models and their local setup status. This command is read-only.
+
+### Manage Model Storage
+
+```bash
+./flashchat manage
+./flashchat manage --list
+```
+
+Manages local and offloaded model storage. The manage view shows each supported model's local/offloaded status, runtime readiness, original blob size, and total storage footprint.
+
+Available storage actions:
+
+- Remove original HuggingFace safetensors blobs after the generated runtime files are complete
+- Delete a local model cache repo
+- Offload a whole HuggingFace cache repo to `OFFLOAD_DIR`
+- Fully reload an offloaded model back to the local HuggingFace cache
+- Restore only the generated `<model>/flashchat/` runtime files from offload storage
+
+Destructive actions require typing the exact model ID. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
 
 ### Status
 
@@ -179,7 +202,9 @@ Configuration is loaded from (priority highest to lowest):
 | `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
 | `FLASHCHAT_MODEL_CONFIG` | Model registry path, including the default model and active setup scripts | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
+| `FLASHCHAT_OFFLOAD_DIR` | Unified root for offloaded HuggingFace model cache repos | unset |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
+| `FLASHCHAT_SERVER_HOST` | Server host | `127.0.0.1` |
 | `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `<model>/flashchat` |
 | `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/flashchat/packed_experts` |
 
@@ -191,6 +216,9 @@ Configuration is loaded from (priority highest to lowest):
 # Model Settings
 MODEL="qwen3.6-35B-A3B"
 
+# Storage Settings
+OFFLOAD_DIR=""
+
 # Generation Defaults
 MAX_TOKENS="8192"
 TEMPERATURE="0.7"
@@ -199,6 +227,7 @@ TOP_P="0.9"
 # Server Settings
 SERVER_PORT="8000"
 SERVER_HOST="127.0.0.1"
+SERVER_LOG_PATH="$HOME/.config/flashchat/logs/server.log"
 
 # UI Settings
 SHOW_THINKING="0"

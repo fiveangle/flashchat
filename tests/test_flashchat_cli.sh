@@ -155,7 +155,11 @@ export HOME="$TMPDIR"
 mkdir -p "${TMPDIR}/.config/flashchat"
 
 REAL_HOME=$(eval echo ~$(whoami))
-ACTUAL_MODEL_PATH="${REAL_HOME}/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46"
+ACTUAL_MODEL_SNAPSHOTS="${REAL_HOME}/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots"
+ACTUAL_MODEL_PATH=""
+if [ -d "$ACTUAL_MODEL_SNAPSHOTS" ]; then
+    ACTUAL_MODEL_PATH=$(find "$ACTUAL_MODEL_SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+fi
 if [ -d "$ACTUAL_MODEL_PATH" ]; then
     export FLASHCHAT_MODEL_PATH="$ACTUAL_MODEL_PATH"
 fi
@@ -163,7 +167,7 @@ fi
 TEST_HOST="127.0.0.1"
 TEST_PORT="19999"
 if curl -fsS "http://${TEST_HOST}:${TEST_PORT}/health" >/dev/null 2>&1; then
-    "$FLASHCHAT" serve --stop --port 19999 >/dev/null 2>&1 || true
+    "$FLASHCHAT" serve --stop --external --port 19999 >/dev/null 2>&1 || true
     sleep 2
 fi
 
@@ -176,6 +180,7 @@ TOP_P="0.9"
 SERVER_PORT="${TEST_PORT}"
 SERVER_HOST="${TEST_HOST}"
 SERVER_LOG_PATH="${TMPDIR}/logs"
+OFFLOAD_DIR="${TMPDIR}/offload"
 SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
 SHOW_THINKING="0"
@@ -227,6 +232,18 @@ run_test_contains "models current marker" "* Current model" "$FLASHCHAT" models
 run_test_contains "models artifact status" "experts:" "$FLASHCHAT" models
 
 # ---------------------------------------------------------------------------
+# Manage command
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Manage Command ==="
+echo ""
+
+run_test_contains "manage list basic" "Flashchat Manage Models" "$FLASHCHAT" manage --list
+run_test_contains "manage offload dir" "Offload directory:" "$FLASHCHAT" manage --list
+run_test_contains "manage runtime status" "runtime:" "$FLASHCHAT" manage --list
+
+# ---------------------------------------------------------------------------
 # Sessions command
 # ---------------------------------------------------------------------------
 
@@ -264,6 +281,7 @@ echo ""
 run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"
 
 # Config --reset and --full-reset: test in isolated temp config
 reset_config="${TMPDIR}/reset_config"
@@ -294,6 +312,9 @@ run_test_contains "serve stop (not running)" "No server running." "$FLASHCHAT" s
 
 # serve --stop --force when nothing is running
 run_test_contains "serve stop force (not running)" "No server running." "$FLASHCHAT" serve --stop --force
+
+# serve --stop --external when nothing is running
+run_test_contains "serve stop external (not running)" "No server running." "$FLASHCHAT" serve --stop --external
 
 # ---------------------------------------------------------------------------
 # Inference Server Tests

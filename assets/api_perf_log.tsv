@@ -81,3 +81,25 @@ timestamp	branch	commit	hostname	hw_model	ram_gib	cpu_summary	model	server_mode	
 2026-05-06T10:54:10Z	codex-config-framework-cleanup	32162f3	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_text_stream	/v1/responses	true	none	default	0		6344	stream_deltas	192	30.265	pass	repeat benchmark x24
 2026-05-06T10:54:25Z	codex-config-framework-cleanup	32162f3	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_call	/v1/responses	false	forced	default	0		15213	tool_calls	1		pass	forced record_result
 2026-05-06T10:54:33Z	codex-config-framework-cleanup	32162f3	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_followup	/v1/responses	false	followup	default	0		7337	text_chars	0		pass	tool_choice none
+2026-05-06T12:22:47Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	health	/health	false	none				41	none			pass	
+2026-05-06T12:22:47Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	v1_root	/v1	false	none				40	none			pass	
+2026-05-06T12:22:48Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	models	/v1/models	false	none				43	none			pass	
+2026-05-06T12:22:52Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_text_nonstream	/v1/chat/completions	false	none	default	0		4378	text_chars	0		pass	
+2026-05-06T12:23:00Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_text_stream	/v1/chat/completions	true	none	default	0		8178	stream_deltas	96	11.739	pass	repeat benchmark x24
+2026-05-06T12:23:21Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_tool_call	/v1/chat/completions	false	forced	default	0		20589	tool_calls	1		pass	forced record_result
+2026-05-06T12:23:31Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_tool_followup	/v1/chat/completions	false	followup	default	0		10242	text_chars	236		pass	tool_choice none
+2026-05-06T12:23:35Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_text_nonstream	/v1/responses	false	none	default	0		3936	text_chars	0		pass	
+2026-05-06T12:23:44Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_text_stream	/v1/responses	true	none	default	0		8420	stream_deltas	192	22.803	pass	repeat benchmark x24
+2026-05-06T12:24:03Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_call	/v1/responses	false	forced	default	0		19249	tool_calls	1		pass	forced record_result
+2026-05-06T12:24:14Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_followup	/v1/responses	false	followup	default	0		10209	text_chars	0		pass	tool_choice none
+2026-05-06T12:28:02Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	health	/health	false	none				40	none			pass	
+2026-05-06T12:28:02Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	v1_root	/v1	false	none				42	none			pass	
+2026-05-06T12:28:02Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	models	/v1/models	false	none				38	none			pass	
+2026-05-06T12:28:05Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_text_nonstream	/v1/chat/completions	false	none	default	0		2995	text_chars	0		pass	
+2026-05-06T12:28:11Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_text_stream	/v1/chat/completions	true	none	default	0		5881	stream_deltas	96	16.324	pass	repeat benchmark x24
+2026-05-06T12:28:26Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_tool_call	/v1/chat/completions	false	forced	default	0		14694	tool_calls	1		pass	forced record_result
+2026-05-06T12:28:33Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	chat_tool_followup	/v1/chat/completions	false	followup	default	0		7104	text_chars	236		pass	tool_choice none
+2026-05-06T12:28:37Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_text_nonstream	/v1/responses	false	none	default	0		3088	text_chars	0		pass	
+2026-05-06T12:28:43Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_text_stream	/v1/responses	true	none	default	0		5880	stream_deltas	192	32.653	pass	repeat benchmark x24
+2026-05-06T12:28:57Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_call	/v1/responses	false	forced	default	0		14881	tool_calls	1		pass	forced record_result
+2026-05-06T12:29:05Z	model-management	fe40dcc	fiveangle-6.lan	Mac17,2	32.0	4p 6e 10g	qwen3.6-35B-A3B	reused	responses_tool_followup	/v1/responses	false	followup	default	0		7204	text_chars	0		pass	tool_choice none

@@ -32,6 +32,7 @@ FLASHCHAT_DEFAULT_SERVER_HTTP_LOG="0"
 FLASHCHAT_DEFAULT_COLOR_OUTPUT="1"
 FLASHCHAT_DEFAULT_TEMPERATURE="0.7"
 FLASHCHAT_DEFAULT_TOP_P="0.9"
+FLASHCHAT_DEFAULT_OFFLOAD_DIR=""
 
 # Config values (set after loading)
 MODEL=""
@@ -46,6 +47,7 @@ SERVER_HTTP_LOG=""
 COLOR_OUTPUT=""
 TEMPERATURE=""
 TOP_P=""
+OFFLOAD_DIR=""
 
 # Derived paths (computed after config load)
 MODEL_PATH=""
@@ -227,6 +229,7 @@ flashchat_load_config() {
     COLOR_OUTPUT=""
     TEMPERATURE=""
     TOP_P=""
+    OFFLOAD_DIR=""
     MODEL_PATH=""
     WEIGHTS_DIR=""
     EXPERTS_DIR=""
@@ -256,6 +259,7 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_COLOR_OUTPUT" ] && COLOR_OUTPUT="$FLASHCHAT_COLOR_OUTPUT"
     [ -n "$FLASHCHAT_TEMPERATURE" ] && TEMPERATURE="$FLASHCHAT_TEMPERATURE"
     [ -n "$FLASHCHAT_TOP_P" ] && TOP_P="$FLASHCHAT_TOP_P"
+    [ -n "$FLASHCHAT_OFFLOAD_DIR" ] && OFFLOAD_DIR="$FLASHCHAT_OFFLOAD_DIR"
     [ -n "$FLASHCHAT_WEIGHTS_DIR" ] && WEIGHTS_DIR="$FLASHCHAT_WEIGHTS_DIR"
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
@@ -283,6 +287,7 @@ flashchat_load_config() {
     COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
     TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
     TOP_P="${TOP_P:-$FLASHCHAT_DEFAULT_TOP_P}"
+    OFFLOAD_DIR="${OFFLOAD_DIR:-$FLASHCHAT_DEFAULT_OFFLOAD_DIR}"
     
     # Compute derived paths
     _flashchat_compute_paths
@@ -306,6 +311,7 @@ flashchat_get() {
         COLOR_OUTPUT) echo "$COLOR_OUTPUT" ;;
         TEMPERATURE) echo "$TEMPERATURE" ;;
         TOP_P) echo "$TOP_P" ;;
+        OFFLOAD_DIR) echo "$OFFLOAD_DIR" ;;
         MODEL_PATH) echo "$MODEL_PATH" ;;
         WEIGHTS_DIR) echo "$WEIGHTS_DIR" ;;
         EXPERTS_DIR) echo "$EXPERTS_DIR" ;;
@@ -328,6 +334,9 @@ flashchat_create_default_config() {
 
 # Model Settings
 MODEL="${MODEL:-$(flashchat_default_model)}"
+
+# Storage Settings
+OFFLOAD_DIR="${OFFLOAD_DIR:-$FLASHCHAT_DEFAULT_OFFLOAD_DIR}"
 
 # Generation Defaults
 MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
