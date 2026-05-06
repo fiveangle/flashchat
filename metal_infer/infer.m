@@ -116,6 +116,13 @@ static int g_server_http_log_enabled = 0;
 static int g_show_thinking_enabled = 0;
 static int g_system_prompt_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
+static float g_default_temperature = 0.7f;
+static float g_default_top_p = 0.8f;
+static int g_default_top_k = 20;
+static float g_default_min_p = 0.0f;
+static float g_default_presence_penalty = 1.5f;
+static float g_default_repetition_penalty = 1.0f;
+static int g_default_reasoning_enabled = 1;
 
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
@@ -243,6 +250,10 @@ static void server_log_open(void) {
     fprintf(g_server_log, "[serve] Build: %s\n", FLASHCHAT_BUILD_STAMP);
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Show thinking: %s\n", g_show_thinking_enabled ? "enabled" : "disabled");
+    server_log_timestamp(g_server_log);
+    fprintf(g_server_log, "[serve] Sampling defaults: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
+            g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
+            g_default_presence_penalty, g_default_repetition_penalty);
     if (g_server_debug_enabled) {
         server_log_timestamp(g_server_log);
         fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
@@ -381,9 +392,6 @@ static int g_expert_freq[MAX_NUM_LAYERS][MAX_NUM_EXPERTS];  // activation count 
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
-static float g_default_temperature = 0.7f;
-static float g_default_top_p = 0.9f;
-static int g_default_reasoning_enabled = 1;
 
 static const char *kApiModelId = NULL;
 
@@ -1164,21 +1172,47 @@ static float clampf_local(float x, float minv, float maxv) {
     return x;
 }
 
-static int sample_top_p_temperature(const float *logits, int dim, float temperature, float top_p) {
+static void apply_sampling_penalties(float *logits, int dim, const int *token_counts,
+                                     float presence_penalty, float repetition_penalty) {
+    if (!logits || !token_counts) return;
+    int use_presence = fabsf(presence_penalty) > 0.000001f;
+    int use_repetition = repetition_penalty > 0.0f && fabsf(repetition_penalty - 1.0f) > 0.000001f;
+    if (!use_presence && !use_repetition) return;
+
+    repetition_penalty = clampf_local(repetition_penalty, 0.01f, 10.0f);
+    for (int i = 0; i < dim; i++) {
+        if (token_counts[i] <= 0) continue;
+        if (use_repetition) {
+            if (logits[i] > 0.0f) logits[i] /= repetition_penalty;
+            else logits[i] *= repetition_penalty;
+        }
+        if (use_presence) {
+            logits[i] -= presence_penalty;
+        }
+    }
+}
+
+static int sample_top_p_temperature(const float *logits, int dim, float temperature,
+                                    float top_p, int top_k, float min_p) {
     if (temperature <= 0.0f) {
         return cpu_argmax(logits, dim);
     }
 
     temperature = clampf_local(temperature, 0.01f, 5.0f);
     top_p = clampf_local(top_p, 0.01f, 1.0f);
-    enum { SAMPLE_TOP_K = 256 };
-    int top_idx[SAMPLE_TOP_K];
-    float top_logits[SAMPLE_TOP_K];
+    min_p = clampf_local(min_p, 0.0f, 1.0f);
+    enum { SAMPLE_MAX_TOP_K = 1024 };
+    int sample_top_k = top_k > 0 ? top_k : 256;
+    if (sample_top_k > SAMPLE_MAX_TOP_K) sample_top_k = SAMPLE_MAX_TOP_K;
+    if (sample_top_k > dim) sample_top_k = dim;
+
+    int top_idx[SAMPLE_MAX_TOP_K];
+    float top_logits[SAMPLE_MAX_TOP_K];
     int top_count = 0;
 
     for (int i = 0; i < dim; i++) {
         float val = logits[i];
-        if (top_count < SAMPLE_TOP_K) {
+        if (top_count < sample_top_k) {
             int j = top_count++;
             while (j > 0 && val > top_logits[j - 1]) {
                 top_logits[j] = top_logits[j - 1];
@@ -1203,7 +1237,7 @@ static int sample_top_p_temperature(const float *logits, int dim, float temperat
     if (top_count == 0) return cpu_argmax(logits, dim);
 
     float max_logit = top_logits[0];
-    float probs[SAMPLE_TOP_K];
+    float probs[SAMPLE_MAX_TOP_K];
     float sum = 0.0f;
     for (int i = 0; i < top_count; i++) {
         probs[i] = expf((top_logits[i] - max_logit) / temperature);
@@ -1212,18 +1246,29 @@ static int sample_top_p_temperature(const float *logits, int dim, float temperat
     if (sum <= 0.0f) return top_idx[0];
     for (int i = 0; i < top_count; i++) probs[i] /= sum;
 
+    int min_p_limit = top_count;
+    if (min_p > 0.0f) {
+        float threshold = probs[0] * min_p;
+        min_p_limit = 1;
+        while (min_p_limit < top_count && probs[min_p_limit] >= threshold) {
+            min_p_limit++;
+        }
+    }
+
     int limit = top_count;
     float cumulative = 0.0f;
-    for (int i = 0; i < top_count; i++) {
+    for (int i = 0; i < min_p_limit; i++) {
         cumulative += probs[i];
         if (cumulative >= top_p) {
             limit = i + 1;
             break;
         }
     }
+    if (limit > min_p_limit) limit = min_p_limit;
 
     float renorm = 0.0f;
     for (int i = 0; i < limit; i++) renorm += probs[i];
+    if (renorm <= 0.0f) return top_idx[0];
     float target = ((float)arc4random() / ((float)UINT32_MAX + 1.0f)) * renorm;
     float running = 0.0f;
     for (int i = 0; i < limit; i++) {
@@ -1235,21 +1280,39 @@ static int sample_top_p_temperature(const float *logits, int dim, float temperat
     return top_idx[limit - 1];
 }
 
-static int pick_next_token(const float *logits, int dim, float temperature, float top_p, int reasoning_enabled) {
+static int pick_next_token(const float *logits, int dim, float temperature, float top_p,
+                           int top_k, float min_p, float presence_penalty,
+                           float repetition_penalty, const int *token_counts,
+                           int reasoning_enabled) {
     float *tmp = NULL;
     const float *use_logits = logits;
-    if (!reasoning_enabled) {
+    if (!reasoning_enabled || token_counts || fabsf(presence_penalty) > 0.000001f ||
+        fabsf(repetition_penalty - 1.0f) > 0.000001f) {
         tmp = malloc((size_t)dim * sizeof(float));
         if (tmp) {
             memcpy(tmp, logits, (size_t)dim * sizeof(float));
-            tmp[g_cfg.think_start_token] = -1e30f;
-            tmp[g_cfg.think_end_token] = -1e30f;
             use_logits = tmp;
         }
     }
-    int tok = sample_top_p_temperature(use_logits, dim, temperature, top_p);
+    if (tmp) {
+        apply_sampling_penalties(tmp, dim, token_counts, presence_penalty, repetition_penalty);
+        if (!reasoning_enabled) {
+            tmp[g_cfg.think_start_token] = -1e30f;
+            tmp[g_cfg.think_end_token] = -1e30f;
+        }
+    }
+    int tok = sample_top_p_temperature(use_logits, dim, temperature, top_p, top_k, min_p);
     free(tmp);
     return tok;
+}
+
+static void seed_token_counts_from_prompt(int *token_counts, int vocab_size, PromptTokens *pt, int start) {
+    if (!token_counts || !pt || !pt->ids) return;
+    if (start < 0) start = 0;
+    for (int i = start; i < pt->count; i++) {
+        int tok = pt->ids[i];
+        if (tok >= 0 && tok < vocab_size) token_counts[tok]++;
+    }
 }
 
 // SiLU activation
@@ -6118,6 +6181,10 @@ typedef struct {
     int max_tokens;
     float temperature;
     float top_p;
+    int top_k;
+    float min_p;
+    float presence_penalty;
+    float repetition_penalty;
     int reasoning_enabled;
     int reasoning_explicit;
     ToolChoiceMode tool_choice_mode;
@@ -6263,6 +6330,10 @@ static void api_request_init(ApiRequest *req, ApiKind kind) {
     req->max_tokens = 8192;
     req->temperature = g_default_temperature;
     req->top_p = g_default_top_p;
+    req->top_k = g_default_top_k;
+    req->min_p = g_default_min_p;
+    req->presence_penalty = g_default_presence_penalty;
+    req->repetition_penalty = g_default_repetition_penalty;
     req->reasoning_enabled = g_default_reasoning_enabled;
     req->tool_choice_mode = TOOL_CHOICE_AUTO;
     strncpy(req->model, kApiModelId, sizeof(req->model) - 1);
@@ -6514,6 +6585,14 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     if (temperature) req->temperature = [temperature floatValue];
     NSNumber *top_p = root[@"top_p"];
     if (top_p) req->top_p = [top_p floatValue];
+    NSNumber *top_k = root[@"top_k"];
+    if (top_k) req->top_k = [top_k intValue];
+    NSNumber *min_p = root[@"min_p"];
+    if (min_p) req->min_p = [min_p floatValue];
+    NSNumber *presence_penalty = root[@"presence_penalty"];
+    if (presence_penalty) req->presence_penalty = [presence_penalty floatValue];
+    NSNumber *repetition_penalty = root[@"repetition_penalty"];
+    if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
     if (reasoning && reasoning != [NSNull null]) {
         req->reasoning_explicit = 1;
@@ -6595,6 +6674,14 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     if (temperature) req->temperature = [temperature floatValue];
     NSNumber *top_p = root[@"top_p"];
     if (top_p) req->top_p = [top_p floatValue];
+    NSNumber *top_k = root[@"top_k"];
+    if (top_k) req->top_k = [top_k intValue];
+    NSNumber *min_p = root[@"min_p"];
+    if (min_p) req->min_p = [min_p floatValue];
+    NSNumber *presence_penalty = root[@"presence_penalty"];
+    if (presence_penalty) req->presence_penalty = [presence_penalty floatValue];
+    NSNumber *repetition_penalty = root[@"repetition_penalty"];
+    if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
     if (reasoning && reasoning != [NSNull null]) {
         req->reasoning_explicit = 1;
@@ -6653,6 +6740,10 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
         @"max_tokens": @(req->max_tokens),
         @"temperature": @(req->temperature),
         @"top_p": @(req->top_p),
+        @"top_k": @(req->top_k),
+        @"min_p": @(req->min_p),
+        @"presence_penalty": @(req->presence_penalty),
+        @"repetition_penalty": @(req->repetition_penalty),
         @"reasoning": @(req->reasoning_enabled),
         @"tools": root[@"tools"] ?: @[],
         @"tool_choice": root[@"tool_choice"] ?: @"auto"
@@ -7256,6 +7347,12 @@ static int render_request_debug(const char *request_path, const char *output_dir
     printf("assembled_chars=%zu\n", strlen(assembled));
     printf("system_tokens=%d\n", sys_tokens);
     printf("assembled_tokens=%d\n", full_token_count);
+    printf("temperature=%.3f\n", req.temperature);
+    printf("top_p=%.3f\n", req.top_p);
+    printf("top_k=%d\n", req.top_k);
+    printf("min_p=%.3f\n", req.min_p);
+    printf("presence_penalty=%.3f\n", req.presence_penalty);
+    printf("repetition_penalty=%.3f\n", req.repetition_penalty);
 
     if (output_dir && output_dir[0]) {
         mkdir(output_dir, 0755);
@@ -7263,7 +7360,7 @@ static int render_request_debug(const char *request_path, const char *output_dir
         write_text_file(output_dir, "system_prompt.txt", sys_prompt);
         write_text_file(output_dir, "conversation.txt", req.conversation_text ?: "");
         write_text_file(output_dir, "assembled_prompt.txt", assembled);
-        char summary[1024];
+        char summary[2048];
         snprintf(summary, sizeof(summary),
                  "{\n"
                  "  \"kind\": \"%s\",\n"
@@ -7273,12 +7370,20 @@ static int render_request_debug(const char *request_path, const char *output_dir
                  "  \"conversation_chars\": %zu,\n"
                  "  \"assembled_chars\": %zu,\n"
                  "  \"system_tokens\": %d,\n"
-                 "  \"assembled_tokens\": %d\n"
+                 "  \"assembled_tokens\": %d,\n"
+                 "  \"temperature\": %.3f,\n"
+                 "  \"top_p\": %.3f,\n"
+                 "  \"top_k\": %d,\n"
+                 "  \"min_p\": %.3f,\n"
+                 "  \"presence_penalty\": %.3f,\n"
+                 "  \"repetition_penalty\": %.3f\n"
                  "}\n",
                  kind == API_KIND_RESPONSES ? "responses" : "chat",
                  req.tool_count, req.tool_choice_mode,
                  strlen(sys_prompt), strlen(req.conversation_text ?: ""),
-                 strlen(assembled), sys_tokens, full_token_count);
+                 strlen(assembled), sys_tokens, full_token_count,
+                 req.temperature, req.top_p, req.top_k, req.min_p,
+                 req.presence_penalty, req.repetition_penalty);
         write_text_file(output_dir, "summary.json", summary);
     }
 
@@ -8446,10 +8551,11 @@ static void serve_loop(
                 continue;
             }
         }
-        server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f reasoning=%d snapshot=%d\n",
+        server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f top_k=%d min_p=%.3f presence=%.2f repetition=%.2f reasoning=%d snapshot=%d\n",
                           request_id, is_chat ? "chat" : "responses",
                           req.conversation_text ? strlen(req.conversation_text) : 0,
                           req.tool_count, req.stream, req.temperature, req.top_p,
+                          req.top_k, req.min_p, req.presence_penalty, req.repetition_penalty,
                           req.reasoning_enabled, req.used_snapshot);
 
         // Workaround: opencode fires a "title generator" request before every chat.
@@ -8546,10 +8652,27 @@ static void serve_loop(
         PromptTokens *pt = tokenize_request_prompt(&req, request_id);
         if (!pt) {
             send_json_error(client_fd, 500, "server_error", "tokenization failed");
+            free(req_sys_prompt);
             api_request_free(&req);
             free(reqbuf);
             close(client_fd);
             continue;
+        }
+        int active_tools = (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE);
+        float effective_presence_penalty = active_tools ? 0.0f : req.presence_penalty;
+        float effective_repetition_penalty = active_tools ? 1.0f : req.repetition_penalty;
+        int *token_counts = NULL;
+        if (fabsf(effective_presence_penalty) > 0.000001f ||
+            fabsf(effective_repetition_penalty - 1.0f) > 0.000001f) {
+            token_counts = calloc((size_t)g_cfg.vocab_size, sizeof(int));
+            if (token_counts) {
+                if (!active_tools) {
+                    int history_start = req.used_snapshot ? 0 : sys_prompt_token_count;
+                    seed_token_counts_from_prompt(token_counts, g_cfg.vocab_size, pt, history_start);
+                }
+            } else {
+                server_log_errorf("[serve] %s sampler penalties disabled: token count allocation failed\n", request_id);
+            }
         }
 
         double t_prefill = now_ms();
@@ -8657,7 +8780,10 @@ static void serve_loop(
             free(normed);
         }
         lm_head_forward(wf, hidden, logits);
-        int next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p, req.reasoning_enabled);
+        int next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p,
+                                         req.top_k, req.min_p, effective_presence_penalty,
+                                         effective_repetition_penalty, token_counts,
+                                         req.reasoning_enabled);
         server_log_errorf("[serve] %s first_token=%d\n", request_id, next_token);
 
         if (g_pred_enabled) {
@@ -8778,6 +8904,9 @@ tool_call_checked:
             }
 
             cache_telemetry_note_token();
+            if (token_counts && next_token >= 0 && next_token < g_cfg.vocab_size) {
+                token_counts[next_token]++;
+            }
             embed_lookup(wf, next_token, hidden);
             for (int layer = 0; layer < g_cfg.num_layers; layer++) {
                 int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
@@ -8798,7 +8927,10 @@ tool_call_checked:
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p, req.reasoning_enabled);
+            next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p,
+                                         req.top_k, req.min_p, effective_presence_penalty,
+                                         effective_repetition_penalty, token_counts,
+                                         req.reasoning_enabled);
         }
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
@@ -8837,6 +8969,7 @@ tool_call_checked:
 
         free(final_json);
         free(gen_response);
+        free(token_counts);
         parsed_tool_call_free(&parsed_tool_call);
         free(tool_call_buf);
         free(pt->ids);
@@ -8919,12 +9052,20 @@ int main(int argc, char **argv) {
         int serve_port = env_serve_port ? atoi(env_serve_port) : 0;
         const char *env_temperature = getenv("FLASHCHAT_TEMPERATURE");
         const char *env_top_p = getenv("FLASHCHAT_TOP_P");
+        const char *env_top_k = getenv("FLASHCHAT_TOP_K");
+        const char *env_min_p = getenv("FLASHCHAT_MIN_P");
+        const char *env_presence_penalty = getenv("FLASHCHAT_PRESENCE_PENALTY");
+        const char *env_repetition_penalty = getenv("FLASHCHAT_REPETITION_PENALTY");
         const char *env_reasoning = getenv("FLASHCHAT_REASONING");
         const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
         const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
         const char *env_system_prompt_cache_max_entries = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES");
         if (env_temperature && env_temperature[0]) g_default_temperature = strtof(env_temperature, NULL);
         if (env_top_p && env_top_p[0]) g_default_top_p = strtof(env_top_p, NULL);
+        if (env_top_k && env_top_k[0]) g_default_top_k = atoi(env_top_k);
+        if (env_min_p && env_min_p[0]) g_default_min_p = strtof(env_min_p, NULL);
+        if (env_presence_penalty && env_presence_penalty[0]) g_default_presence_penalty = strtof(env_presence_penalty, NULL);
+        if (env_repetition_penalty && env_repetition_penalty[0]) g_default_repetition_penalty = strtof(env_repetition_penalty, NULL);
         if (env_reasoning && env_reasoning[0]) {
             g_default_reasoning_enabled = server_flag_enabled(env_reasoning);
         }
@@ -8979,6 +9120,26 @@ int main(int argc, char **argv) {
                         char *val = line + 6;
                         char *quote = strchr(val, '"');
                         if (quote) g_default_top_p = strtof(quote + 1, NULL);
+                    }
+                    if (!env_top_k && strncmp(line, "TOP_K=", 6) == 0) {
+                        char *val = line + 6;
+                        char *quote = strchr(val, '"');
+                        if (quote) g_default_top_k = atoi(quote + 1);
+                    }
+                    if (!env_min_p && strncmp(line, "MIN_P=", 6) == 0) {
+                        char *val = line + 6;
+                        char *quote = strchr(val, '"');
+                        if (quote) g_default_min_p = strtof(quote + 1, NULL);
+                    }
+                    if (!env_presence_penalty && strncmp(line, "PRESENCE_PENALTY=", 17) == 0) {
+                        char *val = line + 17;
+                        char *quote = strchr(val, '"');
+                        if (quote) g_default_presence_penalty = strtof(quote + 1, NULL);
+                    }
+                    if (!env_repetition_penalty && strncmp(line, "REPETITION_PENALTY=", 19) == 0) {
+                        char *val = line + 19;
+                        char *quote = strchr(val, '"');
+                        if (quote) g_default_repetition_penalty = strtof(quote + 1, NULL);
                     }
                     if (!env_show_thinking && strncmp(line, "SHOW_THINKING=", 14) == 0) {
                         char *val = line + 14;

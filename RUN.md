@@ -232,7 +232,11 @@ OFFLOAD_DIR=""
 # Generation Defaults
 MAX_TOKENS="8192"
 TEMPERATURE="0.7"
-TOP_P="0.9"
+TOP_P="0.8"
+TOP_K="20"
+MIN_P="0.0"
+PRESENCE_PENALTY="1.5"
+REPETITION_PENALTY="1.0"
 
 # Server Settings
 SERVER_PORT="8000"
@@ -276,7 +280,11 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 100,
     "temperature": 0.7,
-    "top_p": 0.9
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0
   }'
 ```
 
