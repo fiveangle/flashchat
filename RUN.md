@@ -19,11 +19,16 @@ Running `flashchat` with no arguments launches an interactive menu where you can
 
 ### Prerequisites
 
-That's it! flashchat automatically:
-- Creates a Python virtual environment with numpy on first run
-- Builds the binaries when needed (infer, chat)
+Before running Flashchat, you need:
 
-That's it! On first run, flashchat will automatically:
+- An Apple Silicon Mac with at least 16GB of RAM
+- Enough free internal SSD space for the selected model and generated expert data
+- Xcode Command Line Tools for building the Metal inference binaries
+
+On first run, `flashchat` will guide you through the rest:
+
+- Create a Python virtual environment with NumPy for setup scripts
+- Build the required binaries when needed (`infer`, `chat`)
 - Download the model from HuggingFace (if not present)
 - Create a default configuration file
 - Prompt you through extracting weights and expert data
