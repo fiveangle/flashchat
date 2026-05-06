@@ -35,6 +35,42 @@
         "eos_2": 248044,
         "think_start": 248068,
         "think_end": 248069
+      },
+      "default_sampling_profile": "instruct",
+      "sampling_profiles": {
+        "thinking-general": {
+          "label": "Thinking (general tasks)",
+          "description": "Broader reasoning for open-ended prompts.",
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "reasoning": 1
+        },
+        "thinking-coding": {
+          "label": "Thinking (precise coding)",
+          "description": "More focused reasoning for implementation work.",
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "reasoning": 1
+        },
+        "instruct": {
+          "label": "Instruct (non-thinking)",
+          "description": "Direct responses without hidden reasoning.",
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "reasoning": 0
+        }
       }
     },
     "qwen3.6-35B-A3B": {
@@ -72,6 +108,42 @@
         "eos_2": 248044,
         "think_start": 248068,
         "think_end": 248069
+      },
+      "default_sampling_profile": "instruct",
+      "sampling_profiles": {
+        "thinking-general": {
+          "label": "Thinking (general tasks)",
+          "description": "Broader reasoning for open-ended prompts.",
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "reasoning": 1
+        },
+        "thinking-coding": {
+          "label": "Thinking (precise coding)",
+          "description": "More focused reasoning for implementation work.",
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "reasoning": 1
+        },
+        "instruct": {
+          "label": "Instruct (non-thinking)",
+          "description": "Direct responses without hidden reasoning.",
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "reasoning": 0
+        }
       }
     }
   },

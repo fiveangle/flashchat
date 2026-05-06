@@ -70,6 +70,8 @@ mkdir -p "$CONFIG_DIR"
 cat > "${CONFIG_DIR}/config" <<EOF
 MODEL="${MODEL_ID}"
 MAX_TOKENS="1"
+SAMPLING_PROFILE="custom"
+REASONING="0"
 TEMPERATURE="0.1"
 TOP_P="0.8"
 TOP_K="20"

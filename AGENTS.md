@@ -146,6 +146,7 @@ make test
 - **Server control commands must verify reality, not assume it.** Start/stop helpers should confirm health or actual process exit before reporting success or removing pid/state files.
 - **Persistent server/runtime toggles should be first-class config options.** If a setting is useful beyond one-off debugging, surface it through the config file and `flashchat` configuration wizard instead of leaving it env-only.
 - **Sampling/runtime generation knobs must stay consistent across config, API request parsing, server runtime signatures, docs, and smoke-test perf logging.** Do not add hidden sampler defaults that cannot be inspected or overridden from Flashchat's normal user surfaces.
+- **Model-specific sampling profiles belong in `assets/model_configs.json`.** The Flashchat config should select a `SAMPLING_PROFILE`, with `custom` reserved for manually managed sampler/reasoning values.
 - **When a functional block or milestone is complete, consider prompting for a commit checkpoint.** Don’t interrupt active debugging for every small change, but when a coherent unit of work lands, ask whether it should be committed before moving on.
 
 ### C/Objective-C

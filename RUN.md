@@ -231,6 +231,8 @@ OFFLOAD_DIR=""
 
 # Generation Defaults
 MAX_TOKENS="8192"
+SAMPLING_PROFILE="instruct"
+REASONING="0"
 TEMPERATURE="0.7"
 TOP_P="0.8"
 TOP_K="20"
@@ -253,6 +255,8 @@ COLOR_OUTPUT="1"
 `SERVER_LOG_PATH` may be a `.log` file or a directory. Extensionless paths entered in the configuration wizard are treated as directories and will receive `server.log` plus debug artifacts when debug logging is enabled.
 
 `SYSTEM_PROMPT_CACHE` stores compressed, model-local snapshots under `<model>/flashchat/system_prompt_cache/` so repeated server runs with the same harness/system prompt can skip the expensive system prompt prefill. The cache is bounded by `SYSTEM_PROMPT_CACHE_MAX_ENTRIES`.
+
+`SAMPLING_PROFILE` selects a model-supported generation profile from `assets/model_configs.json`. Use `custom` to edit `REASONING`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`, `PRESENCE_PENALTY`, and `REPETITION_PENALTY` directly.
 
 Flashchat records a runtime signature for servers it starts. If model selection, model registry data, server-affecting settings, or infer source/binary state changes while the server is running, the next Flashchat-managed server use restarts the owned server before reuse.
 
