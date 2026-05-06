@@ -169,7 +169,7 @@ TMP_CONFIG="${TMPDIR}/.config/flashchat/config"
 cat > "$TMP_CONFIG" <<EOF
 MODEL="qwen3.6-35B-A3B"
 QUANTIZATION="4bit"
-MAX_TOKENS="28000"
+MAX_TOKENS="1"
 TEMPERATURE="0.1"
 TOP_P="0.9"
 SERVER_PORT="19999"
@@ -211,6 +211,19 @@ echo ""
 run_test_contains "status basic" "Flashchat Show Status" "$FLASHCHAT"  status
 run_test_contains "status server info" "Server:" "$FLASHCHAT"  status
 run_test_contains "status model info" "Model:" "$FLASHCHAT"  status
+
+# ---------------------------------------------------------------------------
+# Models command
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Models Command ==="
+echo ""
+
+run_test_contains "models basic" "Flashchat Models" "$FLASHCHAT" models
+run_test_contains "models current marker" "* Current model" "$FLASHCHAT" models
+run_test_contains "models artifact status" "4-bit experts:" "$FLASHCHAT" models
+run_test_contains "models deprecated 2bit" "2-bit expert packs are deprecated" "$FLASHCHAT" models
 
 # ---------------------------------------------------------------------------
 # Sessions command

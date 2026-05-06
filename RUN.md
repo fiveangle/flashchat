@@ -136,6 +136,16 @@ Runs performance benchmarks. Uses configuration for model paths.
 
 View and edit settings. If no config exists, defaults are used automatically. The reset option allows you to reconfigure while preserving chat sessions.
 
+The configuration wizard selects from the models in `assets/model_configs.json` and shows the local setup state for each model, including downloaded HuggingFace files and generated files under `<model>/flashchat/`.
+
+### Models
+
+```bash
+./flashchat models
+```
+
+Lists supported models and their local setup status. Existing 2-bit expert packs are shown as deprecated artifacts.
+
 ### Status
 
 ```bash
@@ -169,7 +179,7 @@ Configuration is loaded from (priority highest to lowest):
 | `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
 | `FLASHCHAT_MODEL_CONFIG` | Model registry path | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
-| `FLASHCHAT_QUANTIZATION` | 4bit or 2bit | `4bit` |
+| `FLASHCHAT_QUANTIZATION` | Expert quantization. `2bit` is deprecated. | `4bit` |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
 | `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `<model>/flashchat` |
 | `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/flashchat/packed_experts` |
@@ -182,7 +192,7 @@ Configuration is loaded from (priority highest to lowest):
 # Model Settings
 MODEL="qwen3.6-35B-A3B"
 
-# Quantization: 4bit or 2bit
+# Quantization: 4bit. 2bit is deprecated.
 QUANTIZATION="4bit"
 
 # Generation Defaults
@@ -316,6 +326,6 @@ For OpenCode, a working provider entry looks like:
 | `<model>/flashchat/vocab.bin` | 7.8MB | Tokenizer vocabulary |
 | `<model>/flashchat/expert_index.json` | - | Safetensors expert lookup index |
 | `<model>/flashchat/packed_experts/` | 218GB | 4-bit expert weights |
-| `<model>/flashchat/packed_experts_2bit/` | 120GB | 2-bit expert weights |
+| `<model>/flashchat/packed_experts_2bit/` | 120GB | Deprecated 2-bit expert weights |
 | `~/.config/flashchat/config` | - | User configuration |
 | `~/.flashchat/sessions/` | - | Chat session history |

@@ -76,6 +76,76 @@ except Exception:
 }
 
 # -----------------------------------------------------------------------------
+# Model registry helpers
+# -----------------------------------------------------------------------------
+flashchat_model_exists() {
+    local model_id="$1"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+sys.exit(0 if sys.argv[2] in data.get('models', {}) else 1)
+" "$config_file" "$model_id" 2>/dev/null
+}
+
+flashchat_model_field() {
+    local model_id="$1"
+    local field="$2"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -n "$field" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model = data.get('models', {}).get(sys.argv[2], {})
+value = model.get(sys.argv[3], '')
+print(value if value is not None else '')
+" "$config_file" "$model_id" "$field" 2>/dev/null
+}
+
+flashchat_model_name() {
+    flashchat_model_field "$1" "name"
+}
+
+flashchat_model_repo() {
+    flashchat_model_field "$1" "hf_repo"
+}
+
+flashchat_model_layers() {
+    local layers
+    layers=$(flashchat_model_field "$1" "num_hidden_layers")
+    echo "${layers:-60}"
+}
+
+flashchat_model_path_for_id() {
+    local repo
+    repo=$(flashchat_model_repo "$1")
+    [ -n "$repo" ] || return 1
+    _flashchat_detect_model_path "$repo"
+}
+
+flashchat_list_models() {
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for model_id, model in data.get('models', {}).items():
+    print('\\t'.join([
+        model_id,
+        str(model.get('name', model_id)),
+        str(model.get('hf_repo', '')),
+    ]))
+" "$config_file" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
 # Detect the HuggingFace snapshot path from model repo
 # -----------------------------------------------------------------------------
 _flashchat_detect_model_path() {
@@ -183,12 +253,19 @@ flashchat_load_config() {
     if [ -z "$MODEL" ]; then
         MODEL="$FLASHCHAT_DEFAULT_MODEL"
     fi
+    if ! flashchat_model_exists "$MODEL"; then
+        echo "WARNING: configured model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG; using $FLASHCHAT_DEFAULT_MODEL" >&2
+        MODEL="$FLASHCHAT_DEFAULT_MODEL"
+    fi
     local looked_up_repo
     looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
     if [ -n "$looked_up_repo" ]; then
         MODEL_REPO="$looked_up_repo"
     fi
     QUANTIZATION="${QUANTIZATION:-$FLASHCHAT_DEFAULT_QUANTIZATION}"
+    if [ "$QUANTIZATION" = "2bit" ]; then
+        QUANTIZATION="4bit"
+    fi
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
     SERVER_HOST="${SERVER_HOST:-$FLASHCHAT_DEFAULT_SERVER_HOST}"
@@ -303,6 +380,13 @@ export -f flashchat_create_default_config
 export -f flashchat_has_config
 export -f flashchat_get_pid_file
 export -f flashchat_get_sessions_dir
+export -f flashchat_model_exists
+export -f flashchat_model_field
+export -f flashchat_model_name
+export -f flashchat_model_repo
+export -f flashchat_model_layers
+export -f flashchat_model_path_for_id
+export -f flashchat_list_models
 
 # -----------------------------------------------------------------------------
 # Lookup model config from the bundled model registry.
