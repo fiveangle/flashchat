@@ -145,6 +145,7 @@ make test
 - **When runtime behavior does not match expectations, anchor debugging in captured logs, request dumps, build stamps, and reproducible evidence.** Do not default to assuming the user launched an old binary or made a procedural mistake unless the evidence specifically points there.
 - **Server control commands must verify reality, not assume it.** Start/stop helpers should confirm health or actual process exit before reporting success or removing pid/state files.
 - **Persistent server/runtime toggles should be first-class config options.** If a setting is useful beyond one-off debugging, surface it through the config file and `flashchat` configuration wizard instead of leaving it env-only.
+- **Sampling/runtime generation knobs must stay consistent across config, API request parsing, server runtime signatures, docs, and smoke-test perf logging.** Do not add hidden sampler defaults that cannot be inspected or overridden from Flashchat's normal user surfaces.
 - **When a functional block or milestone is complete, consider prompting for a commit checkpoint.** Don’t interrupt active debugging for every small change, but when a coherent unit of work lands, ask whether it should be committed before moving on.
 
 ### C/Objective-C

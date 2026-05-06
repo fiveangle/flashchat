@@ -159,6 +159,12 @@ Environment variables:
   FLASHCHAT_OFFLOAD_DIR     Unified model offload directory
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_SERVER_HOST    Server host clients connect to
+  FLASHCHAT_TEMPERATURE    Default generation temperature
+  FLASHCHAT_TOP_P          Default nucleus sampling value
+  FLASHCHAT_TOP_K          Default candidate limit
+  FLASHCHAT_MIN_P          Default minimum probability filter
+  FLASHCHAT_PRESENCE_PENALTY    Default presence penalty
+  FLASHCHAT_REPETITION_PENALTY  Default repetition penalty
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
@@ -280,6 +286,8 @@ cmd_status() {
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
+    echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P)"
+    echo "Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
@@ -440,6 +448,7 @@ cmd_config() {
     echo "Model: $(flashchat_get MODEL)"
     echo "Repository: $(flashchat_get MODEL_REPO)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
+    echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P) | Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
@@ -465,6 +474,10 @@ cmd_config_interactive() {
     echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "  -Top-p (0.0-1.0): $(flashchat_get TOP_P) (nucleus sampling - controls output diversity)"
+    echo "  -Top-k (0 uses the legacy candidate cap): $(flashchat_get TOP_K)"
+    echo "  -Min-p (0.0-1.0): $(flashchat_get MIN_P)"
+    echo "  -Presence penalty: $(flashchat_get PRESENCE_PENALTY)"
+    echo "  -Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
     echo "  -Server API publishing port: $(flashchat_get SERVER_PORT)"
     echo "  -Chat client API host IP: $(flashchat_get SERVER_HOST)"
     echo "  -Server log path (file or directory): $(flashchat_get SERVER_LOG_PATH)"
@@ -1051,12 +1064,17 @@ prompt_config_options() {
         echo ""
         
         local default_model default_tokens default_temp
-        local default_top_p default_port default_host default_log_path default_offload_dir default_debug default_http_log default_sys_cache default_sys_cache_entries default_think default_color
+        local default_top_p default_top_k default_min_p default_presence_penalty default_repetition_penalty
+        local default_port default_host default_log_path default_offload_dir default_debug default_http_log default_sys_cache default_sys_cache_entries default_think default_color
         
         default_model=$(flashchat_get MODEL)
         default_tokens=$(flashchat_get MAX_TOKENS)
         default_temp=$(flashchat_get TEMPERATURE)
         default_top_p=$(flashchat_get TOP_P)
+        default_top_k=$(flashchat_get TOP_K)
+        default_min_p=$(flashchat_get MIN_P)
+        default_presence_penalty=$(flashchat_get PRESENCE_PENALTY)
+        default_repetition_penalty=$(flashchat_get REPETITION_PENALTY)
         default_port=$(flashchat_get SERVER_PORT)
         default_host=$(flashchat_get SERVER_HOST)
         default_log_path=$(flashchat_get SERVER_LOG_PATH)
@@ -1113,6 +1131,38 @@ prompt_config_interactive() {
     read -r REPLY
     echo ""
     echo "TOP_P=\"${REPLY:-$default_top_p}\"" >> /tmp/flashchat_new_config
+
+    # Top K
+    local default_top_k
+    default_top_k=$(flashchat_get TOP_K)
+    printf "Top-k [candidate limit; 20 is typical, 0 uses the legacy cap] [%s]: " "$default_top_k"
+    read -r REPLY
+    echo ""
+    echo "TOP_K=\"${REPLY:-$default_top_k}\"" >> /tmp/flashchat_new_config
+
+    # Min P
+    local default_min_p
+    default_min_p=$(flashchat_get MIN_P)
+    printf "Min-p (0.0-1.0) [filters very unlikely tokens; 0 disables] [%s]: " "$default_min_p"
+    read -r REPLY
+    echo ""
+    echo "MIN_P=\"${REPLY:-$default_min_p}\"" >> /tmp/flashchat_new_config
+
+    # Presence Penalty
+    local default_presence_penalty
+    default_presence_penalty=$(flashchat_get PRESENCE_PENALTY)
+    printf "Presence penalty [discourages reusing prior tokens] [%s]: " "$default_presence_penalty"
+    read -r REPLY
+    echo ""
+    echo "PRESENCE_PENALTY=\"${REPLY:-$default_presence_penalty}\"" >> /tmp/flashchat_new_config
+
+    # Repetition Penalty
+    local default_repetition_penalty
+    default_repetition_penalty=$(flashchat_get REPETITION_PENALTY)
+    printf "Repetition penalty [1.0 disables] [%s]: " "$default_repetition_penalty"
+    read -r REPLY
+    echo ""
+    echo "REPETITION_PENALTY=\"${REPLY:-$default_repetition_penalty}\"" >> /tmp/flashchat_new_config
     
     # Server Port
     local default_port
@@ -1882,6 +1932,10 @@ server_runtime_signature() {
         echo "SERVER_PORT=$effective_port"
         echo "TEMPERATURE=$(flashchat_get TEMPERATURE)"
         echo "TOP_P=$(flashchat_get TOP_P)"
+        echo "TOP_K=$(flashchat_get TOP_K)"
+        echo "MIN_P=$(flashchat_get MIN_P)"
+        echo "PRESENCE_PENALTY=$(flashchat_get PRESENCE_PENALTY)"
+        echo "REPETITION_PENALTY=$(flashchat_get REPETITION_PENALTY)"
         echo "SERVER_LOG_PATH=$(flashchat_get SERVER_LOG_PATH)"
         echo "SERVER_DEBUG=$(flashchat_get SERVER_DEBUG)"
         echo "SERVER_HTTP_LOG=$(flashchat_get SERVER_HTTP_LOG)"
@@ -2319,6 +2373,10 @@ cmd_serve() {
     export FLASHCHAT_SERVER_PORT="$server_port"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
     export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
+    export FLASHCHAT_TOP_K="$(flashchat_get TOP_K)"
+    export FLASHCHAT_MIN_P="$(flashchat_get MIN_P)"
+    export FLASHCHAT_PRESENCE_PENALTY="$(flashchat_get PRESENCE_PENALTY)"
+    export FLASHCHAT_REPETITION_PENALTY="$(flashchat_get REPETITION_PENALTY)"
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
@@ -2485,7 +2543,7 @@ cmd_prompt() {
     # Send request
     curl -s -N -X POST "http://$server_host:$server_port/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":$(flashchat_get MAX_TOKENS),\"temperature\":$(flashchat_get TEMPERATURE),\"top_p\":$(flashchat_get TOP_P)}"
+        -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":$(flashchat_get MAX_TOKENS),\"temperature\":$(flashchat_get TEMPERATURE),\"top_p\":$(flashchat_get TOP_P),\"top_k\":$(flashchat_get TOP_K),\"min_p\":$(flashchat_get MIN_P),\"presence_penalty\":$(flashchat_get PRESENCE_PENALTY),\"repetition_penalty\":$(flashchat_get REPETITION_PENALTY)}"
     echo ""
 }
 

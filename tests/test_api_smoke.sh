@@ -17,6 +17,12 @@ MODEL_PATH=""
 WEIGHTS_DIR=""
 EXPERTS_DIR=""
 MODEL_CONFIG=""
+TEMPERATURE_DEFAULT=""
+TOP_P_DEFAULT=""
+TOP_K_DEFAULT=""
+MIN_P_DEFAULT=""
+PRESENCE_PENALTY_DEFAULT=""
+REPETITION_PENALTY_DEFAULT=""
 PERF_LOG_ENABLED=1
 PERF_LOG_PATH="${REPO_ROOT}/assets/api_perf_log.tsv"
 SERVER_MODE="reused"
@@ -119,6 +125,12 @@ load_flashchat_config() {
     WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+    TEMPERATURE_DEFAULT="$(flashchat_get TEMPERATURE)"
+    TOP_P_DEFAULT="$(flashchat_get TOP_P)"
+    TOP_K_DEFAULT="$(flashchat_get TOP_K)"
+    MIN_P_DEFAULT="$(flashchat_get MIN_P)"
+    PRESENCE_PENALTY_DEFAULT="$(flashchat_get PRESENCE_PENALTY)"
+    REPETITION_PENALTY_DEFAULT="$(flashchat_get REPETITION_PENALTY)"
     if [[ $HOST_EXPLICIT -ne 1 ]]; then
         HOST="$(flashchat_get SERVER_HOST)"
         case "${HOST}" in
@@ -133,6 +145,12 @@ load_flashchat_config() {
     export FLASHCHAT_WEIGHTS_DIR="${WEIGHTS_DIR}"
     export FLASHCHAT_EXPERTS_DIR="${EXPERTS_DIR}"
     export FLASHCHAT_MODEL_CONFIG="${MODEL_CONFIG}"
+    export FLASHCHAT_TEMPERATURE="${TEMPERATURE_DEFAULT}"
+    export FLASHCHAT_TOP_P="${TOP_P_DEFAULT}"
+    export FLASHCHAT_TOP_K="${TOP_K_DEFAULT}"
+    export FLASHCHAT_MIN_P="${MIN_P_DEFAULT}"
+    export FLASHCHAT_PRESENCE_PENALTY="${PRESENCE_PENALTY_DEFAULT}"
+    export FLASHCHAT_REPETITION_PENALTY="${REPETITION_PENALTY_DEFAULT}"
 }
 
 require_file() {
@@ -261,9 +279,23 @@ ensure_perf_log_header() {
     if [[ $PERF_LOG_ENABLED -ne 1 ]]; then
         return 0
     fi
+    local expected_header
+    expected_header="timestamp	branch	commit	hostname	hw_model	ram_gib	cpu_summary	model	server_mode	scenario	endpoint	stream	tool_mode	reasoning	temperature	top_p	top_k	min_p	presence_penalty	repetition_penalty	duration_ms	metric_type	metric_value	tok_per_sec	status	notes"
     if [[ ! -f "${PERF_LOG_PATH}" ]]; then
         mkdir -p "$(dirname "${PERF_LOG_PATH}")"
-        printf "timestamp\tbranch\tcommit\thostname\thw_model\tram_gib\tcpu_summary\tmodel\tserver_mode\tscenario\tendpoint\tstream\ttool_mode\treasoning\ttemperature\ttop_p\tduration_ms\tmetric_type\tmetric_value\ttok_per_sec\tstatus\tnotes\n" > "${PERF_LOG_PATH}"
+        printf "%s\n" "${expected_header}" > "${PERF_LOG_PATH}"
+    elif [[ "$(head -n 1 "${PERF_LOG_PATH}")" != "${expected_header}" ]] || awk -F '\t' 'NR > 1 && NF == 22 { found = 1 } END { exit found ? 0 : 1 }' "${PERF_LOG_PATH}"; then
+        local tmp_log
+        tmp_log="${TMPDIR}/api_perf_log.tsv"
+        awk -F '\t' -v OFS='\t' -v expected="${expected_header}" '
+            NR == 1 { print expected; next }
+            NF == 22 {
+                print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,"","","","",$17,$18,$19,$20,$21,$22
+                next
+            }
+            { print }
+        ' "${PERF_LOG_PATH}" > "${tmp_log}"
+        mv "${tmp_log}" "${PERF_LOG_PATH}"
     fi
 }
 
@@ -275,11 +307,15 @@ log_perf_row() {
     local reasoning="$5"
     local temperature="$6"
     local top_p="$7"
-    local duration_ms="$8"
-    local metric_type="$9"
-    local metric_value="${10}"
-    local status="${11}"
-    local notes="${12}"
+    local top_k="$8"
+    local min_p="$9"
+    local presence_penalty="${10}"
+    local repetition_penalty="${11}"
+    local duration_ms="${12}"
+    local metric_type="${13}"
+    local metric_value="${14}"
+    local status="${15}"
+    local notes="${16:-"-"}"
     local tok_per_sec=""
 
     if [[ $PERF_LOG_ENABLED -ne 1 ]]; then
@@ -290,7 +326,7 @@ log_perf_row() {
         tok_per_sec="$(awk -v tokens="${metric_value}" -v dur="${duration_ms}" 'BEGIN { printf "%.3f", (tokens * 1000.0) / dur }')"
     fi
 
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$(timestamp_iso)" \
         "$(git_branch)" \
         "$(git_commit)" \
@@ -307,6 +343,10 @@ log_perf_row() {
         "${reasoning}" \
         "${temperature}" \
         "${top_p}" \
+        "${top_k}" \
+        "${min_p}" \
+        "${presence_penalty}" \
+        "${repetition_penalty}" \
         "${duration_ms}" \
         "${metric_type}" \
         "${metric_value}" \
@@ -464,7 +504,7 @@ measure_request_to_file "${TMPDIR}/health.json" curl -fsS "${BASE_URL}/health"
 cat "${TMPDIR}/health.json"
 echo ""
 assert_contains "${TMPDIR}/health.json" '"status":"ok"' "health returned ok"
-log_perf_row "health" "/health" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
+log_perf_row "health" "/health" "false" "none" "" "" "" "" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
 
 echo ""
 echo "--- GET /v1 ---"
@@ -472,7 +512,7 @@ measure_request_to_file "${TMPDIR}/v1_root.json" curl -fsS "${BASE_URL}/v1"
 cat "${TMPDIR}/v1_root.json"
 echo ""
 assert_contains "${TMPDIR}/v1_root.json" '"object":"service"' "v1 root returned service object"
-log_perf_row "v1_root" "/v1" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
+log_perf_row "v1_root" "/v1" "false" "none" "" "" "" "" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
 
 echo ""
 echo "--- GET /v1/models ---"
@@ -480,7 +520,7 @@ measure_request_to_file "${TMPDIR}/models.json" curl -fsS "${BASE_URL}/v1/models
 cat "${TMPDIR}/models.json"
 echo ""
 assert_contains "${TMPDIR}/models.json" "\"${MODEL_ID}\"" "models lists expected id"
-log_perf_row "models" "/v1/models" "false" "none" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
+log_perf_row "models" "/v1/models" "false" "none" "" "" "" "" "" "" "" "${LAST_DURATION_MS}" "none" "" "pass" ""
 
 echo ""
 echo "--- POST /v1/chat/completions (stream=false) ---"
@@ -497,7 +537,7 @@ cat "${TMPDIR}/chat.json"
 echo ""
 assert_contains "${TMPDIR}/chat.json" '"object":"chat.completion"' "chat completion object present"
 assert_contains "${TMPDIR}/chat.json" '"content":"' "chat completion includes assistant content"
-log_perf_row "chat_text_nonstream" "/v1/chat/completions" "false" "none" "default" "0" "" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/chat.json")" "pass" ""
+log_perf_row "chat_text_nonstream" "/v1/chat/completions" "false" "none" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/chat.json")" "pass" ""
 
 echo ""
 echo "--- POST /v1/chat/completions (stream=true) ---"
@@ -513,7 +553,7 @@ measure_request_to_file "${TMPDIR}/chat_stream.txt" curl -fsS -N -X POST "${BASE
 head -n 20 "${TMPDIR}/chat_stream.txt"
 assert_contains "${TMPDIR}/chat_stream.txt" 'chat.completion.chunk' "chat stream emitted chunks"
 assert_contains "${TMPDIR}/chat_stream.txt" '\[DONE\]' "chat stream completed"
-log_perf_row "chat_text_stream" "/v1/chat/completions" "true" "none" "default" "0" "" "${LAST_DURATION_MS}" "stream_deltas" "$(count_chat_stream_deltas "${TMPDIR}/chat_stream.txt")" "pass" "repeat benchmark x24"
+log_perf_row "chat_text_stream" "/v1/chat/completions" "true" "none" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "stream_deltas" "$(count_chat_stream_deltas "${TMPDIR}/chat_stream.txt")" "pass" "repeat benchmark x24"
 
 echo ""
 echo "--- POST /v1/chat/completions tool-call round trip ---"
@@ -549,7 +589,7 @@ echo ""
 assert_contains "${TMPDIR}/chat_tool_call.json" '"tool_calls"' "chat tool call emitted"
 assert_contains "${TMPDIR}/chat_tool_call.json" '"finish_reason":"tool_calls"' "chat tool call finish reason"
 assert_contains "${TMPDIR}/chat_tool_call.json" '"name":"record_result"' "chat tool call used forced function"
-log_perf_row "chat_tool_call" "/v1/chat/completions" "false" "forced" "default" "0" "" "${LAST_DURATION_MS}" "tool_calls" "1" "pass" "forced record_result"
+log_perf_row "chat_tool_call" "/v1/chat/completions" "false" "forced" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "tool_calls" "1" "pass" "forced record_result"
 
 measure_request_to_file "${TMPDIR}/chat_tool_followup.json" curl -fsS -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
@@ -583,7 +623,7 @@ cat "${TMPDIR}/chat_tool_followup.json"
 echo ""
 assert_contains "${TMPDIR}/chat_tool_followup.json" '"content":"' "chat follow-up returned content"
 assert_not_contains "${TMPDIR}/chat_tool_followup.json" '"tool_calls"' "chat follow-up did not emit another tool call"
-log_perf_row "chat_tool_followup" "/v1/chat/completions" "false" "followup" "default" "0" "" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/chat_tool_followup.json")" "pass" "tool_choice none"
+log_perf_row "chat_tool_followup" "/v1/chat/completions" "false" "followup" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/chat_tool_followup.json")" "pass" "tool_choice none"
 
 echo ""
 echo "--- POST /v1/responses (stream=false) ---"
@@ -600,7 +640,7 @@ cat "${TMPDIR}/responses.json"
 echo ""
 assert_contains "${TMPDIR}/responses.json" '"object":"response"' "responses object present"
 assert_contains "${TMPDIR}/responses.json" '"output"' "responses output present"
-log_perf_row "responses_text_nonstream" "/v1/responses" "false" "none" "default" "0" "" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/responses.json")" "pass" ""
+log_perf_row "responses_text_nonstream" "/v1/responses" "false" "none" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/responses.json")" "pass" ""
 
 echo ""
 echo "--- POST /v1/responses (stream=true) ---"
@@ -616,7 +656,7 @@ measure_request_to_file "${TMPDIR}/responses_stream.txt" curl -fsS -N -X POST "$
 head -n 20 "${TMPDIR}/responses_stream.txt"
 assert_contains "${TMPDIR}/responses_stream.txt" 'response.completed' "responses stream completed event present"
 assert_contains "${TMPDIR}/responses_stream.txt" '\[DONE\]' "responses stream completed"
-log_perf_row "responses_text_stream" "/v1/responses" "true" "none" "default" "0" "" "${LAST_DURATION_MS}" "stream_deltas" "$(count_responses_stream_deltas "${TMPDIR}/responses_stream.txt")" "pass" "repeat benchmark x24"
+log_perf_row "responses_text_stream" "/v1/responses" "true" "none" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "stream_deltas" "$(count_responses_stream_deltas "${TMPDIR}/responses_stream.txt")" "pass" "repeat benchmark x24"
 
 echo ""
 echo "--- POST /v1/responses tool-call round trip ---"
@@ -651,7 +691,7 @@ cat "${TMPDIR}/responses_tool_call.json"
 echo ""
 assert_contains "${TMPDIR}/responses_tool_call.json" '"type":"function_call"' "responses function_call emitted"
 assert_contains "${TMPDIR}/responses_tool_call.json" '"name":"record_result"' "responses tool call used forced function"
-log_perf_row "responses_tool_call" "/v1/responses" "false" "forced" "default" "0" "" "${LAST_DURATION_MS}" "tool_calls" "1" "pass" "forced record_result"
+log_perf_row "responses_tool_call" "/v1/responses" "false" "forced" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "tool_calls" "1" "pass" "forced record_result"
 
 measure_request_to_file "${TMPDIR}/responses_tool_followup.json" curl -fsS -X POST "${BASE_URL}/v1/responses" \
     -H "Content-Type: application/json" \
@@ -685,7 +725,7 @@ cat "${TMPDIR}/responses_tool_followup.json"
 echo ""
 assert_contains "${TMPDIR}/responses_tool_followup.json" '"output_text":"' "responses follow-up returned output text"
 assert_not_contains "${TMPDIR}/responses_tool_followup.json" '"type":"function_call"' "responses follow-up did not emit another function call"
-log_perf_row "responses_tool_followup" "/v1/responses" "false" "followup" "default" "0" "" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/responses_tool_followup.json")" "pass" "tool_choice none"
+log_perf_row "responses_tool_followup" "/v1/responses" "false" "followup" "default" "0" "${TOP_P_DEFAULT}" "${TOP_K_DEFAULT}" "${MIN_P_DEFAULT}" "${PRESENCE_PENALTY_DEFAULT}" "${REPETITION_PENALTY_DEFAULT}" "${LAST_DURATION_MS}" "text_chars" "$(extract_json_text_length "${TMPDIR}/responses_tool_followup.json")" "pass" "tool_choice none"
 
 echo ""
 if [[ $PERF_LOG_ENABLED -eq 1 ]]; then

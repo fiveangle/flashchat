@@ -85,6 +85,12 @@ for i in range(1, 30):
 request = {
     "model": "qwen3.6-35B-A3B",
     "stream": False,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
     "messages": [
         {"role": "system", "content": "You are validating Flashchat's native tool renderer."},
         {"role": "user", "content": "Use the tool if needed."}
@@ -115,6 +121,8 @@ assert_contains "system prompt preserves large schema tail" "SCHEMA_TAIL_MARKER"
 assert_contains "system prompt has native important block" "<IMPORTANT>" "${RENDER_DIR}/system_prompt.txt"
 assert_contains "conversation uses empty think for reasoning off" "<think>" "${RENDER_DIR}/conversation.txt"
 assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" "${RENDER_DIR}/assembled_prompt.txt"
+assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
+assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
 cat > "$TOOL_CALL_TXT" <<'EOF'
 some leading text

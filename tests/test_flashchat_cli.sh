@@ -176,7 +176,11 @@ cat > "$TMP_CONFIG" <<EOF
 MODEL="qwen3.6-35B-A3B"
 MAX_TOKENS="1"
 TEMPERATURE="0.1"
-TOP_P="0.9"
+TOP_P="0.8"
+TOP_K="20"
+MIN_P="0.0"
+PRESENCE_PENALTY="1.5"
+REPETITION_PENALTY="1.0"
 SERVER_PORT="${TEST_PORT}"
 SERVER_HOST="${TEST_HOST}"
 SERVER_LOG_PATH="${TMPDIR}/logs"
@@ -284,6 +288,7 @@ run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $F
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config sampling knobs" "Top-k:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config system prompt cache" "System prompt cache:" bash -c "echo 'n' | $FLASHCHAT  config"
 
 # Config --reset and --full-reset: test in isolated temp config
