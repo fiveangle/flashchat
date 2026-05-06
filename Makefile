@@ -15,6 +15,9 @@
 #   make test      — run all functional smoke tests
 #   make help      — list available targets
 #   make clean     — remove build artifacts
+#   make archive-debug — archive repo-local debug contents under debug/.archived
+#   make clean-venv — remove Python setup virtual environment
+#   make distclean — remove build artifacts, repo-local debug, and setup venv
 #
 # Note: Metal shaders are compiled from source at runtime via
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
@@ -46,7 +49,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke test
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -108,7 +111,10 @@ help:
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "\n"
 	@printf "Maintenance:\n"
-	@printf "  make clean         Remove build artifacts and debug contents\n"
+	@printf "  make clean         Remove build artifacts and archive repo-local ./debug contents\n"
+	@printf "  make archive-debug Archive repo-local ./debug contents under debug/.archived\n"
+	@printf "  make clean-venv    Remove Python setup virtual environment\n"
+	@printf "  make distclean     Remove build artifacts, repo-local ./debug, and setup venv\n"
 
 metal_infer: $(TARGET)
 
@@ -137,9 +143,26 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) $(LINENOISE_SRC) $(LINENOISE_HDR)
 	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) $(LINENOISE_SRC) -o $(CHAT_TARGET)
 
-clean:
+clean: archive-debug
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
-	rm -rf debug/*
+
+archive-debug:
+	@if [ -d debug ]; then \
+		entries="$$(find debug -mindepth 1 -maxdepth 1 ! -name .archived -print)"; \
+		if [ -n "$$entries" ]; then \
+			dest="debug/.archived/logs-$$(date +%Y%m%d-%H%M%S)"; \
+			mkdir -p "$$dest"; \
+			find debug -mindepth 1 -maxdepth 1 ! -name .archived -exec mv {} "$$dest"/ \;; \
+			echo "Archived debug contents to $$dest"; \
+		fi; \
+	fi
+
+clean-venv:
+	rm -rf $(BUILD_DIR)/.venv
+
+distclean: clean-venv
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -rf debug
 
 # Run targets
 run: $(TARGET)

@@ -19,6 +19,7 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <getopt.h>
 #include <dirent.h>
 #include "linenoise.h"
@@ -206,21 +207,42 @@ static void generate_session_id(char *buf, size_t bufsize) {
              (int)getpid(), (long)tv.tv_sec, (int)tv.tv_usec);
 }
 
-static int send_chat_request(int port, const char *user_message, int max_tokens,
-                             const char *session_id, int show_thinking) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { perror("socket"); return -1; }
+static int connect_to_server(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "\n[error] Cannot connect to server on port %d.\n", port);
-        close(sock);
+    struct addrinfo *result = NULL;
+    int rc = getaddrinfo(host, port_str, &hints, &result);
+    if (rc != 0) {
+        fprintf(stderr, "\n[error] Cannot resolve server host %s: %s\n", host, gai_strerror(rc));
         return -1;
     }
+
+    int sock = -1;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) continue;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+            freeaddrinfo(result);
+            return sock;
+        }
+        close(sock);
+        sock = -1;
+    }
+
+    freeaddrinfo(result);
+    fprintf(stderr, "\n[error] Cannot connect to server at %s:%d.\n", host, port);
+    return -1;
+}
+
+static int send_chat_request(const char *host, int port, const char *user_message, int max_tokens,
+                             const char *session_id, int show_thinking) {
+    int sock = connect_to_server(host, port);
+    if (sock < 0) return -1;
 
     char escaped[MAX_INPUT_LINE * 2];
     json_escape(user_message, escaped, sizeof(escaped));
@@ -234,13 +256,13 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
     char request[MAX_INPUT_LINE * 4];
     int req_len = snprintf(request, sizeof(request),
         "POST /v1/chat/completions HTTP/1.1\r\n"
-        "Host: localhost:%d\r\n"
+        "Host: %s:%d\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n"
         "\r\n"
         "%s",
-        port, body_len, body);
+        host, port, body_len, body);
 
     write(sock, request, req_len);
     return sock;
@@ -518,8 +540,13 @@ int main(int argc, char **argv) {
     int max_tokens = 8192;
     int show_thinking = 0;
     const char *resume_id = NULL;
+    const char *host = getenv("FLASHCHAT_SERVER_HOST");
+    if (!host || !host[0] || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0) {
+        host = "127.0.0.1";
+    }
 
     static struct option long_options[] = {
+        {"host",        required_argument, 0, 'H'},
         {"port",        required_argument, 0, 'p'},
         {"max-tokens",  required_argument, 0, 't'},
         {"show-think",  no_argument,       0, 's'},
@@ -532,8 +559,9 @@ int main(int argc, char **argv) {
     init_sessions_dir();
 
     int c;
-    while ((c = getopt_long(argc, argv, "p:t:sr:lh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "H:p:t:sr:lh", long_options, NULL)) != -1) {
         switch (c) {
+            case 'H': host = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 't': max_tokens = atoi(optarg); break;
             case 's': show_thinking = 1; break;
@@ -541,6 +569,7 @@ int main(int argc, char **argv) {
             case 'l': session_list(); return 0;
             case 'h':
                 printf("Usage: %s [options]\n", argv[0]);
+                printf("  --host HOST      Server host (default: 127.0.0.1)\n");
                 printf("  --port N         Server port (default: 8000)\n");
                 printf("  --max-tokens N   Max response tokens (default: 8192)\n");
                 printf("  --show-think     Show <think> blocks (dimmed)\n");
@@ -564,21 +593,16 @@ int main(int argc, char **argv) {
     printf("==================================================\n");
     printf("  %s Chat (Flashchat)\n", model_name ? model_name : "Qwen3.6-35B-A3B");
     printf("==================================================\n");
-    printf("  Server:  http://localhost:%d\n", port);
+    printf("  Server:  http://%s:%d\n", host, port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");
     printf("\n  Commands: /quit /exit /clear /sessions\n");
     printf("==================================================\n\n");
 
     // Health check
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Server not running on port %d.\n", port);
+    int sock = connect_to_server(host, port);
+    if (sock < 0) {
+        fprintf(stderr, "Server not running at %s:%d.\n", host, port);
         fprintf(stderr, "Start it: ./infer --serve %d\n\n", port);
-        close(sock);
         return 1;
     }
     close(sock);
@@ -637,7 +661,7 @@ int main(int argc, char **argv) {
         // Save user turn
         session_save_turn(session_id, "user", input_line);
 
-        sock = send_chat_request(port, input_line, max_tokens, session_id, show_thinking);
+        sock = send_chat_request(host, port, input_line, max_tokens, session_id, show_thinking);
         if (sock < 0) continue;
 
         printf("\n");
@@ -765,7 +789,7 @@ int main(int argc, char **argv) {
             snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
 
             free(response);
-            sock = send_chat_request(port, tool_msg, max_tokens, session_id, show_thinking);
+            sock = send_chat_request(host, port, tool_msg, max_tokens, session_id, show_thinking);
             free(tool_msg);
             if (sock < 0) { response = NULL; break; }
 

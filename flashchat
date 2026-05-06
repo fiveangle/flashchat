@@ -137,6 +137,7 @@ Environment variables:
   FLASHCHAT_MODEL_PATH      Override model path
   FLASHCHAT_MODEL_CONFIG    Override bundled model registry path
   FLASHCHAT_SERVER_PORT    Server port
+  FLASHCHAT_SERVER_HOST    Server host clients connect to
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
 
@@ -146,6 +147,7 @@ EOF
 
 print_opencode_config_snippet() {
     local server_port="$1"
+    local server_host="$2"
     local model_repo
     model_repo="$(flashchat_get MODEL_REPO)"
     cat << EOF
@@ -168,7 +170,7 @@ Add this provider to ~/.config/opencode/opencode.jsonc:
         }
       },
       "options": {
-        "baseURL": "http://127.0.0.1:${server_port}/v1"
+        "baseURL": "http://${server_host}:${server_port}/v1"
       }
     }
   }
@@ -178,31 +180,45 @@ EOF
 
 check_opencode_config() {
     local server_port="$1"
+    local server_host="$2"
     local config_path="${HOME}/.config/opencode/opencode.jsonc"
 
     if [ ! -f "$config_path" ]; then
         echo "OpenCode config not found: $config_path"
         echo ""
-        print_opencode_config_snippet "$server_port"
+        print_opencode_config_snippet "$server_port" "$server_host"
         return 1
     fi
 
     if ! rg -q '@ai-sdk/openai-compatible' "$config_path"; then
         echo "OpenCode config exists but does not appear to define an OpenAI-compatible provider."
         echo ""
-        print_opencode_config_snippet "$server_port"
+        print_opencode_config_snippet "$server_port" "$server_host"
         return 1
     fi
 
-    if ! rg -q "127\\.0\\.0\\.1:${server_port}/v1|localhost:${server_port}/v1" "$config_path"; then
-        echo "OpenCode config does not currently point at http://127.0.0.1:${server_port}/v1"
+    if ! rg -q "${server_host}:${server_port}/v1" "$config_path"; then
+        echo "OpenCode config does not currently point at http://${server_host}:${server_port}/v1"
         echo "Continuing, but if the harness connects to the wrong backend, update your config to:"
         echo ""
-        print_opencode_config_snippet "$server_port"
+        print_opencode_config_snippet "$server_port" "$server_host"
         echo ""
     fi
 
     return 0
+}
+
+flashchat_server_connect_host() {
+    local host
+    host="$(flashchat_get SERVER_HOST)"
+    case "$host" in
+        ""|"0.0.0.0"|"::")
+            echo "127.0.0.1"
+            ;;
+        *)
+            echo "$host"
+            ;;
+    esac
 }
 
 # -----------------------------------------------------------------------------
@@ -1316,16 +1332,20 @@ is_server_running() {
 
 is_server_healthy() {
     local port="$1"
-    curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1
+    local host
+    host="$(flashchat_server_connect_host)"
+    curl -fsS --max-time 2 "http://${host}:${port}/health" >/dev/null 2>&1
 }
 
 wait_for_server() {
     local port="$1"
+    local host
+    host="$(flashchat_server_connect_host)"
     local max_wait=30
     local waited=0
     
     while [ $waited -lt $max_wait ]; do
-        if nc -z 127.0.0.1 "$port" 2>/dev/null && is_server_healthy "$port"; then
+        if nc -z "$host" "$port" 2>/dev/null && is_server_healthy "$port"; then
             return 0
         fi
         sleep 1
@@ -1352,10 +1372,12 @@ wait_for_pid_exit() {
 wait_for_port_clear() {
     local port="$1"
     local timeout="${2:-10}"
+    local host
+    host="$(flashchat_server_connect_host)"
     local waited=0
 
     while [ "$waited" -lt "$timeout" ]; do
-        if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+        if ! nc -z "$host" "$port" 2>/dev/null; then
             return 0
         fi
         sleep 1
@@ -1367,9 +1389,11 @@ wait_for_port_clear() {
 find_available_port() {
     local start_port="$1"
     local port="$start_port"
+    local host
+    host="$(flashchat_server_connect_host)"
     
     while [ $port -lt $((start_port + 10)) ]; do
-        if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+        if ! nc -z "$host" "$port" 2>/dev/null; then
             echo "$port"
             return 0
         fi
@@ -1527,7 +1551,7 @@ cmd_serve() {
                 echo "Server not running (stale PID file)."
                 rm -f "$pid_file"
             fi
-        elif nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+        elif nc -z "$(flashchat_server_connect_host)" "$server_port" 2>/dev/null; then
             local pid
             pid=$(lsof -ti:"$server_port" 2>/dev/null | head -1)
             if [ -n "$pid" ]; then
@@ -1584,6 +1608,8 @@ cmd_serve() {
     
     local server_port
     server_port="${port:-$(flashchat_get SERVER_PORT)}"
+    local server_host
+    server_host="$(flashchat_server_connect_host)"
     
     # Check if WE already started the server
     if is_server_running; then
@@ -1592,7 +1618,7 @@ cmd_serve() {
     fi
     
     # Check if port is available (may be used by another process)
-    if nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+    if nc -z "$server_host" "$server_port" 2>/dev/null; then
         echo "Port $server_port is in use by another process."
         local suggested
         suggested=$(find_available_port $((server_port + 1)))
@@ -1633,7 +1659,7 @@ cmd_serve() {
     if wait_for_server "$server_port"; then
         echo "$infer_pid" > "$pid_file"
         echo "Server running (PID: $infer_pid)"
-        echo "API available at http://127.0.0.1:$server_port"
+        echo "API available at http://$server_host:$server_port"
         echo ""
         echo "Endpoints:"
         echo "  POST /v1/chat/completions"
@@ -1692,9 +1718,11 @@ cmd_chat() {
     
     local server_port
     server_port="${port:-$(flashchat_get SERVER_PORT)}"
+    local server_host
+    server_host="$(flashchat_server_connect_host)"
     
     # Start server if not running
-    if ! nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1708,7 +1736,9 @@ cmd_chat() {
     
     local chat_args=""
     [ -n "$server_port" ] && chat_args="--port $server_port"
+    [ -n "$server_host" ] && chat_args="$chat_args --host $server_host"
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
+    export FLASHCHAT_SERVER_HOST="$server_host"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_HISTORY_FILE="$(flashchat_get_history_file)"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
@@ -1751,9 +1781,11 @@ cmd_prompt() {
     
     local server_port
     server_port=$(flashchat_get SERVER_PORT)
+    local server_host
+    server_host="$(flashchat_server_connect_host)"
     
     # Start server if not running
-    if ! nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1765,7 +1797,7 @@ cmd_prompt() {
     fi
     
     # Send request
-    curl -s -N -X POST "http://127.0.0.1:$server_port/v1/chat/completions" \
+    curl -s -N -X POST "http://$server_host:$server_port/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":$(flashchat_get MAX_TOKENS),\"temperature\":$(flashchat_get TEMPERATURE),\"top_p\":$(flashchat_get TOP_P)}"
     echo ""
@@ -1794,8 +1826,10 @@ cmd_opencode() {
 
     local server_port
     server_port="${port:-$(flashchat_get SERVER_PORT)}"
+    local server_host
+    server_host="$(flashchat_server_connect_host)"
 
-    if ! nc -z 127.0.0.1 "$server_port" 2>/dev/null; then
+    if ! nc -z "$server_host" "$server_port" 2>/dev/null; then
         echo "Starting server..."
         cmd_serve --port "$server_port"
         echo ""
@@ -1805,11 +1839,11 @@ cmd_opencode() {
         error "Server not responding"
     fi
 
-    if ! check_opencode_config "$server_port"; then
+    if ! check_opencode_config "$server_port" "$server_host"; then
         error "OpenCode config is missing or incomplete"
     fi
 
-    echo "Launching OpenCode against http://127.0.0.1:${server_port}/v1"
+    echo "Launching OpenCode against http://${server_host}:${server_port}/v1"
     cd "$SCRIPT_DIR"
     opencode "$@"
 }
@@ -1853,7 +1887,7 @@ interactive_menu() {
         local server_status="Not running"
         if is_server_running; then
             server_status="Running"
-        elif nc -z 127.0.0.1 "$(flashchat_get SERVER_PORT)" 2>/dev/null; then
+        elif nc -z "$(flashchat_server_connect_host)" "$(flashchat_get SERVER_PORT)" 2>/dev/null; then
             server_status="Running (external)"
         fi
         

@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-HOST="127.0.0.1"
+HOST=""
+HOST_EXPLICIT=0
 PORT="9999"
 START_SERVER=1
 STARTED_SERVER=0
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --host)
             HOST="$2"
+            HOST_EXPLICIT=1
             shift 2
             ;;
         --model-id)
@@ -91,7 +93,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-BASE_URL="http://${HOST}:${PORT}"
 TMPDIR="$(mktemp -d /tmp/flashchat-api-smoke.XXXXXX)"
 
 cleanup() {
@@ -118,6 +119,14 @@ load_flashchat_config() {
     WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+    if [[ $HOST_EXPLICIT -ne 1 ]]; then
+        HOST="$(flashchat_get SERVER_HOST)"
+        case "${HOST}" in
+            ""|"0.0.0.0"|"::")
+                HOST="127.0.0.1"
+                ;;
+        esac
+    fi
 
     export FLASHCHAT_MODEL="${MODEL_ID}"
     export FLASHCHAT_MODEL_PATH="${MODEL_PATH}"
@@ -414,8 +423,9 @@ print_summary() {
 }
 
 echo "=== Flashchat API Smoke Test ==="
-echo "Base URL: ${BASE_URL}"
 load_flashchat_config
+BASE_URL="http://${HOST}:${PORT}"
+echo "Base URL: ${BASE_URL}"
 echo "Model: ${MODEL_ID}"
 populate_machine_metadata
 ensure_perf_log_header

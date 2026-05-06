@@ -160,7 +160,9 @@ if [ -d "$ACTUAL_MODEL_PATH" ]; then
     export FLASHCHAT_MODEL_PATH="$ACTUAL_MODEL_PATH"
 fi
 
-if curl -fsS "http://127.0.0.1:19999/health" >/dev/null 2>&1; then
+TEST_HOST="127.0.0.1"
+TEST_PORT="19999"
+if curl -fsS "http://${TEST_HOST}:${TEST_PORT}/health" >/dev/null 2>&1; then
     "$FLASHCHAT" serve --stop --port 19999 >/dev/null 2>&1 || true
     sleep 2
 fi
@@ -171,8 +173,8 @@ MODEL="qwen3.6-35B-A3B"
 MAX_TOKENS="1"
 TEMPERATURE="0.1"
 TOP_P="0.9"
-SERVER_PORT="19999"
-SERVER_HOST="127.0.0.1"
+SERVER_PORT="${TEST_PORT}"
+SERVER_HOST="${TEST_HOST}"
 SERVER_LOG_PATH="${TMPDIR}/logs"
 SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
@@ -297,8 +299,7 @@ run_test_contains "serve stop force (not running)" "No server running." "$FLASHC
 # Inference Server Tests
 # ---------------------------------------------------------------------------
 
-TEST_PORT="19999"
-BASE_URL="http://127.0.0.1:${TEST_PORT}"
+BASE_URL="http://${TEST_HOST}:${TEST_PORT}"
 
 # Start server
 run_test "serve start" "$FLASHCHAT" serve --port "$TEST_PORT"

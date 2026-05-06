@@ -217,6 +217,8 @@ When running the server (`./flashchat serve`):
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Health check |
 
+The examples below assume the default `SERVER_HOST="127.0.0.1"` and `SERVER_PORT="8000"`.
+
 ### Example API Call
 
 ```bash
@@ -318,6 +320,8 @@ For OpenCode, a working provider entry looks like:
   }
 }
 ```
+
+If you changed `SERVER_HOST` or `SERVER_PORT`, use those configured values in `baseURL`.
 
 ## Setup Artifacts
 
