@@ -12,32 +12,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_FILE="${HOME}/.config/flashchat/config"
 
 MODEL_ID=""
-default_model_id() {
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        local from_config
-        from_config="$(grep '^MODEL=' "${CONFIG_FILE}" 2>/dev/null | cut -d'"' -f2)"
-        if [[ -n "${from_config}" ]]; then
-            echo "${from_config}"
-            return 0
-        fi
-    fi
-
-    local config="${REPO_ROOT}/assets/model_configs.json"
-    if [[ -f "$config" ]]; then
-        python3 -c "
-import json, sys
-try:
-    with open('$config') as f:
-        data = json.load(f)
-    print(data.get('default_model', 'qwen3.6-35B-A3B'))
-except Exception:
-    print('qwen3.6-35B-A3B')
-" 2>/dev/null || echo "qwen3.6-35B-A3B"
-    else
-        echo "qwen3.6-35B-A3B"
-    fi
-}
-MODEL_ID="$(default_model_id)"
+MODEL_PATH=""
+WEIGHTS_DIR=""
+EXPERTS_DIR=""
+MODEL_CONFIG=""
 PERF_LOG_ENABLED=1
 PERF_LOG_PATH="${REPO_ROOT}/assets/api_perf_log.tsv"
 SERVER_MODE="reused"
@@ -116,6 +94,54 @@ cleanup() {
     rm -rf "${TMPDIR}"
 }
 trap cleanup EXIT
+
+load_flashchat_config() {
+    if [[ -n "${MODEL_ID}" ]]; then
+        export FLASHCHAT_MODEL="${MODEL_ID}"
+    fi
+
+    set +u
+    source "${REPO_ROOT}/lib/config.sh"
+    flashchat_load_config
+    set -u
+
+    MODEL_ID="$(flashchat_get MODEL)"
+    MODEL_PATH="$(flashchat_get MODEL_PATH)"
+    WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
+    EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
+    MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+
+    export FLASHCHAT_MODEL="${MODEL_ID}"
+    export FLASHCHAT_MODEL_PATH="${MODEL_PATH}"
+    export FLASHCHAT_WEIGHTS_DIR="${WEIGHTS_DIR}"
+    export FLASHCHAT_EXPERTS_DIR="${EXPERTS_DIR}"
+    export FLASHCHAT_MODEL_CONFIG="${MODEL_CONFIG}"
+}
+
+require_file() {
+    local path="$1"
+    local label="$2"
+    if [[ ! -f "${path}" ]]; then
+        echo "ERROR: ${label} is not available for ${MODEL_ID}." >&2
+        echo "Expected: ${path}" >&2
+        echo "Run ./flashchat setup first, or select a configured model with completed runtime artifacts." >&2
+        exit 1
+    fi
+}
+
+preflight_model_artifacts() {
+    if [[ -z "${MODEL_PATH}" || "${MODEL_PATH}" == *"<snapshot>"* || ! -d "${MODEL_PATH}" ]]; then
+        echo "ERROR: Model is not downloaded for ${MODEL_ID}." >&2
+        echo "Expected model snapshot: ${MODEL_PATH}" >&2
+        echo "Run ./flashchat setup first, or select a configured model with downloaded weights." >&2
+        exit 1
+    fi
+
+    require_file "${WEIGHTS_DIR}/model_weights.bin" "Extracted model weights"
+    require_file "${WEIGHTS_DIR}/model_weights.json" "Model weights manifest"
+    require_file "${WEIGHTS_DIR}/vocab.bin" "Tokenizer vocabulary"
+    require_file "${EXPERTS_DIR}/layer_00.bin" "Packed experts"
+}
 
 now_ms() {
     python3 - <<'PY'
@@ -316,6 +342,9 @@ wait_for_server() {
         if curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
             return 0
         fi
+        if [[ $STARTED_SERVER -eq 1 && -n "${SERVER_PID}" ]] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            return 1
+        fi
         sleep 1
         tries=$((tries + 1))
     done
@@ -348,6 +377,8 @@ assert_not_contains() {
 
 echo "=== Flashchat API Smoke Test ==="
 echo "Base URL: ${BASE_URL}"
+load_flashchat_config
+echo "Model: ${MODEL_ID}"
 populate_machine_metadata
 ensure_perf_log_header
 
@@ -358,9 +389,10 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
     fi
     echo ""
     echo "--- Starting local server ---"
+    preflight_model_artifacts
     (
         cd "${REPO_ROOT}/metal_infer"
-        ./infer --serve "${PORT}" --model-id "${MODEL_ID}" >"${TMPDIR}/server.log" 2>&1
+        ./infer --serve "${PORT}" --model-id "${MODEL_ID}" --model "${MODEL_PATH}" >"${TMPDIR}/server.log" 2>&1
     ) &
     SERVER_PID="$!"
     STARTED_SERVER=1
