@@ -38,3 +38,6 @@ metal_infer/routing_data.bin
 
 # Debug output directory
 debug/
+
+# Claude worktrees (why, Antropic ?)
+./claud/worktrees
