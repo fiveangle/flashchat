@@ -71,6 +71,8 @@
 
 #include "model_config.h"
 
+#define FLASHCHAT_BUILD_STAMP __DATE__ " " __TIME__
+
 ModelConfig g_cfg;
 
 // ============================================================================
@@ -110,6 +112,7 @@ static char g_server_log_path[PATH_MAX] = {0};
 static char g_server_log_dir[PATH_MAX] = {0};
 static int g_server_debug_enabled = 0;
 static int g_server_http_log_enabled = 0;
+static int g_show_thinking_enabled = 0;
 
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
@@ -159,6 +162,14 @@ static void server_log_close(void) {
     g_server_log = NULL;
 }
 
+static int server_flag_enabled(const char *value) {
+    return value && value[0] &&
+           strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "off") != 0 &&
+           strcasecmp(value, "no") != 0;
+}
+
 static void server_log_open(void) {
     if (g_server_log) return;
 
@@ -173,22 +184,19 @@ static void server_log_open(void) {
     }
     const char *env_debug = getenv("FLASHCHAT_SERVER_DEBUG");
     const char *env_http_log = getenv("FLASHCHAT_SERVER_HTTP_LOG");
-    g_server_debug_enabled = (env_debug && env_debug[0] &&
-                              strcmp(env_debug, "0") != 0 &&
-                              strcasecmp(env_debug, "false") != 0 &&
-                              strcasecmp(env_debug, "off") != 0);
-    g_server_http_log_enabled = (env_http_log && env_http_log[0] &&
-                                 strcmp(env_http_log, "0") != 0 &&
-                                 strcasecmp(env_http_log, "false") != 0 &&
-                                 strcasecmp(env_http_log, "off") != 0);
+    g_server_debug_enabled = server_flag_enabled(env_debug);
+    g_server_http_log_enabled = server_flag_enabled(env_http_log);
 
     if (!configured_path || [configured_path length] == 0) return;
 
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL is_dir = NO;
     BOOL path_exists = [fm fileExistsAtPath:configured_path isDirectory:&is_dir];
-    if (!path_exists && [configured_path hasSuffix:@"/"]) {
-        is_dir = YES;
+    if (!path_exists) {
+        NSString *last = [configured_path lastPathComponent];
+        if ([configured_path hasSuffix:@"/"] || [[last pathExtension] length] == 0) {
+            is_dir = YES;
+        }
     }
 
     NSString *log_dir = nil;
@@ -228,6 +236,10 @@ static void server_log_open(void) {
     g_server_log_dir[sizeof(g_server_log_dir) - 1] = '\0';
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Logging started\n");
+    server_log_timestamp(g_server_log);
+    fprintf(g_server_log, "[serve] Build: %s\n", FLASHCHAT_BUILD_STAMP);
+    server_log_timestamp(g_server_log);
+    fprintf(g_server_log, "[serve] Show thinking: %s\n", g_show_thinking_enabled ? "enabled" : "disabled");
     if (g_server_debug_enabled) {
         server_log_timestamp(g_server_log);
         fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
@@ -4902,7 +4914,9 @@ static void fused_layer_forward(
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
         int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers) {
+        if (g_metal && g_metal->attn_scores_pipe &&
+            fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+            cache_pos < GPU_KV_SEQ) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
@@ -6057,12 +6071,12 @@ static int read_http_request(int fd, char *buf, int bufsz) {
 }
 
 static char *load_system_prompt(void);
+static char *json_escape_alloc(const char *src);
 
 // Tool definitions for OpenAI function calling
-#define MAX_TOOLS 16
+#define MAX_TOOLS 64
 #define MAX_TOOL_NAME 64
 #define MAX_TOOL_DESC 16000
-#define MAX_TOOL_ARGS 8192
 
 typedef enum {
     API_KIND_CHAT = 1,
@@ -6078,7 +6092,7 @@ typedef enum {
 typedef struct {
     char name[MAX_TOOL_NAME];
     char description[MAX_TOOL_DESC];
-    char parameters[4096];
+    char *parameters;
     int has_parameters;
 } ToolDef;
 
@@ -6102,6 +6116,7 @@ typedef struct {
     float temperature;
     float top_p;
     int reasoning_enabled;
+    int reasoning_explicit;
     ToolChoiceMode tool_choice_mode;
     char forced_tool_name[MAX_TOOL_NAME];
     ToolDef tools[MAX_TOOLS];
@@ -6113,7 +6128,7 @@ typedef struct {
     int is_tool_call;
     char id[64];
     char name[MAX_TOOL_NAME];
-    char arguments[MAX_TOOL_ARGS];
+    char *arguments;
 } ParsedToolCall;
 
 static NSString *json_stringify_obj(id obj) {
@@ -6254,8 +6269,40 @@ static void api_request_free(ApiRequest *req) {
     if (!req) return;
     free(req->system_prompt);
     free(req->conversation_text);
+    for (int i = 0; i < req->tool_count && i < MAX_TOOLS; i++) {
+        free(req->tools[i].parameters);
+        req->tools[i].parameters = NULL;
+    }
     req->system_prompt = NULL;
     req->conversation_text = NULL;
+}
+
+static void parsed_tool_call_free(ParsedToolCall *tool_call) {
+    if (!tool_call) return;
+    free(tool_call->arguments);
+    tool_call->arguments = NULL;
+}
+
+static int append_bytes(char **buf, size_t *len, size_t *cap, const char *src, size_t src_len) {
+    if (!buf || !len || !cap || !src) return -1;
+    if (!*buf) {
+        *cap = src_len + 1;
+        if (*cap < 256) *cap = 256;
+        *buf = calloc(1, *cap);
+        if (!*buf) return -1;
+    }
+    if (*len + src_len + 1 > *cap) {
+        size_t new_cap = *cap;
+        while (*len + src_len + 1 > new_cap) new_cap *= 2;
+        char *grown = realloc(*buf, new_cap);
+        if (!grown) return -1;
+        *buf = grown;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, src, src_len);
+    *len += src_len;
+    (*buf)[*len] = 0;
+    return 0;
 }
 
 static int parse_tool_defs(NSArray *tools, ApiRequest *req) {
@@ -6276,8 +6323,8 @@ static int parse_tool_defs(NSArray *tools, ApiRequest *req) {
         id params = function[@"parameters"];
         if (params && params != [NSNull null]) {
             NSString *params_json = json_stringify_obj(params);
-            strncpy(dst->parameters, [params_json UTF8String], sizeof(dst->parameters) - 1);
-            dst->has_parameters = (dst->parameters[0] != '\0');
+            dst->parameters = dup_nsstring(params_json);
+            dst->has_parameters = (dst->parameters && dst->parameters[0] != '\0');
         }
     }
     req->tool_count = count;
@@ -6300,6 +6347,14 @@ static void parse_tool_choice(id tool_choice, ApiRequest *req) {
         req->tool_choice_mode = TOOL_CHOICE_FORCED;
         strncpy(req->forced_tool_name, [name UTF8String], sizeof(req->forced_tool_name) - 1);
     }
+}
+
+static int request_has_tool_named(ApiRequest *req, const char *name) {
+    if (!req || !name || !name[0]) return 0;
+    for (int i = 0; i < req->tool_count && i < MAX_TOOLS; i++) {
+        if (strcmp(req->tools[i].name, name) == 0) return 1;
+    }
+    return 0;
 }
 
 static int parse_reasoning_value(id value, int fallback) {
@@ -6326,11 +6381,10 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
-// Assemble the system block in native Qwen3 order: when tools are present,
-// the tool-instruction block (`# Tools` ... `</IMPORTANT>`) comes FIRST and
-// the user's system content is appended after a `\n\n` separator, exactly
-// matching the model's chat_template. Without tools, just the user system
-// content.
+// Assemble the system block in native Qwen3 order: user system content first,
+// then the tool-instruction block (`# Tools` ... `</IMPORTANT>`) when tools are
+// present. Keeping the concrete tool grammar last gives it precedence over
+// client-provided system text that may describe a different tool surface.
 //
 // The returned string is the body of the <|im_start|>system ... <|im_end|>
 // block; callers wrap it. Trailing newline is intentionally NOT included so
@@ -6353,15 +6407,15 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
     NSMutableString *final = [NSMutableString string];
 
     if (has_tools) {
+        NSString *trimmed = [user_sys_norm stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed length] > 0) {
+            [final appendString:trimmed];
+            [final appendString:@"\n\n"];
+        }
         char *tool_block = build_tool_instructions(req->tools, req->tool_count);
         if (info) info->tool_instruction_chars = tool_block ? strlen(tool_block) : 0;
         [final appendString:[NSString stringWithUTF8String:tool_block ?: ""]];
         free(tool_block);
-        NSString *trimmed = [user_sys_norm stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if ([trimmed length] > 0) {
-            [final appendString:@"\n\n"];
-            [final appendString:trimmed];
-        }
         // tool_choice=forced: do NOT inject prose. The forcing happens at the
         // assistant-turn prefix (see fill_request_from_chat_json), which
         // prefills <tool_call><function=NAME> so the model has no degree of
@@ -6457,9 +6511,16 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     if (temperature) req->temperature = [temperature floatValue];
     NSNumber *top_p = root[@"top_p"];
     if (top_p) req->top_p = [top_p floatValue];
-    req->reasoning_enabled = parse_reasoning_value(root[@"reasoning"], req->reasoning_enabled);
+    id reasoning = root[@"reasoning"];
+    if (reasoning && reasoning != [NSNull null]) {
+        req->reasoning_explicit = 1;
+        req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
+    }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
+    if (req->tool_count > 0 && !req->reasoning_explicit) {
+        req->reasoning_enabled = 0;
+    }
     NSString *session_id = root[@"session_id"];
     if ([session_id length] > 0) strncpy(req->session_id, [session_id UTF8String], sizeof(req->session_id) - 1);
 
@@ -6531,9 +6592,16 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     if (temperature) req->temperature = [temperature floatValue];
     NSNumber *top_p = root[@"top_p"];
     if (top_p) req->top_p = [top_p floatValue];
-    req->reasoning_enabled = parse_reasoning_value(root[@"reasoning"], req->reasoning_enabled);
+    id reasoning = root[@"reasoning"];
+    if (reasoning && reasoning != [NSNull null]) {
+        req->reasoning_explicit = 1;
+        req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
+    }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
+    if (req->tool_count > 0 && !req->reasoning_explicit) {
+        req->reasoning_enabled = 0;
+    }
 
     NSMutableArray *messages = [NSMutableArray array];
     id input = root[@"input"];
@@ -6816,27 +6884,25 @@ static void sse_send_done(int fd, const char *request_id) {
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_tool_calls(int fd, const char *request_id, const char *tool_call_id, 
                                 const char *function_name, const char *arguments) {
-    // Escape the JSON strings
     char escaped_name[256];
-    char escaped_args[8192];
-    
+    char *escaped_args = json_escape_alloc(arguments ?: "{}");
+    if (!escaped_args) return -1;
+
     char *w = escaped_name;
     for (const char *r = function_name; *r && w < escaped_name + sizeof(escaped_name) - 2; r++) {
         if (*r == '"' || *r == '\\') { *w++ = '\\'; }
         *w++ = *r;
     }
     *w = '\0';
-    
-    w = escaped_args;
-    for (const char *r = arguments; *r && w < escaped_args + sizeof(escaped_args) - 2; r++) {
-        if (*r == '"' || *r == '\\') { *w++ = '\\'; }
-        *w++ = *r;
+
+    size_t chunk_cap = strlen(escaped_args) + strlen(request_id) + strlen(kApiModelId ?: "") + strlen(tool_call_id) + strlen(escaped_name) + 1024;
+    char *chunk = malloc(chunk_cap);
+    if (!chunk) {
+        free(escaped_args);
+        return -1;
     }
-    *w = '\0';
-    
-    char chunk[12288];
     long created = sse_created_timestamp();
-    int n = snprintf(chunk, sizeof(chunk),
+    int n = snprintf(chunk, chunk_cap,
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\","
         "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
@@ -6844,18 +6910,25 @@ static int sse_send_tool_calls(int fd, const char *request_id, const char *tool_
     server_http_log_block(request_id, "response", "sse chat.completion.tool_calls", chunk);
     
     ssize_t wr = write(fd, chunk, n);
-    if (wr <= 0) return -1;
+    if (wr <= 0) {
+        free(chunk);
+        free(escaped_args);
+        return -1;
+    }
     
     // Send done after tool_calls
     created = sse_created_timestamp();
-    n = snprintf(chunk, sizeof(chunk),
+    n = snprintf(chunk, chunk_cap,
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
         "data: [DONE]\n\n",
         request_id, created, kApiModelId);
     server_http_log_block(request_id, "response", "sse chat.completion.tool_calls.done", chunk);
     wr = write(fd, chunk, n);
-    return (wr <= 0) ? -1 : 0;
+    int rc = (wr <= 0) ? -1 : 0;
+    free(chunk);
+    free(escaped_args);
+    return rc;
 }
 
 static const char *SSE_HEADERS =
@@ -6900,6 +6973,36 @@ static int json_escape_cstr(const char *src, char *buf, int bufsize) {
     }
     buf[j] = 0;
     return j;
+}
+
+static char *json_escape_alloc(const char *src) {
+    if (!src) return strdup("");
+    size_t len = strlen(src);
+    size_t cap = len * 2 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; src[i]; i++) {
+        if (j + 3 >= cap) {
+            cap *= 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) {
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+        }
+        switch (src[i]) {
+            case '"':  buf[j++]='\\'; buf[j++]='"'; break;
+            case '\\': buf[j++]='\\'; buf[j++]='\\'; break;
+            case '\n': buf[j++]='\\'; buf[j++]='n'; break;
+            case '\r': buf[j++]='\\'; buf[j++]='r'; break;
+            case '\t': buf[j++]='\\'; buf[j++]='t'; break;
+            default:   buf[j++]=src[i]; break;
+        }
+    }
+    buf[j] = 0;
+    return buf;
 }
 
 static void send_json_error(int fd, int status_code, const char *type, const char *message) {
@@ -7044,9 +7147,171 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
 
     strncpy(parsed->name, name_buf, sizeof(parsed->name) - 1);
     NSString *args_json = json_stringify_obj(args);
-    strncpy(parsed->arguments, [args_json UTF8String], sizeof(parsed->arguments) - 1);
+    parsed->arguments = dup_nsstring(args_json);
     parsed->is_tool_call = 1;
     return 1;
+}
+
+static char *read_text_file_alloc(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = 0;
+    fclose(f);
+    return buf;
+}
+
+static int write_text_file(const char *dir, const char *name, const char *text) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    if (text) fwrite(text, 1, strlen(text), f);
+    fclose(f);
+    return 0;
+}
+
+static int render_request_debug(const char *request_path, const char *output_dir, const char *kind_name) {
+    char *body = read_text_file_alloc(request_path);
+    if (!body) {
+        fprintf(stderr, "ERROR: cannot read request JSON: %s\n", request_path);
+        return 1;
+    }
+
+    NSError *json_error = nil;
+    NSDictionary *root = parse_json_body(body, &json_error);
+    if (!root) {
+        fprintf(stderr, "ERROR: invalid request JSON: %s\n",
+                json_error ? [[json_error localizedDescription] UTF8String] : "unknown error");
+        free(body);
+        return 1;
+    }
+
+    ApiKind kind = API_KIND_CHAT;
+    if (kind_name && strcmp(kind_name, "responses") == 0) {
+        kind = API_KIND_RESPONSES;
+    } else if ((!kind_name || strcmp(kind_name, "auto") == 0) && root[@"input"]) {
+        kind = API_KIND_RESPONSES;
+    }
+
+    ApiRequest req;
+    api_request_init(&req, kind);
+    char *err_msg = NULL;
+    int fill_rc = (kind == API_KIND_RESPONSES)
+        ? fill_request_from_responses_json(root, &req, &err_msg)
+        : fill_request_from_chat_json(root, &req, &err_msg);
+    if (fill_rc != 0) {
+        fprintf(stderr, "ERROR: %s\n", err_msg ? err_msg : "request parse failed");
+        free(err_msg);
+        api_request_free(&req);
+        free(body);
+        return 1;
+    }
+
+    PromptBuildInfo info;
+    char *sys_prompt = build_system_prompt_for_request(&req, &info);
+    size_t total = strlen(sys_prompt) + strlen(req.conversation_text ?: "") + 128;
+    char *assembled = malloc(total);
+    if (!assembled) {
+        fprintf(stderr, "ERROR: render allocation failed\n");
+        free(sys_prompt);
+        api_request_free(&req);
+        free(body);
+        return 1;
+    }
+    snprintf(assembled, total, "<|im_start|>system\n%s<|im_end|>\n%s",
+             sys_prompt, req.conversation_text ?: "");
+
+    int sys_tokens = count_sys_prompt_tokens(sys_prompt);
+    PromptTokens *full_tokens = encode_prompt_text_to_tokens(assembled);
+    int full_token_count = full_tokens ? full_tokens->count : -1;
+    if (full_tokens) {
+        free(full_tokens->ids);
+        free(full_tokens);
+    }
+
+    printf("kind=%s\n", kind == API_KIND_RESPONSES ? "responses" : "chat");
+    printf("tools=%d\n", req.tool_count);
+    printf("tool_choice=%d\n", req.tool_choice_mode);
+    printf("system_chars=%zu\n", strlen(sys_prompt));
+    printf("conversation_chars=%zu\n", strlen(req.conversation_text ?: ""));
+    printf("assembled_chars=%zu\n", strlen(assembled));
+    printf("system_tokens=%d\n", sys_tokens);
+    printf("assembled_tokens=%d\n", full_token_count);
+
+    if (output_dir && output_dir[0]) {
+        mkdir(output_dir, 0755);
+        write_text_file(output_dir, "request.json", body);
+        write_text_file(output_dir, "system_prompt.txt", sys_prompt);
+        write_text_file(output_dir, "conversation.txt", req.conversation_text ?: "");
+        write_text_file(output_dir, "assembled_prompt.txt", assembled);
+        char summary[1024];
+        snprintf(summary, sizeof(summary),
+                 "{\n"
+                 "  \"kind\": \"%s\",\n"
+                 "  \"tools\": %d,\n"
+                 "  \"tool_choice\": %d,\n"
+                 "  \"system_chars\": %zu,\n"
+                 "  \"conversation_chars\": %zu,\n"
+                 "  \"assembled_chars\": %zu,\n"
+                 "  \"system_tokens\": %d,\n"
+                 "  \"assembled_tokens\": %d\n"
+                 "}\n",
+                 kind == API_KIND_RESPONSES ? "responses" : "chat",
+                 req.tool_count, req.tool_choice_mode,
+                 strlen(sys_prompt), strlen(req.conversation_text ?: ""),
+                 strlen(assembled), sys_tokens, full_token_count);
+        write_text_file(output_dir, "summary.json", summary);
+    }
+
+    free(assembled);
+    free(sys_prompt);
+    api_request_free(&req);
+    free(body);
+    return 0;
+}
+
+static int parse_tool_call_debug(const char *path) {
+    char *buf = read_text_file_alloc(path);
+    if (!buf) {
+        fprintf(stderr, "ERROR: cannot read tool-call text: %s\n", path);
+        return 1;
+    }
+    ParsedToolCall parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (!parse_tool_call_from_buffer(buf, &parsed)) {
+        fprintf(stderr, "ERROR: no complete native XML tool call found\n");
+        free(buf);
+        return 1;
+    }
+    char escaped_name[256];
+    char *escaped_args = json_escape_alloc(parsed.arguments ?: "{}");
+    if (!escaped_args) {
+        parsed_tool_call_free(&parsed);
+        free(buf);
+        return 1;
+    }
+    json_escape_cstr(parsed.name, escaped_name, sizeof(escaped_name));
+    printf("{\"name\":\"%s\",\"arguments\":\"%s\"}\n", escaped_name, escaped_args);
+    free(escaped_args);
+    parsed_tool_call_free(&parsed);
+    free(buf);
+    return 0;
 }
 
 static int sse_send_response_text_delta(int fd, const char *response_id, const char *text) {
@@ -7063,22 +7328,34 @@ static int sse_send_response_text_delta(int fd, const char *response_id, const c
 
 static int sse_send_response_tool_call(int fd, const char *response_id, const ParsedToolCall *tool_call) {
     char escaped_name[256];
-    char escaped_args[8192];
+    char *escaped_args = json_escape_alloc(tool_call->arguments ?: "{}");
+    if (!escaped_args) return -1;
     json_escape_cstr(tool_call->name, escaped_name, sizeof(escaped_name));
-    json_escape_cstr(tool_call->arguments, escaped_args, sizeof(escaped_args));
-    char chunk[12288];
-    int n = snprintf(chunk, sizeof(chunk),
+    size_t chunk_cap = strlen(escaped_args) + strlen(response_id) + strlen(tool_call->id) + strlen(escaped_name) + 1024;
+    char *chunk = malloc(chunk_cap);
+    if (!chunk) {
+        free(escaped_args);
+        return -1;
+    }
+    int n = snprintf(chunk, chunk_cap,
                      "event: response.function_call_arguments.delta\n"
                      "data: {\"type\":\"response.function_call_arguments.delta\",\"response_id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"delta\":\"%s\"}\n\n",
                      response_id, tool_call->id, escaped_name, escaped_args);
     server_http_log_block(response_id, "response", "sse response.function_call_arguments.delta", chunk);
-    if (write(fd, chunk, n) <= 0) return -1;
-    n = snprintf(chunk, sizeof(chunk),
+    if (write(fd, chunk, n) <= 0) {
+        free(chunk);
+        free(escaped_args);
+        return -1;
+    }
+    n = snprintf(chunk, chunk_cap,
                  "event: response.output_item.done\n"
                  "data: {\"type\":\"response.output_item.done\",\"response_id\":\"%s\",\"item\":{\"type\":\"function_call\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"%s\"}}\n\n",
                  response_id, tool_call->id, escaped_name, escaped_args);
     server_http_log_block(response_id, "response", "sse response.output_item.done", chunk);
-    return write(fd, chunk, n) <= 0 ? -1 : 0;
+    int rc = write(fd, chunk, n) <= 0 ? -1 : 0;
+    free(chunk);
+    free(escaped_args);
+    return rc;
 }
 
 static void sse_send_response_done(int fd, const char *response_id, const char *final_json) {
@@ -7095,51 +7372,91 @@ static void sse_send_response_done(int fd, const char *response_id, const char *
 
 static char *build_chat_completion_json(const char *request_id, const char *model,
                                         const char *text, const ParsedToolCall *tool_call) {
-    char escaped_text[262144];
-    json_escape_cstr(text ?: "", escaped_text, sizeof(escaped_text));
-    char *body = calloc(1, 300000);
-    if (!body) return NULL;
+    char *escaped_text = json_escape_alloc(text ?: "");
+    if (!escaped_text) return NULL;
+    size_t body_cap = strlen(escaped_text) + 4096;
+    char *body = calloc(1, body_cap);
+    if (!body) {
+        free(escaped_text);
+        return NULL;
+    }
     if (tool_call && tool_call->is_tool_call) {
-        char escaped_name[256], escaped_args[16384];
+        char escaped_name[256];
+        char *escaped_args = json_escape_alloc(tool_call->arguments ?: "{}");
+        if (!escaped_args) {
+            free(body);
+            free(escaped_text);
+            return NULL;
+        }
         json_escape_cstr(tool_call->name, escaped_name, sizeof(escaped_name));
-        json_escape_cstr(tool_call->arguments, escaped_args, sizeof(escaped_args));
-        snprintf(body, 300000,
+        body_cap = strlen(escaped_args) + strlen(request_id) + strlen(model) + strlen(escaped_name) + 4096;
+        char *grown = realloc(body, body_cap);
+        if (!grown) {
+            free(escaped_args);
+            free(body);
+            free(escaped_text);
+            return NULL;
+        }
+        body = grown;
+        snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\","
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\","
                  "\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},"
                  "\"finish_reason\":\"tool_calls\"}]}\n",
                  request_id, model, tool_call->id, escaped_name, escaped_args);
+        free(escaped_args);
     } else {
-        snprintf(body, 300000,
+        snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\","
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                  "\"finish_reason\":\"stop\"}]}\n",
                  request_id, model, escaped_text);
     }
+    free(escaped_text);
     return body;
 }
 
 static char *build_responses_json(const char *response_id, const char *model,
                                   const char *text, const ParsedToolCall *tool_call) {
-    char escaped_text[262144];
-    json_escape_cstr(text ?: "", escaped_text, sizeof(escaped_text));
-    char *body = calloc(1, 320000);
-    if (!body) return NULL;
+    char *escaped_text = json_escape_alloc(text ?: "");
+    if (!escaped_text) return NULL;
+    size_t body_cap = strlen(escaped_text) * 2 + 4096;
+    char *body = calloc(1, body_cap);
+    if (!body) {
+        free(escaped_text);
+        return NULL;
+    }
     if (tool_call && tool_call->is_tool_call) {
-        char escaped_name[256], escaped_args[16384];
+        char escaped_name[256];
+        char *escaped_args = json_escape_alloc(tool_call->arguments ?: "{}");
+        if (!escaped_args) {
+            free(body);
+            free(escaped_text);
+            return NULL;
+        }
         json_escape_cstr(tool_call->name, escaped_name, sizeof(escaped_name));
-        json_escape_cstr(tool_call->arguments, escaped_args, sizeof(escaped_args));
-        snprintf(body, 320000,
+        body_cap = strlen(escaped_args) + strlen(response_id) + strlen(model) + strlen(escaped_name) + 4096;
+        char *grown = realloc(body, body_cap);
+        if (!grown) {
+            free(escaped_args);
+            free(body);
+            free(escaped_text);
+            return NULL;
+        }
+        body = grown;
+        snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"response\",\"model\":\"%s\",\"status\":\"completed\","
                  "\"output\":[{\"type\":\"function_call\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"%s\"}]}\n",
                  response_id, model, tool_call->id, escaped_name, escaped_args);
+        free(escaped_args);
     } else {
-        snprintf(body, 320000,
+        snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"response\",\"model\":\"%s\",\"status\":\"completed\","
                  "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}],"
                  "\"output_text\":\"%s\"}\n",
                  response_id, model, escaped_text, escaped_text);
     }
+    free(escaped_text);
     return body;
 }
 
@@ -7221,7 +7538,7 @@ static char *build_tool_instructions(ToolDef *tools, int tool_count) {
         char desc_esc[MAX_TOOL_DESC * 2];
         json_escape_cstr(tools[i].name, name_esc, sizeof(name_esc));
         json_escape_cstr(tools[i].description, desc_esc, sizeof(desc_esc));
-        const char *params = (tools[i].has_parameters && tools[i].parameters[0])
+        const char *params = (tools[i].has_parameters && tools[i].parameters && tools[i].parameters[0])
             ? tools[i].parameters
             : "{}";
         // Match the template's tojson key order (function before type) — not
@@ -7574,8 +7891,10 @@ static void serve_loop(
                     if (g_metal) {
                         int fa_idx = (i + 1) / g_cfg.full_attn_interval - 1;
                         if (fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers) {
-                            memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_snapshots[i].k_snapshot, sz);
-                            memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_snapshots[i].v_snapshot, sz);
+                            size_t gpu_tokens = cached_sys_token_count < GPU_KV_SEQ ? (size_t)cached_sys_token_count : (size_t)GPU_KV_SEQ;
+                            size_t gpu_sz = gpu_tokens * kv_dim * sizeof(float);
+                            memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_snapshots[i].k_snapshot, gpu_sz);
+                            memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_snapshots[i].v_snapshot, gpu_sz);
                         }
                     }
                 }
@@ -7744,8 +8063,9 @@ static void serve_loop(
 
         char *gen_response = calloc(1, 262144);
         int gen_resp_len = 0;
-        char tool_call_buf[8192] = {0};
-        int tool_call_len = 0;
+        char *tool_call_buf = NULL;
+        size_t tool_call_len = 0;
+        size_t tool_call_cap = 0;
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
@@ -7759,13 +8079,16 @@ static void serve_loop(
         int in_think = (req.reasoning_enabled &&
                         !(req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]))
                        ? 1 : 0;
+        int saw_tool_call_start = 0;
         // When tool_choice forces a specific function, the prompt was prefilled
         // with `<tool_call>\n<function=NAME>\n`. Mirror that prefix into the
         // parser's buffer so it can match `<tool_call>` and extract NAME the
         // moment the model emits a closing `</tool_call>`.
         if (req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]) {
-            tool_call_len = snprintf(tool_call_buf, sizeof(tool_call_buf),
-                                     "<tool_call>\n<function=%s>\n", req.forced_tool_name);
+            char prefix[256];
+            int prefix_len = snprintf(prefix, sizeof(prefix),
+                                      "<tool_call>\n<function=%s>\n", req.forced_tool_name);
+            append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, prefix, (size_t)prefix_len);
         }
         int think_tokens = 0;
 
@@ -7787,21 +8110,42 @@ static void serve_loop(
             if (req.reasoning_enabled && (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token)) {
                 send_as_delta = 0;
             }
+            if (in_think && !g_show_thinking_enabled) {
+                send_as_delta = 0;
+            }
 
             int is_think_marker = (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token);
-            if (!in_think && !is_think_marker && tok_str) {
+            if (!is_think_marker && tok_str) {
                 int tlen = (int)strlen(tok_str);
-                if (gen_resp_len + tlen < 262143) {
+                if (!in_think && gen_resp_len + tlen < 262143) {
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE && tool_call_len + tlen < (int)sizeof(tool_call_buf) - 1) {
-                    memcpy(tool_call_buf + tool_call_len, tok_str, tlen);
-                    tool_call_len += tlen;
-                    tool_call_buf[tool_call_len] = 0;
-                    if (strstr(tool_call_buf, "<tool_call")) send_as_delta = 0;
-                    if (parse_tool_call_from_buffer(tool_call_buf, &parsed_tool_call)) {
+                if (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE) {
+                    if (append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, tok_str, (size_t)tlen) == 0 &&
+                        tool_call_buf && strstr(tool_call_buf, "<tool_call")) {
+                        if (!saw_tool_call_start) {
+                            saw_tool_call_start = 1;
+                            server_log_errorf("[serve] %s detected native tool_call start at generated=%d\n",
+                                              request_id, gen_count);
+                        }
+                        send_as_delta = 0;
+                    }
+                    if (tool_call_buf && parse_tool_call_from_buffer(tool_call_buf, &parsed_tool_call)) {
+                        if (!request_has_tool_named(&req, parsed_tool_call.name)) {
+                            server_log_errorf("[serve] %s rejected unavailable tool_call name=%s\n",
+                                              request_id, parsed_tool_call.name);
+                            if (g_server_debug_enabled) {
+                                server_debug_write_text(request_id, "tool_call_rejected.txt", tool_call_buf);
+                            }
+                            parsed_tool_call_free(&parsed_tool_call);
+                            memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
+                            tool_call_len = 0;
+                            if (tool_call_buf) tool_call_buf[0] = '\0';
+                            saw_tool_call_start = 0;
+                            goto tool_call_checked;
+                        }
                         static int tool_call_counter = 0;
                         snprintf(parsed_tool_call.id, sizeof(parsed_tool_call.id), "call_%d", ++tool_call_counter);
                         if (g_server_debug_enabled) {
@@ -7809,6 +8153,8 @@ static void serve_loop(
                         }
                         break;
                     }
+tool_call_checked:
+                    ;
                 }
             }
 
@@ -7851,6 +8197,15 @@ static void serve_loop(
             next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p, req.reasoning_enabled);
         }
 
+        if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
+            server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
+            if (g_server_debug_enabled && tool_call_buf) {
+                server_debug_write_text(request_id, "tool_call_unparsed.txt", tool_call_buf);
+            }
+        } else if (!parsed_tool_call.is_tool_call && req.tool_count > 0 && g_server_debug_enabled && tool_call_buf) {
+            server_debug_write_text(request_id, "tool_probe_buf.txt", tool_call_buf);
+        }
+
         char *final_json = is_chat
             ? build_chat_completion_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL)
             : build_responses_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL);
@@ -7878,6 +8233,8 @@ static void serve_loop(
 
         free(final_json);
         free(gen_response);
+        parsed_tool_call_free(&parsed_tool_call);
+        free(tool_call_buf);
         free(pt->ids);
         free(pt);
         api_request_free(&req);
@@ -7895,6 +8252,13 @@ static void serve_loop(
 }
 
 // ============================================================================
+
+enum {
+    OPT_RENDER_REQUEST = 1000,
+    OPT_RENDER_OUTPUT,
+    OPT_RENDER_KIND,
+    OPT_PARSE_TOOL_CALL,
+};
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
@@ -7918,6 +8282,10 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --render-request F   Render an API request JSON to prompt/debug files and exit\n");
+    printf("  --render-output DIR  Directory for --render-request debug files\n");
+    printf("  --render-kind KIND   Render kind: auto, chat, responses (default: auto)\n");
+    printf("  --parse-tool-call F  Parse native XML tool-call text and exit\n");
     printf("  --help               This message\n");
 }
 
@@ -7937,6 +8305,10 @@ int main(int argc, char **argv) {
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
+        const char *render_request_path = NULL;
+        const char *render_output_dir = NULL;
+        const char *render_kind = "auto";
+        const char *parse_tool_call_path = NULL;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -7944,12 +8316,14 @@ int main(int argc, char **argv) {
         const char *env_temperature = getenv("FLASHCHAT_TEMPERATURE");
         const char *env_top_p = getenv("FLASHCHAT_TOP_P");
         const char *env_reasoning = getenv("FLASHCHAT_REASONING");
+        const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
         if (env_temperature && env_temperature[0]) g_default_temperature = strtof(env_temperature, NULL);
         if (env_top_p && env_top_p[0]) g_default_top_p = strtof(env_top_p, NULL);
         if (env_reasoning && env_reasoning[0]) {
-            g_default_reasoning_enabled = (strcmp(env_reasoning, "0") != 0 &&
-                                           strcasecmp(env_reasoning, "false") != 0 &&
-                                           strcasecmp(env_reasoning, "off") != 0);
+            g_default_reasoning_enabled = server_flag_enabled(env_reasoning);
+        }
+        if (env_show_thinking && env_show_thinking[0]) {
+            g_show_thinking_enabled = server_flag_enabled(env_show_thinking);
         }
 
         // Also try to read config from ~/.config/flashchat/config if env vars not set
@@ -7993,6 +8367,15 @@ int main(int argc, char **argv) {
                         char *quote = strchr(val, '"');
                         if (quote) g_default_top_p = strtof(quote + 1, NULL);
                     }
+                    if (!env_show_thinking && strncmp(line, "SHOW_THINKING=", 14) == 0) {
+                        char *val = line + 14;
+                        char *quote = strchr(val, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            g_show_thinking_enabled = server_flag_enabled(quote + 1);
+                        }
+                    }
                 }
                 fclose(cfg);
             }
@@ -8020,6 +8403,10 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"render-request", required_argument, 0, OPT_RENDER_REQUEST},
+            {"render-output",  required_argument, 0, OPT_RENDER_OUTPUT},
+            {"render-kind",    required_argument, 0, OPT_RENDER_KIND},
+            {"parse-tool-call", required_argument, 0, OPT_PARSE_TOOL_CALL},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8054,6 +8441,10 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case OPT_RENDER_REQUEST: render_request_path = optarg; break;
+                case OPT_RENDER_OUTPUT: render_output_dir = optarg; break;
+                case OPT_RENDER_KIND: render_kind = optarg; break;
+                case OPT_PARSE_TOOL_CALL: parse_tool_call_path = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8075,6 +8466,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         kApiModelId = g_cfg.model_id;
+
+        if (parse_tool_call_path) {
+            return parse_tool_call_debug(parse_tool_call_path);
+        }
+        if (render_request_path) {
+            return render_request_debug(render_request_path, render_output_dir, render_kind);
+        }
 
         // Build default paths under the per-model Flashchat artifact directory.
         char default_weights[1024], default_manifest[1024], default_vocab[1024];

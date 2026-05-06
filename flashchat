@@ -59,6 +59,22 @@ error() {
     exit 1
 }
 
+normalize_server_log_path() {
+    local path="$1"
+    [ -z "$path" ] && return
+    case "$path" in
+        */) echo "$path" ;;
+        *)
+            local base="${path##*/}"
+            if [[ "$base" = *.* ]]; then
+                echo "$path"
+            else
+                echo "${path}/"
+            fi
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # Parse global options
 # -----------------------------------------------------------------------------
@@ -1106,10 +1122,12 @@ prompt_config_interactive() {
     # Server Log Path
     local default_log_path
     default_log_path=$(flashchat_get SERVER_LOG_PATH)
-    printf "Server log path (file or directory) [%s]: " "$default_log_path"
+    printf "Server log path (.log file or directory; extensionless paths become directories) [%s]: " "$default_log_path"
     read -r REPLY
     echo ""
-    echo "SERVER_LOG_PATH=\"${REPLY:-$default_log_path}\"" >> /tmp/flashchat_new_config
+    local selected_log_path
+    selected_log_path=$(normalize_server_log_path "${REPLY:-$default_log_path}")
+    echo "SERVER_LOG_PATH=\"$selected_log_path\"" >> /tmp/flashchat_new_config
 
     # Model Offload Directory
     local default_offload_dir
@@ -2178,6 +2196,7 @@ cmd_serve() {
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
     export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
+    export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"

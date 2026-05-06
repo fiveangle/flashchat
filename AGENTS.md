@@ -105,8 +105,10 @@ make fullbench      # Full forward benchmark (3 iterations)
 # Framework regression tests
 ./tests/test_flashchat_cli.sh
 ./tests/test_flashchat_manage.sh
+./tests/test_tool_template_render.sh
 make cli-smoke
 make manage-smoke
+make tool-template-smoke
 make api-smoke
 make test
 ```
@@ -134,9 +136,11 @@ make test
 - **When making user-facing changes (especially output/UX), look for similar patterns elsewhere in the project.** For example, if you consolidate section headers in one command, check other commands for the same issue and apply the same fix.
 - **Never ask the user to perform manual steps that can be automated.** If something needs testing, write a script to do it automatically rather than asking the user to do it manually.
 - **When changing the HTTP/API surface, add or update an automated smoke test whenever feasible.** Prefer a lightweight script that exercises the live endpoints the same way frontend harnesses will.
+- **Tool-calling changes should validate rendering before live agent testing.** Use `metal_infer/infer --render-request ... --render-output ...` and `make tool-template-smoke` to verify native Qwen tool-template rendering and XML parser behavior before comparing nanocode/opencode live logs.
 - **Shell helpers should preserve the caller's working directory unless changing directories is the explicit purpose of the helper.** Save and restore `pwd` inside build/setup helpers that `cd` internally.
 - **Always verify the environment state before and after making changes.** Check that config files, model caches, and other state are preserved or properly restored. Test that changes don't inadvertently delete or corrupt user data.
 - **Server-side debug visibility matters.** Changes to `infer --serve` should preserve persistent logging so background server runs remain debuggable without requiring an interactive launch.
+- **When runtime behavior does not match expectations, anchor debugging in captured logs, request dumps, build stamps, and reproducible evidence.** Do not default to assuming the user launched an old binary or made a procedural mistake unless the evidence specifically points there.
 - **Server control commands must verify reality, not assume it.** Start/stop helpers should confirm health or actual process exit before reporting success or removing pid/state files.
 - **Persistent server/runtime toggles should be first-class config options.** If a setting is useful beyond one-off debugging, surface it through the config file and `flashchat` configuration wizard instead of leaving it env-only.
 - **When a functional block or milestone is complete, consider prompting for a commit checkpoint.** Don’t interrupt active debugging for every small change, but when a coherent unit of work lands, ask whether it should be committed before moving on.

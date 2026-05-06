@@ -13,6 +13,7 @@
 #   make api-smoke — run HTTP API smoke test
 #   make cli-smoke — run Flashchat CLI smoke test
 #   make manage-smoke — run model management storage smoke test
+#   make tool-template-smoke — run native tool template render/parser smoke test
 #   make test      — run all functional smoke tests
 #   make help      — list available targets
 #   make clean     — remove build artifacts
@@ -50,7 +51,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke test
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -109,6 +110,7 @@ help:
 	@printf "Tests:\n"
 	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
 	@printf "  make manage-smoke  Run model management storage smoke test\n"
+	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "\n"
@@ -213,4 +215,7 @@ cli-smoke:
 manage-smoke:
 	bash tests/test_flashchat_manage.sh
 
-test: cli-smoke manage-smoke api-smoke
+tool-template-smoke: $(INFER_TARGET)
+	bash tests/test_tool_template_render.sh
+
+test: cli-smoke manage-smoke tool-template-smoke api-smoke

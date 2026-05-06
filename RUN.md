@@ -130,6 +130,16 @@ Runs a single prompt and prints the response.
 
 Runs performance benchmarks. Uses configuration for model paths.
 
+### Tool Template Debugging
+
+```bash
+./metal_infer/infer --render-request request.json --render-output debug/rendered-request
+./metal_infer/infer --parse-tool-call tool_call.txt
+make tool-template-smoke
+```
+
+The render path parses an OpenAI-compatible request and writes the exact native Qwen system prompt, conversation text, assembled prompt, and summary counts without loading model weights or starting the server. Use it to compare nanocode/opencode request logs with Flashchat's prompt rendering before debugging live model behavior.
+
 ### Configuration
 
 ```bash
@@ -233,6 +243,8 @@ SERVER_LOG_PATH="$HOME/.config/flashchat/logs/server.log"
 SHOW_THINKING="0"
 COLOR_OUTPUT="1"
 ```
+
+`SERVER_LOG_PATH` may be a `.log` file or a directory. Extensionless paths entered in the configuration wizard are treated as directories and will receive `server.log` plus debug artifacts when debug logging is enabled.
 
 ## API Endpoints
 
