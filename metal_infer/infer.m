@@ -123,6 +123,15 @@ static float g_default_min_p = 0.0f;
 static float g_default_presence_penalty = 1.5f;
 static float g_default_repetition_penalty = 1.0f;
 static int g_default_reasoning_enabled = 1;
+// When 1 (default), the sampler hard-overrides to greedy (temp=0) for any
+// token generated *inside* a `<tool_call>...</tool_call>` block. Sampling
+// diversity inside the rigid XML format has no upside (the format primer
+// has high-confidence tokens) and a real downside (model occasionally
+// picks `\n` instead of the function-name token, which we observed
+// post-K=8 fix on long multi-turn nanocoder sessions). Override via the
+// FLASHCHAT_TOOL_CALL_GREEDY=0 env var if you want sampled tool-call
+// content (e.g. for diversifying tool parameter values across runs).
+static int g_tool_call_greedy_enabled = 1;
 
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
@@ -9218,6 +9227,27 @@ static void serve_loop(
         free(req_sys_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
 
+        // Generation-side state. Declared up here (instead of further down where
+        // it used to live) so the very first sampler call can honor the
+        // tool-call-greedy override for forced tool_choice (where the prompt
+        // already places us inside <tool_call><function=NAME> and the first
+        // generated token should likewise be format-deterministic).
+        char *tool_call_buf = NULL;
+        size_t tool_call_len = 0;
+        size_t tool_call_cap = 0;
+        int saw_tool_call_start = 0;
+        // When tool_choice forces a specific function, the prompt was prefilled
+        // with `<tool_call>\n<function=NAME>\n`. Mirror that prefix into the
+        // parser's buffer so it can match `<tool_call>` and extract NAME the
+        // moment the model emits a closing `</tool_call>`.
+        if (req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]) {
+            char prefix[256];
+            int prefix_len = snprintf(prefix, sizeof(prefix),
+                                      "<tool_call>\n<function=%s>\n", req.forced_tool_name);
+            append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, prefix, (size_t)prefix_len);
+            saw_tool_call_start = 1;
+        }
+
         if (final_norm_w) {
             float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
             cpu_rms_norm(hidden, final_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
@@ -9225,11 +9255,20 @@ static void serve_loop(
             free(normed);
         }
         lm_head_forward(wf, hidden, logits);
-        int next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p,
+        // Tool-call format-stability override: when we're inside a <tool_call>
+        // block, force greedy decoding on every token. The model has high
+        // confidence on the right format tokens; sampling diversity here only
+        // produces malformed XML / dropped function-name tokens. Disable via
+        // FLASHCHAT_TOOL_CALL_GREEDY=0.
+        float effective_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
+                                      ? 0.0f
+                                      : req.temperature;
+        int next_token = pick_next_token(logits, g_cfg.vocab_size, effective_temperature, req.top_p,
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
-        server_log_errorf("[serve] %s first_token=%d\n", request_id, next_token);
+        server_log_errorf("[serve] %s first_token=%d%s\n", request_id, next_token,
+                          (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
 
         if (g_pred_enabled) {
             g_pred_generating = 1;
@@ -9238,9 +9277,6 @@ static void serve_loop(
 
         char *gen_response = calloc(1, 262144);
         int gen_resp_len = 0;
-        char *tool_call_buf = NULL;
-        size_t tool_call_len = 0;
-        size_t tool_call_cap = 0;
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
@@ -9254,17 +9290,6 @@ static void serve_loop(
         int in_think = (req.reasoning_enabled &&
                         !(req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]))
                        ? 1 : 0;
-        int saw_tool_call_start = 0;
-        // When tool_choice forces a specific function, the prompt was prefilled
-        // with `<tool_call>\n<function=NAME>\n`. Mirror that prefix into the
-        // parser's buffer so it can match `<tool_call>` and extract NAME the
-        // moment the model emits a closing `</tool_call>`.
-        if (req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]) {
-            char prefix[256];
-            int prefix_len = snprintf(prefix, sizeof(prefix),
-                                      "<tool_call>\n<function=%s>\n", req.forced_tool_name);
-            append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, prefix, (size_t)prefix_len);
-        }
         int think_tokens = 0;
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
@@ -9372,7 +9397,14 @@ tool_call_checked:
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            next_token = pick_next_token(logits, g_cfg.vocab_size, req.temperature, req.top_p,
+            // Mirror the first-token override: inside a <tool_call> block we
+            // sample greedily so the rigid XML format doesn't get sampled
+            // into something malformed (e.g. <function=\n instead of
+            // <function=name).
+            float iter_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
+                                     ? 0.0f
+                                     : req.temperature;
+            next_token = pick_next_token(logits, g_cfg.vocab_size, iter_temperature, req.top_p,
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
@@ -9505,6 +9537,7 @@ int main(int argc, char **argv) {
         const char *env_presence_penalty = getenv("FLASHCHAT_PRESENCE_PENALTY");
         const char *env_repetition_penalty = getenv("FLASHCHAT_REPETITION_PENALTY");
         const char *env_active_experts = getenv("FLASHCHAT_ACTIVE_EXPERTS");
+        const char *env_tool_call_greedy = getenv("FLASHCHAT_TOOL_CALL_GREEDY");
         const char *env_reasoning = getenv("FLASHCHAT_REASONING");
         const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
         const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
@@ -9526,6 +9559,12 @@ int main(int argc, char **argv) {
                 K = v;
                 fprintf(stderr, "[init] FLASHCHAT_ACTIVE_EXPERTS=%d overrides config K\n", v);
             }
+        }
+        if (env_tool_call_greedy && env_tool_call_greedy[0]) {
+            g_tool_call_greedy_enabled = server_flag_enabled(env_tool_call_greedy);
+            fprintf(stderr, "[init] FLASHCHAT_TOOL_CALL_GREEDY=%d (sampling inside <tool_call>...</tool_call> %s)\n",
+                    g_tool_call_greedy_enabled,
+                    g_tool_call_greedy_enabled ? "forced greedy" : "uses request sampling");
         }
         if (env_reasoning && env_reasoning[0]) {
             g_default_reasoning_enabled = server_flag_enabled(env_reasoning);
