@@ -6455,10 +6455,12 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
-// Assemble the system block in native Qwen3 order: user system content first,
-// then the tool-instruction block (`# Tools` ... `</IMPORTANT>`) when tools are
-// present. Keeping the concrete tool grammar last gives it precedence over
-// client-provided system text that may describe a different tool surface.
+// Assemble the system block in native Qwen3 order, matching chat_template.jinja:
+// the tool-instruction block (`# Tools` ... `</IMPORTANT>`) comes FIRST, then
+// `\n\n` + user system content. The model was post-trained with the tool
+// grammar at the start of the system block as the primer that activates
+// tool-calling mode; placing user content before it shifts the grammar far
+// out of distribution and degrades tool-calling reliability vs lmstudio.
 //
 // The returned string is the body of the <|im_start|>system ... <|im_end|>
 // block; callers wrap it. Trailing newline is intentionally NOT included so
@@ -6481,15 +6483,15 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
     NSMutableString *final = [NSMutableString string];
 
     if (has_tools) {
-        NSString *trimmed = [user_sys_norm stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if ([trimmed length] > 0) {
-            [final appendString:trimmed];
-            [final appendString:@"\n\n"];
-        }
         char *tool_block = build_tool_instructions(req->tools, req->tool_count);
         if (info) info->tool_instruction_chars = tool_block ? strlen(tool_block) : 0;
         [final appendString:[NSString stringWithUTF8String:tool_block ?: ""]];
         free(tool_block);
+        NSString *trimmed = [user_sys_norm stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed length] > 0) {
+            [final appendString:@"\n\n"];
+            [final appendString:trimmed];
+        }
         // tool_choice=forced: do NOT inject prose. The forcing happens at the
         // assistant-turn prefix (see fill_request_from_chat_json), which
         // prefills <tool_call><function=NAME> so the model has no degree of
@@ -6600,8 +6602,15 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
+    // Native Qwen3 tool calls are far more format-compliant when the assistant
+    // turn opens with `<think>\n` (matching chat_template's enable_thinking=true).
+    // Without thinking, a long client system prompt (e.g. nanocoder's 11kB prose)
+    // dominates the format primer and the model emits Python-style or partial
+    // XML. With thinking, the model commits to tool-calling mode during the
+    // think block and reliably produces correct `<tool_call>` XML. Enable by
+    // default when tools are active and the client did not pin reasoning.
     if (req->tool_count > 0 && !req->reasoning_explicit) {
-        req->reasoning_enabled = 0;
+        req->reasoning_enabled = 1;
     }
     NSString *session_id = root[@"session_id"];
     if ([session_id length] > 0) strncpy(req->session_id, [session_id UTF8String], sizeof(req->session_id) - 1);
@@ -6689,8 +6698,10 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
+    // Mirror chat-completions: tools active without explicit reasoning enables
+    // thinking, which dramatically improves native XML format adherence.
     if (req->tool_count > 0 && !req->reasoning_explicit) {
-        req->reasoning_enabled = 0;
+        req->reasoning_enabled = 1;
     }
 
     NSMutableArray *messages = [NSMutableArray array];
@@ -8036,6 +8047,166 @@ static int capture_system_prompt_snapshots(int token_count,
     return 0;
 }
 
+static size_t first_byte_diff(const void *a, const void *b, size_t n);
+static int load_system_prompt_disk_cache(const char *model_path, uint64_t prompt_hash, int expected_tokens,
+                                         KVSnapshot *kv_snapshots,
+                                         float **la_conv_snapshots, float **la_ssm_snapshots,
+                                         void **gpu_delta_snapshots, void **gpu_conv_snapshots,
+                                         int *loaded_tokens);
+
+// Fingerprint every persistent runtime buffer that affects inference. Used
+// to localize "snapshot does not faithfully represent runtime state" bugs:
+// fingerprint live state immediately after a cold prefill, then again
+// immediately after restore-from-snapshot — any per-buffer mismatch points
+// to either incomplete capture, missing-from-snapshot state, or buggy
+// restore. Gated by FLASHCHAT_CACHE_FINGERPRINT=1.
+typedef struct {
+    int valid;
+    int token_count;
+    int kv_len[MAX_NUM_LAYERS];
+    uint64_t fp_kv_k_cpu[MAX_NUM_LAYERS];
+    uint64_t fp_kv_v_cpu[MAX_NUM_LAYERS];
+    uint64_t fp_conv_cpu[MAX_NUM_LAYERS];
+    uint64_t fp_ssm_cpu[MAX_NUM_LAYERS];
+    uint64_t fp_kv_k_gpu[MAX_FULL_ATTN_LAYERS];
+    uint64_t fp_kv_v_gpu[MAX_FULL_ATTN_LAYERS];
+    uint64_t fp_buf_delta[MAX_LINEAR_LAYERS];
+    uint64_t fp_buf_conv[MAX_LINEAR_LAYERS];
+} RuntimeFingerprint;
+
+static RuntimeFingerprint g_fp_post_cold = {0};
+
+static uint64_t fnv1a64(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static int cache_fingerprint_enabled(void) {
+    const char *e = getenv("FLASHCHAT_CACHE_FINGERPRINT");
+    return (e && e[0] && e[0] != '0') ? 1 : 0;
+}
+
+static void fingerprint_runtime_state(int token_count,
+                                      KVCache **kv_caches,
+                                      void **layer_states,
+                                      RuntimeFingerprint *fp) {
+    memset(fp, 0, sizeof(*fp));
+    fp->token_count = token_count;
+    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+    size_t kv_sz = (size_t)token_count * kv_dim * sizeof(float);
+    size_t conv_state_size = (size_t)(g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
+    size_t ssm_state_size = (size_t)g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
+    size_t gpu_tokens = token_count < GPU_KV_SEQ ? (size_t)token_count : (size_t)GPU_KV_SEQ;
+    size_t gpu_kv_sz = gpu_tokens * kv_dim * sizeof(float);
+
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (kv_caches[i]) {
+            fp->fp_kv_k_cpu[i] = fnv1a64(kv_caches[i]->k_cache, kv_sz);
+            fp->fp_kv_v_cpu[i] = fnv1a64(kv_caches[i]->v_cache, kv_sz);
+            fp->kv_len[i] = kv_caches[i]->len;
+            if (g_metal) {
+                int fa_idx = (i + 1) / g_cfg.full_attn_interval - 1;
+                if (fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers) {
+                    if (g_metal->buf_kv_k[fa_idx])
+                        fp->fp_kv_k_gpu[fa_idx] = fnv1a64([g_metal->buf_kv_k[fa_idx] contents], gpu_kv_sz);
+                    if (g_metal->buf_kv_v[fa_idx])
+                        fp->fp_kv_v_gpu[fa_idx] = fnv1a64([g_metal->buf_kv_v[fa_idx] contents], gpu_kv_sz);
+                }
+            }
+        }
+        if (layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+            if (s->conv_state) fp->fp_conv_cpu[i] = fnv1a64(s->conv_state, conv_state_size);
+            if (s->ssm_state) fp->fp_ssm_cpu[i] = fnv1a64(s->ssm_state, ssm_state_size);
+        }
+    }
+    if (g_metal && g_metal->delta_net_step) {
+        for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+            if (g_metal->buf_delta_state[i])
+                fp->fp_buf_delta[i] = fnv1a64([g_metal->buf_delta_state[i] contents], serve_gpu_delta_snapshot_size());
+            if (g_metal->buf_conv_state[i])
+                fp->fp_buf_conv[i] = fnv1a64([g_metal->buf_conv_state[i] contents], serve_gpu_conv_snapshot_size());
+        }
+    }
+    fp->valid = 1;
+}
+
+static void diff_runtime_fingerprints(const RuntimeFingerprint *cold,
+                                      const RuntimeFingerprint *restored) {
+    if (!cold->valid) {
+        server_log_errorf("[cache-fp] no baseline captured; first cold prefill must run with FLASHCHAT_CACHE_FINGERPRINT=1\n");
+        return;
+    }
+    if (cold->token_count != restored->token_count) {
+        server_log_errorf("[cache-fp] token_count mismatch cold=%d restored=%d (skipping diff)\n",
+                          cold->token_count, restored->token_count);
+        return;
+    }
+    int total = 0, kv_cpu = 0, kv_gpu = 0, ls = 0, gpu_lin = 0;
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (cold->fp_kv_k_cpu[i] != restored->fp_kv_k_cpu[i]) {
+            server_log_errorf("[cache-fp] DIFF layer=%d kv_k_cpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_kv_k_cpu[i], restored->fp_kv_k_cpu[i]);
+            kv_cpu++; total++;
+        }
+        if (cold->fp_kv_v_cpu[i] != restored->fp_kv_v_cpu[i]) {
+            server_log_errorf("[cache-fp] DIFF layer=%d kv_v_cpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_kv_v_cpu[i], restored->fp_kv_v_cpu[i]);
+            kv_cpu++; total++;
+        }
+        if (cold->kv_len[i] != restored->kv_len[i]) {
+            server_log_errorf("[cache-fp] DIFF layer=%d kv_len cold=%d restored=%d\n",
+                              i, cold->kv_len[i], restored->kv_len[i]);
+            kv_cpu++; total++;
+        }
+        if (cold->fp_conv_cpu[i] != restored->fp_conv_cpu[i]) {
+            server_log_errorf("[cache-fp] DIFF layer=%d la_conv_cpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_conv_cpu[i], restored->fp_conv_cpu[i]);
+            ls++; total++;
+        }
+        if (cold->fp_ssm_cpu[i] != restored->fp_ssm_cpu[i]) {
+            server_log_errorf("[cache-fp] DIFF layer=%d la_ssm_cpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_ssm_cpu[i], restored->fp_ssm_cpu[i]);
+            ls++; total++;
+        }
+    }
+    for (int i = 0; i < g_cfg.num_full_attn_layers; i++) {
+        if (cold->fp_kv_k_gpu[i] != restored->fp_kv_k_gpu[i]) {
+            server_log_errorf("[cache-fp] DIFF fa_idx=%d kv_k_gpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_kv_k_gpu[i], restored->fp_kv_k_gpu[i]);
+            kv_gpu++; total++;
+        }
+        if (cold->fp_kv_v_gpu[i] != restored->fp_kv_v_gpu[i]) {
+            server_log_errorf("[cache-fp] DIFF fa_idx=%d kv_v_gpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_kv_v_gpu[i], restored->fp_kv_v_gpu[i]);
+            kv_gpu++; total++;
+        }
+    }
+    for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+        if (cold->fp_buf_delta[i] != restored->fp_buf_delta[i]) {
+            server_log_errorf("[cache-fp] DIFF linear_idx=%d buf_delta_gpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_buf_delta[i], restored->fp_buf_delta[i]);
+            gpu_lin++; total++;
+        }
+        if (cold->fp_buf_conv[i] != restored->fp_buf_conv[i]) {
+            server_log_errorf("[cache-fp] DIFF linear_idx=%d buf_conv_gpu cold=%016llx restored=%016llx\n",
+                              i, cold->fp_buf_conv[i], restored->fp_buf_conv[i]);
+            gpu_lin++; total++;
+        }
+    }
+    if (total == 0) {
+        server_log_errorf("[cache-fp] PASS post-restore == post-cold-prefill (all buffers identical)\n");
+    } else {
+        server_log_errorf("[cache-fp] FAILED %d divergence(s) — kv_cpu=%d, kv_gpu=%d, layer_state_cpu=%d, gpu_linear=%d\n",
+                          total, kv_cpu, kv_gpu, ls, gpu_lin);
+    }
+}
+
 static int save_system_prompt_disk_cache(const char *model_path,
                                          uint64_t prompt_hash,
                                          int token_count,
@@ -8145,6 +8316,90 @@ static int save_system_prompt_disk_cache(const char *model_path,
     }
     server_log_errorf("[serve] sys_prompt_disk_cache saved %s raw=%.2fGiB stored=%.2fGiB chunks=%u\n",
                       path, raw_total / 1073741824.0, stored_total / 1073741824.0, chunk_count);
+
+    // Optional runtime self-check: reload the file we just wrote and diff it
+    // against the in-memory snapshot we just persisted. Catches GPU MTLBuffer
+    // coherency at capture time, wrong size constants for live data, and any
+    // path the synthetic unit test can't simulate. Gated behind env var so it
+    // only runs when investigating; it allocates ~0.5GiB of shadow buffers
+    // and adds a few seconds to the save path.
+    const char *validate_env = getenv("FLASHCHAT_CACHE_VALIDATE");
+    if (validate_env && validate_env[0] && validate_env[0] != '0') {
+        size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+        size_t kv_sz = (size_t)token_count * kv_dim * sizeof(float);
+        size_t conv_state_size = (size_t)hdr.conv_state_size;
+        size_t ssm_state_size = (size_t)hdr.ssm_state_size;
+        size_t gpu_delta_size = (size_t)hdr.gpu_delta_size;
+        size_t gpu_conv_size = (size_t)hdr.gpu_conv_size;
+
+        KVSnapshot *kv_load = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+        float **conv_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+        float **ssm_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+        void *gpu_delta_load[MAX_LINEAR_LAYERS] = {0};
+        void *gpu_conv_load[MAX_LINEAR_LAYERS] = {0};
+        int loaded_tokens = 0;
+        int diffs = 0;
+
+        if (load_system_prompt_disk_cache(model_path, prompt_hash, token_count,
+                                          kv_load, conv_load, ssm_load,
+                                          gpu_delta_load, gpu_conv_load,
+                                          &loaded_tokens) != 0) {
+            server_log_errorf("[cache-validate] FAIL load returned error for %s\n", path);
+            diffs++;
+        } else {
+            for (int i = 0; i < g_cfg.num_layers; i++) {
+                int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
+                if (is_full && kv_snapshots[i].k_snapshot && kv_load[i].k_snapshot) {
+                    if (memcmp(kv_snapshots[i].k_snapshot, kv_load[i].k_snapshot, kv_sz) != 0) {
+                        size_t off = first_byte_diff(kv_snapshots[i].k_snapshot, kv_load[i].k_snapshot, kv_sz);
+                        server_log_errorf("[cache-validate] FAIL layer=%d kind=KV_K diverges at byte %zu of %zu\n", i, off, kv_sz);
+                        diffs++;
+                    }
+                    if (memcmp(kv_snapshots[i].v_snapshot, kv_load[i].v_snapshot, kv_sz) != 0) {
+                        size_t off = first_byte_diff(kv_snapshots[i].v_snapshot, kv_load[i].v_snapshot, kv_sz);
+                        server_log_errorf("[cache-validate] FAIL layer=%d kind=KV_V diverges at byte %zu of %zu\n", i, off, kv_sz);
+                        diffs++;
+                    }
+                }
+                if (!is_full && la_conv_snapshots[i] && conv_load[i]) {
+                    if (memcmp(la_conv_snapshots[i], conv_load[i], conv_state_size) != 0) {
+                        size_t off = first_byte_diff(la_conv_snapshots[i], conv_load[i], conv_state_size);
+                        server_log_errorf("[cache-validate] FAIL layer=%d kind=LA_CONV diverges at byte %zu of %zu\n", i, off, conv_state_size);
+                        diffs++;
+                    }
+                    if (memcmp(la_ssm_snapshots[i], ssm_load[i], ssm_state_size) != 0) {
+                        size_t off = first_byte_diff(la_ssm_snapshots[i], ssm_load[i], ssm_state_size);
+                        server_log_errorf("[cache-validate] FAIL layer=%d kind=LA_SSM diverges at byte %zu of %zu\n", i, off, ssm_state_size);
+                        diffs++;
+                    }
+                }
+            }
+            if (g_metal && g_metal->delta_net_step) {
+                for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+                    if (gpu_delta_snapshots[i] && gpu_delta_load[i] &&
+                        memcmp(gpu_delta_snapshots[i], gpu_delta_load[i], gpu_delta_size) != 0) {
+                        size_t off = first_byte_diff(gpu_delta_snapshots[i], gpu_delta_load[i], gpu_delta_size);
+                        server_log_errorf("[cache-validate] FAIL linear_layer=%d kind=GPU_DELTA diverges at byte %zu of %zu\n", i, off, gpu_delta_size);
+                        diffs++;
+                    }
+                    if (gpu_conv_snapshots[i] && gpu_conv_load[i] &&
+                        memcmp(gpu_conv_snapshots[i], gpu_conv_load[i], gpu_conv_size) != 0) {
+                        size_t off = first_byte_diff(gpu_conv_snapshots[i], gpu_conv_load[i], gpu_conv_size);
+                        server_log_errorf("[cache-validate] FAIL linear_layer=%d kind=GPU_CONV diverges at byte %zu of %zu\n", i, off, gpu_conv_size);
+                        diffs++;
+                    }
+                }
+            }
+            free_system_prompt_snapshots(kv_load, conv_load, ssm_load, gpu_delta_load, gpu_conv_load);
+        }
+        free(kv_load); free(conv_load); free(ssm_load);
+
+        if (diffs == 0) {
+            server_log_errorf("[cache-validate] PASS in-memory == disk-roundtrip for hash=%llx\n", (unsigned long long)prompt_hash);
+        } else {
+            server_log_errorf("[cache-validate] FAILED %d divergence(s) for hash=%llx\n", diffs, (unsigned long long)prompt_hash);
+        }
+    }
     return 0;
 }
 
@@ -8370,6 +8625,177 @@ static void prune_system_prompt_disk_cache(const char *model_path) {
     }
 }
 
+// Round-trip self-test for the on-disk system prompt cache. Synthesizes
+// snapshot data with deterministic patterns, runs it through the real
+// save+load codepath into a temp directory, and memcmp's loaded vs original
+// for every (kind, layer) tuple. Catches serializer regressions: header
+// rewrites, LZFSE roundtrip, FNV1a checksum, chunk ordering, struct layout.
+//
+// Caller must have g_cfg loaded; weights and Metal are NOT required (the
+// GPU snapshot path is exercised separately by the runtime validator since
+// it depends on live MTLBuffer state). Returns 0 on PASS, nonzero on FAIL.
+static size_t first_byte_diff(const void *a, const void *b, size_t n) {
+    const uint8_t *pa = (const uint8_t *)a, *pb = (const uint8_t *)b;
+    for (size_t i = 0; i < n; i++) if (pa[i] != pb[i]) return i;
+    return n;
+}
+
+static int cache_roundtrip_test(void) {
+    int prev_enabled = g_system_prompt_cache_enabled;
+    int prev_max = g_system_prompt_cache_max_entries;
+    g_system_prompt_cache_enabled = 1;
+    if (g_system_prompt_cache_max_entries <= 0) g_system_prompt_cache_max_entries = 6;
+
+    int failures = 0;
+    fprintf(stderr, "[cache-roundtrip] model=%s layers=%d full=%d linear=%d\n",
+            g_cfg.model_id, g_cfg.num_layers, g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
+
+    char tmp_dir[] = "/tmp/flashchat-cache-roundtrip-XXXXXX";
+    if (!mkdtemp(tmp_dir)) {
+        fprintf(stderr, "[cache-roundtrip] FAIL mkdtemp: %s\n", strerror(errno));
+        return 1;
+    }
+
+    // Use a small token count so the test runs in milliseconds even though
+    // realistic prefills are 7000+. Compression and roundtrip semantics are
+    // unaffected by token count.
+    int token_count = 128;
+    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+    size_t kv_sz = (size_t)token_count * kv_dim * sizeof(float);
+    size_t conv_state_size = (size_t)(g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
+    size_t ssm_state_size = (size_t)g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
+
+    KVSnapshot *kv_orig = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+    float **conv_orig = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    float **ssm_orig = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    void *gpu_delta_dummy[MAX_LINEAR_LAYERS] = {0};
+    void *gpu_conv_dummy[MAX_LINEAR_LAYERS] = {0};
+
+    if (!kv_orig || !conv_orig || !ssm_orig) {
+        fprintf(stderr, "[cache-roundtrip] FAIL alloc originals\n");
+        failures++;
+        goto cleanup;
+    }
+
+    // Deterministic, non-trivially-compressible patterns so LZFSE actually
+    // round-trips real-looking content (not all zeros).
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
+        if (is_full) {
+            kv_orig[i].k_snapshot = malloc(kv_sz);
+            kv_orig[i].v_snapshot = malloc(kv_sz);
+            if (!kv_orig[i].k_snapshot || !kv_orig[i].v_snapshot) { failures++; goto cleanup; }
+            kv_orig[i].len = token_count;
+            float *k = kv_orig[i].k_snapshot;
+            float *v = kv_orig[i].v_snapshot;
+            size_t n = kv_sz / sizeof(float);
+            for (size_t j = 0; j < n; j++) {
+                k[j] = sinf((float)(i * 7919u + j * 31u) * 1e-4f);
+                v[j] = cosf((float)(i * 7919u + j * 31u) * 1e-4f) + 0.5f;
+            }
+        } else {
+            conv_orig[i] = malloc(conv_state_size);
+            ssm_orig[i] = malloc(ssm_state_size);
+            if (!conv_orig[i] || !ssm_orig[i]) { failures++; goto cleanup; }
+            float *c = conv_orig[i];
+            float *s = ssm_orig[i];
+            for (size_t j = 0; j < conv_state_size / sizeof(float); j++) c[j] = (float)((i + 1) * 13 + j) * 1e-3f;
+            for (size_t j = 0; j < ssm_state_size / sizeof(float); j++) s[j] = (float)((i + 1) * 17 + j) * 1e-4f;
+        }
+    }
+
+    uint64_t hash = 0xCAFEBABE12345678ULL;
+    int save_rc = save_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                                kv_orig, conv_orig, ssm_orig,
+                                                gpu_delta_dummy, gpu_conv_dummy);
+    if (save_rc != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL save rc=%d\n", save_rc);
+        failures++;
+        goto cleanup;
+    }
+
+    KVSnapshot *kv_load = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+    float **conv_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    float **ssm_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    void *gpu_delta_load[MAX_LINEAR_LAYERS] = {0};
+    void *gpu_conv_load[MAX_LINEAR_LAYERS] = {0};
+    int loaded_tokens = 0;
+    int load_rc = load_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                                kv_load, conv_load, ssm_load,
+                                                gpu_delta_load, gpu_conv_load,
+                                                &loaded_tokens);
+    if (load_rc != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL load rc=%d\n", load_rc);
+        failures++;
+        if (kv_load) { free(kv_load); free(conv_load); free(ssm_load); }
+        goto cleanup;
+    }
+    if (loaded_tokens != token_count) {
+        fprintf(stderr, "[cache-roundtrip] FAIL token count saved=%d loaded=%d\n", token_count, loaded_tokens);
+        failures++;
+    }
+
+    int kv_diffs = 0, conv_diffs = 0, ssm_diffs = 0;
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
+        if (is_full) {
+            if (memcmp(kv_orig[i].k_snapshot, kv_load[i].k_snapshot, kv_sz) != 0) {
+                size_t off = first_byte_diff(kv_orig[i].k_snapshot, kv_load[i].k_snapshot, kv_sz);
+                fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=KV_K diverges at byte %zu of %zu\n", i, off, kv_sz);
+                kv_diffs++;
+            }
+            if (memcmp(kv_orig[i].v_snapshot, kv_load[i].v_snapshot, kv_sz) != 0) {
+                size_t off = first_byte_diff(kv_orig[i].v_snapshot, kv_load[i].v_snapshot, kv_sz);
+                fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=KV_V diverges at byte %zu of %zu\n", i, off, kv_sz);
+                kv_diffs++;
+            }
+            if (kv_load[i].len != kv_orig[i].len) {
+                fprintf(stderr, "[cache-roundtrip] FAIL layer=%d KVSnapshot.len orig=%d load=%d\n", i, kv_orig[i].len, kv_load[i].len);
+                kv_diffs++;
+            }
+        } else {
+            if (memcmp(conv_orig[i], conv_load[i], conv_state_size) != 0) {
+                size_t off = first_byte_diff(conv_orig[i], conv_load[i], conv_state_size);
+                fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=LA_CONV diverges at byte %zu of %zu\n", i, off, conv_state_size);
+                conv_diffs++;
+            }
+            if (memcmp(ssm_orig[i], ssm_load[i], ssm_state_size) != 0) {
+                size_t off = first_byte_diff(ssm_orig[i], ssm_load[i], ssm_state_size);
+                fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=LA_SSM diverges at byte %zu of %zu\n", i, off, ssm_state_size);
+                ssm_diffs++;
+            }
+        }
+    }
+    failures += kv_diffs + conv_diffs + ssm_diffs;
+
+    free_system_prompt_snapshots(kv_load, conv_load, ssm_load, gpu_delta_load, gpu_conv_load);
+    free(kv_load); free(conv_load); free(ssm_load);
+
+cleanup:
+    if (kv_orig) free_system_prompt_snapshots(kv_orig, conv_orig, ssm_orig, gpu_delta_dummy, gpu_conv_dummy);
+    free(kv_orig); free(conv_orig); free(ssm_orig);
+
+    char path[PATH_MAX];
+    if (system_prompt_cache_path(tmp_dir, hash, path, sizeof(path)) == 0) unlink(path);
+    char dir[PATH_MAX];
+    if (system_prompt_cache_dir(tmp_dir, dir, sizeof(dir)) == 0) rmdir(dir);
+    char fc_dir[PATH_MAX];
+    snprintf(fc_dir, sizeof(fc_dir), "%s/flashchat", tmp_dir);
+    rmdir(fc_dir);
+    rmdir(tmp_dir);
+
+    g_system_prompt_cache_enabled = prev_enabled;
+    g_system_prompt_cache_max_entries = prev_max;
+
+    if (failures == 0) {
+        fprintf(stderr, "[cache-roundtrip] PASS all chunks identical (token_count=%d, full=%d, linear=%d)\n",
+                token_count, g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
+        return 0;
+    }
+    fprintf(stderr, "[cache-roundtrip] FAILED %d divergence(s)\n", failures);
+    return 1;
+}
+
 static void serve_loop(
     int port,
     const char *model_path,
@@ -8551,10 +8977,12 @@ static void serve_loop(
                 continue;
             }
         }
-        server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d temp=%.2f top_p=%.2f top_k=%d min_p=%.3f presence=%.2f repetition=%.2f reasoning=%d snapshot=%d\n",
+        server_log_errorf("[serve] %s endpoint=%s prompt_chars=%zu tools=%d stream=%d active_experts=%d/%d temp=%.2f top_p=%.2f top_k=%d min_p=%.3f presence=%.2f repetition=%.2f reasoning=%d snapshot=%d\n",
                           request_id, is_chat ? "chat" : "responses",
                           req.conversation_text ? strlen(req.conversation_text) : 0,
-                          req.tool_count, req.stream, req.temperature, req.top_p,
+                          req.tool_count, req.stream,
+                          K, g_cfg.num_experts_per_tok,
+                          req.temperature, req.top_p,
                           req.top_k, req.min_p, req.presence_penalty, req.repetition_penalty,
                           req.reasoning_enabled, req.used_snapshot);
 
@@ -8612,6 +9040,12 @@ static void serve_loop(
             pos = cached_sys_token_count;
             snapshot_restored = 1;
             req.used_snapshot = 1;
+            if (cache_fingerprint_enabled() && g_fp_post_cold.valid) {
+                RuntimeFingerprint fp_post_restore;
+                fingerprint_runtime_state(cached_sys_token_count, kv_caches, layer_states, &fp_post_restore);
+                server_log_errorf("[cache-fp] diff post-in-memory-restore vs post-cold-prefill (request=%s)\n", request_id);
+                diff_runtime_fingerprints(&g_fp_post_cold, &fp_post_restore);
+            }
         } else if (g_system_prompt_cache_enabled &&
                    load_system_prompt_disk_cache(model_path, req_sys_hash, sys_prompt_token_count,
                                                  kv_snapshots,
@@ -8634,6 +9068,12 @@ static void serve_loop(
             pos = cached_sys_token_count;
             snapshot_restored = 1;
             req.used_snapshot = 1;
+            if (cache_fingerprint_enabled() && g_fp_post_cold.valid) {
+                RuntimeFingerprint fp_post_restore;
+                fingerprint_runtime_state(cached_sys_token_count, kv_caches, layer_states, &fp_post_restore);
+                server_log_errorf("[cache-fp] diff post-disk-restore vs post-cold-prefill (request=%s)\n", request_id);
+                diff_runtime_fingerprints(&g_fp_post_cold, &fp_post_restore);
+            }
         } else {
             // Cache miss: clear state and run full prefill
             if (cached_sys_hash != 0) {
@@ -8741,6 +9181,11 @@ static void serve_loop(
                 cached_sys_token_count = sys_token_end;
                 server_log_errorf("[serve] %s sys_prompt_cache saved hash=%llu tokens=%d\n",
                                   request_id, cached_sys_hash, cached_sys_token_count);
+                if (cache_fingerprint_enabled()) {
+                    fingerprint_runtime_state(sys_token_end, kv_caches, layer_states, &g_fp_post_cold);
+                    server_log_errorf("[cache-fp] captured live runtime fingerprint after cold prefill (request=%s tokens=%d)\n",
+                                      request_id, sys_token_end);
+                }
             } else {
                 cached_sys_hash = 0;
                 cached_sys_token_count = 0;
@@ -8995,6 +9440,7 @@ enum {
     OPT_RENDER_OUTPUT,
     OPT_RENDER_KIND,
     OPT_PARSE_TOOL_CALL,
+    OPT_CACHE_ROUNDTRIP_TEST,
 };
 
 static void print_usage(const char *prog) {
@@ -9023,6 +9469,7 @@ static void print_usage(const char *prog) {
     printf("  --render-output DIR  Directory for --render-request debug files\n");
     printf("  --render-kind KIND   Render kind: auto, chat, responses (default: auto)\n");
     printf("  --parse-tool-call F  Parse native XML tool-call text and exit\n");
+    printf("  --cache-roundtrip-test  Run synthetic disk-cache save/load roundtrip self-test and exit\n");
     printf("  --help               This message\n");
 }
 
@@ -9039,13 +9486,14 @@ int main(int argc, char **argv) {
         const char *env_model_id = getenv("FLASHCHAT_MODEL");
         const char *model_id = (env_model_id && env_model_id[0]) ? env_model_id : NULL;
         int max_tokens = 20;
-        int K = 4;
+        int K = 0;  // 0 = use g_cfg.num_experts_per_tok after config load; --k overrides
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         const char *render_request_path = NULL;
         const char *render_output_dir = NULL;
         const char *render_kind = "auto";
         const char *parse_tool_call_path = NULL;
+        int cache_roundtrip_test_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -9056,6 +9504,7 @@ int main(int argc, char **argv) {
         const char *env_min_p = getenv("FLASHCHAT_MIN_P");
         const char *env_presence_penalty = getenv("FLASHCHAT_PRESENCE_PENALTY");
         const char *env_repetition_penalty = getenv("FLASHCHAT_REPETITION_PENALTY");
+        const char *env_active_experts = getenv("FLASHCHAT_ACTIVE_EXPERTS");
         const char *env_reasoning = getenv("FLASHCHAT_REASONING");
         const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
         const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
@@ -9066,6 +9515,18 @@ int main(int argc, char **argv) {
         if (env_min_p && env_min_p[0]) g_default_min_p = strtof(env_min_p, NULL);
         if (env_presence_penalty && env_presence_penalty[0]) g_default_presence_penalty = strtof(env_presence_penalty, NULL);
         if (env_repetition_penalty && env_repetition_penalty[0]) g_default_repetition_penalty = strtof(env_repetition_penalty, NULL);
+        // FLASHCHAT_ACTIVE_EXPERTS: ad-hoc override for K (active experts per token).
+        // Useful for K-sweep benchmarks. Has the same precedence as --k (whichever
+        // is parsed last wins; --k is parsed via getopt below, env is read here, so
+        // a CLI --k passed simultaneously will override the env). Empty/0 = no
+        // override, use g_cfg.num_experts_per_tok from registry.
+        if (env_active_experts && env_active_experts[0]) {
+            int v = atoi(env_active_experts);
+            if (v > 0) {
+                K = v;
+                fprintf(stderr, "[init] FLASHCHAT_ACTIVE_EXPERTS=%d overrides config K\n", v);
+            }
+        }
         if (env_reasoning && env_reasoning[0]) {
             g_default_reasoning_enabled = server_flag_enabled(env_reasoning);
         }
@@ -9198,6 +9659,7 @@ int main(int argc, char **argv) {
             {"render-output",  required_argument, 0, OPT_RENDER_OUTPUT},
             {"render-kind",    required_argument, 0, OPT_RENDER_KIND},
             {"parse-tool-call", required_argument, 0, OPT_PARSE_TOOL_CALL},
+            {"cache-roundtrip-test", no_argument,  0, OPT_CACHE_ROUNDTRIP_TEST},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -9236,6 +9698,7 @@ int main(int argc, char **argv) {
                 case OPT_RENDER_OUTPUT: render_output_dir = optarg; break;
                 case OPT_RENDER_KIND: render_kind = optarg; break;
                 case OPT_PARSE_TOOL_CALL: parse_tool_call_path = optarg; break;
+                case OPT_CACHE_ROUNDTRIP_TEST: cache_roundtrip_test_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -9258,11 +9721,38 @@ int main(int argc, char **argv) {
         }
         kApiModelId = g_cfg.model_id;
 
+        // K (active experts per token) defaults to the model's num_experts_per_tok
+        // from config — i.e. exactly what the model was trained with. Previously
+        // hardcoded to 4 across all models, which silently halved active experts
+        // for Qwen3.5-A17B (trained with K=10) and Qwen3.6-A3B (trained with K=8).
+        // --k still overrides for the streaming-bound 397B model where the SSD
+        // I/O cost of more experts may justify the quality tradeoff.
+        //
+        // Hard cap at MAX_K=8 (Metal multi-expert buffer slots). For models trained
+        // with K>8 (e.g. 397B-A17B's K=10) this is a known under-experting that
+        // requires expanding MAX_K to fix; report it loudly so it is not silent.
+        if (K <= 0) {
+            K = g_cfg.num_experts_per_tok > 0 ? g_cfg.num_experts_per_tok : 4;
+            fprintf(stderr, "[init] K=%d active experts (from config num_experts_per_tok)\n", K);
+        } else {
+            fprintf(stderr, "[init] K=%d active experts (--k override; config wants %d)\n",
+                    K, g_cfg.num_experts_per_tok);
+        }
+        if (K > MAX_K) {
+            fprintf(stderr, "[init] WARNING: requested K=%d exceeds MAX_K=%d (Metal buffer slots); "
+                            "clamping to %d. Model will run UNDER-EXPERTED. Increase MAX_K to fix.\n",
+                    K, MAX_K, MAX_K);
+            K = MAX_K;
+        }
+
         if (parse_tool_call_path) {
             return parse_tool_call_debug(parse_tool_call_path);
         }
         if (render_request_path) {
             return render_request_debug(render_request_path, render_output_dir, render_kind);
+        }
+        if (cache_roundtrip_test_requested) {
+            return cache_roundtrip_test();
         }
 
         // Build default paths under the per-model Flashchat artifact directory.

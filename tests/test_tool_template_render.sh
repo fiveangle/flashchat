@@ -119,6 +119,21 @@ assert_contains "system prompt keeps late tool definitions" "dummy_tool_29" "${R
 assert_contains "system prompt keeps required fields" '"required":\["result","count","ok","items"\]' "${RENDER_DIR}/system_prompt.txt"
 assert_contains "system prompt preserves large schema tail" "SCHEMA_TAIL_MARKER" "${RENDER_DIR}/system_prompt.txt"
 assert_contains "system prompt has native important block" "<IMPORTANT>" "${RENDER_DIR}/system_prompt.txt"
+
+# Native chat_template.jinja places the tool block FIRST, then a `\n\n`
+# separator, then the user-supplied system content. The 35B-A3B model was
+# post-trained with this order; reversing it shifts the tool grammar far
+# out of distribution and degrades tool-calling reliability vs lmstudio.
+sys_prompt_path="${RENDER_DIR}/system_prompt.txt"
+tools_offset=$(grep -b -m1 '^# Tools' "$sys_prompt_path" | cut -d: -f1)
+user_offset=$(grep -b -m1 'You are validating' "$sys_prompt_path" | cut -d: -f1)
+if [[ -n "$tools_offset" && -n "$user_offset" && "$tools_offset" -lt "$user_offset" ]]; then
+    assert_pass "tool block precedes user system content (native order)"
+else
+    assert_fail "tool block precedes user system content (native order)" \
+        "tools_offset=$tools_offset user_offset=$user_offset"
+fi
+
 assert_contains "conversation uses empty think for reasoning off" "<think>" "${RENDER_DIR}/conversation.txt"
 assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" "${RENDER_DIR}/assembled_prompt.txt"
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"

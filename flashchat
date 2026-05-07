@@ -167,6 +167,10 @@ Environment variables:
   FLASHCHAT_REASONING      Enable default reasoning mode (0/1)
   FLASHCHAT_PRESENCE_PENALTY    Default presence penalty
   FLASHCHAT_REPETITION_PENALTY  Default repetition penalty
+  FLASHCHAT_ACTIVE_EXPERTS  Override active experts per token (K). Empty/0 = use
+                            the model registry's num_experts_per_tok (the trained
+                            value). Set to a numeric value for K-sweeps or to
+                            trade quality for SSD streaming bandwidth.
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
@@ -292,6 +296,14 @@ cmd_status() {
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
     echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P)"
     echo "Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
+    local _ae_eff _ae_mdl
+    _ae_eff="$(flashchat_effective_active_experts)"
+    _ae_mdl="$(flashchat_model_active_experts "$(flashchat_get MODEL)")"
+    if [ -n "${FLASHCHAT_ACTIVE_EXPERTS:-}" ] && [ "${FLASHCHAT_ACTIVE_EXPERTS}" -gt 0 ] 2>/dev/null; then
+        echo "Active experts (K): ${_ae_eff} (FLASHCHAT_ACTIVE_EXPERTS override; model trained with K=${_ae_mdl:-?})"
+    else
+        echo "Active experts (K): ${_ae_eff} (from model registry num_experts_per_tok)"
+    fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
@@ -454,6 +466,14 @@ cmd_config() {
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Sampling profile: $(flashchat_get SAMPLING_PROFILE) | Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P) | Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
+    local _ae_eff _ae_mdl
+    _ae_eff="$(flashchat_effective_active_experts)"
+    _ae_mdl="$(flashchat_model_active_experts "$(flashchat_get MODEL)")"
+    if [ -n "${FLASHCHAT_ACTIVE_EXPERTS:-}" ] && [ "${FLASHCHAT_ACTIVE_EXPERTS}" -gt 0 ] 2>/dev/null; then
+        echo "Active experts (K): ${_ae_eff} (FLASHCHAT_ACTIVE_EXPERTS override; model trained with K=${_ae_mdl:-?})"
+    else
+        echo "Active experts (K): ${_ae_eff} (model registry num_experts_per_tok)"
+    fi
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
@@ -485,6 +505,7 @@ cmd_config_interactive() {
     echo "  -Min-p (0.0-1.0): $(flashchat_get MIN_P)"
     echo "  -Presence penalty: $(flashchat_get PRESENCE_PENALTY)"
     echo "  -Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
+    echo "  -Active experts (K, from model registry): $(flashchat_effective_active_experts) [override via FLASHCHAT_ACTIVE_EXPERTS env var]"
     echo "  -Server API publishing port: $(flashchat_get SERVER_PORT)"
     echo "  -Chat client API host IP: $(flashchat_get SERVER_HOST)"
     echo "  -Server log path (file or directory): $(flashchat_get SERVER_LOG_PATH)"
@@ -1277,6 +1298,7 @@ prompt_config_interactive() {
         read -r REPLY
         echo ""
         echo "REPETITION_PENALTY=\"${REPLY:-$default_repetition_penalty}\"" >> /tmp/flashchat_new_config
+
     fi
     
     # Server Port
@@ -2495,6 +2517,10 @@ cmd_serve() {
     export FLASHCHAT_MIN_P="$(flashchat_get MIN_P)"
     export FLASHCHAT_PRESENCE_PENALTY="$(flashchat_get PRESENCE_PENALTY)"
     export FLASHCHAT_REPETITION_PENALTY="$(flashchat_get REPETITION_PENALTY)"
+    # FLASHCHAT_ACTIVE_EXPERTS is intentionally NOT re-exported from flashchat_get
+    # (it has no user-config home, registry is K's home). If the user sets it in
+    # their shell before invoking `flashchat serve`, bash propagates it to the
+    # `infer` child naturally.
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
     export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"

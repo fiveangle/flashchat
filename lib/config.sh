@@ -158,6 +158,26 @@ flashchat_model_default_sampling_profile() {
     flashchat_model_field "$1" "default_sampling_profile"
 }
 
+# Resolve the model's trained active-experts (K) from the registry. Returns
+# empty string if the field is missing — caller decides what default to use.
+flashchat_model_active_experts() {
+    flashchat_model_field "$1" "num_experts_per_tok"
+}
+
+# Resolve the *effective* active-experts value: $FLASHCHAT_ACTIVE_EXPERTS env
+# override if set and >0, else the model's trained num_experts_per_tok from
+# the registry. The env var is the user's escape hatch (e.g. for sweeping K
+# during quality-vs-streaming-cost benchmarks); otherwise the registry is the
+# authoritative source for K.
+flashchat_effective_active_experts() {
+    local override="${FLASHCHAT_ACTIVE_EXPERTS:-}"
+    if [ -n "$override" ] && [ "$override" -gt 0 ] 2>/dev/null; then
+        echo "$override"
+        return
+    fi
+    flashchat_model_active_experts "${MODEL:-$(flashchat_default_model)}"
+}
+
 flashchat_model_sampling_profile_field() {
     local model_id="$1"
     local profile_id="$2"

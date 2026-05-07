@@ -51,7 +51,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke test
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -111,6 +111,7 @@ help:
 	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
 	@printf "  make manage-smoke  Run model management storage smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
+	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "\n"
@@ -218,4 +219,7 @@ manage-smoke:
 tool-template-smoke: $(INFER_TARGET)
 	bash tests/test_tool_template_render.sh
 
-test: cli-smoke manage-smoke tool-template-smoke api-smoke
+cache-roundtrip-smoke: $(INFER_TARGET)
+	bash tests/test_disk_cache_roundtrip.sh
+
+test: cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke api-smoke
