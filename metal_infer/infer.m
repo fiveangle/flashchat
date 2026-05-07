@@ -6626,18 +6626,90 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
 
     NSMutableString *system_prompt = [NSMutableString string];
     NSMutableString *conversation = [NSMutableString string];
+
+    // Compute last_query_index per chat_template.jinja's `multi_step_tool`
+    // logic. Walking the message list in reverse, the last `user` message
+    // whose content is NOT `<tool_response>...</tool_response>`-wrapped is
+    // the user's most recent real query. Assistant turns AFTER this index
+    // (i.e., the rolling-checkpoint window — typically the recent
+    // tool-calling turns whose results we are now responding to) MUST
+    // preserve their `<think>...</think>` wrapping, even if reasoning is
+    // empty. The model was post-trained to expect `<|im_start|>assistant\n
+    // <think>\n...\n</think>\n\n<content>` for those turns; emitting bare
+    // content without the think pair leaves the model out of distribution
+    // and produces premature-EOS / repetitive-thinking failures on the
+    // follow-up generation. Older assistant turns get think markers
+    // stripped to keep the context compact.
+    NSInteger last_query_index = (NSInteger)[messages count] - 1;
+    {
+        BOOL multi_step_tool = YES;
+        for (NSInteger i = (NSInteger)[messages count] - 1; i >= 0 && multi_step_tool; i--) {
+            NSDictionary *m = messages[i];
+            if (![m isKindOfClass:[NSDictionary class]]) continue;
+            NSString *r = m[@"role"] ?: @"user";
+            if (![r isEqualToString:@"user"]) continue;
+            NSString *c = flatten_content_value(m[@"content"]) ?: @"";
+            NSString *trimmed = [c stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            BOOL is_tool_response = ([trimmed hasPrefix:@"<tool_response>"] && [trimmed hasSuffix:@"</tool_response>"]);
+            if (!is_tool_response) {
+                multi_step_tool = NO;
+                last_query_index = i;
+            }
+        }
+    }
+
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSInteger msg_index = -1;
     for (NSDictionary *msg in messages) {
+        msg_index++;
         if (![msg isKindOfClass:[NSDictionary class]]) continue;
         NSString *role = msg[@"role"] ?: @"user";
-        NSString *content = flatten_content_value(msg[@"content"]);
+        // chat_template.jinja line 82: `set content = render_content(...)|trim`.
+        // Apply the same trim per message so structural newlines around tags
+        // come from the template, not from incidental client formatting.
+        NSString *content = [flatten_content_value(msg[@"content"]) stringByTrimmingCharactersInSet:ws];
         if ([role isEqualToString:@"system"]) {
             if ([system_prompt length] > 0) [system_prompt appendString:@"\n\n"];
             [system_prompt appendString:content ?: @""];
             continue;
         }
         if ([role isEqualToString:@"assistant"]) {
+            // Per chat_template.jinja: extract reasoning_content either from
+            // an explicit `reasoning_content` string field (OpenAI-style
+            // separated reasoning) or by splitting `content` on </think>
+            // tags. After extraction, if this turn is in the rolling-checkpoint
+            // window, wrap the body with <think>\n{reasoning}\n</think>\n\n
+            // markers; otherwise emit bare body (legacy turn, think stripped).
+            NSString *reasoning = nil;
+            NSString *body = content ?: @"";
+            id raw_reasoning = msg[@"reasoning_content"];
+            if ([raw_reasoning isKindOfClass:[NSString class]]) {
+                reasoning = raw_reasoning;
+            } else {
+                NSRange close_think = [body rangeOfString:@"</think>"];
+                if (close_think.location != NSNotFound) {
+                    NSString *before = [body substringToIndex:close_think.location];
+                    NSString *after = [body substringFromIndex:NSMaxRange(close_think)];
+                    NSRange open_think = [before rangeOfString:@"<think>" options:NSBackwardsSearch];
+                    if (open_think.location != NSNotFound) {
+                        reasoning = [before substringFromIndex:NSMaxRange(open_think)];
+                    } else {
+                        reasoning = before;
+                    }
+                    while ([after hasPrefix:@"\n"]) after = [after substringFromIndex:1];
+                    body = after;
+                }
+            }
+            if (!reasoning) reasoning = @"";
+            reasoning = [reasoning stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
             NSMutableString *assistant = [NSMutableString string];
-            if ([content length] > 0) [assistant appendString:content];
+            if (msg_index > last_query_index) {
+                [assistant appendFormat:@"<think>\n%@\n</think>\n\n", reasoning];
+                [assistant appendString:body];
+            } else {
+                [assistant appendString:body];
+            }
             append_assistant_tool_calls(assistant, msg[@"tool_calls"]);
             append_chat_turn(conversation, @"assistant", assistant);
             continue;
