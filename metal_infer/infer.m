@@ -7028,12 +7028,14 @@ static long sse_created_timestamp(void) {
 
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
-static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
-    char chunk[4096];
-    // Escape the token text for JSON
-    char escaped[2048];
-    char *w = escaped;
-    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
+// Inline JSON-escape helper used by sse_send_delta and sse_send_reasoning_delta.
+// Escapes the four characters that are illegal in JSON strings (", \, control
+// chars rendered as \n/\r/\t). Truncates if escaped > out_sz - 8 to leave
+// room for trailing nul. Returns the escaped string in `out`.
+static void sse_escape_token(const char *token_text, char *out, size_t out_sz) {
+    char *w = out;
+    char *end = out + out_sz - 8;
+    for (const char *r = token_text; *r && w < end; r++) {
         switch (*r) {
             case '"':  *w++ = '\\'; *w++ = '"';  break;
             case '\\': *w++ = '\\'; *w++ = '\\'; break;
@@ -7044,12 +7046,37 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
         }
     }
     *w = '\0';
+}
+
+static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
+    char chunk[4096];
+    char escaped[2048];
+    sse_escape_token(token_text, escaped, sizeof(escaped));
     long created = sse_created_timestamp();
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
         request_id, created, kApiModelId, escaped);
     server_http_log_block(request_id, "response", "sse chat.completion.chunk", chunk);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
+
+// DeepSeek-style streaming for thinking tokens. Routes the model's `<think>...
+// </think>` content into `delta.reasoning_content` instead of `delta.content`,
+// so OpenAI-extension-aware clients can render reasoning separately from the
+// final assistant response. Used while in_think is true; once `</think>` fires
+// the loop reverts to sse_send_delta for the actual response body.
+static int sse_send_reasoning_delta(int fd, const char *request_id, const char *token_text) {
+    char chunk[4096];
+    char escaped[2048];
+    sse_escape_token(token_text, escaped, sizeof(escaped));
+    long created = sse_created_timestamp();
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+        request_id, created, kApiModelId, escaped);
+    server_http_log_block(request_id, "response", "sse chat.completion.reasoning_chunk", chunk);
     ssize_t wr = write(fd, chunk, n);
     return (wr <= 0) ? -1 : 0;
 }
@@ -7570,13 +7597,45 @@ static void sse_send_response_done(int fd, const char *response_id, const char *
     http_write(fd, chunk, n);
 }
 
+// Build the non-streaming OpenAI-compatible chat completion response.
+// `text` is the post-`</think>` assistant content; `reasoning_text` is the
+// in-`<think>` content (DeepSeek-style separated reasoning). Pass NULL or ""
+// for reasoning_text to omit the field. When a tool_call fires, content is
+// "" by convention and tool_calls carries the structured call; reasoning is
+// still included if present so clients can show "the model thought X then
+// decided to call Y".
 static char *build_chat_completion_json(const char *request_id, const char *model,
-                                        const char *text, const ParsedToolCall *tool_call) {
+                                        const char *text, const char *reasoning_text,
+                                        const ParsedToolCall *tool_call) {
     char *escaped_text = json_escape_alloc(text ?: "");
     if (!escaped_text) return NULL;
-    size_t body_cap = strlen(escaped_text) + 4096;
+    char *escaped_reasoning = NULL;
+    if (reasoning_text && reasoning_text[0]) {
+        escaped_reasoning = json_escape_alloc(reasoning_text);
+        if (!escaped_reasoning) {
+            free(escaped_text);
+            return NULL;
+        }
+    }
+    // Optional `,"reasoning_content":"<escaped>"` fragment, empty when absent.
+    char *reasoning_field = NULL;
+    if (escaped_reasoning) {
+        size_t rf_cap = strlen(escaped_reasoning) + 32;
+        reasoning_field = malloc(rf_cap);
+        if (!reasoning_field) {
+            free(escaped_reasoning);
+            free(escaped_text);
+            return NULL;
+        }
+        snprintf(reasoning_field, rf_cap, ",\"reasoning_content\":\"%s\"", escaped_reasoning);
+    }
+    const char *rf = reasoning_field ? reasoning_field : "";
+
+    size_t body_cap = strlen(escaped_text) + strlen(rf) + 4096;
     char *body = calloc(1, body_cap);
     if (!body) {
+        free(reasoning_field);
+        free(escaped_reasoning);
         free(escaped_text);
         return NULL;
     }
@@ -7585,33 +7644,39 @@ static char *build_chat_completion_json(const char *request_id, const char *mode
         char *escaped_args = json_escape_alloc(tool_call->arguments ?: "{}");
         if (!escaped_args) {
             free(body);
+            free(reasoning_field);
+            free(escaped_reasoning);
             free(escaped_text);
             return NULL;
         }
         json_escape_cstr(tool_call->name, escaped_name, sizeof(escaped_name));
-        body_cap = strlen(escaped_args) + strlen(request_id) + strlen(model) + strlen(escaped_name) + 4096;
+        body_cap = strlen(escaped_args) + strlen(rf) + strlen(request_id) + strlen(model) + strlen(escaped_name) + 4096;
         char *grown = realloc(body, body_cap);
         if (!grown) {
             free(escaped_args);
             free(body);
+            free(reasoning_field);
+            free(escaped_reasoning);
             free(escaped_text);
             return NULL;
         }
         body = grown;
         snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\","
-                 "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\","
+                 "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"%s,"
                  "\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},"
                  "\"finish_reason\":\"tool_calls\"}]}\n",
-                 request_id, model, tool_call->id, escaped_name, escaped_args);
+                 request_id, model, rf, tool_call->id, escaped_name, escaped_args);
         free(escaped_args);
     } else {
         snprintf(body, body_cap,
                  "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":\"%s\","
-                 "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+                 "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"%s},"
                  "\"finish_reason\":\"stop\"}]}\n",
-                 request_id, model, escaped_text);
+                 request_id, model, escaped_text, rf);
     }
+    free(reasoning_field);
+    free(escaped_reasoning);
     free(escaped_text);
     return body;
 }
@@ -9081,7 +9146,7 @@ static void serve_loop(
                 sse_send_delta(client_fd, request_id, fixed_title);
                 sse_send_done(client_fd, request_id);
             } else {
-                char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL);
+                char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL, NULL);
                 if (final_json) {
                     send_json_ok(client_fd, final_json);
                     free(final_json);
@@ -9349,6 +9414,13 @@ static void serve_loop(
 
         char *gen_response = calloc(1, 262144);
         int gen_resp_len = 0;
+        // DeepSeek-style separated reasoning. While in_think is true the
+        // generation tokens accumulate here (and stream as
+        // delta.reasoning_content); after </think> they go to gen_response
+        // (and stream as delta.content). think_budget caps at 2048 tokens, so
+        // 65536 bytes is a generous bound.
+        char *gen_reasoning = calloc(1, 65536);
+        int gen_reasoning_len = 0;
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
@@ -9389,7 +9461,13 @@ static void serve_loop(
             int is_think_marker = (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token);
             if (!is_think_marker && tok_str) {
                 int tlen = (int)strlen(tok_str);
-                if (!in_think && gen_resp_len + tlen < 262143) {
+                if (in_think) {
+                    if (gen_reasoning_len + tlen < 65535) {
+                        memcpy(gen_reasoning + gen_reasoning_len, tok_str, tlen);
+                        gen_reasoning_len += tlen;
+                        gen_reasoning[gen_reasoning_len] = 0;
+                    }
+                } else if (gen_resp_len + tlen < 262143) {
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
@@ -9431,9 +9509,18 @@ tool_call_checked:
             }
 
             if (send_as_delta && req.stream && tok_str) {
-                int rc = is_chat
-                    ? sse_send_delta(client_fd, request_id, tok_str)
-                    : sse_send_response_text_delta(client_fd, request_id, tok_str);
+                int rc;
+                if (is_chat) {
+                    // DeepSeek-style routing: in-think tokens → delta.reasoning_content,
+                    // post-think tokens → delta.content. OpenAI-extension-aware clients
+                    // (and our chat template renderer on the next turn) can then keep
+                    // reasoning structurally separated from the assistant response.
+                    rc = in_think
+                        ? sse_send_reasoning_delta(client_fd, request_id, tok_str)
+                        : sse_send_delta(client_fd, request_id, tok_str);
+                } else {
+                    rc = sse_send_response_text_delta(client_fd, request_id, tok_str);
+                }
                 if (rc < 0) {
                     server_log_errorf("[serve] %s client disconnected during stream\n", request_id);
                     break;
@@ -9492,7 +9579,7 @@ tool_call_checked:
         }
 
         char *final_json = is_chat
-            ? build_chat_completion_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL)
+            ? build_chat_completion_json(request_id, req.model, gen_response, gen_reasoning, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL)
             : build_responses_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL);
 
         if (req.stream) {
@@ -9518,6 +9605,7 @@ tool_call_checked:
 
         free(final_json);
         free(gen_response);
+        free(gen_reasoning);
         free(token_counts);
         parsed_tool_call_free(&parsed_tool_call);
         free(tool_call_buf);
