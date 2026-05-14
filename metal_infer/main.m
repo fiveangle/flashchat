@@ -1512,10 +1512,23 @@ int main(int argc, char **argv) {
         if (!model_id) {
             model_id = getenv("FLASHCHAT_MODEL");
         }
-        if (!model_id) {
-            model_id = "qwen3.6-35B-A3B";
-        }
         const char *config_json_path = resolve_model_config_path();
+        if (!model_id) {
+            static char default_model_id[64];
+            if (load_default_model_id(config_json_path, default_model_id, sizeof(default_model_id)) == 0
+                && default_model_id[0] != '\0') {
+                model_id = default_model_id;
+            } else {
+                fprintf(stderr,
+                    "ERROR: No model ID could be determined. Checked:\n"
+                    "  - --model-id CLI flag: not provided\n"
+                    "  - FLASHCHAT_MODEL environment variable: not set\n"
+                    "  - %s default_model field: could not be read (file missing or malformed)\n"
+                    "Run 'flashchat config' to set a default model, or pass --model-id explicitly.\n",
+                    config_json_path ? config_json_path : "model_configs.json");
+                return 1;
+            }
+        }
         if (load_model_config(config_json_path, model_id, &g_cfg) != 0) {
             fprintf(stderr, "ERROR: Failed to load model config for '%s'\n", model_id);
             return 1;

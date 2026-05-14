@@ -83,7 +83,7 @@ for i in range(1, 30):
         }
     })
 request = {
-    "model": "qwen3.6-35B-A3B",
+    "model": "mlx-community-Qwen36-35B-A3B-4bit",
     "stream": False,
     "temperature": 0.6,
     "top_p": 0.95,
@@ -106,7 +106,7 @@ echo ""
 echo "=== Flashchat Tool Template Render Smoke ==="
 echo ""
 
-render_output=$("$INFER" --model-id qwen3.6-35B-A3B --render-request "$REQUEST_JSON" --render-output "$RENDER_DIR" 2>&1)
+render_output=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$REQUEST_JSON" --render-output "$RENDER_DIR" 2>&1)
 if printf "%s" "$render_output" | grep -q "tools=30"; then
     assert_pass "render request reports thirty tools"
 else
@@ -160,7 +160,7 @@ true
 </tool_call>
 EOF
 
-parsed=$("$INFER" --model-id qwen3.6-35B-A3B --parse-tool-call "$TOOL_CALL_TXT" | tail -1)
+parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$TOOL_CALL_TXT" | tail -1)
 python3 - "$parsed" <<'PY'
 import json
 import sys

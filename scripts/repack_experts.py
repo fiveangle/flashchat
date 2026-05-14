@@ -11,11 +11,11 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight  → scales → biases
 
 Usage:
-    python scripts/repack_experts.py --model-id qwen3.6-35B-A3B
-    python scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/expert_index.json
-    python scripts/repack_experts.py --model-id qwen3.6-35B-A3B --layers 0-4
-    python scripts/repack_experts.py --model-id qwen3.6-35B-A3B --dry-run
-    python scripts/repack_experts.py --model-id qwen3.6-35B-A3B --verify-only 0
+    python scripts/repack_experts.py --model-id mlx-community-Qwen36-35B-A3B-4bit
+    python scripts/repack_experts.py --model-id mlx-community-Qwen36-35B-A3B-4bit --index /path/expert_index.json
+    python scripts/repack_experts.py --model-id mlx-community-Qwen36-35B-A3B-4bit --layers 0-4
+    python scripts/repack_experts.py --model-id mlx-community-Qwen36-35B-A3B-4bit --dry-run
+    python scripts/repack_experts.py --model-id mlx-community-Qwen36-35B-A3B-4bit --verify-only 0
 """
 
 import argparse
@@ -286,7 +286,7 @@ def detect_model_path(hf_repo):
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
     parser.add_argument("--model-id", type=str, required=True,
-                        help="Model ID from model_configs.json (e.g. qwen3.6-35B-A3B)")
+                        help="Model ID from model_configs.json (e.g. mlx-community-Qwen36-35B-A3B-4bit)")
     parser.add_argument("--index",
                         default=get_default_index_path(),
                         help="Path to expert_index.json (default: auto-detect from model path)")

@@ -173,7 +173,7 @@ fi
 
 TMP_CONFIG="${TMPDIR}/.config/flashchat/config"
 cat > "$TMP_CONFIG" <<EOF
-MODEL="qwen3.6-35B-A3B"
+MODEL="mlx-community-Qwen36-35B-A3B-4bit"
 MAX_TOKENS="1"
 SAMPLING_PROFILE="custom"
 REASONING="0"
@@ -212,7 +212,7 @@ run_test_contains "config file missing uses defaults" "Flashchat Show Status" "$
 run_test_contains "config file valid" "Flashchat Show Status" "$FLASHCHAT" status
 run_test_contains "verbose flag" "Usage:" "$FLASHCHAT" -v --help
 run_test "quiet flag" "$FLASHCHAT" -q --help
-run_test_contains "model override" "Usage:" "$FLASHCHAT" --model qwen3.6-35B-A3B --help
+run_test_contains "model override" "Usage:" "$FLASHCHAT" --model mlx-community-Qwen36-35B-A3B-4bit --help
 
 # ---------------------------------------------------------------------------
 # Status command
@@ -361,7 +361,7 @@ else
 
     # Test /v1/models endpoint
     output=$(curl -fsS "${BASE_URL}/v1/models" 2>/dev/null)
-    if echo "$output" | grep -q '"id":"qwen3.6-35B-A3B"'; then
+    if echo "$output" | grep -q '"id":"mlx-community-Qwen36-35B-A3B-4bit"'; then
         assert_pass "api models endpoint"
     else
         assert_fail "api models endpoint" "unexpected response: $output"

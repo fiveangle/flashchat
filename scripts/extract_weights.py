@@ -9,8 +9,8 @@ Outputs:
   - model_weights.json: manifest mapping tensor names to {offset, size, shape, dtype}
 
 Usage:
-    python scripts/extract_weights.py --model-id qwen3.6-35B-A3B
-    python scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path --output /out
+    python scripts/extract_weights.py --model-id mlx-community-Qwen36-35B-A3B-4bit
+    python scripts/extract_weights.py --model-id mlx-community-Qwen36-35B-A3B-4bit --model /path --output /out
 """
 
 import json
@@ -142,7 +142,7 @@ def load_8bit_tensor_overrides(config_path):
 def main():
     parser = argparse.ArgumentParser(description="Extract non-expert weights to binary")
     parser.add_argument("--model-id", type=str, required=True,
-                        help="Model ID from model_configs.json (e.g. qwen3.6-35B-A3B)")
+                        help="Model ID from model_configs.json (e.g. mlx-community-Qwen36-35B-A3B-4bit)")
     parser.add_argument("--model", type=str, default=None,
                         help="Path to model directory (default: auto-detect from HF cache)")
     parser.add_argument("--output", type=str, default=None,

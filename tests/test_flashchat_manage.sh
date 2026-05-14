@@ -12,7 +12,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-MODEL_ID="qwen3.6-35B-A3B"
+MODEL_ID="mlx-community-Qwen36-35B-A3B-4bit"
 REPO_DIR_NAME="models--mlx-community--Qwen3.6-35B-A3B-4bit"
 SNAPSHOT_ID="test-snapshot"
 LAYER_COUNT=40

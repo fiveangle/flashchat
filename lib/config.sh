@@ -21,7 +21,7 @@ FLASHCHAT_CONFIG_FILE=""
 FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG:-${FLASHCHAT_REPO_ROOT}/assets/model_configs.json}"
 
 # Default configuration values
-FLASHCHAT_DEFAULT_MODEL="qwen3.6-35B-A3B"
+FLASHCHAT_DEFAULT_MODEL="mlx-community-Qwen36-35B-A3B-4bit"
 FLASHCHAT_DEFAULT_MAX_TOKENS="8192"
 FLASHCHAT_DEFAULT_SERVER_PORT="8000"
 FLASHCHAT_DEFAULT_SERVER_HOST="127.0.0.1"
@@ -363,8 +363,26 @@ flashchat_load_config() {
         MODEL="$default_model"
     fi
     if ! flashchat_model_exists "$MODEL"; then
-        echo "WARNING: configured model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG; using $default_model" >&2
-        MODEL="$default_model"
+        if [ -n "$MODEL_REPO" ]; then
+            local derived_id="${MODEL_REPO//\//-}"
+            derived_id="${derived_id//./}"
+            if flashchat_model_exists "$derived_id"; then
+                MODEL="$derived_id"
+                if [ -f "$FLASHCHAT_CONFIG_FILE" ]; then
+                    sed -i '' "s/^MODEL=.*/MODEL=\"$derived_id\"/" "$FLASHCHAT_CONFIG_FILE" 2>/dev/null || true
+                fi
+            else
+                echo "WARNING: model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG." >&2
+                echo "  Run 'flashchat config' to select your model, or set FLASHCHAT_MODEL_REPO." >&2
+                echo "  Using default model '$default_model' for now." >&2
+                MODEL="$default_model"
+            fi
+        else
+            echo "WARNING: model '$MODEL' is not in $FLASHCHAT_MODEL_CONFIG (may be an old-format ID)." >&2
+            echo "  Run 'flashchat config' to select your model again." >&2
+            echo "  Using default model '$default_model' for now." >&2
+            MODEL="$default_model"
+        fi
     fi
     local looked_up_repo
     looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
