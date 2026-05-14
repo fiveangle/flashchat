@@ -574,6 +574,10 @@ print_model_status_list() {
     local i=0
     local model_id name repo marker status
 
+    printf "  [0] Add a model...\n"
+    printf "      (only model_type qwen3_5_moe is supported)\n"
+    printf "\n"
+
     while IFS=$'\t' read -r model_id name repo; do
         [ -n "$model_id" ] || continue
         i=$((i + 1))
@@ -585,6 +589,201 @@ print_model_status_list() {
         printf "      Repo: %s\n" "$repo"
         printf "      %s\n" "$status"
     done < <(flashchat_list_models)
+}
+
+add_model_to_registry() {
+    echo "" >&2
+    echo "=== Add a Model ===" >&2
+    echo "" >&2
+    echo "Enter the HuggingFace model repository ID." >&2
+    echo "Example: mlx-community/Qwen3.6-35B-A3B-4bit" >&2
+    echo "" >&2
+    printf "HuggingFace model ID: " >&2
+    read -r REPLY
+    echo "" >&2
+    local repo="$REPLY"
+    if [ -z "$repo" ]; then
+        echo "Cancelled." >&2
+        return 1
+    fi
+
+    echo "Fetching config.json from HuggingFace..." >&2
+    local config_json_path
+    config_json_path=$(download_hf_file "$repo" "config.json")
+    if [ -z "$config_json_path" ] || [ ! -f "$config_json_path" ]; then
+        echo "ERROR: Unable to download config.json for '$repo'." >&2
+        echo "  Check that the repository exists and is accessible." >&2
+        return 1
+    fi
+
+    local model_type
+    model_type=$(python3 -c "import json; print(json.load(open('$config_json_path')).get('model_type',''))")
+    if [ "$model_type" != "qwen3_5_moe" ]; then
+        echo "ERROR: Model type is '$model_type', but only 'qwen3_5_moe' is supported." >&2
+        return 1
+    fi
+
+    local model_id="${repo//\//-}"
+    model_id="${model_id//./}"
+
+    if flashchat_model_exists "$model_id"; then
+        echo "Model '$model_id' is already in the registry." >&2
+        return 1
+    fi
+
+    local model_name
+    model_name="${repo##*/}"
+
+    local registry_file
+    registry_file=$(flashchat_get MODEL_CONFIG)
+
+    local tmp_entry
+    tmp_entry=$(mktemp)
+
+    if ! python3 << PYEOF > "$tmp_entry" 2>&1
+import json, sys
+
+with open('$config_json_path') as f:
+    cfg = json.load(f)
+
+with open('$registry_file') as f:
+    registry = json.load(f)
+
+# Find template model (any existing qwen-style model)
+template = None
+for mid, m in registry.get('models', {}).items():
+    if 'Qwen' in m.get('name', ''):
+        template = m
+        break
+if not template:
+    template = next(iter(registry.get('models', {}).values()), None)
+    template = template if template else {}
+
+# MLX-community models nest architecture fields under text_config;
+# original Qwen configs keep them at the top level.
+c = cfg.get('text_config', cfg)
+
+hidden_size = c.get('hidden_size', 2048)
+num_hidden_layers = c.get('num_hidden_layers', 40)
+num_attention_heads = c.get('num_attention_heads', 16)
+num_key_value_heads = c.get('num_key_value_heads', 2)
+head_dim = c.get('head_dim', 256)
+vocab_size = c.get('vocab_size', 248320)
+rms_norm_eps = c.get('rms_norm_eps', 1e-06)
+
+moe = c.get('moe_config', {})
+num_experts = moe.get('num_experts', c.get('num_experts', 256))
+num_experts_per_tok = moe.get('num_experts_per_tok', c.get('num_experts_per_tok', 8))
+moe_intermediate_size = moe.get('moe_intermediate_size', c.get('moe_intermediate_size', 512))
+shared_expert_intermediate_size = moe.get('shared_expert_intermediate_size', c.get('shared_expert_intermediate_size', 512))
+
+full_attention_interval = c.get('full_attention_interval', 4)
+
+la = c.get('linear_attention', {})
+linear_num_value_heads = la.get('num_value_heads', c.get('linear_num_value_heads', 32))
+linear_num_key_heads = la.get('num_key_heads', c.get('linear_num_key_heads', 16))
+linear_key_head_dim = la.get('key_head_dim', c.get('linear_key_head_dim', 128))
+linear_value_head_dim = la.get('value_head_dim', c.get('linear_value_head_dim', 128))
+linear_conv_kernel_dim = la.get('conv_kernel_dim', c.get('linear_conv_kernel_dim', 4))
+
+partial_rotary_factor = c.get('partial_rotary_factor', 0.25)
+# rope_theta may live under rope_parameters (MLX format) or directly in the config
+rope_theta = c.get('rope_theta')
+if rope_theta is None:
+    rope_theta = c.get('rope_parameters', {}).get('rope_theta', 10000000.0)
+
+# Quantization config can be at top level or under text_config
+qc = cfg.get('quantization_config', cfg.get('quantization', {}))
+bits = qc.get('bits', 4)
+group_size = qc.get('group_size', 64)
+
+entry = {
+    'name': '$model_name',
+    'hf_repo': '$repo',
+    'hidden_size': hidden_size,
+    'num_hidden_layers': num_hidden_layers,
+    'num_attention_heads': num_attention_heads,
+    'num_key_value_heads': num_key_value_heads,
+    'head_dim': head_dim,
+    'vocab_size': vocab_size,
+    'rms_norm_eps': rms_norm_eps,
+    'num_experts': num_experts,
+    'num_experts_per_tok': num_experts_per_tok,
+    'moe_intermediate_size': moe_intermediate_size,
+    'shared_expert_intermediate_size': shared_expert_intermediate_size,
+    'full_attention_interval': full_attention_interval,
+    'linear_num_value_heads': linear_num_value_heads,
+    'linear_num_key_heads': linear_num_key_heads,
+    'linear_key_head_dim': linear_key_head_dim,
+    'linear_value_head_dim': linear_value_head_dim,
+    'linear_conv_kernel_dim': linear_conv_kernel_dim,
+    'partial_rotary_factor': partial_rotary_factor,
+    'rope_theta': rope_theta,
+    'quantization': {'bits': bits, 'group_size': group_size},
+    'scripts': {
+        'extract_weights': 'scripts/extract_weights.py',
+        'repack_experts': 'scripts/repack_experts.py'
+    },
+    'special_tokens': template.get('special_tokens', {
+        'eos_1': 248046,
+        'eos_2': 248044,
+        'think_start': 248068,
+        'think_end': 248069
+    }),
+    'default_sampling_profile': 'instruct',
+    'sampling_profiles': template.get('sampling_profiles', {})
+}
+
+print(json.dumps(entry, indent=2))
+PYEOF
+    then
+        echo "ERROR: Failed to parse model configuration." >&2
+        cat "$tmp_entry" >&2
+        rm -f "$tmp_entry"
+        return 1
+    fi
+
+    echo "Parsed model configuration:" >&2
+    cat "$tmp_entry" >&2
+    echo "" >&2
+    read -p "Add to registry? [Y/n] " -n 1 -r >&2
+    echo "" >&2
+    if [[ ! $REPLY =~ ^[Yy]$ ]] && [ -n "$REPLY" ]; then
+        echo "Cancelled." >&2
+        rm -f "$tmp_entry"
+        return 1
+    fi
+
+    python3 << PYEOF
+import json, os, shutil
+
+with open('$registry_file') as f:
+    data = json.load(f)
+
+with open('$tmp_entry') as f:
+    entry = json.load(f)
+
+data['models']['$model_id'] = entry
+
+# If no default_model set, use this one
+if not data.get('default_model'):
+    data['default_model'] = '$model_id'
+
+backup = '$registry_file.backup.' + str(os.getpid())
+shutil.copy('$registry_file', backup)
+
+with open('$registry_file', 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+
+print('Registry updated.')
+PYEOF
+
+    rm -f "$tmp_entry"
+    echo "Model '$model_id' added to registry." >&2
+    echo "It will be downloaded on the next run." >&2
+    echo "" >&2
+    echo "$model_id"
 }
 
 select_model_from_registry() {
@@ -615,6 +814,17 @@ select_model_from_registry() {
         if [ -z "$REPLY" ]; then
             echo "$default_model"
             return
+        fi
+        if [[ "$REPLY" = "0" ]] || [[ "$REPLY" =~ ^[Aa]$ ]]; then
+            local added_model
+            if added_model=$(add_model_to_registry); then
+                echo "$added_model"
+                return
+            fi
+            # add_model_to_registry printed error; loop again
+            print_model_status_list >&2
+            echo "" >&2
+            continue
         fi
         if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
             i=$((REPLY - 1))
@@ -1612,6 +1822,52 @@ check_hf_cli() {
     fi
 }
 
+# Download a specific file or full snapshot from a HuggingFace repo.
+# For single files, suppresses tool output and prints the cached file path to stdout.
+# For full snapshots, shows progress and returns success/failure (no stdout path).
+download_hf_file() {
+    local repo="$1"
+    local filename="${2:-}"
+    local escaped_repo="${repo//\//--}"
+    local hf_cache="${HOME}/.cache/huggingface/hub"
+    local snapshot_dir="${hf_cache}/models--${escaped_repo}/snapshots"
+
+    if check_hf_cli; then
+        if [ -n "$filename" ]; then
+            hf download -q "$repo" "$filename" >/dev/null 2>&1 || true
+        else
+            hf download "$repo" || true
+        fi
+    else
+        local dl_venv="/tmp/hf_dl_$$"
+        python3 -m venv "$dl_venv" >/dev/null 2>&1
+        "$dl_venv/bin/pip" install huggingface-hub -q >/dev/null 2>&1
+        if [ -n "$filename" ]; then
+            "$dl_venv/bin/python" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='$repo', filename='$filename')" >/dev/null 2>&1 || true
+        else
+            "$dl_venv/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$repo')" || true
+        fi
+        rm -rf "$dl_venv"
+    fi
+
+    if [ -d "$snapshot_dir" ]; then
+        local latest
+        latest=$(ls -1 "$snapshot_dir" 2>/dev/null | sort | tail -1)
+        if [ -n "$latest" ]; then
+            if [ -n "$filename" ]; then
+                local file_path="${snapshot_dir}/${latest}/${filename}"
+                if [ -f "$file_path" ]; then
+                    echo "$file_path"
+                    return 0
+                fi
+            else
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 check_homebrew() {
     if command -v brew &> /dev/null; then
         return 0
@@ -1710,17 +1966,14 @@ prompt_download_model() {
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         echo "Downloading model..."
-        
-        if check_hf_cli; then
-            echo "Using Homebrew hf CLI..."
-            hf download "$model_repo"
-        else
-            echo "Installing huggingface-hub in temporary venv..."
-            HF_VENV="/tmp/hf_$$"
-            python3 -m venv "$HF_VENV"
-            "$HF_VENV/bin/pip" install huggingface-hub -q 2>/dev/null
-            "$HF_VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model_repo')"
-            rm -rf "$HF_VENV"
+
+        if ! download_hf_file "$model_repo"; then
+            echo ""
+            echo "WARNING: Download command finished but model files were not found."
+            echo "The client may have updated itself and requested a re-run."
+            echo ""
+            echo "Please re-run: ./flashchat"
+            exit 1
         fi
 
         # Verify the download actually succeeded

@@ -238,6 +238,8 @@ run_test "model registry json valid" python3 -m json.tool "${REPO_ROOT}/assets/m
 run_test_contains "models basic" "Flashchat Models" "$FLASHCHAT" models
 run_test_contains "models current marker" "* Current model" "$FLASHCHAT" models
 run_test_contains "models artifact status" "experts:" "$FLASHCHAT" models
+run_test_contains "models add option shown" "Add a model" "$FLASHCHAT" models
+run_test_contains "models add option supported type" "qwen3_5_moe" "$FLASHCHAT" models
 
 # ---------------------------------------------------------------------------
 # Manage command
