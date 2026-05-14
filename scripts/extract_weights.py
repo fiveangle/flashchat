@@ -312,7 +312,7 @@ def main():
 
                 weight_u32 = np.frombuffer(weight_data, dtype=np.uint32).reshape(shape)
                 out_dim = shape[0]
-                in_dim = hidden_size
+                in_dim = shape[1] * 4
 
                 new_w_u32, new_s_bf16, new_b_bf16 = convert_8bit_to_4bit(
                     weight_u32, scales_data, biases_data, out_dim, in_dim, group_size=64

@@ -1668,12 +1668,11 @@ check_model_extracted() {
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
 
-    # Check if original HuggingFace model exists (safetensors)
-    # Use glob to match any shard pattern (e.g., model-00001-of-00004, model-00001-of-00046)
+    # Check if original HuggingFace model weight files exist.
+    # config.json alone (e.g. from the add-model wizard) is not sufficient.
     for f in "$model_path"/model-*.safetensors "$model_path"/model.safetensors; do
         [ -f "$f" ] && return 0
     done
-    [ -f "$model_path/config.json" ] && return 0
     return 1
 }
 
