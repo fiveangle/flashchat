@@ -54,12 +54,23 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local name="$1"
+    local unexpected="$2"
+    local output="$3"
+    if printf "%s" "$output" | grep -q "$unexpected"; then
+        assert_fail "$name" "unexpected '$unexpected'"
+    else
+        assert_pass "$name"
+    fi
+}
+
 TMPDIR="$(mktemp -d /tmp/flashchat-manage-test.XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 export HOME="${TMPDIR}/home"
 CONFIG_DIR="${HOME}/.config/flashchat"
-HF_CACHE="${HOME}/.cache/huggingface/hub"
+HF_CACHE="${TMPDIR}/custom-hf-cache"
 LOCAL_REPO="${HF_CACHE}/${REPO_DIR_NAME}"
 OFFLOAD_DIR="${TMPDIR}/offload"
 OFFLOADED_REPO="${OFFLOAD_DIR}/${REPO_DIR_NAME}"
@@ -81,6 +92,7 @@ REPETITION_PENALTY="1.0"
 SERVER_PORT="19998"
 SERVER_HOST="127.0.0.1"
 SERVER_LOG_PATH="${TMPDIR}/logs"
+HUGGINGFACE_CACHE_DIR="${HF_CACHE}"
 OFFLOAD_DIR="${OFFLOAD_DIR}"
 SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
@@ -109,6 +121,11 @@ reset_storage() {
 run_manage() {
     local input="$1"
     printf "%b" "$input" | "$FLASHCHAT" manage --interactive 2>&1
+}
+
+run_flashchat() {
+    local input="$1"
+    printf "%b" "$input" | "$FLASHCHAT" 2>&1
 }
 
 echo ""
@@ -160,6 +177,16 @@ output=$(run_manage "${MODEL_ID}\n4\n${MODEL_ID}\nq\n")
 assert_contains "full reload moves repo back" "Model fully reloaded" "$output"
 assert_exists "full reload restores local repo" "$LOCAL_REPO"
 assert_not_exists "full reload removes offload copy" "$OFFLOADED_REPO"
+
+reset_storage
+output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
+assert_contains "startup restore setup offloads model" "Model offloaded" "$output"
+output=$(run_flashchat "y\nq\n")
+assert_contains "startup restore offers offload copy" "Offloaded Model Found" "$output"
+assert_contains "startup restore reloads model" "Model fully reloaded" "$output"
+assert_not_contains "startup restore skips HF download prompt" "Model Download Required" "$output"
+assert_exists "startup restore creates local repo" "$LOCAL_REPO"
+assert_not_exists "startup restore consumes offload repo" "$OFFLOADED_REPO"
 
 reset_storage
 mkdir -p "$OFFLOADED_REPO"

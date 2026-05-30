@@ -186,6 +186,7 @@ REPETITION_PENALTY="1.0"
 SERVER_PORT="${TEST_PORT}"
 SERVER_HOST="${TEST_HOST}"
 SERVER_LOG_PATH="${TMPDIR}/logs"
+HUGGINGFACE_CACHE_DIR="${TMPDIR}/custom-hf-cache"
 OFFLOAD_DIR="${TMPDIR}/offload"
 SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
@@ -250,6 +251,7 @@ echo "=== Manage Command ==="
 echo ""
 
 run_test_contains "manage list basic" "Flashchat Manage Models" "$FLASHCHAT" manage --list
+run_test_contains "manage HuggingFace cache dir" "HuggingFace cache directory:" "$FLASHCHAT" manage --list
 run_test_contains "manage offload dir" "Offload directory:" "$FLASHCHAT" manage --list
 run_test_contains "manage runtime status" "runtime:" "$FLASHCHAT" manage --list
 
@@ -291,6 +293,7 @@ echo ""
 run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config HuggingFace cache dir" "HuggingFace cache dir:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config sampling profile" "Sampling profile:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config sampling knobs" "Top-k:" bash -c "echo 'n' | $FLASHCHAT  config"

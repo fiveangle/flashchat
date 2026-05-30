@@ -156,6 +156,7 @@ Environment variables:
   FLASHCHAT_MODEL           Model ID (default: qwen3.6-35B-A3B)
   FLASHCHAT_MODEL_PATH      Override model path
   FLASHCHAT_MODEL_CONFIG    Override bundled model registry path
+  FLASHCHAT_HUGGINGFACE_CACHE_DIR  HuggingFace hub cache directory
   FLASHCHAT_OFFLOAD_DIR     Unified model offload directory
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_SERVER_HOST    Server host clients connect to
@@ -313,6 +314,7 @@ cmd_status() {
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
+    echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
 }
 
@@ -483,6 +485,7 @@ cmd_config() {
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
+    echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
     echo ""
     echo "File: $config_file"
@@ -514,6 +517,7 @@ cmd_config_interactive() {
     echo "  -Server API publishing port: $(flashchat_get SERVER_PORT)"
     echo "  -Chat client API host IP: $(flashchat_get SERVER_HOST)"
     echo "  -Server log path (file or directory): $(flashchat_get SERVER_LOG_PATH)"
+    echo "  -HuggingFace cache directory: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     echo "  -Model offload directory: $(flashchat_get OFFLOAD_DIR)"
     echo "  -Server debug logging artifacts (0/1): $(flashchat_get SERVER_DEBUG)"
     echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
@@ -940,7 +944,28 @@ hf_repo_dir_name() {
 }
 
 flashchat_hf_cache_dir() {
-    printf "%s/.cache/huggingface/hub\n" "$HOME"
+    flashchat_get HUGGINGFACE_CACHE_DIR
+}
+
+ensure_huggingface_cache_dir() {
+    local hf_cache
+    hf_cache=$(flashchat_hf_cache_dir)
+    if [ -z "$hf_cache" ]; then
+        echo "No HUGGINGFACE_CACHE_DIR is configured."
+        return 1
+    fi
+    if [[ "$hf_cache" != /* ]]; then
+        echo "HUGGINGFACE_CACHE_DIR must be an absolute path: $hf_cache"
+        return 1
+    fi
+    if ! mkdir -p "$hf_cache"; then
+        echo "Unable to create HUGGINGFACE_CACHE_DIR: $hf_cache"
+        return 1
+    fi
+    if [ ! -w "$hf_cache" ]; then
+        echo "HUGGINGFACE_CACHE_DIR is not writable: $hf_cache"
+        return 1
+    fi
 }
 
 model_local_repo_dir() {
@@ -1013,6 +1038,25 @@ model_runtime_status_for_repo() {
     fi
 }
 
+model_original_weights_present_for_snapshot() {
+    local snapshot="$1"
+    local f
+    for f in "$snapshot"/model-*.safetensors "$snapshot"/model.safetensors; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
+
+model_repo_can_restore() {
+    local model_id="$1"
+    local repo_dir="$2"
+    local snapshot
+    snapshot=$(latest_snapshot_in_repo "$repo_dir" 2>/dev/null || true)
+    [ -n "$snapshot" ] || return 1
+    model_runtime_ready_for_snapshot "$model_id" "$snapshot" && return 0
+    model_original_weights_present_for_snapshot "$snapshot"
+}
+
 model_original_blob_size_for_repo() {
     local repo_dir="$1"
     local snapshot
@@ -1020,6 +1064,32 @@ model_original_blob_size_for_repo() {
     if [ -n "$snapshot" ]; then
         get_model_blobs_size "$snapshot"
     fi
+}
+
+reload_model_from_offload_repo() {
+    local model_id="$1"
+    local local_repo offloaded_repo
+    local_repo=$(model_local_repo_dir "$model_id")
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    if [ ! -d "$offloaded_repo" ]; then
+        echo "Offloaded model is not present."
+        return 1
+    fi
+    ensure_huggingface_cache_dir || return 1
+    if [ -e "$local_repo" ]; then
+        echo "Refusing to overwrite existing local model:"
+        echo "$local_repo"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$local_repo")"; then
+        echo "Unable to create local HuggingFace cache parent."
+        return 1
+    fi
+    if ! mv "$offloaded_repo" "$local_repo"; then
+        echo "Unable to reload model."
+        return 1
+    fi
+    echo "Model fully reloaded."
 }
 
 confirm_exact_model_id() {
@@ -1074,6 +1144,7 @@ print_manage_model_status_list() {
     local model_id name repo marker local_repo offloaded_repo
     local local_state offloaded_state runtime_state offloaded_runtime blobs_size local_size offloaded_size
 
+    echo "HuggingFace cache directory: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     if [ -n "$offload_dir" ]; then
         echo "Offload directory: $offload_dir"
     else
@@ -1259,15 +1330,7 @@ manage_full_reload_model() {
     echo "This will move the entire offloaded model repo back to local HuggingFace cache:"
     echo "$local_repo"
     confirm_exact_model_id "$model_id" "Type the exact model ID to fully reload this model:" || return 1
-    if ! mkdir -p "$(dirname "$local_repo")"; then
-        echo "Unable to create local HuggingFace cache parent."
-        return 1
-    fi
-    if ! mv "$offloaded_repo" "$local_repo"; then
-        echo "Unable to reload model."
-        return 1
-    fi
-    echo "Model fully reloaded."
+    reload_model_from_offload_repo "$model_id"
 }
 
 manage_restore_runtime_only() {
@@ -1393,7 +1456,7 @@ prompt_config_options() {
         
         local default_model default_tokens default_temp
         local default_top_p default_top_k default_min_p default_presence_penalty default_repetition_penalty
-        local default_port default_host default_log_path default_offload_dir default_debug default_http_log default_sys_cache default_sys_cache_entries default_think default_color
+        local default_port default_host default_log_path default_hf_cache_dir default_offload_dir default_debug default_http_log default_sys_cache default_sys_cache_entries default_think default_color
         
         default_model=$(flashchat_get MODEL)
         default_tokens=$(flashchat_get MAX_TOKENS)
@@ -1406,6 +1469,7 @@ prompt_config_options() {
         default_port=$(flashchat_get SERVER_PORT)
         default_host=$(flashchat_get SERVER_HOST)
         default_log_path=$(flashchat_get SERVER_LOG_PATH)
+        default_hf_cache_dir=$(flashchat_get HUGGINGFACE_CACHE_DIR)
         default_offload_dir=$(flashchat_get OFFLOAD_DIR)
         default_debug=$(flashchat_get SERVER_DEBUG)
         default_http_log=$(flashchat_get SERVER_HTTP_LOG)
@@ -1542,6 +1606,14 @@ prompt_config_interactive() {
     selected_log_path=$(normalize_server_log_path "${REPLY:-$default_log_path}")
     echo "SERVER_LOG_PATH=\"$selected_log_path\"" >> /tmp/flashchat_new_config
 
+    # HuggingFace Cache Directory
+    local default_hf_cache_dir
+    default_hf_cache_dir=$(flashchat_get HUGGINGFACE_CACHE_DIR)
+    printf "HuggingFace cache directory (absolute path) [%s]: " "$default_hf_cache_dir"
+    read -r REPLY
+    echo ""
+    echo "HUGGINGFACE_CACHE_DIR=\"${REPLY:-$default_hf_cache_dir}\"" >> /tmp/flashchat_new_config
+
     # Model Offload Directory
     local default_offload_dir
     default_offload_dir=$(flashchat_get OFFLOAD_DIR)
@@ -1668,12 +1740,7 @@ check_model_extracted() {
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
 
-    # Check if original HuggingFace model weight files exist.
-    # config.json alone (e.g. from the add-model wizard) is not sufficient.
-    for f in "$model_path"/model-*.safetensors "$model_path"/model.safetensors; do
-        [ -f "$f" ] && return 0
-    done
-    return 1
+    model_original_weights_present_for_snapshot "$model_path"
 }
 
 prompt_extract_setup() {
@@ -1828,23 +1895,25 @@ download_hf_file() {
     local repo="$1"
     local filename="${2:-}"
     local escaped_repo="${repo//\//--}"
-    local hf_cache="${HOME}/.cache/huggingface/hub"
+    local hf_cache
+    hf_cache=$(flashchat_get HUGGINGFACE_CACHE_DIR)
     local snapshot_dir="${hf_cache}/models--${escaped_repo}/snapshots"
+    ensure_huggingface_cache_dir || return 1
 
     if check_hf_cli; then
         if [ -n "$filename" ]; then
-            hf download -q "$repo" "$filename" >/dev/null 2>&1 || true
+            HF_HUB_CACHE="$hf_cache" hf download -q "$repo" "$filename" >/dev/null 2>&1 || true
         else
-            hf download "$repo" || true
+            HF_HUB_CACHE="$hf_cache" hf download "$repo" || true
         fi
     else
         local dl_venv="/tmp/hf_dl_$$"
         python3 -m venv "$dl_venv" >/dev/null 2>&1
         "$dl_venv/bin/pip" install huggingface-hub -q >/dev/null 2>&1
         if [ -n "$filename" ]; then
-            "$dl_venv/bin/python" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='$repo', filename='$filename')" >/dev/null 2>&1 || true
+            HF_HUB_CACHE="$hf_cache" "$dl_venv/bin/python" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='$repo', filename='$filename')" >/dev/null 2>&1 || true
         else
-            "$dl_venv/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$repo')" || true
+            HF_HUB_CACHE="$hf_cache" "$dl_venv/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$repo')" || true
         fi
         rm -rf "$dl_venv"
     fi
@@ -1991,6 +2060,82 @@ prompt_download_model() {
         echo "Download cancelled. Run 'flashchat' again when ready."
         exit 0
     fi
+}
+
+prompt_restore_model_from_offload() {
+    local model_id model_repo offload_dir offloaded_repo local_repo
+    model_id=$(flashchat_get MODEL)
+    model_repo=$(flashchat_get MODEL_REPO)
+    offload_dir=$(flashchat_get OFFLOAD_DIR)
+
+    [ -n "$offload_dir" ] || return 1
+
+    if [[ "$offload_dir" != /* ]]; then
+        echo "Configured model offload directory is not an absolute path: $offload_dir"
+        echo "Skipping offload restore."
+        echo ""
+        return 1
+    fi
+
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id" 2>/dev/null || true)
+    [ -n "$offloaded_repo" ] || return 1
+    [ -d "$offloaded_repo" ] || return 1
+
+    if ! model_repo_can_restore "$model_id" "$offloaded_repo"; then
+        echo "A matching offload directory exists, but it does not contain a usable model snapshot:"
+        echo "$offloaded_repo"
+        echo ""
+        return 1
+    fi
+
+    local_repo=$(model_local_repo_dir "$model_id")
+    if [ -e "$local_repo" ]; then
+        echo "A matching offloaded model was found, but the local cache path already exists:"
+        echo "$local_repo"
+        echo ""
+        echo "Move or repair the incomplete local cache repo with './flashchat manage' before restoring."
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Offloaded Model Found ==="
+    echo ""
+    echo "Model not found locally, but an offloaded copy is available:"
+    echo "$offloaded_repo"
+    echo ""
+    echo "Restore it to the HuggingFace cache now?"
+    echo "Model: $model_repo"
+    read -p "Restore now? [Y/n] " -n 1 -r
+    echo ""
+
+    if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+        if ! reload_model_from_offload_repo "$model_id"; then
+            exit 1
+        fi
+        flashchat_load_config
+        return 0
+    fi
+
+    echo "Restore cancelled. Run 'flashchat' again when ready."
+    exit 0
+}
+
+prompt_model_restore_or_download() {
+    local required_message="$1"
+
+    echo ""
+    echo "=== Model Not Found ==="
+    echo ""
+    echo "The configured model is not in the HuggingFace cache."
+    echo ""
+
+    if prompt_restore_model_from_offload; then
+        return 0
+    fi
+
+    echo "$required_message"
+    echo ""
+    prompt_download_model
 }
 
 prompt_extract_weights() {
@@ -2241,7 +2386,7 @@ ensure_setup() {
         if check_model_extracted; then
             break
         fi
-        prompt_download_model
+        prompt_model_restore_or_download "Download is required before setup can continue."
         flashchat_load_config
     done
 
@@ -2710,13 +2855,7 @@ cmd_serve() {
             echo ""
             prompt_extract_setup
         else
-            echo ""
-            echo "=== Model Not Found ==="
-            echo ""
-            echo "The configured model is not in the HuggingFace cache."
-            echo "Download is required before starting the server."
-            echo ""
-            prompt_download_model
+            prompt_model_restore_or_download "Download is required before starting the server."
         fi
     fi
     
@@ -2847,13 +2986,7 @@ cmd_chat() {
             echo ""
             prompt_extract_setup
         else
-            echo ""
-            echo "=== Model Not Found ==="
-            echo ""
-            echo "The configured model is not in the HuggingFace cache."
-            echo "Download is required before starting chat."
-            echo ""
-            prompt_download_model
+            prompt_model_restore_or_download "Download is required before starting chat."
         fi
     fi
     
@@ -2912,13 +3045,7 @@ cmd_prompt() {
             echo ""
             prompt_extract_setup
         else
-            echo ""
-            echo "=== Model Not Found ==="
-            echo ""
-            echo "The configured model is not in the HuggingFace cache."
-            echo "Download is required before running prompts."
-            echo ""
-            prompt_download_model
+            prompt_model_restore_or_download "Download is required before running prompts."
         fi
     fi
     
@@ -3017,13 +3144,7 @@ interactive_menu() {
                 echo ""
                 prompt_extract_setup
             else
-                echo ""
-                echo "=== Model Not Found ==="
-                echo ""
-                echo "The configured model is not in the HuggingFace cache."
-                echo "Downloading is required before running."
-                echo ""
-                prompt_download_model
+                prompt_model_restore_or_download "Downloading is required before running."
             fi
         fi
     fi

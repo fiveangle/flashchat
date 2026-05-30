@@ -24,12 +24,64 @@
 # Note: Metal shaders are compiled from source at runtime via
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
 
+SHELL := /bin/bash
+
 BUILD_DIR = metal_infer
 
+ifeq ($(origin CC),default)
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
+endif
+OPT ?= aggressive
+
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
-LDFLAGS = -lpthread -lcompression
+BASE_CFLAGS = -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
+BASE_LDFLAGS = -lpthread -lcompression
+
+VALID_OPTS = aggressive conservative debug
+ifeq ($(filter $(OPT),$(VALID_OPTS)),)
+$(error Unknown OPT='$(OPT)'. Use one of: $(VALID_OPTS))
+endif
+
+cc-option = $(strip $(shell tmp=$$(mktemp /tmp/flashchat-cc-option.XXXXXX); \
+	printf 'int main(void){return 0;}\n' | $(CC) -x objective-c $(BASE_CFLAGS) $(1) -c -o "$$tmp" - >/dev/null 2>&1 && printf '%s' '$(1)'; \
+	rm -f "$$tmp"))
+
+link-option = $(strip $(shell tmp=$$(mktemp /tmp/flashchat-link-option.XXXXXX); rm -f "$$tmp"; \
+	printf 'int main(void){return 0;}\n' | $(CC) -x objective-c $(BASE_CFLAGS) $(BASE_LDFLAGS) $(1) -o "$$tmp" - >/dev/null 2>&1 && printf '%s' '$(1)'; \
+	rm -f "$$tmp"))
+
+APPLE_CPU_NAME = $(shell sysctl -n machdep.cpu.brand_string 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed -n 's/^apple \([a-z0-9]*\).*/\1/p')
+DETECTED_MCPU_FLAG = $(if $(APPLE_CPU_NAME),-mcpu=apple-$(APPLE_CPU_NAME))
+CPU_CFLAGS := $(call cc-option,-mcpu=native)
+ifeq ($(CPU_CFLAGS),)
+CPU_CFLAGS := $(call cc-option,$(DETECTED_MCPU_FLAG))
+endif
+
+AGGRESSIVE_LTO = $(call link-option,-flto)
+AGGRESSIVE_EXTRA_CFLAGS = \
+	$(call cc-option,-ffast-math) \
+	$(call cc-option,-funroll-loops) \
+	$(call cc-option,-fvectorize) \
+	$(call cc-option,-fslp-vectorize) \
+	$(call cc-option,-ftree-vectorize) \
+	$(call cc-option,-falign-functions=16)
+
+ifeq ($(OPT),aggressive)
+OPT_CFLAGS = -O3 $(CPU_CFLAGS) $(AGGRESSIVE_LTO) $(AGGRESSIVE_EXTRA_CFLAGS)
+OPT_LDFLAGS = $(AGGRESSIVE_LTO)
+endif
+ifeq ($(OPT),conservative)
+OPT_CFLAGS = -O2 $(CPU_CFLAGS)
+OPT_LDFLAGS =
+endif
+ifeq ($(OPT),debug)
+OPT_CFLAGS = -O0 -g $(CPU_CFLAGS)
+OPT_LDFLAGS =
+endif
+
+CFLAGS = $(BASE_CFLAGS) $(OPT_CFLAGS)
+LDFLAGS = $(BASE_LDFLAGS) $(OPT_LDFLAGS)
+CHAT_CFLAGS = $(if $(filter debug,$(OPT)),-O0 -g,-O2 $(CPU_CFLAGS)) -Wall -fobjc-arc
 
 TARGET = $(BUILD_DIR)/metal_infer
 MAIN_SRC = $(BUILD_DIR)/main.m
@@ -51,7 +103,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke test
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -92,6 +144,13 @@ help:
 	@printf "  make chat          Build interactive chat client\n"
 	@printf "  make build-chat    Alias for chat\n"
 	@printf "  make metallib      Precompile Metal shaders\n"
+	@printf "  make print-build-config  Show compiler and optimization settings\n"
+	@printf "\n"
+	@printf "Build options:\n"
+	@printf "  OPT=aggressive     Fastest probed local build (default)\n"
+	@printf "  OPT=conservative   Native CPU, fewer risky optimization flags\n"
+	@printf "  OPT=debug          Debug symbols, no speed-oriented flags\n"
+	@printf "  CC=clang           Override compiler command\n"
 	@printf "\n"
 	@printf "Run:\n"
 	@printf "  make infer-run     Run a short inference prompt\n"
@@ -121,6 +180,18 @@ help:
 	@printf "  make clean-venv    Remove Python setup virtual environment\n"
 	@printf "  make distclean     Remove build artifacts, repo-local ./debug, and setup venv\n"
 
+print-build-config:
+	@printf "Compiler command: %s\n" "$(CC)"
+	@printf "Compiler path: "
+	@command -v $(firstword $(CC)) 2>/dev/null || printf "%s\n" "$(firstword $(CC))"
+	@$(CC) --version | head -1
+	@printf "Optimization profile: %s\n" "$(OPT)"
+	@printf "Detected CPU: %s\n" "$$(sysctl -n machdep.cpu.brand_string 2>/dev/null || printf unknown)"
+	@printf "CPU flags: %s\n" "$(CPU_CFLAGS)"
+	@printf "CFLAGS: %s\n" "$(CFLAGS)"
+	@printf "LDFLAGS: %s\n" "$(LDFLAGS)"
+	@printf "CHAT_CFLAGS: %s\n" "$(CHAT_CFLAGS)"
+
 metal_infer: $(TARGET)
 
 infer: $(INFER_TARGET)
@@ -129,6 +200,7 @@ chat: $(CHAT_TARGET)
 
 # Build the binary (shaders compiled at runtime from source)
 $(TARGET): $(MAIN_SRC) $(SHADER_SRC)
+	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(MAIN_SRC) -o $(TARGET)
 
 # Optional: pre-compile shaders (not required — runtime compilation is the default)
@@ -142,11 +214,13 @@ $(SHADER_LIB): $(SHADER_AIR)
 
 # Build the inference engine
 $(INFER_TARGET): $(INFER_SRC)
+	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
 # Build the chat client (thin HTTP/SSE client + linenoise line editor)
 $(CHAT_TARGET): $(CHAT_SRC) $(LINENOISE_SRC) $(LINENOISE_HDR)
-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) $(LINENOISE_SRC) -o $(CHAT_TARGET)
+	@$(MAKE) --no-print-directory print-build-config
+	$(CC) $(CHAT_CFLAGS) -framework Foundation $(CHAT_SRC) $(LINENOISE_SRC) -o $(CHAT_TARGET)
 
 clean: archive-debug
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)

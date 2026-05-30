@@ -150,7 +150,7 @@ The render path parses an OpenAI-compatible request and writes the exact native 
 
 View and edit settings. If no config exists, defaults are used automatically. The reset option allows you to reconfigure while preserving chat sessions.
 
-The configuration wizard selects from the models in `assets/model_configs.json` and shows the local setup state for each model, including downloaded HuggingFace files and generated files under `<model>/flashchat/`.
+The configuration wizard selects from the models in `assets/model_configs.json` and shows the local setup state for each model, including downloaded HuggingFace files and generated files under `<model>/flashchat/`. By default Flashchat uses the standard HuggingFace hub cache at `~/.cache/huggingface/hub`; set `HUGGINGFACE_CACHE_DIR` in the config if your model cache lives somewhere else.
 
 ### Models
 
@@ -177,7 +177,7 @@ Available storage actions:
 - Fully reload an offloaded model back to the local HuggingFace cache
 - Restore only the generated `<model>/flashchat/` runtime files from offload storage
 
-Destructive actions require typing the exact model ID. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
+Destructive actions require typing the exact model ID. Local model storage uses one global HuggingFace hub cache directory configured as `HUGGINGFACE_CACHE_DIR`, defaulting to `~/.cache/huggingface/hub`. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
 
 ### Status
 
@@ -212,6 +212,7 @@ Configuration is loaded from (priority highest to lowest):
 | `FLASHCHAT_MODEL` | Supported model ID | `qwen3.6-35B-A3B` |
 | `FLASHCHAT_MODEL_CONFIG` | Model registry path, including the default model and active setup scripts | `assets/model_configs.json` |
 | `FLASHCHAT_MODEL_PATH` | Override model path | Auto-detected |
+| `FLASHCHAT_HUGGINGFACE_CACHE_DIR` | HuggingFace hub cache directory for local model repos | `~/.cache/huggingface/hub` |
 | `FLASHCHAT_OFFLOAD_DIR` | Unified root for offloaded HuggingFace model cache repos | unset |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
 | `FLASHCHAT_SERVER_HOST` | Server host | `127.0.0.1` |
@@ -227,6 +228,7 @@ Configuration is loaded from (priority highest to lowest):
 MODEL="qwen3.6-35B-A3B"
 
 # Storage Settings
+HUGGINGFACE_CACHE_DIR="${HOME}/.cache/huggingface/hub"
 OFFLOAD_DIR=""
 
 # Generation Defaults
@@ -317,6 +319,19 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stream": false
   }'
 ```
+
+## Build Optimization Profiles
+
+Flashchat defaults to the fastest probed local build profile because the Metal shaders and native binaries are rebuilt for the machine running the model.
+
+```bash
+make print-build-config
+make
+make OPT=conservative
+make OPT=debug
+```
+
+`OPT=aggressive` is the default and uses supported native CPU, LTO, fast-math, vectorization, unroll, and alignment flags. `OPT=conservative` keeps native CPU tuning but skips the riskier speed flags for troubleshooting. `OPT=debug` builds with debug symbols and no speed-oriented flags.
 
 ## API Smoke Test
 
