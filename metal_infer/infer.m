@@ -422,9 +422,11 @@ static uint8_t g_expert_seen[MAX_NUM_LAYERS][MAX_NUM_EXPERTS / 8];  // bitset: s
 
 // Async pread state defined after InferPreadTask (see below)
 
+__attribute__((unused))
 static inline int expert_is_seen(int layer, int expert) {
     return (g_expert_seen[layer][expert >> 3] >> (expert & 7)) & 1;
 }
+__attribute__((unused))
 static inline void expert_mark_seen(int layer, int expert) {
     g_expert_seen[layer][expert >> 3] |= (1 << (expert & 7));
 }
@@ -1967,6 +1969,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 // Encode one expert forward using multi-expert slot k.
 // Expert data must already be in buf_multi_expert_data[k].
 // Input must already be in buf_multi_expert_input.
+__attribute__((unused))
 static void gpu_encode_expert_forward_slot(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
@@ -2062,6 +2065,7 @@ static void gpu_encode_expert_forward_slot(
 // Expert data must already be in data_buf.
 // Input must already be in buf_multi_expert_input.
 // Uses slot k's gate/up/act/out scratch buffers.
+__attribute__((unused))
 static void gpu_encode_expert_forward_slot_buf(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
@@ -2852,9 +2856,7 @@ static void linear_attention_forward(
         return;
     }
 
-    static int la_debug_count = 0;
-    la_debug_count++;
-    int la_debug = 0;  // set to (la_debug_count <= N) to enable debug
+    int la_debug = 0;
 
     if (la_debug) {
         fprintf(stderr, "[LA-DBG] layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -3422,6 +3424,7 @@ typedef struct {
     int thread_id;
 } InferPreadThreadArg;
 
+__attribute__((unused))
 static void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
     for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
@@ -3537,6 +3540,7 @@ static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+    (void)mmap_base;
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
@@ -3586,6 +3590,7 @@ static void io_pool_shutdown(void) {
 
 // Parallel pread of K experts into Metal buffers using pthreads.
 // Returns number of successfully loaded experts, sets valid[] flags.
+__attribute__((unused))
 static int parallel_pread_experts(
     int packed_fd,
     int *expert_indices,
@@ -3622,6 +3627,7 @@ static int parallel_pread_experts(
 // Parallel pread into explicit buffer set (for double buffering).
 // Same as parallel_pread_experts but reads into caller-specified MTLBuffers.
 // ============================================================================
+__attribute__((unused))
 static int parallel_pread_experts_into(
     int packed_fd,
     int *expert_indices,
@@ -4046,6 +4052,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
 
 // Build I/O plan on main thread (ARC-safe: extracts void* from id<MTLBuffer>),
 // then signal background prefetch thread.
+__attribute__((unused))
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                   int *expert_indices, int K,
                                   id<MTLBuffer> __strong *dst_bufs) {
@@ -4068,6 +4075,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
 
 // Wait for background prefetch to complete. Returns number of loaded experts.
 // Copies valid[] flags into caller's array.
+__attribute__((unused))
 static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
     pthread_mutex_lock(&pf->mutex);
     while (!pf->done) {
@@ -4084,6 +4092,7 @@ static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
 static InferPrefetchCtx *g_prefetch = NULL;
 static pthread_t g_prefetch_tid;
 
+__attribute__((unused))
 static void infer_prefetch_init(void) {
     if (g_prefetch) return;
     g_prefetch = calloc(1, sizeof(InferPrefetchCtx));
@@ -4093,6 +4102,7 @@ static void infer_prefetch_init(void) {
     pthread_create(&g_prefetch_tid, NULL, infer_prefetch_thread_fn, g_prefetch);
 }
 
+__attribute__((unused))
 static void infer_prefetch_shutdown(void) {
     if (!g_prefetch) return;
     pthread_mutex_lock(&g_prefetch->mutex);
@@ -6844,6 +6854,7 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
 
 // Save a conversation turn to ~/.config/flashchat/sessions/<session_id>.jsonl
 // Shared data store with the chat client.
+__attribute__((unused))
 static void server_save_turn(const char *session_id, const char *role, const char *content) {
     if (!session_id || !session_id[0] || !content) return;
     const char *home = getenv("HOME");
@@ -6888,6 +6899,7 @@ static void server_save_turn(const char *session_id, const char *role, const cha
 
 // Extract "session_id" string from JSON body. Copies into out_buf (max out_size).
 // Returns 1 if found, 0 if missing.
+__attribute__((unused))
 static int extract_session_id(const char *buf, char *out_buf, int out_size) {
     const char *p = strstr(buf, "\"session_id\"");
     if (!p) return 0;
@@ -7004,6 +7016,7 @@ static char *extract_tool_results(const char *buf) {
 }
 
 // Check if request contains tool results (continuing after tool call)
+__attribute__((unused))
 static int has_tool_results(const char *buf) {
     return extract_tool_results(buf) != NULL;
 }
@@ -7727,6 +7740,7 @@ static char *build_responses_json(const char *response_id, const char *model,
 
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+__attribute__((unused))
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
@@ -7743,6 +7757,7 @@ static PromptTokens *tokenize_user_turn(const char *user_content) {
 // Tokenize a continuation turn for session caching.
 // Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
 // Used when the KV cache already contains the prior conversation state.
+__attribute__((unused))
 static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
@@ -7837,6 +7852,7 @@ static char *build_tool_instructions(ToolDef *tools, int tool_count) {
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
+__attribute__((unused))
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
     if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
@@ -7874,6 +7890,7 @@ static PromptTokens *tokenize_chat_message_old(const char *user_content) {
 
 // The main serve loop. Model state must already be initialized.
 // Sync CPU linear attention state → GPU buffers
+__attribute__((unused))
 static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
     if (!g_metal || !g_metal->delta_net_step || !layer_states) return;
     int li = 0;
@@ -7893,6 +7910,7 @@ static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
     }
 }
 
+__attribute__((unused))
 static void clear_runtime_state_serve(void **layer_states, KVCache **kv_caches) {
     size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
@@ -8793,6 +8811,7 @@ static int cache_roundtrip_test(void) {
     if (g_system_prompt_cache_max_entries <= 0) g_system_prompt_cache_max_entries = 6;
 
     int failures = 0;
+    uint64_t hash = 0xCAFEBABE12345678ULL;
     fprintf(stderr, "[cache-roundtrip] model=%s layers=%d full=%d linear=%d\n",
             g_cfg.model_id, g_cfg.num_layers, g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
 
@@ -8850,7 +8869,6 @@ static int cache_roundtrip_test(void) {
         }
     }
 
-    uint64_t hash = 0xCAFEBABE12345678ULL;
     int save_rc = save_system_prompt_disk_cache(tmp_dir, hash, token_count,
                                                 kv_orig, conv_orig, ssm_orig,
                                                 gpu_delta_dummy, gpu_conv_dummy);

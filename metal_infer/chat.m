@@ -294,7 +294,7 @@ typedef struct {
     int pending_len;
 } MdState;
 
-static MdState g_md = {0, 0, 0, 0, 1, {0}, 0};
+static MdState g_md = {0, 0, 0, 0, 0, 1, {0}, 0};
 
 static void md_reset(void) {
     memset(&g_md, 0, sizeof(g_md));

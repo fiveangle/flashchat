@@ -1055,6 +1055,7 @@ static void encode_expert_compute(
 // Encode weighted sum of K expert outputs into a command buffer
 // ============================================================================
 
+__attribute__((unused))
 static void encode_weighted_sum(
     MetalContext *ctx,
     id<MTLCommandBuffer> cmdbuf,
@@ -1198,16 +1199,8 @@ static FullForwardTiming run_full_forward(
         per_k_act[k]  = metal_buf_shared(ctx, g_cfg.moe_intermediate * sizeof(float));
         per_k_out[k]  = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
     }
-    // Keep originals for compatibility
-    id<MTLBuffer> gate_out = per_k_gate[0];
-    id<MTLBuffer> up_out   = per_k_up[0];
-    id<MTLBuffer> act_out  = per_k_act[0];
-
     // Stacked expert outputs for weighted combination
     id<MTLBuffer> stacked = metal_buf_shared(ctx, K * g_cfg.hidden_dim * sizeof(float));
-
-    // Per-expert output buffer (unused now — using per_k_out instead)
-    id<MTLBuffer> expert_out = per_k_out[0];
 
     // Hidden state buffer (h): starts with input, accumulates residual per layer
     id<MTLBuffer> h_buf = metal_buf_shared(ctx, g_cfg.hidden_dim * sizeof(float));
