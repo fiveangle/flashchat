@@ -6474,6 +6474,33 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
+// Scan a message's content for the froggeric think-toggle tags. Returns:
+//   1  if `<|think_on|>` was found (caller flips reasoning on)
+//  -1  if `<|think_off|>` was found (caller flips reasoning off)
+//   0  if neither tag is present
+// The matching tag is stripped from `*content_io` in place. If both tags are
+// present, the LAST one wins (matches froggeric's interception order).
+static int extract_think_toggle(NSMutableString *content_io) {
+    if (!content_io) return 0;
+    int result = 0;
+    NSRange on_range = [content_io rangeOfString:@"<|think_on|>" options:NSBackwardsSearch];
+    NSRange off_range = [content_io rangeOfString:@"<|think_off|>" options:NSBackwardsSearch];
+    if (on_range.location != NSNotFound && (off_range.location == NSNotFound || on_range.location > off_range.location)) {
+        result = 1;
+    } else if (off_range.location != NSNotFound) {
+        result = -1;
+    }
+    [content_io replaceOccurrencesOfString:@"<|think_on|>"
+                                withString:@""
+                                   options:0
+                                     range:NSMakeRange(0, [content_io length])];
+    [content_io replaceOccurrencesOfString:@"<|think_off|>"
+                                withString:@""
+                                   options:0
+                                     range:NSMakeRange(0, [content_io length])];
+    return result;
+}
+
 // Assemble the system block in native Qwen3 order, matching chat_template.jinja:
 // the tool-instruction block (`# Tools` ... `</IMPORTANT>`) comes FIRST, then
 // `\n\n` + user system content. The model was post-trained with the tool
@@ -6637,59 +6664,48 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     NSMutableString *system_prompt = [NSMutableString string];
     NSMutableString *conversation = [NSMutableString string];
 
-    // Compute last_query_index per chat_template.jinja's `multi_step_tool`
-    // logic. Walking the message list in reverse, the last `user` message
-    // whose content is NOT `<tool_response>...</tool_response>`-wrapped is
-    // the user's most recent real query. Assistant turns AFTER this index
-    // (i.e., the rolling-checkpoint window — typically the recent
-    // tool-calling turns whose results we are now responding to) MUST
-    // preserve their `<think>...</think>` wrapping, even if reasoning is
-    // empty. The model was post-trained to expect `<|im_start|>assistant\n
-    // <think>\n...\n</think>\n\n<content>` for those turns; emitting bare
-    // content without the think pair leaves the model out of distribution
-    // and produces premature-EOS / repetitive-thinking failures on the
-    // follow-up generation. Older assistant turns get think markers
-    // stripped to keep the context compact.
-    NSInteger last_query_index = (NSInteger)[messages count] - 1;
-    {
-        BOOL multi_step_tool = YES;
-        for (NSInteger i = (NSInteger)[messages count] - 1; i >= 0 && multi_step_tool; i--) {
-            NSDictionary *m = messages[i];
-            if (![m isKindOfClass:[NSDictionary class]]) continue;
-            NSString *r = m[@"role"] ?: @"user";
-            if (![r isEqualToString:@"user"]) continue;
-            NSString *c = flatten_content_value(m[@"content"]) ?: @"";
-            NSString *trimmed = [c stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            BOOL is_tool_response = ([trimmed hasPrefix:@"<tool_response>"] && [trimmed hasSuffix:@"</tool_response>"]);
-            if (!is_tool_response) {
-                multi_step_tool = NO;
-                last_query_index = i;
-            }
-        }
-    }
+    // froggeric v18/v19 "preserve_thinking" + "abolish empty think". Past
+    // assistant turns are rendered with whatever `<think>...</think>` content
+    // they were originally generated with — we never strip non-empty thinking
+    // and we never inject empty `<think>\n</think>` as a placeholder. The
+    // older behavior (strip on old turns, wrap empty on recent turns) created
+    // KV-cache invalidation every turn and trained the model in-context to
+    // associate empty think blocks with imminent tool calls, producing 80%+
+    // premature `<|im_end|>` aborts.
 
     NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
-    NSInteger msg_index = -1;
     for (NSDictionary *msg in messages) {
-        msg_index++;
         if (![msg isKindOfClass:[NSDictionary class]]) continue;
         NSString *role = msg[@"role"] ?: @"user";
         // chat_template.jinja line 82: `set content = render_content(...)|trim`.
         // Apply the same trim per message so structural newlines around tags
         // come from the template, not from incidental client formatting.
-        NSString *content = [flatten_content_value(msg[@"content"]) stringByTrimmingCharactersInSet:ws];
-        if ([role isEqualToString:@"system"]) {
+        NSMutableString *content_buf = [NSMutableString stringWithString:
+            [flatten_content_value(msg[@"content"]) stringByTrimmingCharactersInSet:ws]];
+        // froggeric thinking-toggle interception: if the message embeds
+        // `<|think_on|>` or `<|think_off|>`, flip the reasoning flag and
+        // strip the tag before the model ever sees it.
+        int toggle = extract_think_toggle(content_buf);
+        if (toggle != 0) {
+            req->reasoning_explicit = 1;
+            req->reasoning_enabled = (toggle > 0) ? 1 : 0;
+        }
+        NSString *content = [content_buf stringByTrimmingCharactersInSet:ws];
+        // froggeric "developer" role support: modern OpenAI-compatible APIs
+        // use `developer` for system-level instructions on reasoning models.
+        // Fold it into the system prompt block.
+        if ([role isEqualToString:@"system"] || [role isEqualToString:@"developer"]) {
             if ([system_prompt length] > 0) [system_prompt appendString:@"\n\n"];
             [system_prompt appendString:content ?: @""];
             continue;
         }
         if ([role isEqualToString:@"assistant"]) {
-            // Per chat_template.jinja: extract reasoning_content either from
-            // an explicit `reasoning_content` string field (OpenAI-style
-            // separated reasoning) or by splitting `content` on </think>
-            // tags. After extraction, if this turn is in the rolling-checkpoint
-            // window, wrap the body with <think>\n{reasoning}\n</think>\n\n
-            // markers; otherwise emit bare body (legacy turn, think stripped).
+            // Extract reasoning either from an explicit `reasoning_content`
+            // field (OpenAI separated form) or by splitting `content` on
+            // <think>...</think>. Past assistant turns are always rendered
+            // with whatever they originally produced — non-empty reasoning
+            // is preserved verbatim, empty reasoning emits NO think markers
+            // at all (v19 "abolish empty think").
             NSString *reasoning = nil;
             NSString *body = content ?: @"";
             id raw_reasoning = msg[@"reasoning_content"];
@@ -6714,12 +6730,10 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
             reasoning = [reasoning stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
             NSMutableString *assistant = [NSMutableString string];
-            if (msg_index > last_query_index) {
+            if ([reasoning length] > 0) {
                 [assistant appendFormat:@"<think>\n%@\n</think>\n\n", reasoning];
-                [assistant appendString:body];
-            } else {
-                [assistant appendString:body];
             }
+            [assistant appendString:body];
             append_assistant_tool_calls(assistant, msg[@"tool_calls"]);
             append_chat_turn(conversation, @"assistant", assistant);
             continue;

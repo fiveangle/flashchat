@@ -139,6 +139,86 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
+# ----- froggeric v19 chat-template fixes: renderer correctness -----
+# Build a second request that exercises: developer role, <|think_off|> toggle,
+# preserved <think> on old assistant turn, empty-reasoning new assistant turn.
+
+V19_REQUEST_JSON="${TMPDIR}/v19_request.json"
+V19_RENDER_DIR="${TMPDIR}/v19_rendered"
+
+python3 - "$V19_REQUEST_JSON" <<'PY'
+import json, sys
+request = {
+    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "stream": False,
+    "messages": [
+        {"role": "developer", "content": "Developer-supplied instructions: V19_DEV_MARKER"},
+        {"role": "system", "content": "You are validating the v19 fixes."},
+        {"role": "user", "content": "First user question. <|think_off|>"},
+        {"role": "assistant", "content": "<think>\nOLD_REASONING_MARKER\n</think>\n\nFirst answer."},
+        {"role": "user", "content": "Try the tool please."},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "record_result",
+             "arguments": {"result": "x", "count": 1, "ok": True, "items": []}}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+    ],
+    "tools": [{"type": "function", "function": {
+        "name": "record_result",
+        "description": "Record a result.",
+        "parameters": {"type": "object", "properties": {
+            "result": {"type": "string"}, "count": {"type": "integer"},
+            "ok": {"type": "boolean"}, "items": {"type": "array", "items": {"type": "string"}}
+        }, "required": ["result", "count", "ok", "items"]}
+    }}],
+    "tool_choice": "auto"
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_REQUEST_JSON" --render-output "$V19_RENDER_DIR" >/dev/null 2>&1
+
+V19_SYS="${V19_RENDER_DIR}/system_prompt.txt"
+V19_CONV="${V19_RENDER_DIR}/conversation.txt"
+V19_FULL="${V19_RENDER_DIR}/assembled_prompt.txt"
+
+assert_contains "developer role folded into system prompt" "V19_DEV_MARKER" "$V19_SYS"
+
+# think_off toggle was present in a user message: reasoning should be OFF,
+# so the generation prompt MUST contain the empty think block (generation
+# prefix only — past turns must not).
+if grep -q "<|im_start|>assistant" "$V19_FULL" && \
+   tail -c 60 "$V19_FULL" | grep -q "<think>"; then
+    assert_pass "think_off toggle flips generation prompt to reasoning-off form"
+else
+    assert_fail "think_off toggle flips generation prompt to reasoning-off form" \
+        "expected empty-think prefix at end of assembled_prompt.txt"
+fi
+
+# v19 abolishes empty think on past assistant turns. The tool-calling
+# assistant turn has empty reasoning — it MUST NOT render
+# `<think>\n\n</think>` followed by past-turn content. The ONLY allowed
+# occurrence of an empty `<think></think>` is the reasoning-off generation
+# prefix, which lives at the end of the file. We strip the trailing
+# generation prefix in Python (grep is line-oriented and cannot match the
+# multi-line pattern).
+if python3 - "$V19_CONV" <<'PY'
+import sys
+src = open(sys.argv[1], "r").read()
+idx = src.rfind("<|im_start|>assistant")
+past = src[:idx] if idx >= 0 else src
+sys.exit(0 if "<think>\n\n</think>" in past else 1)
+PY
+then
+    assert_fail "no empty-<think> wrapping on past assistant turns" \
+        "found '<think>\\n\\n</think>' in past-turn-only slice"
+else
+    assert_pass "no empty-<think> wrapping on past assistant turns"
+fi
+
+assert_contains "preserve_thinking keeps old assistant reasoning" "OLD_REASONING_MARKER" "$V19_CONV"
+
 cat > "$TOOL_CALL_TXT" <<'EOF'
 some leading text
 <tool_call>
