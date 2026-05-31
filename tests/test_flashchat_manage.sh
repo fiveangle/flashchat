@@ -181,12 +181,32 @@ assert_not_exists "full reload removes offload copy" "$OFFLOADED_REPO"
 reset_storage
 output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
 assert_contains "startup restore setup offloads model" "Model offloaded" "$output"
-output=$(run_flashchat "y\nq\n")
+output=$(run_flashchat "\nq\n")
 assert_contains "startup restore offers offload copy" "Offloaded Model Found" "$output"
+assert_contains "startup restore offers offload run" "Run from offload directory" "$output"
 assert_contains "startup restore reloads model" "Model fully reloaded" "$output"
 assert_not_contains "startup restore skips HF download prompt" "Model Download Required" "$output"
 assert_exists "startup restore creates local repo" "$LOCAL_REPO"
 assert_not_exists "startup restore consumes offload repo" "$OFFLOADED_REPO"
+
+reset_storage
+output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
+assert_contains "startup offload run setup offloads model" "Model offloaded" "$output"
+output=$(run_flashchat "u\nq\n")
+assert_contains "startup offload run offers offload copy" "Offloaded Model Found" "$output"
+assert_contains "startup offload run uses offloaded model" "Using offloaded model for this run" "$output"
+assert_not_contains "startup offload run skips HF download prompt" "Model Download Required" "$output"
+assert_not_exists "startup offload run leaves local repo absent" "$LOCAL_REPO"
+assert_exists "startup offload run keeps offload repo" "$OFFLOADED_REPO"
+
+reset_storage
+output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
+mkdir -p "$LOCAL_REPO"
+output=$(run_flashchat "y\nq\n")
+assert_contains "startup offload collision reports reload unavailable" "Reloading to the HuggingFace cache is unavailable" "$output"
+assert_contains "startup offload collision uses offloaded model" "Using offloaded model for this run" "$output"
+assert_exists "startup offload collision keeps local repo" "$LOCAL_REPO"
+assert_exists "startup offload collision keeps offload repo" "$OFFLOADED_REPO"
 
 reset_storage
 mkdir -p "$OFFLOADED_REPO"

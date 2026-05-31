@@ -31,7 +31,7 @@ BUILD_DIR = metal_infer
 ifeq ($(origin CC),default)
 CC = clang
 endif
-OPT ?= aggressive
+OPT ?= conservative
 
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 BASE_CFLAGS = -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK

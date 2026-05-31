@@ -1092,6 +1092,27 @@ reload_model_from_offload_repo() {
     echo "Model fully reloaded."
 }
 
+use_model_from_offload_repo() {
+    local model_id="$1"
+    local offloaded_repo snapshot
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    if [ ! -d "$offloaded_repo" ]; then
+        echo "Offloaded model is not present."
+        return 1
+    fi
+    snapshot=$(latest_snapshot_in_repo "$offloaded_repo" 2>/dev/null || true)
+    if [ -z "$snapshot" ]; then
+        echo "Offloaded model has no snapshot directory."
+        return 1
+    fi
+    export FLASHCHAT_MODEL_PATH="$snapshot"
+    export FLASHCHAT_WEIGHTS_DIR="${snapshot}/flashchat"
+    export FLASHCHAT_EXPERTS_DIR="${snapshot}/flashchat/packed_experts"
+    flashchat_load_config
+    echo "Using offloaded model for this run."
+    echo "$snapshot"
+}
+
 confirm_exact_model_id() {
     local model_id="$1"
     local prompt="${2:-Type the exact model ID to continue}"
@@ -2063,7 +2084,7 @@ prompt_download_model() {
 }
 
 prompt_restore_model_from_offload() {
-    local model_id model_repo offload_dir offloaded_repo local_repo
+    local model_id model_repo offload_dir offloaded_repo local_repo local_collision
     model_id=$(flashchat_get MODEL)
     model_repo=$(flashchat_get MODEL_REPO)
     offload_dir=$(flashchat_get OFFLOAD_DIR)
@@ -2089,12 +2110,9 @@ prompt_restore_model_from_offload() {
     fi
 
     local_repo=$(model_local_repo_dir "$model_id")
+    local_collision=0
     if [ -e "$local_repo" ]; then
-        echo "A matching offloaded model was found, but the local cache path already exists:"
-        echo "$local_repo"
-        echo ""
-        echo "Move or repair the incomplete local cache repo with './flashchat manage' before restoring."
-        exit 1
+        local_collision=1
     fi
 
     echo ""
@@ -2103,12 +2121,44 @@ prompt_restore_model_from_offload() {
     echo "Model not found locally, but an offloaded copy is available:"
     echo "$offloaded_repo"
     echo ""
-    echo "Restore it to the HuggingFace cache now?"
     echo "Model: $model_repo"
-    read -p "Restore now? [Y/n] " -n 1 -r
     echo ""
 
-    if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+    if [ "$local_collision" -eq 1 ]; then
+        echo "A matching offloaded model was found, but the local cache path already exists:"
+        echo "$local_repo"
+        echo ""
+        echo "Reloading to the HuggingFace cache is unavailable until that path is repaired or moved."
+        echo "Run from the offloaded copy instead?"
+        read -p "Run from offload? [y/N] " -n 1 -r
+        echo ""
+
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if ! use_model_from_offload_repo "$model_id"; then
+                exit 1
+            fi
+            return 0
+        fi
+
+        echo "Cancelled. Run 'flashchat' again when ready."
+        exit 0
+    fi
+
+    echo "Choose how to use it:"
+    echo "  [R] Reload to HuggingFace cache (default)"
+    echo "  [U] Run from offload directory for this launch"
+    echo "  [C] Cancel"
+    read -p "Selection [R/u/c] " -n 1 -r
+    echo ""
+
+    if [[ $REPLY =~ ^[Uu]$ ]]; then
+        if ! use_model_from_offload_repo "$model_id"; then
+            exit 1
+        fi
+        return 0
+    fi
+
+    if [[ $REPLY =~ ^[Rr]$ ]] || [ -z "$REPLY" ]; then
         if ! reload_model_from_offload_repo "$model_id"; then
             exit 1
         fi
@@ -2116,7 +2166,7 @@ prompt_restore_model_from_offload() {
         return 0
     fi
 
-    echo "Restore cancelled. Run 'flashchat' again when ready."
+    echo "Cancelled. Run 'flashchat' again when ready."
     exit 0
 }
 
