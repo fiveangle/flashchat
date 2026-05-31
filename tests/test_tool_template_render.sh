@@ -139,9 +139,10 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
-# ----- froggeric v19 chat-template fixes: renderer correctness -----
+# ----- froggeric v19 chat-template fixes -----
 # Build a second request that exercises: developer role, <|think_off|> toggle,
-# preserved <think> on old assistant turn, empty-reasoning new assistant turn.
+# preserved <think> on old assistant turn, empty-reasoning new assistant turn,
+# and a Tier-2 tool-error escalation (2 consecutive errors).
 
 V19_REQUEST_JSON="${TMPDIR}/v19_request.json"
 V19_RENDER_DIR="${TMPDIR}/v19_rendered"
@@ -161,7 +162,12 @@ request = {
             {"id": "c1", "function": {"name": "record_result",
              "arguments": {"result": "x", "count": 1, "ok": True, "items": []}}}
         ]},
-        {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+        {"role": "tool", "tool_call_id": "c1", "content": "{\"error\": \"missing parameter description\"}"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c2", "function": {"name": "record_result",
+             "arguments": {"result": "x", "count": 1, "ok": True, "items": []}}}
+        ]},
+        {"role": "tool", "tool_call_id": "c2", "content": "Traceback (most recent call last):\n  File X line 1\nValueError: again"}
     ],
     "tools": [{"type": "function", "function": {
         "name": "record_result",
@@ -196,8 +202,8 @@ else
         "expected empty-think prefix at end of assembled_prompt.txt"
 fi
 
-# v19 abolishes empty think on past assistant turns. The tool-calling
-# assistant turn has empty reasoning — it MUST NOT render
+# v19 abolishes empty think on past assistant turns. The two tool-calling
+# assistant turns have empty reasoning — they MUST NOT render
 # `<think>\n\n</think>` followed by past-turn content. The ONLY allowed
 # occurrence of an empty `<think></think>` is the reasoning-off generation
 # prefix, which lives at the end of the file. We strip the trailing
@@ -218,6 +224,117 @@ else
 fi
 
 assert_contains "preserve_thinking keeps old assistant reasoning" "OLD_REASONING_MARKER" "$V19_CONV"
+
+# Tier-2 escalation: 2 consecutive tool errors -> <IMPORTANT> directive in the
+# user turn carrying the LAST tool_response (the Traceback). Should not appear
+# attached to the first error.
+if grep -q "twice in a row" "$V19_CONV"; then
+    assert_pass "Tier-2 IMPORTANT directive injected after second tool error"
+else
+    assert_fail "Tier-2 IMPORTANT directive injected after second tool error" \
+        "expected 'twice in a row' marker in conversation.txt"
+fi
+# The directive must be inside the LAST tool_response user turn, not the first.
+tier2_offset=$(grep -b -m1 'twice in a row' "$V19_CONV" | cut -d: -f1)
+last_resp_offset=$(grep -b 'Traceback' "$V19_CONV" | tail -1 | cut -d: -f1)
+first_resp_offset=$(grep -b 'missing parameter description' "$V19_CONV" | head -1 | cut -d: -f1)
+if [[ -n "$tier2_offset" && -n "$last_resp_offset" && -n "$first_resp_offset" \
+      && "$tier2_offset" -gt "$last_resp_offset" \
+      && "$tier2_offset" -gt "$first_resp_offset" ]]; then
+    assert_pass "Tier-2 directive placed after the most recent tool_response"
+else
+    assert_fail "Tier-2 directive placed after the most recent tool_response" \
+        "tier2=$tier2_offset last=$last_resp_offset first=$first_resp_offset"
+fi
+
+# ----- Tier-1 escalation (single error) -----
+V19_TIER1_JSON="${TMPDIR}/v19_tier1_request.json"
+V19_TIER1_DIR="${TMPDIR}/v19_tier1_rendered"
+
+python3 - "$V19_TIER1_JSON" <<'PY'
+import json, sys
+request = {
+    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "stream": False,
+    "messages": [
+        {"role": "user", "content": "Try the tool."},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "record_result",
+             "arguments": {"result": "x", "count": 1, "ok": True, "items": []}}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{\"error\": \"bad param\"}"}
+    ],
+    "tools": [{"type": "function", "function": {
+        "name": "record_result", "description": "Record a result.",
+        "parameters": {"type": "object", "properties": {
+            "result": {"type": "string"}, "count": {"type": "integer"},
+            "ok": {"type": "boolean"}, "items": {"type": "array", "items": {"type": "string"}}
+        }, "required": ["result", "count", "ok", "items"]}
+    }}],
+    "tool_choice": "auto",
+    "reasoning": True
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_TIER1_JSON" --render-output "$V19_TIER1_DIR" >/dev/null 2>&1
+
+V19_TIER1_FULL="${V19_TIER1_DIR}/assembled_prompt.txt"
+if grep -q "reconsider" "$V19_TIER1_FULL"; then
+    assert_pass "Tier-1 correction seed injected into assistant think block"
+else
+    assert_fail "Tier-1 correction seed injected into assistant think block" \
+        "expected 'reconsider' marker after generation <think> opener"
+fi
+# Tier-1 should NOT trigger the Tier-2 user-turn directive.
+if grep -q "twice in a row" "$V19_TIER1_FULL"; then
+    assert_fail "Tier-1 alone does not trigger Tier-2 IMPORTANT directive" \
+        "Tier-2 directive leaked into single-error case"
+else
+    assert_pass "Tier-1 alone does not trigger Tier-2 IMPORTANT directive"
+fi
+
+# ----- Smart error detection: false positives must NOT escalate -----
+V19_OK_JSON="${TMPDIR}/v19_ok_request.json"
+V19_OK_DIR="${TMPDIR}/v19_ok_rendered"
+
+python3 - "$V19_OK_JSON" <<'PY'
+import json, sys
+ok_payload = json.dumps({"status": "ok", "error_rate": 0.0, "items": ["a", "b"]})
+request = {
+    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "stream": False,
+    "messages": [
+        {"role": "user", "content": "Try the tool."},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "record_result",
+             "arguments": {"result": "x", "count": 1, "ok": True, "items": []}}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": ok_payload}
+    ],
+    "tools": [{"type": "function", "function": {
+        "name": "record_result", "description": "Record a result.",
+        "parameters": {"type": "object", "properties": {
+            "result": {"type": "string"}, "count": {"type": "integer"},
+            "ok": {"type": "boolean"}, "items": {"type": "array", "items": {"type": "string"}}
+        }, "required": ["result", "count", "ok", "items"]}
+    }}],
+    "tool_choice": "auto",
+    "reasoning": True
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_OK_JSON" --render-output "$V19_OK_DIR" >/dev/null 2>&1
+V19_OK_FULL="${V19_OK_DIR}/assembled_prompt.txt"
+if grep -q "reconsider\|twice in a row" "$V19_OK_FULL"; then
+    assert_fail "successful response with 'error_rate' does not trigger escalation" \
+        "smart detection should ignore 'error_rate' key"
+else
+    assert_pass "successful response with 'error_rate' does not trigger escalation"
+fi
 
 cat > "$TOOL_CALL_TXT" <<'EOF'
 some leading text

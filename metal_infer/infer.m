@@ -6474,6 +6474,34 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
+// froggeric v18 "Smart False-Positive Error Detection": substring matching on
+// the word "error" is dangerous because successful API/JSON returns routinely
+// contain it as a key prefix (`error_rate`, `errors_logged`). We use strict
+// structural guards instead, plus a length gate so long well-formed responses
+// don't trip on a stray keyword, and exclusion guards for shell-echo lines
+// (commands starting with `$`) and search-tool timing footers.
+static BOOL looks_like_tool_error(NSString *content) {
+    if (!content) return NO;
+    NSString *trimmed = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([trimmed length] == 0) return NO;
+    // Length gate: only short responses are scanned. A 50KB stdout buffer that
+    // happens to contain the word "error" is almost certainly normal output.
+    if ([trimmed length] >= 500) return NO;
+    // Exclusion: a line beginning with `$ ` is a shell echo of the command we
+    // ran, not an error from running it.
+    if ([trimmed hasPrefix:@"$ "]) return NO;
+    // Exclusion: search-result footers like "Took 0.42s" or "found 3 results".
+    NSString *lower = [trimmed lowercaseString];
+    if ([lower hasPrefix:@"took "] || [lower hasPrefix:@"found "]) return NO;
+    // Positive guards: JSON error key, Python exception, stack trace, missing
+    // command. These are the structural signatures of actual failures.
+    if ([content rangeOfString:@"\"error\":"].location != NSNotFound) return YES;
+    if ([content rangeOfString:@"Exception:"].location != NSNotFound) return YES;
+    if ([content rangeOfString:@"Traceback"].location != NSNotFound) return YES;
+    if ([content rangeOfString:@"command not found"].location != NSNotFound) return YES;
+    return NO;
+}
+
 // Scan a message's content for the froggeric think-toggle tags. Returns:
 //   1  if `<|think_on|>` was found (caller flips reasoning on)
 //  -1  if `<|think_off|>` was found (caller flips reasoning off)
@@ -6672,9 +6700,58 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     // KV-cache invalidation every turn and trained the model in-context to
     // associate empty think blocks with imminent tool calls, producing 80%+
     // premature `<|im_end|>` aborts.
+    //
+    // We still walk the message tail to detect the most recent
+    // `<tool_response>` and count how many consecutive responses look like
+    // tool errors. That feeds the two-tier error-escalation injection below:
+    //   * 1 consecutive error  → seed the assistant `<think>` with a
+    //                            correction directive at generation time
+    //   * 2+ consecutive errors → bypass thinking and inject an out-of-band
+    //                             `<IMPORTANT>` directive after the last
+    //                             `</tool_response>` in the user turn
+    NSInteger last_tool_response_index = -1;
+    int consecutive_tool_errors = 0;
+    {
+        BOOL still_in_tail = YES;
+        for (NSInteger i = (NSInteger)[messages count] - 1; i >= 0 && still_in_tail; i--) {
+            NSDictionary *m = messages[i];
+            if (![m isKindOfClass:[NSDictionary class]]) continue;
+            NSString *r = m[@"role"] ?: @"user";
+            BOOL is_tool_role = [r isEqualToString:@"tool"];
+            NSString *c = flatten_content_value(m[@"content"]) ?: @"";
+            NSString *trimmed = [c stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            BOOL is_wrapped_response = ([r isEqualToString:@"user"]
+                && [trimmed hasPrefix:@"<tool_response>"]
+                && [trimmed hasSuffix:@"</tool_response>"]);
+            if (is_tool_role || is_wrapped_response) {
+                if (last_tool_response_index < 0) last_tool_response_index = i;
+                NSString *inner = c;
+                if (is_wrapped_response) {
+                    NSString *body = trimmed;
+                    if ([body hasPrefix:@"<tool_response>"]) {
+                        body = [body substringFromIndex:[@"<tool_response>" length]];
+                    }
+                    if ([body hasSuffix:@"</tool_response>"]) {
+                        body = [body substringToIndex:[body length] - [@"</tool_response>" length]];
+                    }
+                    inner = body;
+                }
+                if (looks_like_tool_error(inner)) {
+                    consecutive_tool_errors++;
+                } else {
+                    still_in_tail = NO;
+                }
+                continue;
+            }
+            if ([r isEqualToString:@"assistant"]) continue;
+            still_in_tail = NO;
+        }
+    }
 
     NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSInteger msg_index = -1;
     for (NSDictionary *msg in messages) {
+        msg_index++;
         if (![msg isKindOfClass:[NSDictionary class]]) continue;
         NSString *role = msg[@"role"] ?: @"user";
         // chat_template.jinja line 82: `set content = render_content(...)|trim`.
@@ -6739,16 +6816,44 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
             continue;
         }
         if ([role isEqualToString:@"tool"]) {
-            append_chat_turn(conversation, @"user", normalized_tool_response(msg));
+            NSString *body = normalized_tool_response(msg);
+            // Tier-2 escalation: when the same call has failed twice in a
+            // row, inject an out-of-band <IMPORTANT> directive after the
+            // </tool_response> close. The model is wrapped inside the user
+            // turn so the directive cannot be confused with assistant
+            // output. We respect `reasoning_enabled=0`: the directive does
+            // NOT open a <think> block in that mode (froggeric v18 fix).
+            if (msg_index == last_tool_response_index && consecutive_tool_errors >= 2) {
+                body = [body stringByAppendingString:
+                    @"\n<IMPORTANT>\nThe previous tool call has failed twice in a row with the same kind of error. Do not repeat the identical call. Either change the parameters, choose a different function, or stop calling tools and explain the problem to the user.\n</IMPORTANT>"];
+            }
+            append_chat_turn(conversation, @"user", body);
             continue;
         }
-        append_chat_turn(conversation, @"user", content ?: @"");
+        NSString *body = content ?: @"";
+        if (msg_index == last_tool_response_index && consecutive_tool_errors >= 2) {
+            body = [body stringByAppendingString:
+                @"\n<IMPORTANT>\nThe previous tool call has failed twice in a row with the same kind of error. Do not repeat the identical call. Either change the parameters, choose a different function, or stop calling tools and explain the problem to the user.\n</IMPORTANT>"];
+        }
+        append_chat_turn(conversation, @"user", body);
     }
     // Native Qwen3 generation prompt: open the assistant turn with <think>\n
     // for reasoning-on (model generates content INSIDE the think block first),
-    // or inject an empty <think>...</think> block for reasoning-off.
+    // or inject an empty <think>...</think> block for reasoning-off. The
+    // empty-think-here is at GENERATION time only — it's required because the
+    // model was trained to always start with a think marker. v19's "abolish
+    // empty think" applies to past-turn rendering, not the generation prefix.
     if (req->reasoning_enabled) {
         [conversation appendString:@"<|im_start|>assistant\n<think>\n"];
+        // Tier-1 escalation: exactly one consecutive tool error and reasoning
+        // is enabled. Seed the <think> block with a concrete correction
+        // directive at a different token position than the previous attempt's
+        // think opener — this breaks the cached attractor state that was
+        // driving the model to re-emit the identical failing call.
+        if (consecutive_tool_errors == 1) {
+            [conversation appendString:
+                @"The previous tool call returned an error. I need to reconsider: check parameter names and types against the schema, fix whatever was wrong, and call the function again with corrected arguments.\n"];
+        }
     } else {
         [conversation appendString:@"<|im_start|>assistant\n<think>\n\n</think>\n\n"];
     }
