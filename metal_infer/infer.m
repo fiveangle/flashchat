@@ -5103,7 +5103,14 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
     int cap=8192;
     for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
-    int prompt[]={9707,11,358,1079,4378,264,13027,729,311}; int np=(int)(sizeof(prompt)/sizeof(prompt[0]));
+    // Real coding prompt (tokenized) for a representative acceptance/speedup number;
+    // fall back to an arbitrary seed if the tokenizer is unavailable.
+    int fb[]={9707,11,358,1079,4378,264,13027,729,311};
+    int *prompt; int np;
+    PromptTokens *pt = encode_prompt_text_to_tokens(
+        "Write a Python function to merge two sorted lists into one sorted list.\n\ndef merge_sorted(a, b):\n    ");
+    if (pt && pt->count > 0) { np=pt->count; prompt=malloc(np*4); for(int i=0;i<np;i++) prompt[i]=(int)pt->ids[i]; }
+    else { np=9; prompt=malloc(np*4); memcpy(prompt,fb,np*4); }
     float *h=malloc(Hd*4),*logits=malloc(V*4); int *base_tok=malloc(max_new*4),*mtp_tok=malloc(max_new*4);
     #define IS_EOS(t) ((t)==g_cfg.eos_token_1||(t)==g_cfg.eos_token_2)
 
@@ -5201,7 +5208,14 @@ static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int 
     KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
     int cap=8192;
     for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
-    int prompt[]={9707,11,358,1079,4378,264,13027,729,311}; int np=(int)(sizeof(prompt)/sizeof(prompt[0]));
+    // Real coding prompt (tokenized) for a representative acceptance/speedup number;
+    // fall back to an arbitrary seed if the tokenizer is unavailable.
+    int fb[]={9707,11,358,1079,4378,264,13027,729,311};
+    int *prompt; int np;
+    PromptTokens *pt = encode_prompt_text_to_tokens(
+        "Write a Python function to merge two sorted lists into one sorted list.\n\ndef merge_sorted(a, b):\n    ");
+    if (pt && pt->count > 0) { np=pt->count; prompt=malloc(np*4); for(int i=0;i<np;i++) prompt[i]=(int)pt->ids[i]; }
+    else { np=9; prompt=malloc(np*4); memcpy(prompt,fb,np*4); }
     float *h=malloc(Hd*4),*logits=malloc(V*4); int *base_tok=malloc(max_new*4),*mtp_tok=malloc(max_new*4);
     #define IS_EOS(t) ((t)==g_cfg.eos_token_1||(t)==g_cfg.eos_token_2)
     // baseline
