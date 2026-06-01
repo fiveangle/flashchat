@@ -4665,6 +4665,73 @@ static void gpu_snap_restore(GpuStateSnap *s, KVCache **kv) {
     }
 }
 
+// 4d-ii: the amortized batched 2-position forward on faithful GPU primitives.
+// full-attn = attn_block_2, linear = linear_block_2 (GPU delta-net), MoE = moe_block_2.
+// All weight-bound matmuls are batched (matmul2); operates on production GPU state.
+static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
+                                  KVCache **kv, int *fds, int pos_a, int pos_b,
+                                  float *log_a, float *log_b) {
+    int Hd = g_cfg.hidden_dim;
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        if (((layer + 1) % g_cfg.full_attn_interval) == 0)
+            attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
+        else
+            linear_block_2(wf, layer, ha, hb);
+        moe_block_2(wf, layer, ha, hb, fds[layer]);
+    }
+    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
+    float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
+    cpu_rms_norm(ha, norm_w, na, Hd, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, norm_w, nb, Hd, g_cfg.rms_norm_eps);
+    TensorInfo *wi=get_tensor_info(wf,"lm_head.weight"), *si=get_tensor_info(wf,"lm_head.scales"), *bi=get_tensor_info(wf,"lm_head.biases");
+    gpu_dequant_matmul2(g_metal, (uint32_t*)((char*)wf->data+wi->offset), (uint16_t*)((char*)wf->data+si->offset),
+                        (uint16_t*)((char*)wf->data+bi->offset), na, nb, log_a, log_b, g_cfg.vocab_size, Hd, g_cfg.group_size);
+    free(na); free(nb);
+}
+
+// 4d-ii validation: fused_layer_forward_2 must match two sequential production
+// forwards (prod_forward_1) over ALL layers at decode positions — the end-to-end
+// faithfulness check that catches fp compounding across 40 layers.
+static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vf2] requires GPU\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads*g_cfg.head_dim, Ld = g_cfg.num_layers, K = g_cfg.num_experts_per_tok;
+    int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld,sizeof(void*));
+    KVCache **kv = calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld,sizeof(LinearAttnState*));
+    int cap = 256;
+    for (int i=0;i<Ld;i++){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/flashchat/packed_experts/layer_%02d.bin",model_path,i); fds[i]=open(p,O_RDONLY);
+        if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} }
+        if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)cap*kv_dim,sizeof(float)); }
+        else ls[i]=linear_attn_state_new(); }
+    float *h=malloc(Hd*sizeof(float)), *scratch=malloc(V*sizeof(float));
+    int P=35;
+    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
+    for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++) h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
+    GpuStateSnap snap; gpu_snap_alloc(&snap); gpu_snap_save(&snap, kv);
+
+    int ta=400, tb=500;
+    float *Hao=malloc(Hd*sizeof(float)),*Hbo=malloc(Hd*sizeof(float)),*la_o=malloc(V*sizeof(float)),*lb_o=malloc(V*sizeof(float));
+    embed_lookup(wf,ta,Hao); prod_forward_1(wf,Hao,P,kv,ls,fds,mmaps,K,la_o);
+    embed_lookup(wf,tb,Hbo); prod_forward_1(wf,Hbo,P+1,kv,ls,fds,mmaps,K,lb_o);
+
+    gpu_snap_restore(&snap, kv);
+    float *Hat=malloc(Hd*sizeof(float)),*Hbt=malloc(Hd*sizeof(float)),*la_t=malloc(V*sizeof(float)),*lb_t=malloc(V*sizeof(float));
+    embed_lookup(wf,ta,Hat); embed_lookup(wf,tb,Hbt);
+    fused_layer_forward_2(wf,Hat,Hbt,kv,fds,P,P+1,la_t,lb_t);
+
+    double ea=0,eb=0,ref=0; for(int i=0;i<V;i++){ ea=fmax(ea,fabs(la_o[i]-la_t[i])); eb=fmax(eb,fabs(lb_o[i]-lb_t[i])); ref=fmax(ref,fabs(la_o[i])); }
+    int aa_o=cpu_argmax(la_o,V),aa_t=cpu_argmax(la_t,V),bb_o=cpu_argmax(lb_o,V),bb_t=cpu_argmax(lb_t,V);
+    double ra=ref>0?ea/ref:ea, rb=ref>0?eb/ref:eb;
+    fprintf(stderr,"[mtp-vf2] tokenA argmax prod=%d batched=%d rel=%.3e | tokenB argmax prod=%d batched=%d rel=%.3e\n", aa_o,aa_t,ra,bb_o,bb_t,rb);
+    int ok = (aa_o==aa_t)&&(bb_o==bb_t);
+    fprintf(stderr,"[mtp-vf2] %s (argmax match is what matters for lossless verify; rel err is fp drift over 40 layers)\n", ok?"PASS: batched forward argmax matches production":"DIVERGE: argmax differs");
+
+    gpu_snap_free(&snap);
+    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i]) linear_attn_state_free(ls[i]); if(mmaps[i]){struct stat st; fstat(fds[i],&st); munmap(mmaps[i],st.st_size);} if(fds[i]>=0) close(fds[i]); }
+    free(fds); free(mmaps); free(kv); free(ls); free(h); free(scratch);
+    free(Hao); free(Hbo); free(la_o); free(lb_o); free(Hat); free(Hbt); free(la_t); free(lb_t);
+    return ok?0:1;
+}
+
 // 4d-i: verify/accept loop on the PRODUCTION forward (faithful hiddens), verify
 // done as two sequential production forwards (no amortization yet — validates
 // acceptance recovery, GPU-state rollback, and losslessness before the batched
@@ -11763,6 +11830,7 @@ enum {
     OPT_MTP_VERIFY_ROLLBACK,
     OPT_MTP_VERIFY_DEEP,
     OPT_MTP_VERIFY_LINEAR,
+    OPT_MTP_VERIFY_FORWARD2,
     OPT_MTP_GENERATE,
     OPT_MTP_GENERATE_GPU,
 };
@@ -11830,6 +11898,7 @@ int main(int argc, char **argv) {
         int mtp_verify_rollback_requested = 0;
         int mtp_verify_deep_requested = 0;
         int mtp_verify_linear_requested = 0;
+        int mtp_verify_forward2_requested = 0;
         int mtp_generate_requested = 0;
         int mtp_generate_gpu_requested = 0;
         
@@ -12029,6 +12098,7 @@ int main(int argc, char **argv) {
             {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
             {"mtp-verify-deep", no_argument,      0, OPT_MTP_VERIFY_DEEP},
             {"mtp-verify-linear", no_argument,    0, OPT_MTP_VERIFY_LINEAR},
+            {"mtp-verify-forward2", no_argument,  0, OPT_MTP_VERIFY_FORWARD2},
             {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"help",          no_argument,       0, 'h'},
@@ -12081,6 +12151,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
                 case OPT_MTP_VERIFY_DEEP: mtp_verify_deep_requested = 1; break;
                 case OPT_MTP_VERIFY_LINEAR: mtp_verify_linear_requested = 1; break;
+                case OPT_MTP_VERIFY_FORWARD2: mtp_verify_forward2_requested = 1; break;
                 case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
@@ -12283,6 +12354,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_linear_requested) {
             return mtp_verify_linear(wf, model_path);
+        }
+        if (mtp_verify_forward2_requested) {
+            return mtp_verify_forward2(wf, model_path);
         }
         if (mtp_generate_requested) {
             return mtp_generate(wf, model_path, 48);
