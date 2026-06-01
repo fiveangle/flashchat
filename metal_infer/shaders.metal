@@ -546,6 +546,88 @@ kernel void dequant_matmulN_4bit_v4(
 
 
 // ============================================================================
+// Kernel 1e-ILP: matmulN with multiple rows per simdgroup (load-latency hiding).
+// ============================================================================
+// matmulN measured ~60 GB/s (1/8 of bandwidth) and the tiled-X experiment showed it
+// is NOT memory-traffic bound — it's load-latency bound: each simdgroup processes one
+// row, issuing w_row[col] then immediately consuming it in dependent FMAs, so the
+// load latency stalls the lane. Fix: give each simdgroup ROWS_PER_SIMD rows. The
+// per-row weight loads (w_row0[col], w_row1[col], ...) are independent, so the GPU
+// keeps several in flight and overlaps their latency — classic ILP latency hiding,
+// without needing more threadgroups/occupancy. Rows also share the (L2-hot) X reads.
+// No threadgroup memory / no barriers, so out-of-range rows just skip their store.
+#define ROWS_PER_SIMD 4
+
+kernel void dequant_matmulN_4bit_v5(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    X          [[buffer(3)]],  // [N][in_dim]
+    device float*          OUT        [[buffer(4)]],  // [N][out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         N          [[buffer(8)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_base = (tgid * ROWS_PER_TG + simd_group) * ROWS_PER_SIMD;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+
+    // Per-row weight/scale/bias pointers; clamp OOB rows so loads stay in-bounds.
+    device const uint32_t* w_row[ROWS_PER_SIMD];
+    device const uint16_t* s_row[ROWS_PER_SIMD];
+    device const uint16_t* b_row[ROWS_PER_SIMD];
+    for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+        uint rr = row_base + r;
+        uint srr = (rr < out_dim) ? rr : 0;
+        w_row[r] = W_packed + (size_t)srr * packed_cols;
+        s_row[r] = scales   + (size_t)srr * num_groups;
+        b_row[r] = biases   + (size_t)srr * num_groups;
+    }
+
+    float acc[ROWS_PER_SIMD][MATMULN_MAXN];
+    for (uint r = 0; r < ROWS_PER_SIMD; r++)
+        for (uint n = 0; n < N; n++) acc[r][n] = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / packed_per_group;
+        // Issue the independent per-row weight loads up front so they overlap.
+        uint32_t packed[ROWS_PER_SIMD];
+        float scale[ROWS_PER_SIMD], bias[ROWS_PER_SIMD];
+        for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+            packed[r] = w_row[r][col];
+            scale[r]  = bf16_to_f32(s_row[r][g]);
+            bias[r]   = bf16_to_f32(b_row[r][g]);
+        }
+        uint x_base = col * 8;
+        for (uint n = 0; n < N; n++) {
+            device const float* xn = X + (size_t)n * in_dim;
+            for (uint k = 0; k < 8; k++) {
+                float xv = xn[x_base + k];
+                for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+                    float nib = float((packed[r] >> (k * 4)) & 0xF);
+                    acc[r][n] = fma(nib, scale[r] * xv, fma(bias[r], xv, acc[r][n]));
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+        uint rr = row_base + r;
+        if (rr >= out_dim) continue;       // uniform across the simdgroup
+        for (uint n = 0; n < N; n++) {
+            float s = simd_sum(acc[r][n]);
+            if (simd_lane == 0) OUT[n * out_dim + rr] = s;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),

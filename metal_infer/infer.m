@@ -392,16 +392,21 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 // Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
-// matmulN kernel select: 0 = v3 (default, fastest here), 1 = tiled-X v4.
-// v4 staged X in threadgroup memory to cut its re-read traffic, but measured SLOWER
-// (8900->10805 ms): Apple's L2 already absorbs the X re-reads, so tiling only added
-// staging stores + two barriers/tile that serialize the simdgroups. Kept behind an
-// opt-in flag as a documented negative result. Set FLASHCHAT_MATMULN_V4=1 to A/B.
-static int g_matmuln_tiled = -1;
-static inline int matmuln_tiled(void) {
-    if (g_matmuln_tiled < 0) g_matmuln_tiled = getenv("FLASHCHAT_MATMULN_V4") ? 1 : 0;
-    return g_matmuln_tiled;
+// matmulN kernel select. 0 = v3 (one row/simdgroup), 1 = tiled-X v4, 2 = v5 (multi-row
+// per simdgroup for load-latency hiding). v4 staged X in threadgroup memory but measured
+// SLOWER (L2 already absorbs the X re-reads); kept as a documented negative. v5 gives each
+// simdgroup ROWS_PER_SIMD rows so the independent per-row weight loads overlap — addresses
+// matmulN's load-latency bound directly. FLASHCHAT_MATMULN_V3/V4/V5=1 to A/B.
+static int g_matmuln_mode = -1;
+static inline int matmuln_mode(void) {
+    if (g_matmuln_mode < 0)
+        g_matmuln_mode = getenv("FLASHCHAT_MATMULN_V4") ? 1 :
+                         getenv("FLASHCHAT_MATMULN_V3") ? 0 : 2; // default v5
+    return g_matmuln_mode;
 }
+// Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
+// simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
+static inline uint32_t matmuln_rows_per_tg(void) { return matmuln_mode() == 2 ? 8 * 4 : 8; }
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -1980,6 +1985,7 @@ typedef struct {
     id<MTLComputePipelineState> matmul2_v3;   // batched N=2 (MTP draft/verify)
     id<MTLComputePipelineState> matmulN_v3;    // batched N-wide (depth-N verify)
     id<MTLComputePipelineState> matmulN_v4;    // tiled-X matmulN (threadgroup X cache)
+    id<MTLComputePipelineState> matmulN_v5;    // multi-row-per-simdgroup matmulN (ILP)
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2118,6 +2124,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matmul2_v3    = makePipe(@"dequant_matmul2_4bit_v3");
     ctx->matmulN_v3    = makePipe(@"dequant_matmulN_4bit_v3");
     ctx->matmulN_v4    = makePipe(@"dequant_matmulN_4bit_v4");
+    ctx->matmulN_v5    = makePipe(@"dequant_matmulN_4bit_v5");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -2464,6 +2471,12 @@ static void gpu_dequant_matmul2(
     memcpy(out1_f32, [o1 contents], o_size);
 }
 
+// Active matmulN pipeline for the selected mode (see matmuln_mode()).
+static inline id<MTLComputePipelineState> matmuln_pipe(MetalCtx *ctx) {
+    int m = matmuln_mode();
+    return m == 2 ? ctx->matmulN_v5 : (m == 1 ? ctx->matmulN_v4 : ctx->matmulN_v3);
+}
+
 // N-wide batched dequant matmul (N<=8): X is [N][in_dim], OUT is [N][out_dim],
 // both host-side contiguous. One weight read serves all N tokens.
 static void gpu_dequant_matmulN(
@@ -2486,7 +2499,7 @@ static void gpu_dequant_matmulN(
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:matmuln_tiled() ? ctx->matmulN_v4 : ctx->matmulN_v3];
+    [enc setComputePipelineState:matmuln_pipe(ctx)];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -2496,7 +2509,8 @@ static void gpu_dequant_matmulN(
     [enc setBytes:&in_dim  length:4 atIndex:6];
     [enc setBytes:&group_size length:4 atIndex:7];
     [enc setBytes:&N length:4 atIndex:8];
-    uint32_t num_tgs = (out_dim + 7) / 8;
+    uint32_t rpt = matmuln_rows_per_tg();
+    uint32_t num_tgs = (out_dim + rpt - 1) / rpt;
     [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];
     [cmdbuf commit];
@@ -2543,7 +2557,8 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:matmuln_tiled() ? ctx->matmulN_v4 : ctx->matmulN_v3];
+    [enc setComputePipelineState:matmuln_pipe(ctx)];
+    uint32_t rpt = matmuln_rows_per_tg();
     for (int j = 0; j < nj; j++) {
         NSUInteger w_off = (NSUInteger)((const char *)jobs[j].W - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)jobs[j].S - (const char *)[ctx->wf_buf contents]);
@@ -2557,7 +2572,7 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
         [enc setBytes:&jobs[j].in_dim  length:4 atIndex:6];
         [enc setBytes:&jobs[j].group_size length:4 atIndex:7];
         [enc setBytes:&jobs[j].N length:4 atIndex:8];
-        uint32_t num_tgs = (jobs[j].out_dim + 7) / 8;
+        uint32_t num_tgs = (jobs[j].out_dim + rpt - 1) / rpt;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     [enc endEncoding];
