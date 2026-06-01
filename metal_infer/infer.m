@@ -4092,19 +4092,62 @@ static void ref_forward_1(WeightFile *wf, float *h, KVCache **kv, LinearAttnStat
     free(n);
 }
 
+// Rollback state for a rejected draft: undo token b's contributions, leaving the
+// state as if only token a (the accepted token) had been processed.
+typedef struct {
+    int kv_pre_len[MAX_NUM_LAYERS];  // full-attn: kv->len before token a
+    float *conv[MAX_NUM_LAYERS];     // linear: conv_state snapshot after a, before b
+    float *ssm[MAX_NUM_LAYERS];      // linear: ssm_state snapshot after a, before b
+} VerifyRollback;
+
+static int verify_conv_sz(void) { return (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim; }
+static int verify_ssm_sz(void)  { return g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim; }
+
+static void verify_rollback_init(VerifyRollback *rb) {
+    memset(rb, 0, sizeof(*rb));
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (((i + 1) % g_cfg.full_attn_interval) != 0) {
+            rb->conv[i] = malloc(verify_conv_sz() * sizeof(float));
+            rb->ssm[i]  = malloc(verify_ssm_sz()  * sizeof(float));
+        }
+    }
+}
+static void verify_rollback_free(VerifyRollback *rb) {
+    for (int i = 0; i < g_cfg.num_layers; i++) { free(rb->conv[i]); free(rb->ssm[i]); }
+}
+// Undo token b: truncate KV (drop b's appended K/V) and restore linear states.
+static void verify_rollback_apply(VerifyRollback *rb, KVCache **kv, LinearAttnState **ls) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
+            kv[i]->len = rb->kv_pre_len[i] + 1;  // keep a (appended first), drop b
+        } else {
+            memcpy(ls[i]->conv_state, rb->conv[i], verify_conv_sz() * sizeof(float));
+            memcpy(ls[i]->ssm_state,  rb->ssm[i],  verify_ssm_sz()  * sizeof(float));
+        }
+    }
+}
+
 // 4b: full batched 2-position backbone forward. Layer-by-layer so token b sees
 // token a's freshly-written KV (full attn) and a-updated recurrent state (linear).
+// If rb != NULL, capture per-layer rollback state (post-a) so a rejected draft
+// can be undone via verify_rollback_apply.
 static void backbone_forward_2(WeightFile *wf, float *ha, float *hb,
                                KVCache **kv, LinearAttnState **ls, int *fds,
-                               int pos_a, int pos_b, float *log_a, float *log_b) {
+                               int pos_a, int pos_b, float *log_a, float *log_b,
+                               VerifyRollback *rb) {
     int Hd = g_cfg.hidden_dim;
     for (int layer = 0; layer < g_cfg.num_layers; layer++) {
         int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
         if (is_full) {
+            if (rb) rb->kv_pre_len[layer] = kv[layer]->len;
             attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
         } else {
             // Linear recurrence is sequential: a updates the state, then b reads it.
             linear_attention_forward(wf, layer, ha, ls[layer]);
+            if (rb) {
+                memcpy(rb->conv[layer], ls[layer]->conv_state, verify_conv_sz() * sizeof(float));
+                memcpy(rb->ssm[layer],  ls[layer]->ssm_state,  verify_ssm_sz()  * sizeof(float));
+            }
             linear_attention_forward(wf, layer, hb, ls[layer]);
         }
         moe_block_2(wf, layer, ha, hb, fds[layer]);
@@ -4154,7 +4197,7 @@ static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
 
     // Batched: one 2-position forward on fresh caches.
     embed_lookup(wf, tok_a, ha); embed_lookup(wf, tok_b, hb);
-    backbone_forward_2(wf, ha, hb, kvb, lsb, fds, 0, 1, log_a_b, log_b_b);
+    backbone_forward_2(wf, ha, hb, kvb, lsb, fds, 0, 1, log_a_b, log_b_b, NULL);
 
     double err_a = 0, err_b = 0;
     for (int i = 0; i < V; i++) { err_a = fmax(err_a, fabs(log_a_r[i]-log_a_b[i])); err_b = fmax(err_b, fabs(log_b_r[i]-log_b_b[i])); }
@@ -4174,6 +4217,71 @@ static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
     }
     free(fds); free(kvr); free(kvb); free(lsr); free(lsb);
     free(log_a_r); free(log_b_r); free(log_a_b); free(log_b_b); free(ha); free(hb);
+    return ok ? 0 : 1;
+}
+
+// 4c-i: validate draft-reject rollback. After a batched verify forward of
+// [t_next@P, draft@P+1], rolling back must leave the state identical to having
+// processed only t_next@P (a single forward). Otherwise rejects corrupt output.
+static int mtp_verify_rollback(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vroll] requires GPU\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int Ld = g_cfg.num_layers;
+    int *fds = malloc(Ld * sizeof(int));
+    KVCache **kvv = calloc(Ld, sizeof(KVCache*)), **kvg = calloc(Ld, sizeof(KVCache*));
+    LinearAttnState **lsv = calloc(Ld, sizeof(LinearAttnState*)), **lsg = calloc(Ld, sizeof(LinearAttnState*));
+    int cap = 64;
+    for (int i = 0; i < Ld; i++) {
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        fds[i] = open(p, O_RDONLY);
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
+            kvv[i] = calloc(1, sizeof(KVCache)); kvv[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float)); kvv[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
+            kvg[i] = calloc(1, sizeof(KVCache)); kvg[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float)); kvg[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
+        } else { lsv[i] = linear_attn_state_new(); lsg[i] = linear_attn_state_new(); }
+    }
+    float *scratch = malloc(V * sizeof(float)), *h = malloc(Hd * sizeof(float));
+    int prefix[3] = { 100, 200, 300 }; int P = 3;
+    for (int pp = 0; pp < P; pp++) {
+        embed_lookup(wf, prefix[pp], h); ref_forward_1(wf, h, kvv, lsv, fds, pp, scratch);
+        embed_lookup(wf, prefix[pp], h); ref_forward_1(wf, h, kvg, lsg, fds, pp, scratch);
+    }
+    int t_next = 400, draft = 500;
+    VerifyRollback rb; verify_rollback_init(&rb);
+    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float)), *la = malloc(V*sizeof(float)), *lb = malloc(V*sizeof(float));
+    embed_lookup(wf, t_next, ha); embed_lookup(wf, draft, hb);
+    backbone_forward_2(wf, ha, hb, kvv, lsv, fds, P, P + 1, la, lb, &rb);
+    verify_rollback_apply(&rb, kvv, lsv);
+    // Ground truth: single forward of t_next@P.
+    embed_lookup(wf, t_next, h); ref_forward_1(wf, h, kvg, lsg, fds, P, scratch);
+
+    double max_err = 0.0; int len_mismatch = 0;
+    for (int i = 0; i < Ld; i++) {
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
+            if (kvv[i]->len != kvg[i]->len) len_mismatch++;
+            int n = kvg[i]->len * kv_dim;
+            for (int j = 0; j < n; j++) {
+                max_err = fmax(max_err, fabs(kvv[i]->k_cache[j] - kvg[i]->k_cache[j]));
+                max_err = fmax(max_err, fabs(kvv[i]->v_cache[j] - kvg[i]->v_cache[j]));
+            }
+        } else {
+            for (int j = 0; j < verify_conv_sz(); j++) max_err = fmax(max_err, fabs(lsv[i]->conv_state[j] - lsg[i]->conv_state[j]));
+            for (int j = 0; j < verify_ssm_sz();  j++) max_err = fmax(max_err, fabs(lsv[i]->ssm_state[j]  - lsg[i]->ssm_state[j]));
+        }
+    }
+    int ok = (len_mismatch == 0) && (max_err < 1e-3);
+    fprintf(stderr, "[mtp-vroll] kv len mismatches=%d | state max_err=%.3e | %s\n",
+            len_mismatch, max_err, ok ? "PASS: reject rollback restores a-only state" : "FAIL: rollback corrupts state");
+
+    verify_rollback_free(&rb);
+    for (int i = 0; i < Ld; i++) {
+        if (kvv[i]) { free(kvv[i]->k_cache); free(kvv[i]->v_cache); free(kvv[i]); }
+        if (kvg[i]) { free(kvg[i]->k_cache); free(kvg[i]->v_cache); free(kvg[i]); }
+        if (lsv[i]) linear_attn_state_free(lsv[i]);
+        if (lsg[i]) linear_attn_state_free(lsg[i]);
+        if (fds[i] >= 0) close(fds[i]);
+    }
+    free(fds); free(kvv); free(kvg); free(lsv); free(lsg);
+    free(scratch); free(h); free(ha); free(hb); free(la); free(lb);
     return ok ? 0 : 1;
 }
 
@@ -11212,6 +11320,7 @@ enum {
     OPT_MTP_BENCH_MOE,
     OPT_MTP_VERIFY_LAYER,
     OPT_MTP_VERIFY_FORWARD,
+    OPT_MTP_VERIFY_ROLLBACK,
 };
 
 static void print_usage(const char *prog) {
@@ -11274,6 +11383,7 @@ int main(int argc, char **argv) {
         int mtp_bench_moe_requested = 0;
         int mtp_verify_layer_requested = 0;
         int mtp_verify_forward_requested = 0;
+        int mtp_verify_rollback_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -11468,6 +11578,7 @@ int main(int argc, char **argv) {
             {"mtp-bench-moe", no_argument,        0, OPT_MTP_BENCH_MOE},
             {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
             {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
+            {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11515,6 +11626,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_BENCH_MOE: mtp_bench_moe_requested = 1; break;
                 case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
                 case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
+                case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11706,6 +11818,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_forward_requested) {
             return mtp_verify_forward(wf, model_path);
+        }
+        if (mtp_verify_rollback_requested) {
+            return mtp_verify_rollback(wf, model_path);
         }
 
         // ---- Load vocabulary ----
