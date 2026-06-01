@@ -421,6 +421,25 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 
 static int g_expert_freq[MAX_NUM_LAYERS][MAX_NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
+
+// ----------------------------------------------------------------------------
+// MTP expert-overlap instrumentation.
+// Projects the SSD I/O a batched 2-position draft/verify forward would incur.
+// A batched verify of [accepted_token, draft] loads, per layer, the UNION of
+// the two tokens' active experts. When a draft is accepted (draft == real next
+// token), that union is exactly the overlap between two consecutive real decode
+// steps — which is what we measure here. Enabled when MTP is active or via
+// FLASHCHAT_MTP_OVERLAP=1. Decode-phase only (gated on g_pred_generating).
+// ----------------------------------------------------------------------------
+static int  g_mtp_overlap_enabled = 0;
+static int  g_overlap_in_decode = 0;             // 1 during auto-regressive decode (not prefill)
+static int  g_overlap_prev[MAX_NUM_LAYERS][16];  // previous decode step's experts per layer
+static int  g_overlap_prev_k[MAX_NUM_LAYERS];    // count per layer (0 = no previous step yet)
+static long g_overlap_single_sum = 0;    // sum of per-layer K over counted step-pairs (1 token's load)
+static long g_overlap_separate_sum = 0;  // sum of (K_prev + K_cur): two separate single-token forwards
+static long g_overlap_union_sum = 0;     // sum of |prev ∪ cur|: one batched 2-position forward
+static long g_overlap_intersect_sum = 0; // sum of |prev ∩ cur|
+static int  g_overlap_layer_pairs = 0;   // number of per-layer step-pairs counted
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -1282,6 +1301,36 @@ static int mtp_shadow_draft_token(WeightFile *wf, const char *model_path,
     free(mtp_hidden);
     if (out_draft_token) *out_draft_token = draft_token;
     return rc == 0 && draft_token >= 0 ? 0 : -1;
+}
+
+// Report measured expert overlap and project the I/O-bound speedup ceiling for a
+// batched draft/verify forward, given the observed MTP draft acceptance rate.
+static void mtp_overlap_report(int shadow_hits, int shadow_checks) {
+    if (!g_mtp_overlap_enabled || g_overlap_layer_pairs == 0) return;
+
+    double mean_single = (double)g_overlap_single_sum / g_overlap_layer_pairs;
+    double overlap_frac = (double)g_overlap_intersect_sum / (double)g_overlap_single_sum;
+    // Batched 2-position forward loads the union; two separate forwards load both
+    // sets. union/separate is the I/O a batched verify costs vs. plain decoding of
+    // the same two tokens (0.5 = perfect overlap/2x potential, 1.0 = break-even).
+    double io_ratio = (double)g_overlap_union_sum / (double)g_overlap_separate_sum;
+
+    fprintf(stderr, "[mtp] expert overlap: layer-pairs=%d mean_active=%.2f/layer "
+                    "overlap=%.1f%% batched_io_vs_separate=%.3f\n",
+            g_overlap_layer_pairs, mean_single, 100.0 * overlap_frac, io_ratio);
+
+    if (shadow_checks > 0) {
+        double A = (double)shadow_hits / (double)shadow_checks;
+        // A batched forward of [accepted, draft] loads union experts and yields
+        // (1+A) committed tokens on average (2 if accepted, 1 if rejected).
+        // I/O-bound speedup vs. one single-token forward per token:
+        //   single_per_tok / (union_per_batch / (1+A)) = (1+A) * single/union.
+        double single_over_union = (double)g_overlap_single_sum / (double)g_overlap_union_sum;
+        double projected = (1.0 + A) * single_over_union;
+        fprintf(stderr, "[mtp] projection: acceptance=%.1f%% -> I/O-bound speedup ~%.2fx "
+                        "(>1 worth building, ~1 break-even). GPU compute not modeled.\n",
+                100.0 * A, projected);
+    }
 }
 
 // ============================================================================
@@ -6050,6 +6099,28 @@ static void fused_layer_forward(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
+    // MTP overlap: compare this layer's active experts to the same layer's set
+    // from the previous decode step, then store the current set for the next.
+    if (g_mtp_overlap_enabled && g_overlap_in_decode && layer_idx < MAX_NUM_LAYERS) {
+        int ck = actual_K < 16 ? actual_K : 16;
+        int pk = g_overlap_prev_k[layer_idx];
+        if (pk > 0) {
+            int inter = 0;
+            for (int i = 0; i < ck; i++) {
+                for (int j = 0; j < pk; j++) {
+                    if (expert_indices[i] == g_overlap_prev[layer_idx][j]) { inter++; break; }
+                }
+            }
+            g_overlap_intersect_sum += inter;
+            g_overlap_single_sum   += ck;
+            g_overlap_separate_sum += ck + pk;
+            g_overlap_union_sum    += ck + pk - inter;
+            g_overlap_layer_pairs++;
+        }
+        for (int i = 0; i < ck; i++) g_overlap_prev[layer_idx][i] = expert_indices[i];
+        g_overlap_prev_k[layer_idx] = ck;
+    }
+
     if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
         // For each expert:
@@ -10060,6 +10131,7 @@ static void serve_loop(
             g_pred_generating = 1;
             g_pred_valid = 0;
         }
+        g_overlap_in_decode = 1;
 
         char *gen_response = calloc(1, 262144);
         int gen_resp_len = 0;
@@ -10246,6 +10318,8 @@ tool_call_checked:
             server_log_errorf("[mtp] %s shadow summary hits=%d checks=%d rate=%.1f%%\n",
                               request_id, mtp_shadow_hits, mtp_shadow_checks, hit_rate);
         }
+        mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
+        g_overlap_in_decode = 0;
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
             server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
@@ -10760,6 +10834,14 @@ int main(int argc, char **argv) {
         if (g_mtp_predictions > 0) {
             build_mtp_cache(wf);
         }
+        {
+            const char *env_overlap = getenv("FLASHCHAT_MTP_OVERLAP");
+            g_mtp_overlap_enabled = (g_mtp_predictions > 0) ||
+                                    (env_overlap && server_flag_enabled(env_overlap));
+            if (g_mtp_overlap_enabled) {
+                fprintf(stderr, "[mtp] expert-overlap instrumentation active (decode steps only)\n");
+            }
+        }
         if (mtp_preflight_requested) {
             int rc_fc = mtp_preflight_forward(wf);
             int rc_layer = mtp_preflight_decoder_layer(wf, model_path);
@@ -11112,6 +11194,7 @@ int main(int argc, char **argv) {
             g_pred_generating = 1;  // enable prediction storage/use during generation
             g_pred_valid = 0;       // reset — first gen token builds predictions
         }
+        g_overlap_in_decode = 1;
         for (int gen = 1; gen < max_tokens; gen++) {
             double t_gen_start = now_ms();
 
@@ -11205,6 +11288,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[mtp] shadow summary hits=%d checks=%d rate=%.1f%%\n",
                     mtp_shadow_hits, mtp_shadow_checks, hit_rate);
         }
+        mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
 
         if (g_timing_enabled) timing_print();
         printf("\n\n--- Statistics ---\n");
