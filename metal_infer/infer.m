@@ -4285,6 +4285,101 @@ static int mtp_verify_rollback(WeightFile *wf, const char *model_path) {
     return ok ? 0 : 1;
 }
 
+#define MTP_IS_EOS(t) ((t) == g_cfg.eos_token_1 || (t) == g_cfg.eos_token_2)
+
+// 4c-ii: the verify/accept decode loop. Runs baseline greedy and MTP-verify on
+// the same prompt using the same CPU blocks, confirms identical output (lossless),
+// and reports speedup + acceptance. (Absolute tok/s reflects the CPU-orchestrated
+// block path, not the production GPU pipeline; the MTP/baseline RATIO is the
+// meaningful number.)
+static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
+    if (!g_metal || !g_metal->wf_buf || !g_mtp_cache.ready) {
+        fprintf(stderr, "[mtp-gen] requires GPU + MTP weights (run with FLASHCHAT_MTP=1)\n"); return 1;
+    }
+    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, Ld = g_cfg.num_layers;
+    int *fds = malloc(Ld * sizeof(int));
+    KVCache **kv = calloc(Ld, sizeof(KVCache*));
+    LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
+    int cap = 8192;
+    for (int i = 0; i < Ld; i++) {
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        fds[i] = open(p, O_RDONLY);
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
+            kv[i] = calloc(1, sizeof(KVCache));
+            kv[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float));
+            kv[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
+        } else ls[i] = linear_attn_state_new();
+    }
+    #define RESET_STATE() do { for (int i=0;i<Ld;i++){ if(kv[i]) kv[i]->len=0; if(ls[i]){ memset(ls[i]->conv_state,0,verify_conv_sz()*sizeof(float)); memset(ls[i]->ssm_state,0,verify_ssm_sz()*sizeof(float)); } } } while(0)
+
+    int prompt[] = { 9707, 11, 358, 1079, 4378, 264, 13027, 729, 311 };  // arbitrary valid ids
+    int np = (int)(sizeof(prompt) / sizeof(prompt[0]));
+    float *h = malloc(Hd*sizeof(float)), *logits = malloc(V*sizeof(float));
+    int *base_tok = malloc(max_new*sizeof(int)), *mtp_tok = malloc(max_new*sizeof(int));
+
+    // ---- Baseline greedy (sequential single forwards) ----
+    RESET_STATE();
+    for (int p = 0; p < np; p++) { embed_lookup(wf, prompt[p], h); ref_forward_1(wf, h, kv, ls, fds, p, logits); }
+    int tok = cpu_argmax(logits, V), pos = np, bn = 0;
+    double t0 = now_ms();
+    while (bn < max_new) {
+        base_tok[bn++] = tok; if (MTP_IS_EOS(tok)) break;
+        embed_lookup(wf, tok, h); ref_forward_1(wf, h, kv, ls, fds, pos, logits); pos++; tok = cpu_argmax(logits, V);
+    }
+    double base_ms = now_ms() - t0;
+
+    // ---- MTP verify/accept ----
+    RESET_STATE(); g_mtp_kv_len = 0;
+    for (int p = 0; p < np; p++) { embed_lookup(wf, prompt[p], h); ref_forward_1(wf, h, kv, ls, fds, p, logits); }
+    int t_next = cpu_argmax(logits, V);
+    float *hcur = malloc(Hd*sizeof(float)); memcpy(hcur, h, Hd*sizeof(float));
+    pos = np;
+    VerifyRollback rb; verify_rollback_init(&rb);
+    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float)), *la = malloc(V*sizeof(float)), *lb = malloc(V*sizeof(float));
+    int mn = 0, accepts = 0, checks = 0, fwd_calls = 0;
+    double t1 = now_ms();
+    while (mn < max_new) {
+        if (MTP_IS_EOS(t_next)) { mtp_tok[mn++] = t_next; break; }
+        int d = -1; mtp_shadow_draft_token(wf, model_path, hcur, t_next, &d);
+        if (d < 0) {  // no draft: plain single step
+            mtp_tok[mn++] = t_next;
+            embed_lookup(wf, t_next, ha); ref_forward_1(wf, ha, kv, ls, fds, pos, la); fwd_calls++;
+            memcpy(hcur, ha, Hd*sizeof(float)); pos++; t_next = cpu_argmax(la, V);
+            continue;
+        }
+        embed_lookup(wf, t_next, ha); embed_lookup(wf, d, hb);
+        backbone_forward_2(wf, ha, hb, kv, ls, fds, pos, pos+1, la, lb, &rb); fwd_calls++;
+        int t_v1 = cpu_argmax(la, V);
+        mtp_tok[mn++] = t_next; checks++;
+        if (t_v1 == d) {  // accept draft
+            accepts++;
+            if (mn < max_new) mtp_tok[mn++] = d;
+            memcpy(hcur, hb, Hd*sizeof(float)); t_next = cpu_argmax(lb, V); pos += 2;
+        } else {          // reject: undo b, emit verified token next
+            verify_rollback_apply(&rb, kv, ls);
+            memcpy(hcur, ha, Hd*sizeof(float)); t_next = t_v1; pos += 1;
+        }
+    }
+    double mtp_ms = now_ms() - t1;
+
+    int n = bn < mn ? bn : mn, mism = 0;
+    for (int i = 0; i < n; i++) if (base_tok[i] != mtp_tok[i]) { mism++; if (mism == 1) fprintf(stderr, "[mtp-gen] first mismatch at %d: base=%d mtp=%d\n", i, base_tok[i], mtp_tok[i]); }
+    double acc = checks ? 100.0*accepts/checks : 0.0;
+    fprintf(stderr, "[mtp-gen] baseline: %d tok in %.0f ms (%.2f tok/s)\n", bn, base_ms, 1000.0*bn/base_ms);
+    fprintf(stderr, "[mtp-gen] mtp:      %d tok in %.0f ms (%.2f tok/s) | %d forwards | acceptance=%.1f%% (%d/%d)\n",
+            mn, mtp_ms, 1000.0*mn/mtp_ms, fwd_calls, acc, accepts, checks);
+    fprintf(stderr, "[mtp-gen] speedup=%.2fx | tokens/forward: base=1.00 mtp=%.2f\n",
+            mtp_ms > 0 ? (base_ms/bn) / (mtp_ms/mn) : 0.0, (double)mn/fwd_calls);
+    fprintf(stderr, "[mtp-gen] lossless check: %d/%d tokens match baseline | %s\n",
+            n - mism, n, mism == 0 ? "PASS: identical output" : "FAIL: output diverges");
+
+    verify_rollback_free(&rb);
+    for (int i = 0; i < Ld; i++) { if (kv[i]){ free(kv[i]->k_cache); free(kv[i]->v_cache); free(kv[i]); } if (ls[i]) linear_attn_state_free(ls[i]); if (fds[i]>=0) close(fds[i]); }
+    free(fds); free(kv); free(ls); free(h); free(logits); free(base_tok); free(mtp_tok); free(hcur); free(ha); free(hb); free(la); free(lb);
+    #undef RESET_STATE
+    return mism == 0 ? 0 : 1;
+}
+
 // ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
@@ -11321,6 +11416,7 @@ enum {
     OPT_MTP_VERIFY_LAYER,
     OPT_MTP_VERIFY_FORWARD,
     OPT_MTP_VERIFY_ROLLBACK,
+    OPT_MTP_GENERATE,
 };
 
 static void print_usage(const char *prog) {
@@ -11384,6 +11480,7 @@ int main(int argc, char **argv) {
         int mtp_verify_layer_requested = 0;
         int mtp_verify_forward_requested = 0;
         int mtp_verify_rollback_requested = 0;
+        int mtp_generate_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -11579,6 +11676,7 @@ int main(int argc, char **argv) {
             {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
             {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
             {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
+            {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11627,6 +11725,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
                 case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
                 case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
+                case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11821,6 +11920,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_rollback_requested) {
             return mtp_verify_rollback(wf, model_path);
+        }
+        if (mtp_generate_requested) {
+            return mtp_generate(wf, model_path, 48);
         }
 
         // ---- Load vocabulary ----
