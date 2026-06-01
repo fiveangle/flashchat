@@ -4384,6 +4384,118 @@ static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
     return mism == 0 ? 0 : 1;
 }
 
+// Production single-token forward (reuses fused_layer_forward, faithful). h holds
+// the token embedding on entry; on return h is the pre-norm hidden, logits filled.
+static void prod_forward_1(WeightFile *wf, float *h, int pos, KVCache **kv,
+                           LinearAttnState **ls, int *fds, void **mmaps, int K, float *logits) {
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+        fused_layer_forward(wf, layer, h, is_full ? kv[layer] : NULL, is_full ? NULL : ls[layer],
+                            pos, mmaps[layer], K, fds[layer]);
+    }
+    complete_deferred_experts();
+    uint16_t *nw = get_tensor_ptr(wf, "model.norm.weight");
+    int Hd = g_cfg.hidden_dim;
+    float *n = malloc(Hd * sizeof(float));
+    cpu_rms_norm(h, nw, n, Hd, g_cfg.rms_norm_eps);
+    lm_head_forward(wf, n, logits);
+    free(n);
+}
+
+// Snapshot of the production recurrent GPU state (delta-net + conv) + KV lengths,
+// for reject-rollback of a speculative draft on the real pipeline.
+typedef struct { float **delta; float **conv; int *kvlen; } GpuStateSnap;
+static void gpu_snap_alloc(GpuStateSnap *s) {
+    s->delta = calloc(g_cfg.num_linear_layers, sizeof(float*));
+    s->conv  = calloc(g_cfg.num_linear_layers, sizeof(float*));
+    s->kvlen = calloc(g_cfg.num_layers, sizeof(int));
+    for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+        s->delta[i] = malloc(64*128*128 * sizeof(float));
+        s->conv[i]  = malloc(3*12288 * sizeof(float));
+    }
+}
+static void gpu_snap_free(GpuStateSnap *s) {
+    for (int i = 0; i < g_cfg.num_linear_layers; i++) { free(s->delta[i]); free(s->conv[i]); }
+    free(s->delta); free(s->conv); free(s->kvlen);
+}
+static int linear_idx_of(int layer) { return layer - (layer + 1) / g_cfg.full_attn_interval; }
+static void gpu_snap_save(GpuStateSnap *s, KVCache **kv) {
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        if (((layer + 1) % g_cfg.full_attn_interval) == 0) { s->kvlen[layer] = kv[layer]->len; }
+        else { int li = linear_idx_of(layer);
+            memcpy(s->delta[li], [g_metal->buf_delta_state[li] contents], 64*128*128*sizeof(float));
+            memcpy(s->conv[li],  [g_metal->buf_conv_state[li] contents],  3*12288*sizeof(float)); }
+    }
+}
+static void gpu_snap_restore(GpuStateSnap *s, KVCache **kv) {
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        if (((layer + 1) % g_cfg.full_attn_interval) == 0) { kv[layer]->len = s->kvlen[layer]; }
+        else { int li = linear_idx_of(layer);
+            memcpy([g_metal->buf_delta_state[li] contents], s->delta[li], 64*128*128*sizeof(float));
+            memcpy([g_metal->buf_conv_state[li] contents],  s->conv[li],  3*12288*sizeof(float)); }
+    }
+}
+
+// 4d-i: verify/accept loop on the PRODUCTION forward (faithful hiddens), verify
+// done as two sequential production forwards (no amortization yet — validates
+// acceptance recovery, GPU-state rollback, and losslessness before the batched
+// kernels add speedup in 4d-ii).
+static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new) {
+    if (!g_metal || !g_metal->wf_buf || !g_mtp_cache.ready) { fprintf(stderr, "[mtp-gpu] requires GPU + MTP\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, Ld = g_cfg.num_layers, K = g_cfg.num_experts_per_tok;
+    int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld, sizeof(void*));
+    KVCache **kv = calloc(Ld, sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
+    for (int i = 0; i < Ld; i++) {
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        fds[i] = open(p, O_RDONLY); mmaps[i] = NULL;
+        if (fds[i] >= 0) { struct stat st; if (fstat(fds[i], &st)==0 && st.st_size>0){ void *m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m; } }
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) { kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); }
+        else ls[i] = linear_attn_state_new();
+    }
+    int prompt[] = { 9707, 11, 358, 1079, 4378, 264, 13027, 729, 311 }; int np = (int)(sizeof(prompt)/sizeof(prompt[0]));
+    float *h = malloc(Hd*sizeof(float)), *logits = malloc(V*sizeof(float));
+    int *base_tok = malloc(max_new*sizeof(int)), *mtp_tok = malloc(max_new*sizeof(int));
+
+    // baseline greedy
+    reset_delta_net_state(); for (int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
+    for (int pp=0; pp<np; pp++){ embed_lookup(wf, prompt[pp], h); prod_forward_1(wf,h,pp,kv,ls,fds,mmaps,K,logits); }
+    int tok = cpu_argmax(logits,V), pos=np, bn=0; double t0=now_ms();
+    while (bn<max_new){ base_tok[bn++]=tok; if(MTP_IS_EOS(tok))break; embed_lookup(wf,tok,h); prod_forward_1(wf,h,pos,kv,ls,fds,mmaps,K,logits); pos++; tok=cpu_argmax(logits,V);}
+    double base_ms = now_ms()-t0;
+
+    // MTP verify (sequential faithful forwards + GPU rollback)
+    reset_delta_net_state(); for (int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0; g_mtp_kv_len=0;
+    for (int pp=0; pp<np; pp++){ embed_lookup(wf, prompt[pp], h); prod_forward_1(wf,h,pp,kv,ls,fds,mmaps,K,logits); }
+    int t_next=cpu_argmax(logits,V); float *hcur=malloc(Hd*sizeof(float)); memcpy(hcur,h,Hd*sizeof(float)); pos=np;
+    GpuStateSnap snap; gpu_snap_alloc(&snap);
+    float *ha=malloc(Hd*sizeof(float)), *hb=malloc(Hd*sizeof(float)), *la=malloc(V*sizeof(float)), *lb=malloc(V*sizeof(float));
+    int mn=0, accepts=0, checks=0; double t1=now_ms();
+    while (mn<max_new){
+        if (MTP_IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
+        int d=-1; mtp_shadow_draft_token(wf, model_path, hcur, t_next, &d);
+        if (d<0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la); memcpy(hcur,ha,Hd*sizeof(float)); pos++; t_next=cpu_argmax(la,V); continue; }
+        embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la);
+        gpu_snap_save(&snap, kv);
+        int t_v1=cpu_argmax(la,V); mtp_tok[mn++]=t_next; checks++;
+        embed_lookup(wf,d,hb); prod_forward_1(wf,hb,pos+1,kv,ls,fds,mmaps,K,lb);
+        if (t_v1==d){ accepts++; if(mn<max_new) mtp_tok[mn++]=d; { int dm=-1; mtp_shadow_draft_token(wf,model_path,ha,d,&dm); } memcpy(hcur,hb,Hd*sizeof(float)); t_next=cpu_argmax(lb,V); pos+=2; }
+        else { gpu_snap_restore(&snap, kv); memcpy(hcur,ha,Hd*sizeof(float)); t_next=t_v1; pos+=1; }
+    }
+    double mtp_ms=now_ms()-t1;
+    int n = bn<mn?bn:mn, mism=0;
+    for (int i=0;i<n;i++) if(base_tok[i]!=mtp_tok[i]){ mism++; if(mism==1) fprintf(stderr,"[mtp-gpu] first mismatch at %d: base=%d mtp=%d\n",i,base_tok[i],mtp_tok[i]); }
+    double accpct = checks?100.0*accepts/checks:0.0;
+    fprintf(stderr,"[mtp-gpu] baseline: %d tok %.0f ms (%.2f tok/s)\n", bn, base_ms, 1000.0*bn/base_ms);
+    fprintf(stderr,"[mtp-gpu] mtp(seq verify): %d tok %.0f ms (%.2f tok/s) | acceptance=%.1f%% (%d/%d)\n", mn, mtp_ms, 1000.0*mn/mtp_ms, accpct, accepts, checks);
+    fprintf(stderr,"[mtp-gpu] lossless: %d/%d match | %s\n", n-mism, n, mism==0?"PASS":"FAIL");
+    fprintf(stderr,"[mtp-gpu] NOTE: verify is sequential (2 forwards/step) so no speedup yet; validates acceptance + GPU rollback + losslessness\n");
+
+    gpu_snap_free(&snap);
+    for (int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i]) linear_attn_state_free(ls[i]); if(mmaps[i]) { struct stat st; fstat(fds[i],&st); munmap(mmaps[i], st.st_size);} if(fds[i]>=0) close(fds[i]); }
+    free(fds); free(mmaps); free(kv); free(ls); free(h); free(logits); free(base_tok); free(mtp_tok); free(hcur); free(ha); free(hb); free(la); free(lb);
+    return mism==0 ? 0 : 1;
+}
+
 // ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
@@ -11421,6 +11533,7 @@ enum {
     OPT_MTP_VERIFY_FORWARD,
     OPT_MTP_VERIFY_ROLLBACK,
     OPT_MTP_GENERATE,
+    OPT_MTP_GENERATE_GPU,
 };
 
 static void print_usage(const char *prog) {
@@ -11485,6 +11598,7 @@ int main(int argc, char **argv) {
         int mtp_verify_forward_requested = 0;
         int mtp_verify_rollback_requested = 0;
         int mtp_generate_requested = 0;
+        int mtp_generate_gpu_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -11681,6 +11795,7 @@ int main(int argc, char **argv) {
             {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
             {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
             {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
+            {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11730,6 +11845,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
                 case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
                 case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11927,6 +12043,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_generate_requested) {
             return mtp_generate(wf, model_path, 48);
+        }
+        if (mtp_generate_gpu_requested) {
+            return mtp_generate_gpu(wf, model_path, 48);
         }
 
         // ---- Load vocabulary ----
