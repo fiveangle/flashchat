@@ -2387,12 +2387,30 @@ static void gpu_dequant_matvec(
 
 // Batched N=2 dequant matmul: one weight read serves two input vectors.
 // Foundation for MTP draft/verify. Requires in_dim <= 4096 (v3 x_shared limit).
+static void gpu_dequant_matmulN(MetalCtx *ctx, const void *W_packed, const void *scales,
+    const void *biases, const float *X, float *OUT, uint32_t out_dim, uint32_t in_dim,
+    uint32_t group_size, uint32_t N);
+
 static void gpu_dequant_matmul2(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
     const float *x0_f32, const float *x1_f32, float *out0_f32, float *out1_f32,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
+    // The matmul2 v3 kernel caches the input in x_shared[4096], so it only handles
+    // in_dim <= 4096. For larger inputs (e.g. dense-27B hidden=5120, down_proj=17408)
+    // route to matmulN, which reads X from device and handles any in_dim.
+    if (in_dim > 4096) {
+        float *X = malloc((size_t)2 * in_dim * sizeof(float));
+        float *O = malloc((size_t)2 * out_dim * sizeof(float));
+        memcpy(X, x0_f32, in_dim * sizeof(float));
+        memcpy(X + in_dim, x1_f32, in_dim * sizeof(float));
+        gpu_dequant_matmulN(ctx, W_packed, scales, biases, X, O, out_dim, in_dim, group_size, 2);
+        memcpy(out0_f32, O, out_dim * sizeof(float));
+        memcpy(out1_f32, O + out_dim, out_dim * sizeof(float));
+        free(X); free(O);
+        return;
+    }
     static id<MTLBuffer> in0 = nil, in1 = nil, o0 = nil, o1 = nil;
     size_t i_size = (size_t)in_dim * sizeof(float);
     size_t o_size = (size_t)out_dim * sizeof(float);
@@ -2556,8 +2574,13 @@ static int mtp_bench_matmul(WeightFile *wf) {
             double per_call = (now_ms() - t) / M;
             double per_tok = per_call / N;
             if (N == 1) base_per_tok = per_tok;
-            fprintf(stderr, "[mtp-depth] lm_head N=%u | call=%.4f ms | per-token=%.4f ms | per-tok-ratio=%.3f\n",
-                    N, per_call, per_tok, base_per_tok > 0 ? per_tok / base_per_tok : 1.0);
+            // Correctness: matmulN row n must equal gpu_dequant_matvec on X[n].
+            float *ref = malloc(out_dim * sizeof(float)); double mxerr = 0;
+            gpu_dequant_matvec(g_metal, W, S, B, X + (size_t)(N-1)*in_dim, ref, out_dim, in_dim, gs);
+            for (uint32_t i = 0; i < out_dim; i++) mxerr = fmax(mxerr, fabs(ref[i] - O[(size_t)(N-1)*out_dim + i]));
+            free(ref);
+            fprintf(stderr, "[mtp-depth] lm_head N=%u | call=%.4f ms | per-token=%.4f ms | per-tok-ratio=%.3f | matmulN-vs-matvec max_err=%.2e\n",
+                    N, per_call, per_tok, base_per_tok > 0 ? per_tok / base_per_tok : 1.0, mxerr);
             free(X); free(O);
         }
         fprintf(stderr, "[mtp-depth] per-tok-ratio is fraction of N=1 cost; lower = deeper batching amortizes more\n");
@@ -3853,6 +3876,32 @@ static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
     free(gated_a); free(gated_b); free(oa); free(ob_out);
 }
 
+// Dense-27B batched (N=2) MLP block: hidden += down(swiglu(gate(h_post), up(h_post)))
+// for both tokens. Uses matmulN (not matmul2) since dense in_dims 5120/17408 exceed
+// the matmul2 x_shared 4096 limit. No routing/experts/shared → no drift amplification.
+static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
+    int H = g_cfg.hidden_dim, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
+    char nm[256];
+    #define DW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint16_t *post_w = (snprintf(nm,sizeof(nm),"model.layers.%d.post_attention_layernorm.weight",layer), get_tensor_ptr(wf,nm));
+    uint32_t *gw=DW("gate_proj.weight"); uint16_t *gs=DW("gate_proj.scales"),*gb=DW("gate_proj.biases");
+    uint32_t *uw=DW("up_proj.weight");   uint16_t *us=DW("up_proj.scales"),  *ub=DW("up_proj.biases");
+    uint32_t *dw=DW("down_proj.weight"); uint16_t *ds=DW("down_proj.scales"),*db=DW("down_proj.biases");
+    #undef DW
+    float *hp = malloc((size_t)2*H*sizeof(float));   // [2][hidden] packed h_post
+    cpu_rms_norm(ha, post_w, hp,     H, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, post_w, hp + H, H, g_cfg.rms_norm_eps);
+    float *g2 = malloc((size_t)2*inter*sizeof(float)), *u2 = malloc((size_t)2*inter*sizeof(float)), *a2 = malloc((size_t)2*inter*sizeof(float));
+    gpu_dequant_matmulN(g_metal, gw, gs, gb, hp, g2, inter, H, gsz, 2);
+    gpu_dequant_matmulN(g_metal, uw, us, ub, hp, u2, inter, H, gsz, 2);
+    cpu_swiglu(g2,         u2,         a2,         inter);
+    cpu_swiglu(g2 + inter, u2 + inter, a2 + inter, inter);
+    float *o2 = malloc((size_t)2*H*sizeof(float));
+    gpu_dequant_matmulN(g_metal, dw, ds, db, a2, o2, H, inter, gsz, 2);
+    for (int i = 0; i < H; i++) { ha[i] += o2[i]; hb[i] += o2[H + i]; }
+    free(hp); free(g2); free(u2); free(a2); free(o2);
+}
+
 // Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
 // calls (the oracle) on an identical pre-seeded KV cache, and should be faster
 // (q/k/v projections amortized). Gated by --mtp-bench-attn.
@@ -4680,7 +4729,10 @@ static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
             attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
         else
             linear_block_2(wf, layer, ha, hb);
-        moe_block_2(wf, layer, ha, hb, fds[layer]);
+        if (g_cfg.num_experts == 0)
+            dense_mlp_block_2(wf, layer, ha, hb);
+        else
+            moe_block_2(wf, layer, ha, hb, fds[layer]);
     }
     uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
     float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
