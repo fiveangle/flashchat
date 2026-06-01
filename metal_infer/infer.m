@@ -3754,8 +3754,10 @@ static void attn_block_2(
 // driven per-token (a updates buf_conv_state/buf_delta_state[li], then b reads them
 // — faithful to production, recurrence is sequential anyway); out_proj amortized.
 // hidden = residual + out_proj(gated_delta_output). Mirrors attn_block_2's contract.
+// Snapshot of recurrent GPU state + KV lens for batched-verify reject-rollback.
+typedef struct { float **delta; float **conv; int *kvlen; } GpuStateSnap;
 __attribute__((unused))
-static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
+static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb, GpuStateSnap *rb) {
     int Hd = g_cfg.hidden_dim, gsz = g_cfg.group_size;
     int li = layer - (layer + 1) / g_cfg.full_attn_interval;   // linear_layer_idx
     int qkv_dim = g_cfg.linear_conv_dim;
@@ -3864,6 +3866,11 @@ static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
           [e endEncoding]; }
         [cmd commit]; [cmd waitUntilCompleted];
         memcpy(gated_t[t], [g_metal->batch_out[6] contents], z_dim*sizeof(float));
+        // Capture post-token-a recurrent state (before token b) for reject-rollback.
+        if (rb && t == 0) {
+            memcpy(rb->delta[li], [g_metal->buf_delta_state[li] contents], 64*128*128*sizeof(float));
+            memcpy(rb->conv[li],  [g_metal->buf_conv_state[li] contents],  3*12288*sizeof(float));
+        }
     }
 
     // out_proj (amortized, in_dim=linear_total_value=4096 fits matmul2)
@@ -4340,7 +4347,7 @@ static int mtp_verify_linear(WeightFile *wf, const char *model_path) {
     memcpy([g_metal->buf_conv_state[li] contents], Sc, csz);
     float *Hat = malloc(Hd*sizeof(float)), *Hbt = malloc(Hd*sizeof(float));
     memcpy(Hat, Ha, Hd*sizeof(float)); memcpy(Hbt, Hb, Hd*sizeof(float));
-    linear_block_2(wf, layer, Hat, Hbt);
+    linear_block_2(wf, layer, Hat, Hbt, NULL);
     moe_block_1(wf, layer, Hat, fd);
     moe_block_1(wf, layer, Hbt, fd);
 
@@ -4683,9 +4690,7 @@ static void prod_forward_1(WeightFile *wf, float *h, int pos, KVCache **kv,
     free(n);
 }
 
-// Snapshot of the production recurrent GPU state (delta-net + conv) + KV lengths,
-// for reject-rollback of a speculative draft on the real pipeline.
-typedef struct { float **delta; float **conv; int *kvlen; } GpuStateSnap;
+// GpuStateSnap typedef'd earlier (before linear_block_2).
 static void gpu_snap_alloc(GpuStateSnap *s) {
     s->delta = calloc(g_cfg.num_linear_layers, sizeof(float*));
     s->conv  = calloc(g_cfg.num_linear_layers, sizeof(float*));
@@ -4716,19 +4721,32 @@ static void gpu_snap_restore(GpuStateSnap *s, KVCache **kv) {
             memcpy([g_metal->buf_conv_state[li] contents],  s->conv[li],  3*12288*sizeof(float)); }
     }
 }
+// Reject-rollback: restore state to token-a-only. Full layers: kvlen captured
+// PRE-token-a, so a-only len = kvlen+1 (keep a, drop b). Linear: delta/conv were
+// captured POST-token-a (in linear_block_2), so restore them directly.
+static void batched_rollback_apply(GpuStateSnap *s, KVCache **kv) {
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        if (((layer + 1) % g_cfg.full_attn_interval) == 0) { kv[layer]->len = s->kvlen[layer] + 1; }
+        else { int li = linear_idx_of(layer);
+            memcpy([g_metal->buf_delta_state[li] contents], s->delta[li], 64*128*128*sizeof(float));
+            memcpy([g_metal->buf_conv_state[li] contents],  s->conv[li],  3*12288*sizeof(float)); }
+    }
+}
 
 // 4d-ii: the amortized batched 2-position forward on faithful GPU primitives.
 // full-attn = attn_block_2, linear = linear_block_2 (GPU delta-net), MoE = moe_block_2.
 // All weight-bound matmuls are batched (matmul2); operates on production GPU state.
 static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
                                   KVCache **kv, int *fds, int pos_a, int pos_b,
-                                  float *log_a, float *log_b) {
+                                  float *log_a, float *log_b, GpuStateSnap *rb) {
     int Hd = g_cfg.hidden_dim;
     for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-        if (((layer + 1) % g_cfg.full_attn_interval) == 0)
+        if (((layer + 1) % g_cfg.full_attn_interval) == 0) {
+            if (rb) rb->kvlen[layer] = kv[layer]->len;  // pre-token-a KV len (rollback)
             attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
-        else
-            linear_block_2(wf, layer, ha, hb);
+        } else {
+            linear_block_2(wf, layer, ha, hb, rb);      // captures post-a delta/conv if rb
+        }
         if (g_cfg.num_experts == 0)
             dense_mlp_block_2(wf, layer, ha, hb);
         else
@@ -4771,7 +4789,7 @@ static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
     gpu_snap_restore(&snap, kv);
     float *Hat=malloc(Hd*sizeof(float)),*Hbt=malloc(Hd*sizeof(float)),*la_t=malloc(V*sizeof(float)),*lb_t=malloc(V*sizeof(float));
     embed_lookup(wf,ta,Hat); embed_lookup(wf,tb,Hbt);
-    fused_layer_forward_2(wf,Hat,Hbt,kv,fds,P,P+1,la_t,lb_t);
+    fused_layer_forward_2(wf,Hat,Hbt,kv,fds,P,P+1,la_t,lb_t,NULL);
 
     double ea=0,eb=0,ref=0; for(int i=0;i<V;i++){ ea=fmax(ea,fabs(la_o[i]-la_t[i])); eb=fmax(eb,fabs(lb_o[i]-lb_t[i])); ref=fmax(ref,fabs(la_o[i])); }
     int aa_o=cpu_argmax(la_o,V),aa_t=cpu_argmax(la_t,V),bb_o=cpu_argmax(lb_o,V),bb_t=cpu_argmax(lb_t,V);
@@ -4794,7 +4812,7 @@ static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
     for (int m = 0; m < MT; m++) {
         gpu_snap_restore(&snap, kv);
         embed_lookup(wf, ta, Hat); embed_lookup(wf, tb, Hbt);
-        fused_layer_forward_2(wf, Hat, Hbt, kv, fds, P, P+1, la_t, lb_t);
+        fused_layer_forward_2(wf, Hat, Hbt, kv, fds, P, P+1, la_t, lb_t, NULL);
     }
     double batched2 = (now_ms() - t) / MT;  // cost of 1 batched forward (2 positions)
     double cost_ratio = batched2 / seq2;
@@ -4963,12 +4981,11 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
         if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
         int d=dense_mtp_draft(wf,hcur,t_next);
         if(d<0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la); memcpy(hcur,ha,Hd*4); pos++; t_next=cpu_argmax(la,V); continue; }
-        gpu_snap_save(&snap,kv);
         embed_lookup(wf,t_next,ha); embed_lookup(wf,d,hb);
-        fused_layer_forward_2(wf,ha,hb,kv,fds,pos,pos+1,la,lb);
+        fused_layer_forward_2(wf,ha,hb,kv,fds,pos,pos+1,la,lb,&snap);  // captures post-a rollback state
         int t_v1=cpu_argmax(la,V); mtp_tok[mn++]=t_next; checks++;
         if(t_v1==d){ accepts++; if(mn<max_new) mtp_tok[mn++]=d; memcpy(hcur,hb,Hd*4); t_next=cpu_argmax(lb,V); pos+=2; }
-        else { gpu_snap_restore(&snap,kv); embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la); memcpy(hcur,ha,Hd*4); t_next=t_v1; pos++; }
+        else { batched_rollback_apply(&snap,kv); memcpy(hcur,ha,Hd*4); t_next=t_v1; pos++; }  // drop b, keep a — no re-forward
     }
     double mtp_ms=now_ms()-t1;
     int n=bn<mn?bn:mn,mism=0; for(int i=0;i<n;i++) if(base_tok[i]!=mtp_tok[i]){mism++; if(mism==1)fprintf(stderr,"[mtp-dense] first mismatch @%d base=%d mtp=%d\n",i,base_tok[i],mtp_tok[i]);}
