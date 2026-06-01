@@ -23,6 +23,16 @@ import sys
 import os
 
 
+def parse_merge_pair(pair):
+    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+        return pair[0], pair[1]
+    if isinstance(pair, str):
+        parts = pair.split(" ")
+        if len(parts) == 2:
+            return parts[0], parts[1]
+    raise ValueError(f"Unsupported merge pair format: {pair!r}")
+
+
 def get_default_model_path():
     """Get default model path for the original supported model."""
     model_repo = 'mlx-community/Qwen3.5-397B-A17B-4bit'
@@ -74,7 +84,7 @@ def main():
 
         # Merges
         for pair in merges:
-            a, b = pair[0], pair[1]
+            a, b = parse_merge_pair(pair)
             ab = a.encode('utf-8')
             bb = b.encode('utf-8')
             f.write(struct.pack('<H', len(ab)))

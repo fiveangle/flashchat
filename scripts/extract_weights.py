@@ -24,6 +24,8 @@ from collections import defaultdict
 import re
 import numpy as np
 
+from flashchat_quant import convert_8bit_to_4bit
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------------
@@ -66,60 +68,6 @@ def parse_safetensors_header(filepath):
         header = json.loads(f.read(header_len))
         data_start = 8 + header_len
     return header, data_start
-
-# ---------------------------------------------------------------------------
-# 8-bit → 4-bit conversion
-# ---------------------------------------------------------------------------
-
-def bf16_to_f32(bf16_bytes):
-    u16 = np.frombuffer(bf16_bytes, dtype=np.uint16)
-    u32 = u16.astype(np.uint32) << 16
-    return u32.view(np.float32)
-
-def f32_to_bf16(f32_arr):
-    u32 = f32_arr.astype(np.float32).view(np.uint32)
-    u16 = (u32 >> 16).astype(np.uint16)
-    return u16.tobytes()
-
-def convert_8bit_to_4bit(weight_u32, scales_bf16, biases_bf16, out_dim, in_dim, group_size=64):
-    num_groups = in_dim // group_size
-    scales_f32 = bf16_to_f32(scales_bf16).reshape(out_dim, num_groups)
-    biases_f32 = bf16_to_f32(biases_bf16).reshape(out_dim, num_groups)
-
-    u8_vals = np.zeros((out_dim, in_dim), dtype=np.uint8)
-    for i in range(4):
-        u8_vals[:, i::4] = (weight_u32[:, :in_dim // 4] >> (8 * i)) & 0xFF
-
-    f32_vals = np.zeros((out_dim, in_dim), dtype=np.float32)
-    for g in range(num_groups):
-        start = g * group_size
-        end = start + group_size
-        f32_vals[:, start:end] = (u8_vals[:, start:end].astype(np.float32) *
-                                   scales_f32[:, g:g+1] + biases_f32[:, g:g+1])
-
-    new_scales_f32 = np.zeros((out_dim, num_groups), dtype=np.float32)
-    new_biases_f32 = np.zeros((out_dim, num_groups), dtype=np.float32)
-    u4_vals = np.zeros((out_dim, in_dim), dtype=np.uint8)
-
-    for g in range(num_groups):
-        start = g * group_size
-        end = start + group_size
-        group_data = f32_vals[:, start:end]
-        min_vals = group_data.min(axis=1, keepdims=True)
-        max_vals = group_data.max(axis=1, keepdims=True)
-        ranges = np.where(max_vals - min_vals < 1e-8, 1e-8, max_vals - min_vals)
-        new_scales_f32[:, g:g+1] = ranges / 15.0
-        new_biases_f32[:, g:g+1] = min_vals
-        u4 = np.clip(np.round((group_data - min_vals) / new_scales_f32[:, g:g+1]), 0, 15).astype(np.uint8)
-        u4_vals[:, start:end] = u4
-
-    new_weight_u32 = np.zeros((out_dim, in_dim // 8), dtype=np.uint32)
-    for i in range(8):
-        new_weight_u32 |= (u4_vals[:, i::8].astype(np.uint32) << (4 * i))
-
-    new_scales_bf16 = f32_to_bf16(new_scales_f32.flatten())
-    new_biases_bf16 = f32_to_bf16(new_biases_f32.flatten())
-    return new_weight_u32, new_scales_bf16, new_biases_bf16
 
 def load_8bit_tensor_overrides(config_path):
     overrides = {}
@@ -319,8 +267,8 @@ def main():
                 )
 
                 weight_data = new_w_u32.tobytes()
-                scales_data = new_s_bf16
-                biases_data = new_b_bf16
+                scales_data = new_s_bf16.tobytes()
+                biases_data = new_b_bf16.tobytes()
 
                 if offset % ALIGN != 0:
                     pad = ALIGN - (offset % ALIGN)
