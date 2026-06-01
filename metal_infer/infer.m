@@ -2141,6 +2141,9 @@ static MetalCtx *metal_setup(void) {
     if (max_in < (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim) * sizeof(float)) {
         max_in = (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim) * sizeof(float);  // o_proj input = 8192
     }
+    if (max_in < (size_t)g_cfg.dense_intermediate * sizeof(float)) {
+        max_in = (size_t)g_cfg.dense_intermediate * sizeof(float);  // dense down_proj input = 17408
+    }
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
 
@@ -7016,9 +7019,13 @@ static void fused_layer_forward(
 
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
+        // Dense (num_experts==0) never takes the fused CMD2 path that computes GPU
+        // attention, so force CPU attention (else attn_out_for_oproj=NULL is never
+        // consumed and the o_proj input is stale).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                              kv->len >= 32 && kv->len < GPU_KV_SEQ &&
+                              g_cfg.num_experts > 0);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -7059,10 +7066,17 @@ static void fused_layer_forward(
         // q_proj_out, k_out, v_out, q, q_gate, attn_out are static scratch.
     } else if (gpu_linear_attn) {
         // ---- GPU linear attention: already computed in CMD1 ----
-        // batch_out[6] already contains gated_rms_norm output (8192 floats)
-        // Set a non-NULL sentinel so CMD2 enters fused path, but skip the memcpy
-        static float gpu_linear_sentinel;
-        attn_out_for_oproj = &gpu_linear_sentinel;
+        // batch_out[6] already contains gated_rms_norm output (linear_total_value floats)
+        if (g_cfg.num_experts == 0) {
+            // Dense takes the non-fused fallback o_proj, which reads attn_out_for_oproj
+            // directly — so copy the gated output into a real buffer (not a sentinel).
+            memcpy(s_gated_out, [g_metal->batch_out[6] contents], g_cfg.linear_total_value * sizeof(float));
+            attn_out_for_oproj = s_gated_out;
+        } else {
+            // MoE: fused CMD2 path reads batch_out[6] directly; sentinel just signals non-NULL.
+            static float gpu_linear_sentinel;
+            attn_out_for_oproj = &gpu_linear_sentinel;
+        }
     } else {
         // ---- Linear attention CPU compute ----
         if (!linear_attn_bypass) {

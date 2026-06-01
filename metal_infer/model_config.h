@@ -11,7 +11,7 @@
 // Compile-time maximums
 // ============================================================================
 
-#define MAX_HIDDEN_DIM              4096
+#define MAX_HIDDEN_DIM              6144   // Qwen3.6-27B dense: hidden 5120 (q_dim 6144); was 4096
 #define MAX_NUM_LAYERS              64
 #define MAX_NUM_EXPERTS             512
 #define MAX_NUM_ATTN_HEADS          64
