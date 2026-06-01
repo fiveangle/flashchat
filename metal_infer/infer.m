@@ -1966,6 +1966,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matmul2_v3;   // batched N=2 (MTP draft/verify)
+    id<MTLComputePipelineState> matmulN_v3;    // batched N-wide (depth-N verify)
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2102,6 +2103,7 @@ static MetalCtx *metal_setup(void) {
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matmul2_v3    = makePipe(@"dequant_matmul2_4bit_v3");
+    ctx->matmulN_v3    = makePipe(@"dequant_matmulN_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -2427,6 +2429,45 @@ static void gpu_dequant_matmul2(
     memcpy(out1_f32, [o1 contents], o_size);
 }
 
+// N-wide batched dequant matmul (N<=8): X is [N][in_dim], OUT is [N][out_dim],
+// both host-side contiguous. One weight read serves all N tokens.
+static void gpu_dequant_matmulN(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *X, float *OUT,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size, uint32_t N
+) {
+    static id<MTLBuffer> xbuf = nil, obuf = nil;
+    size_t xs = (size_t)N * in_dim * sizeof(float);
+    size_t os = (size_t)N * out_dim * sizeof(float);
+    if (!xbuf || (size_t)[xbuf length] < xs) xbuf = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
+    if (!obuf || (size_t)[obuf length] < os) obuf = [ctx->device newBufferWithLength:os options:MTLResourceStorageModeShared];
+    memcpy([xbuf contents], X, xs);
+
+    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matmulN_v3];
+    [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+    [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+    [enc setBuffer:xbuf offset:0 atIndex:3];
+    [enc setBuffer:obuf offset:0 atIndex:4];
+    [enc setBytes:&out_dim length:4 atIndex:5];
+    [enc setBytes:&in_dim  length:4 atIndex:6];
+    [enc setBytes:&group_size length:4 atIndex:7];
+    [enc setBytes:&N length:4 atIndex:8];
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+    memcpy(OUT, [obuf contents], os);
+}
+
 // Stage 1 microbench: does one weight read serve two tokens? Times two separate
 // single-token matvecs vs one batched N=2 matmul on real weight matrices, and
 // verifies the batched output matches. The ratio (batched / 2×single) is the
@@ -2488,6 +2529,36 @@ static int mtp_bench_matmul(WeightFile *wf) {
         free(x0); free(x1); free(r0); free(r1); free(b0); free(b1);
     }
     fprintf(stderr, "[mtp-bench] ratio < 1.0 means batching amortizes the weight read (lower = better; 0.5 = ideal 2x)\n");
+
+    // Depth sweep on lm_head: per-token cost vs batch width N (the compute-side
+    // case for deeper speculation — fixed weight read amortized over more tokens).
+    TensorInfo *wi = get_tensor_info(wf, "lm_head.weight");
+    TensorInfo *si = get_tensor_info(wf, "lm_head.scales");
+    TensorInfo *bi = get_tensor_info(wf, "lm_head.biases");
+    if (wi && si && bi) {
+        uint32_t out_dim = (uint32_t)g_cfg.vocab_size, in_dim = (uint32_t)g_cfg.hidden_dim, gs = (uint32_t)g_cfg.group_size;
+        uint32_t *W = (uint32_t *)((char *)wf->data + wi->offset);
+        uint16_t *S = (uint16_t *)((char *)wf->data + si->offset);
+        uint16_t *B = (uint16_t *)((char *)wf->data + bi->offset);
+        double base_per_tok = 0.0;
+        for (uint32_t N = 1; N <= 4; N++) {
+            float *X = malloc((size_t)N * in_dim * sizeof(float));
+            float *O = malloc((size_t)N * out_dim * sizeof(float));
+            for (uint32_t n = 0; n < N; n++)
+                for (uint32_t i = 0; i < in_dim; i++) X[n*in_dim+i] = sinf((i + n*7) * 0.01f);
+            for (int w = 0; w < 5; w++) gpu_dequant_matmulN(g_metal, W, S, B, X, O, out_dim, in_dim, gs, N);
+            const int M = 80;
+            double t = now_ms();
+            for (int m = 0; m < M; m++) gpu_dequant_matmulN(g_metal, W, S, B, X, O, out_dim, in_dim, gs, N);
+            double per_call = (now_ms() - t) / M;
+            double per_tok = per_call / N;
+            if (N == 1) base_per_tok = per_tok;
+            fprintf(stderr, "[mtp-depth] lm_head N=%u | call=%.4f ms | per-token=%.4f ms | per-tok-ratio=%.3f\n",
+                    N, per_call, per_tok, base_per_tok > 0 ? per_tok / base_per_tok : 1.0);
+            free(X); free(O);
+        }
+        fprintf(stderr, "[mtp-depth] per-tok-ratio is fraction of N=1 cost; lower = deeper batching amortizes more\n");
+    }
     return 0;
 }
 
