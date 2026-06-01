@@ -4983,7 +4983,7 @@ static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new)
 // Dense MTP draft: produce one draft token from the dense MTP head given the
 // backbone hidden (hcur) and the accepted token. Context-free self-attention
 // (single token, copy-V — like the 35B which still hit 55-83%). Dense MLP head.
-static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next) {
+static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next, int do_append, float *out_hidden) {
     int H = g_cfg.hidden_dim, V = g_cfg.vocab_size, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
     int qpd = g_cfg.num_attn_heads * g_cfg.head_dim * 2, qd = g_cfg.num_attn_heads * g_cfg.head_dim;
     int kvd = g_cfg.num_kv_heads * g_cfg.head_dim, hpk = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
@@ -5018,25 +5018,28 @@ static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next) {
     for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
     // Real causal self-attention over a persistent MTP KV cache (replaces copy-V):
     // append this token's K/V, attend over [0..len]. Built from accepted tokens only.
-    int mtp_pos = g_mtp_kv_len;
-    apply_rotary_emb(q, k, mtp_pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
-    if (g_mtp_k_cache && g_mtp_v_cache && g_mtp_kv_len < GPU_KV_SEQ) {
-        memcpy(g_mtp_k_cache + (size_t)g_mtp_kv_len*kvd, k, kvd*4);
-        memcpy(g_mtp_v_cache + (size_t)g_mtp_kv_len*kvd, v, kvd*4);
-        g_mtp_kv_len++;
-    }
-    int ctx = g_mtp_kv_len > 0 ? g_mtp_kv_len : 1;
-    const float *kc = g_mtp_k_cache ? g_mtp_k_cache : k;
-    const float *vc = g_mtp_v_cache ? g_mtp_v_cache : v;
+    // Real causal self-attention over committed MTP KV cache + the current token.
+    // do_append persists the current token's K/V (committed-token rule); rollout
+    // drafts pass do_append=0 (attend over context, don't pollute the cache).
+    apply_rotary_emb(q, k, g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    int ncomm = (g_mtp_k_cache && g_mtp_v_cache) ? g_mtp_kv_len : 0;
+    int ctx = ncomm + 1;  // committed positions + current token
     float ascale = 1.0f / sqrtf((float)g_cfg.head_dim);
     for (int h=0;h<g_cfg.num_attn_heads;h++){
         int kvh=h/hpk; float *qh=q+h*g_cfg.head_dim;
         float *sc=malloc(ctx*sizeof(float));
-        for (int p=0;p<ctx;p++){ const float *kp=kc+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale; }
+        for (int p=0;p<ncomm;p++){ const float *kp=g_mtp_k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale; }
+        { const float *kp=k+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[ncomm]=dt*ascale; }
         cpu_softmax(sc, ctx);
         float *oh=ao+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
-        for (int p=0;p<ctx;p++){ const float *vp=vc+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d]; }
+        for (int p=0;p<ncomm;p++){ const float *vp=g_mtp_v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d]; }
+        { const float *vp=v+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[ncomm]*vp[d]; }
         free(sc);
+    }
+    if (do_append && g_mtp_k_cache && g_mtp_v_cache && g_mtp_kv_len < GPU_KV_SEQ) {
+        memcpy(g_mtp_k_cache + (size_t)g_mtp_kv_len*kvd, k, kvd*4);
+        memcpy(g_mtp_v_cache + (size_t)g_mtp_kv_len*kvd, v, kvd*4);
+        g_mtp_kv_len++;
     }
     for (int i=0;i<qd;i++) ao[i]*=cpu_sigmoid(qg[i]);
     fast_dequant_matvec(ow,os,ob, ao, ap, H, qd, gsz);
@@ -5048,6 +5051,7 @@ static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next) {
     cpu_swiglu(g,u,a,inter);
     fast_dequant_matvec(mdw,mds,mdb, a, o, H, inter, gsz);
     for (int i=0;i<H;i++) x[i]+=o[i];
+    if (out_hidden) memcpy(out_hidden, x, H*4);  // pre-final-norm MTP hidden (for rollout chaining)
     float *fn=malloc(H*4),*logits=malloc(V*4);
     cpu_rms_norm(x, mnorm, fn, H, eps);
     lm_head_forward(wf, fn, logits);
@@ -5123,7 +5127,7 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     int mn=0,accepts=0,checks=0; double t1=now_ms();
     while(mn<max_new){
         if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
-        int d=dense_mtp_draft(wf,hcur,t_next);
+        int d=dense_mtp_draft(wf,hcur,t_next,1,NULL);
         if(d<0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la); memcpy(hcur,ha,Hd*4); pos++; t_next=cpu_argmax(la,V); continue; }
         embed_lookup(wf,t_next,ha); embed_lookup(wf,d,hb);
         fused_layer_forward_2(wf,ha,hb,kv,fds,pos,pos+1,la,lb,&snap);  // captures post-a rollback state
@@ -5184,6 +5188,77 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
     free(fds);free(mmaps);free(kv);free(ls);free(h);free(scratch);free(lo);free(hs);free(ln);
     return allmatch?0:1;
+}
+
+// Depth-D dense MTP speculative decode: roll out D drafts (autoregressive MTP),
+// verify all D+1 positions in one batched forward, accept the longest correct
+// prefix. Full-accept keeps state; partial-accept rolls back via a short re-forward.
+static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int max_new, int D) {
+    (void)model_path;
+    if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts != 0) { fprintf(stderr,"[mtp-d%d] requires dense GPU\n",D); return 1; }
+    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4;
+    int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
+    KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
+    int cap=8192;
+    for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
+    int prompt[]={9707,11,358,1079,4378,264,13027,729,311}; int np=(int)(sizeof(prompt)/sizeof(prompt[0]));
+    float *h=malloc(Hd*4),*logits=malloc(V*4); int *base_tok=malloc(max_new*4),*mtp_tok=malloc(max_new*4);
+    #define IS_EOS(t) ((t)==g_cfg.eos_token_1||(t)==g_cfg.eos_token_2)
+    // baseline
+    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
+    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
+    int tok=cpu_argmax(logits,V),pos=np,bn=0; double t0=now_ms();
+    while(bn<max_new){ base_tok[bn++]=tok; if(IS_EOS(tok))break; embed_lookup(wf,tok,h); prod_forward_1(wf,h,pos,kv,ls,fds,mmaps,K,logits); pos++; tok=cpu_argmax(logits,V);}
+    double base_ms=now_ms()-t0;
+    // MTP depth-D verify
+    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
+    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
+    int t_next=cpu_argmax(logits,V); float *hcur=malloc(Hd*4); memcpy(hcur,h,Hd*4); pos=np;
+    if(!g_mtp_k_cache){ g_mtp_k_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,4); g_mtp_v_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,4);} g_mtp_kv_len=0;
+    GpuStateSnap snap; gpu_snap_alloc(&snap);
+    int *drafts=malloc(D*4); float *mh=malloc((size_t)D*Hd*4);
+    float *hs=malloc((size_t)(D+1)*Hd*4),*ln=malloc((size_t)(D+1)*V*4); int *posv=malloc((D+1)*4);
+    int mn=0,accepts=0,checks=0; double t1=now_ms();
+    while(mn<max_new){
+        if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
+        // rollout D drafts (no MTP-KV append; chain MTP hiddens)
+        int nd=0; const float *mhp=hcur;
+        for(int j=0;j<D;j++){ int dj=dense_mtp_draft(wf,mhp,(j==0?t_next:drafts[j-1]),0,mh+(size_t)j*Hd); if(dj<0)break; drafts[j]=dj; mhp=mh+(size_t)j*Hd; nd++; }
+        if(nd==0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,hs); prod_forward_1(wf,hs,pos,kv,ls,fds,mmaps,K,ln); dense_mtp_advance(wf,hcur,t_next); memcpy(hcur,hs,Hd*4); pos++; t_next=cpu_argmax(ln,V); continue; }
+        int Nv=nd+1;
+        gpu_snap_save(&snap,kv);
+        embed_lookup(wf,t_next,hs); for(int j=0;j<nd;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
+        for(int t=0;t<Nv;t++) posv[t]=pos+t;
+        fused_dense_forward_N(wf,hs,Nv,kv,posv,ln);
+        mtp_tok[mn++]=t_next;
+        int acc=0;
+        for(int j=0;j<nd;j++){ int tv=cpu_argmax(ln+(size_t)j*V,V); checks++; if(drafts[j]==tv){ accepts++; acc++; if(mn<max_new)mtp_tok[mn++]=drafts[j]; } else break; }
+        int next_tok = cpu_argmax(ln+(size_t)acc*V,V);  // acc==nd: bonus; acc<nd: real reject token
+        float *hcommit = hs;
+        if(acc<nd){ // partial: rollback + re-forward the acc+1 committed tokens
+            gpu_snap_restore(&snap,kv);
+            embed_lookup(wf,t_next,hs); for(int j=0;j<acc;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
+            for(int t=0;t<acc+1;t++) posv[t]=pos+t;
+            fused_dense_forward_N(wf,hs,acc+1,kv,posv,ln);
+            next_tok = cpu_argmax(ln+(size_t)acc*V,V);
+        }
+        // MTP-KV advance for committed tokens (t_next + accepted drafts)
+        dense_mtp_advance(wf,hcur,t_next);
+        for(int j=0;j<acc;j++) dense_mtp_advance(wf,hcommit+(size_t)j*Hd,drafts[j]);
+        memcpy(hcur,hcommit+(size_t)acc*Hd,Hd*4);
+        t_next=next_tok; pos += acc+1;
+    }
+    double mtp_ms=now_ms()-t1;
+    int n=bn<mn?bn:mn,mism=0; for(int i=0;i<n;i++) if(base_tok[i]!=mtp_tok[i]){mism++; if(mism==1)fprintf(stderr,"[mtp-d%d] first mismatch @%d base=%d mtp=%d\n",D,i,base_tok[i],mtp_tok[i]);}
+    double accpct=checks?100.0*accepts/checks:0;
+    fprintf(stderr,"[mtp-d%d] baseline: %d tok %.0f ms (%.2f tok/s)\n",D,bn,base_ms,1000.0*bn/base_ms);
+    fprintf(stderr,"[mtp-d%d] mtp(depth-%d): %d tok %.0f ms (%.2f tok/s) | per-draft accept=%.1f%% (%d/%d)\n",D,D,mn,mtp_ms,1000.0*mn/mtp_ms,accpct,accepts,checks);
+    fprintf(stderr,"[mtp-d%d] SPEEDUP=%.2fx | lossless: %d/%d match %s\n",D, base_ms>0&&mtp_ms>0?(1000.0*mn/mtp_ms)/(1000.0*bn/base_ms):0, n-mism,n, mism==0?"PASS":"FAIL");
+    gpu_snap_free(&snap);
+    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
+    free(fds);free(mmaps);free(kv);free(ls);free(h);free(logits);free(base_tok);free(mtp_tok);free(hcur);free(drafts);free(mh);free(hs);free(ln);free(posv);
+    #undef IS_EOS
+    return mism==0?0:1;
 }
 
 // ============================================================================
@@ -12271,6 +12346,7 @@ enum {
     OPT_MTP_GENERATE_GPU,
     OPT_MTP_GENERATE_DENSE,
     OPT_MTP_VERIFY_FORWARDN,
+    OPT_MTP_GENERATE_DEPTH3,
 };
 
 static void print_usage(const char *prog) {
@@ -12341,6 +12417,7 @@ int main(int argc, char **argv) {
         int mtp_generate_gpu_requested = 0;
         int mtp_generate_dense_requested = 0;
         int mtp_verify_forwardN_requested = 0;
+        int mtp_generate_depth3_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -12543,6 +12620,7 @@ int main(int argc, char **argv) {
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"mtp-generate-dense", no_argument,   0, OPT_MTP_GENERATE_DENSE},
             {"mtp-verify-forwardN", no_argument,  0, OPT_MTP_VERIFY_FORWARDN},
+            {"mtp-generate-depth3", no_argument,  0, OPT_MTP_GENERATE_DEPTH3},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -12598,6 +12676,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_DENSE: mtp_generate_dense_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_MTP_GENERATE_DEPTH3: mtp_generate_depth3_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -12813,6 +12892,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_forwardN_requested) {
             return mtp_verify_forwardN(wf, model_path);
+        }
+        if (mtp_generate_depth3_requested) {
+            return mtp_generate_dense_depth(wf, model_path, 64, 3);
         }
 
         // ---- Load vocabulary ----
