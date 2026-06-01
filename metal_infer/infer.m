@@ -3909,6 +3909,97 @@ static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
     free(hp); free(g2); free(u2); free(a2); free(o2);
 }
 
+// Depth-N dense layer forward: process N positions (hs = [N][H]) through one dense
+// layer (attention + dense MLP). All weight-bound matmuls amortized via matmulN;
+// attention/delta-net run per-position (sequential, so position i sees earlier ones).
+// pos[i] = absolute sequence position of token i. Dense models only (num_experts==0).
+static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos) {
+    int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, inter=g_cfg.dense_intermediate, eps_layer=0; (void)eps_layer;
+    float eps=g_cfg.rms_norm_eps;
+    int is_full = ((layer+1)%g_cfg.full_attn_interval)==0;
+    char nm[256];
+    #define LW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d." suf,layer), get_tensor_ptr(wf,nm))
+    uint16_t *iln=LW("input_layernorm.weight"), *paln=LW("post_attention_layernorm.weight");
+    float *res=malloc((size_t)N*H*4), *nmd=malloc((size_t)N*H*4);
+    memcpy(res, hs, (size_t)N*H*4);
+    for (int i=0;i<N;i++) cpu_rms_norm(hs+(size_t)i*H, iln, nmd+(size_t)i*H, H, eps);
+
+    if (is_full) {
+        int qpd=g_cfg.num_attn_heads*g_cfg.head_dim*2, qd=g_cfg.num_attn_heads*g_cfg.head_dim, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, hpk=g_cfg.num_attn_heads/g_cfg.num_kv_heads;
+        uint32_t *qw=LW("self_attn.q_proj.weight");uint16_t *qs=LW("self_attn.q_proj.scales"),*qb=LW("self_attn.q_proj.biases");
+        uint32_t *kw=LW("self_attn.k_proj.weight");uint16_t *ks=LW("self_attn.k_proj.scales"),*kb=LW("self_attn.k_proj.biases");
+        uint32_t *vw=LW("self_attn.v_proj.weight");uint16_t *vs=LW("self_attn.v_proj.scales"),*vb=LW("self_attn.v_proj.biases");
+        uint32_t *ow=LW("self_attn.o_proj.weight");uint16_t *os=LW("self_attn.o_proj.scales"),*ob=LW("self_attn.o_proj.biases");
+        uint16_t *qn=LW("self_attn.q_norm.weight"),*kn=LW("self_attn.k_norm.weight");
+        float *qp=malloc((size_t)N*qpd*4),*kk=malloc((size_t)N*kvd*4),*vv=malloc((size_t)N*kvd*4),*ao=malloc((size_t)N*qd*4);
+        gpu_dequant_matmulN(g_metal,qw,qs,qb,nmd,qp,qpd,H,gsz,N);
+        gpu_dequant_matmulN(g_metal,kw,ks,kb,nmd,kk,kvd,H,gsz,N);
+        gpu_dequant_matmulN(g_metal,vw,vs,vb,nmd,vv,kvd,H,gsz,N);
+        float ascale=1.f/sqrtf((float)g_cfg.head_dim);
+        for (int t=0;t<N;t++){
+            float *q=malloc(qd*4),*qg=malloc(qd*4); float *kt=kk+(size_t)t*kvd,*vt=vv+(size_t)t*kvd;
+            for(int h=0;h<g_cfg.num_attn_heads;h++){ float*s=qp+(size_t)t*qpd+h*2*g_cfg.head_dim; memcpy(q+h*g_cfg.head_dim,s,g_cfg.head_dim*4); memcpy(qg+h*g_cfg.head_dim,s+g_cfg.head_dim,g_cfg.head_dim*4);}
+            for(int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*iv*bf16_to_f32(qn[i]);}
+            for(int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=kt+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*iv*bf16_to_f32(kn[i]);}
+            apply_rotary_emb(q,kt,pos[t],g_cfg.num_attn_heads,g_cfg.num_kv_heads,g_cfg.head_dim,g_cfg.rotary_dim);
+            int cp=kv->len; memcpy(kv->k_cache+(size_t)cp*kvd,kt,kvd*4); memcpy(kv->v_cache+(size_t)cp*kvd,vt,kvd*4); kv->len++;
+            float *aot=ao+(size_t)t*qd;
+            for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(kv->len*4);
+                for(int p=0;p<kv->len;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
+                cpu_softmax(sc,kv->len); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
+                for(int p=0;p<kv->len;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
+            for(int i=0;i<qd;i++)aot[i]*=cpu_sigmoid(qg[i]);
+            free(q);free(qg);
+        }
+        float *ap=malloc((size_t)N*H*4); gpu_dequant_matmulN(g_metal,ow,os,ob,ao,ap,H,qd,gsz,N);
+        for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
+        free(qp);free(kk);free(vv);free(ao);free(ap);
+    } else {
+        int li=layer-(layer+1)/g_cfg.full_attn_interval, qkv_dim=g_cfg.linear_conv_dim, z_dim=g_cfg.linear_total_value, nvh=g_cfg.linear_num_v_heads, nkh=g_cfg.linear_num_k_heads;
+        uint32_t *qkvw=LW("linear_attn.in_proj_qkv.weight");uint16_t *qkvs=LW("linear_attn.in_proj_qkv.scales"),*qkvb=LW("linear_attn.in_proj_qkv.biases");
+        uint32_t *zw=LW("linear_attn.in_proj_z.weight");uint16_t *zs=LW("linear_attn.in_proj_z.scales"),*zb=LW("linear_attn.in_proj_z.biases");
+        uint32_t *bw=LW("linear_attn.in_proj_b.weight");uint16_t *bs=LW("linear_attn.in_proj_b.scales"),*bb_=LW("linear_attn.in_proj_b.biases");
+        uint32_t *aw=LW("linear_attn.in_proj_a.weight");uint16_t *as_=LW("linear_attn.in_proj_a.scales"),*ab=LW("linear_attn.in_proj_a.biases");
+        uint32_t *olw=LW("linear_attn.out_proj.weight");uint16_t *ols=LW("linear_attn.out_proj.scales"),*olb=LW("linear_attn.out_proj.biases");
+        uint16_t *convw=LW("linear_attn.conv1d.weight"),*gnw=LW("linear_attn.norm.weight"); float *Alog=(float*)LW("linear_attn.A_log"); uint16_t *dtb=LW("linear_attn.dt_bias");
+        float *qkv=malloc((size_t)N*qkv_dim*4),*z=malloc((size_t)N*z_dim*4),*be=malloc((size_t)N*nvh*4),*al=malloc((size_t)N*nvh*4),*gated=malloc((size_t)N*z_dim*4);
+        gpu_dequant_matmulN(g_metal,qkvw,qkvs,qkvb,nmd,qkv,qkv_dim,H,gsz,N);
+        gpu_dequant_matmulN(g_metal,zw,zs,zb,nmd,z,z_dim,H,gsz,N);
+        gpu_dequant_matmulN(g_metal,bw,bs,bb_,nmd,be,nvh,H,gsz,N);
+        gpu_dequant_matmulN(g_metal,aw,as_,ab,nmd,al,nvh,H,gsz,N);
+        NSUInteger cvo=(NSUInteger)((const char*)convw-(const char*)[g_metal->wf_buf contents]),alo=(NSUInteger)((const char*)Alog-(const char*)[g_metal->wf_buf contents]),dto=(NSUInteger)((const char*)dtb-(const char*)[g_metal->wf_buf contents]),gno=(NSUInteger)((const char*)gnw-(const char*)[g_metal->wf_buf contents]);
+        uint32_t cd=g_cfg.linear_conv_dim,kd=g_cfg.linear_key_dim,vd2=g_cfg.linear_value_dim,khpv=(uint32_t)(nvh/nkh); float invs=1.f/sqrtf((float)g_cfg.linear_key_dim);
+        for (int t=0;t<N;t++){
+            memcpy([g_metal->batch_out[0] contents],qkv+(size_t)t*qkv_dim,qkv_dim*4); memcpy([g_metal->batch_out[1] contents],z+(size_t)t*z_dim,z_dim*4);
+            memcpy([g_metal->batch_out[2] contents],be+(size_t)t*nvh,nvh*4); memcpy([g_metal->batch_out[3] contents],al+(size_t)t*nvh,nvh*4);
+            id<MTLCommandBuffer> cmd=[g_metal->queue commandBuffer];
+            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->conv1d_step];[e setBuffer:g_metal->buf_conv_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[0] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:cvo atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:3];[e setBytes:&cd length:4 atIndex:4];[e dispatchThreadgroups:MTLSizeMake((cd+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];}
+            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->rms_norm_qk];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:1];[e setBytes:&kd length:4 atIndex:2];[e setBytes:&invs length:4 atIndex:3];[e dispatchThreadgroups:MTLSizeMake(nkh,1,1) threadsPerThreadgroup:MTLSizeMake(kd,1,1)];[e endEncoding];}
+            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->compute_decay_beta];[e setBuffer:g_metal->batch_out[3] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[2] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:alo atIndex:2];[e setBuffer:g_metal->wf_buf offset:dto atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(nvh,1,1)];[e endEncoding];}
+            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->delta_net_step];[e setBuffer:g_metal->buf_delta_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:2*g_cfg.linear_total_key*4 atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:6];[e setBytes:&khpv length:sizeof(khpv) atIndex:7];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];[e endEncoding];}
+            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->gated_rms_norm];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[1] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:gno atIndex:2];[e setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];[e setBytes:&vd2 length:4 atIndex:4];[e setBytes:&eps length:4 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(vd2,1,1)];[e endEncoding];}
+            [cmd commit];[cmd waitUntilCompleted];
+            memcpy(gated+(size_t)t*z_dim,[g_metal->batch_out[6] contents],z_dim*4);
+        }
+        float *ap=malloc((size_t)N*H*4); gpu_dequant_matmulN(g_metal,olw,ols,olb,gated,ap,H,z_dim,gsz,N);
+        for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
+        free(qkv);free(z);free(be);free(al);free(gated);free(ap);
+    }
+    // dense MLP (N positions)
+    uint32_t *gw=LW("mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
+    uint32_t *uw=LW("mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
+    uint32_t *dw=LW("mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
+    #undef LW
+    float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
+    float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4),*oN=malloc((size_t)N*H*4);
+    gpu_dequant_matmulN(g_metal,gw,gs,gb,hp,gN,inter,H,gsz,N);
+    gpu_dequant_matmulN(g_metal,uw,us,ub,hp,uN,inter,H,gsz,N);
+    for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
+    gpu_dequant_matmulN(g_metal,dw,ds,db,aN,oN,H,inter,gsz,N);
+    for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
+    free(res);free(nmd);free(hp);free(gN);free(uN);free(aN);free(oN);
+}
+
 // Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
 // calls (the oracle) on an identical pre-seeded KV cache, and should be faster
 // (q/k/v projections amortized). Gated by --mtp-bench-attn.
@@ -5051,6 +5142,48 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     free(fds);free(mmaps);free(kv);free(ls);free(h);free(logits);free(base_tok);free(mtp_tok);free(hcur);free(ha);free(hb);free(la);free(lb);
     #undef IS_EOS
     return mism==0?0:1;
+}
+
+// Depth-N batched forward: N positions through all layers + norm + batched lm_head.
+// hs[N*H] in/out (ends as per-position pre-norm hidden); logits[N*V] out.
+static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *pos, float *logits) {
+    int H=g_cfg.hidden_dim, V=g_cfg.vocab_size, gsz=g_cfg.group_size;
+    for (int layer=0; layer<g_cfg.num_layers; layer++)
+        dense_layer_forward_N(wf, layer, hs, N, kv[layer], pos);
+    uint16_t *nw=get_tensor_ptr(wf,"model.norm.weight");
+    float *nd=malloc((size_t)N*H*4);
+    for (int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H, nw, nd+(size_t)t*H, H, g_cfg.rms_norm_eps);
+    TensorInfo *wi=get_tensor_info(wf,"lm_head.weight"),*si=get_tensor_info(wf,"lm_head.scales"),*bi=get_tensor_info(wf,"lm_head.biases");
+    gpu_dequant_matmulN(g_metal,(uint32_t*)((char*)wf->data+wi->offset),(uint16_t*)((char*)wf->data+si->offset),(uint16_t*)((char*)wf->data+bi->offset), nd, logits, V, H, gsz, N);
+    free(nd);
+}
+
+// Depth-N faithfulness: fused_dense_forward_N (N positions) must argmax-match N
+// sequential production forwards. Validates the N-generalized dense layer.
+static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts!=0) { fprintf(stderr,"[mtp-vfN] requires dense GPU\n"); return 1; }
+    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4, N=4;
+    int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
+    KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
+    int cap=256;
+    for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
+    float *h=malloc(Hd*4),*scratch=malloc(V*4); int P=35;
+    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
+    for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++)h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
+    GpuStateSnap snap; gpu_snap_alloc(&snap); gpu_snap_save(&snap,kv);
+    int toks[4]={400,401,402,403};
+    float *lo=malloc((size_t)N*V*4); // oracle logits per position
+    for(int t=0;t<N;t++){ embed_lookup(wf,toks[t],h); prod_forward_1(wf,h,P+t,kv,ls,fds,mmaps,K,lo+(size_t)t*V); }
+    gpu_snap_restore(&snap,kv);
+    float *hs=malloc((size_t)N*Hd*4),*ln=malloc((size_t)N*V*4); int posv[4]={P,P+1,P+2,P+3};
+    for(int t=0;t<N;t++) embed_lookup(wf,toks[t],hs+(size_t)t*Hd);
+    fused_dense_forward_N(wf,hs,N,kv,posv,ln);
+    int allmatch=1; for(int t=0;t<N;t++){ int ao=cpu_argmax(lo+(size_t)t*V,V),an=cpu_argmax(ln+(size_t)t*V,V); double e=0,r=0; for(int i=0;i<V;i++){e=fmax(e,fabs(lo[(size_t)t*V+i]-ln[(size_t)t*V+i]));r=fmax(r,fabs(lo[(size_t)t*V+i]));} fprintf(stderr,"[mtp-vfN] pos%d argmax prod=%d batchedN=%d rel=%.2e\n",t,ao,an,r>0?e/r:e); if(ao!=an)allmatch=0; }
+    fprintf(stderr,"[mtp-vfN] %s\n", allmatch?"PASS: depth-N forward matches production":"DIVERGE");
+    gpu_snap_free(&snap);
+    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
+    free(fds);free(mmaps);free(kv);free(ls);free(h);free(scratch);free(lo);free(hs);free(ln);
+    return allmatch?0:1;
 }
 
 // ============================================================================
@@ -12137,6 +12270,7 @@ enum {
     OPT_MTP_GENERATE,
     OPT_MTP_GENERATE_GPU,
     OPT_MTP_GENERATE_DENSE,
+    OPT_MTP_VERIFY_FORWARDN,
 };
 
 static void print_usage(const char *prog) {
@@ -12206,6 +12340,7 @@ int main(int argc, char **argv) {
         int mtp_generate_requested = 0;
         int mtp_generate_gpu_requested = 0;
         int mtp_generate_dense_requested = 0;
+        int mtp_verify_forwardN_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -12407,6 +12542,7 @@ int main(int argc, char **argv) {
             {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"mtp-generate-dense", no_argument,   0, OPT_MTP_GENERATE_DENSE},
+            {"mtp-verify-forwardN", no_argument,  0, OPT_MTP_VERIFY_FORWARDN},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -12461,6 +12597,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_DENSE: mtp_generate_dense_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -12673,6 +12810,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_generate_dense_requested) {
             return mtp_generate_dense(wf, model_path, 64);
+        }
+        if (mtp_verify_forwardN_requested) {
+            return mtp_verify_forwardN(wf, model_path);
         }
 
         // ---- Load vocabulary ----
