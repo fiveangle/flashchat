@@ -4075,6 +4075,52 @@ static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
     return rc;
 }
 
+// 4d-ii scoping: is the CPU reference (full_attention_forward + moe_block_1) faithful
+// to production fused_layer_forward at a DECODE position (len>=32, where production
+// switches to GPU attention)? Prefill a full-attn layer's KV to len=40 via production,
+// copy that KV to the reference, then compare both at pos 40. Same prefix K/V, so this
+// isolates GPU-attention vs CPU-attention numerics. If MATCH, 4d-ii's full-attn layers
+// can reuse attn_block_2 + moe_block_2.
+static int mtp_verify_deep(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-deep] requires GPU\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, K = g_cfg.num_experts_per_tok;
+    int layer = g_cfg.full_attn_interval - 1;   // first full-attention layer (uses GPU attn at len>=32)
+    int P = 40, cap = 128;
+    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    int fd = open(path, O_RDONLY);
+    void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    KVCache kvp = {0}; kvp.k_cache = calloc((size_t)cap*kv_dim,sizeof(float)); kvp.v_cache = calloc((size_t)cap*kv_dim,sizeof(float));
+    float *H = malloc(Hd*sizeof(float));
+    for (int p = 0; p < P; p++) {
+        for (int i = 0; i < Hd; i++) H[i] = sinf((i + p*7) * 0.01f) * 0.4f;
+        fused_layer_forward(wf, layer, H, &kvp, NULL, p, mm!=MAP_FAILED?mm:NULL, K, fd);
+        complete_deferred_experts();
+    }
+    // Reference KV = exact copy of the production-built K/V (no prefix drift).
+    KVCache kvc = {0}; kvc.k_cache = malloc((size_t)cap*kv_dim*sizeof(float)); kvc.v_cache = malloc((size_t)cap*kv_dim*sizeof(float));
+    memcpy(kvc.k_cache, kvp.k_cache, (size_t)cap*kv_dim*sizeof(float));
+    memcpy(kvc.v_cache, kvp.v_cache, (size_t)cap*kv_dim*sizeof(float));
+    kvc.len = kvp.len;
+
+    float *Hp = malloc(Hd*sizeof(float)), *Hc = malloc(Hd*sizeof(float));
+    for (int i = 0; i < Hd; i++) { Hp[i] = cosf(i*0.011f)*0.4f; Hc[i] = Hp[i]; }
+    fused_layer_forward(wf, layer, Hp, &kvp, NULL, P, mm!=MAP_FAILED?mm:NULL, K, fd);
+    complete_deferred_experts();
+    full_attention_forward(wf, layer, Hc, &kvc, P);
+    moe_block_1(wf, layer, Hc, fd);
+
+    double err = 0, ref = 0;
+    for (int i = 0; i < Hd; i++) { err = fmax(err, fabs(Hp[i]-Hc[i])); ref = fmax(ref, fabs(Hp[i])); }
+    double rel = ref>0 ? err/ref : err;
+    fprintf(stderr, "[mtp-deep] full-attn layer=%d at pos=%d (len=%d, GPU-attn regime) | max_err=%.3e rel=%.3e | %s\n",
+            layer, P, kvc.len, err, rel, rel < 5e-2 ? "MATCH (reuse attn_block_2+moe_block_2)" : "DIVERGE (need GPU 2-query attn)");
+
+    if (mm!=MAP_FAILED) munmap(mm, st.st_size); if (fd>=0) close(fd);
+    free(kvp.k_cache); free(kvp.v_cache); free(kvc.k_cache); free(kvc.v_cache); free(H); free(Hp); free(Hc);
+    return rel < 5e-2 ? 0 : 1;
+}
+
 // Reference single-token forward through all layers + norm + lm_head (CPU blocks).
 static void ref_forward_1(WeightFile *wf, float *h, KVCache **kv, LinearAttnState **ls,
                           int *fds, int pos, float *logits) {
@@ -11532,6 +11578,7 @@ enum {
     OPT_MTP_VERIFY_LAYER,
     OPT_MTP_VERIFY_FORWARD,
     OPT_MTP_VERIFY_ROLLBACK,
+    OPT_MTP_VERIFY_DEEP,
     OPT_MTP_GENERATE,
     OPT_MTP_GENERATE_GPU,
 };
@@ -11597,6 +11644,7 @@ int main(int argc, char **argv) {
         int mtp_verify_layer_requested = 0;
         int mtp_verify_forward_requested = 0;
         int mtp_verify_rollback_requested = 0;
+        int mtp_verify_deep_requested = 0;
         int mtp_generate_requested = 0;
         int mtp_generate_gpu_requested = 0;
         
@@ -11794,6 +11842,7 @@ int main(int argc, char **argv) {
             {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
             {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
             {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
+            {"mtp-verify-deep", no_argument,      0, OPT_MTP_VERIFY_DEEP},
             {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"help",          no_argument,       0, 'h'},
@@ -11844,6 +11893,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
                 case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
                 case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
+                case OPT_MTP_VERIFY_DEEP: mtp_verify_deep_requested = 1; break;
                 case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
@@ -12040,6 +12090,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_rollback_requested) {
             return mtp_verify_rollback(wf, model_path);
+        }
+        if (mtp_verify_deep_requested) {
+            return mtp_verify_deep(wf, model_path);
         }
         if (mtp_generate_requested) {
             return mtp_generate(wf, model_path, 48);
