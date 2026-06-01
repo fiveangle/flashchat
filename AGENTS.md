@@ -147,6 +147,7 @@ make test
 - **Persistent server/runtime toggles should be first-class config options.** If a setting is useful beyond one-off debugging, surface it through the config file and `flashchat` configuration wizard instead of leaving it env-only.
 - **Sampling/runtime generation knobs must stay consistent across config, API request parsing, server runtime signatures, docs, and smoke-test perf logging.** Do not add hidden sampler defaults that cannot be inspected or overridden from Flashchat's normal user surfaces.
 - **Model-specific sampling profiles belong in `assets/model_configs.json`.** The Flashchat config should select a `SAMPLING_PROFILE`, with `custom` reserved for manually managed sampler/reasoning values.
+- **Multi-token prediction policy:** MTP is a model/profile capability, not just a debugging flag. Treat `MTP` as a numeric draft budget: empty means auto from the selected profile or model registry, `0` means force disabled, and any positive value enables MTP with that many attempted draft predictions. MTP-capable models should enable it by default through registry/profile metadata, while users can create profiles such as `MTP=0` or `MTP=3` for the same model without changing the model artifacts.
 - **When a functional block or milestone is complete, consider prompting for a commit checkpoint.** Don’t interrupt active debugging for every small change, but when a coherent unit of work lands, ask whether it should be committed before moving on.
 
 ### C/Objective-C

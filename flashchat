@@ -178,6 +178,7 @@ Environment variables:
                               content (e.g. for diversifying parameter values
                               across runs).
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
+  FLASHCHAT_MTP                  Multi-token prediction draft budget (0 disables, empty=auto)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
 
@@ -312,6 +313,7 @@ cmd_status() {
     fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
+    echo "Multi-token prediction: ${MTP:-auto} draft budget"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
     echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
@@ -484,6 +486,7 @@ cmd_config() {
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
+    echo "Multi-token prediction: ${MTP:-auto} draft budget"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
     echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
@@ -523,6 +526,7 @@ cmd_config_interactive() {
     echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
     echo "  -Persistent system prompt cache (0/1): $(flashchat_get SYSTEM_PROMPT_CACHE)"
     echo "  -Persistent system prompt cache entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+    echo "  -Multi-token prediction draft budget (empty=auto, 0=disabled): ${MTP:-auto}"
     echo "  -Show thinking tokens (0/1): $(flashchat_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashchat_get COLOR_OUTPUT)"
     unset REPLY
@@ -572,6 +576,29 @@ model_artifact_status() {
     echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts"
 }
 
+model_registry_script() {
+    local model_id="$1"
+    local script_key="$2"
+    local fallback="$3"
+    local model_config
+    model_config=$(flashchat_get MODEL_CONFIG)
+    [ -n "$model_id" ] || return 1
+    [ -n "$script_key" ] || return 1
+    [ -f "$model_config" ] || {
+        echo "$fallback"
+        return
+    }
+    python3 - "$model_config" "$model_id" "$script_key" "$fallback" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model = data.get("models", {}).get(sys.argv[2], {})
+print(model.get("scripts", {}).get(sys.argv[3]) or sys.argv[4])
+PY
+}
+
 print_model_status_list() {
     local current_model
     current_model="$(flashchat_get MODEL)"
@@ -580,6 +607,7 @@ print_model_status_list() {
 
     printf "  [0] Add a model...\n"
     printf "      (only model_type qwen3_5_moe is supported)\n"
+    printf "  [E] Edit a model registry entry...\n"
     printf "\n"
 
     while IFS=$'\t' read -r model_id name repo; do
@@ -696,14 +724,28 @@ rope_theta = c.get('rope_theta')
 if rope_theta is None:
     rope_theta = c.get('rope_parameters', {}).get('rope_theta', 10000000.0)
 
-# Quantization config can be at top level or under text_config
+# Quantization config can be at top level or under text_config. Native BF16
+# checkpoints have no quantization metadata; Flashchat compiles them into its
+# runtime 4-bit format during setup.
 qc = cfg.get('quantization_config', cfg.get('quantization', {}))
+native_bf16_source = not bool(qc)
 bits = qc.get('bits', 4)
 group_size = qc.get('group_size', 64)
+mtp_layers = c.get('mtp_num_hidden_layers', cfg.get('mtp_num_hidden_layers', 0))
+scripts = {
+    'extract_weights': 'scripts/extract_weights.py',
+    'repack_experts': 'scripts/repack_experts.py'
+}
+if native_bf16_source:
+    scripts = {
+        'extract_weights': 'scripts/compile_native_qwen.py',
+        'repack_experts': 'scripts/compile_native_qwen.py'
+    }
 
 entry = {
     'name': '$model_name',
     'hf_repo': '$repo',
+    'source_format': 'native_bf16' if native_bf16_source else 'mlx_quantized',
     'hidden_size': hidden_size,
     'num_hidden_layers': num_hidden_layers,
     'num_attention_heads': num_attention_heads,
@@ -713,6 +755,9 @@ entry = {
     'rms_norm_eps': rms_norm_eps,
     'num_experts': num_experts,
     'num_experts_per_tok': num_experts_per_tok,
+    'mtp_default_predictions': 1 if mtp_layers else 0,
+    'mtp_max_predictions': 3 if mtp_layers else 0,
+    'mtp_num_hidden_layers': mtp_layers,
     'moe_intermediate_size': moe_intermediate_size,
     'shared_expert_intermediate_size': shared_expert_intermediate_size,
     'full_attention_interval': full_attention_interval,
@@ -724,10 +769,7 @@ entry = {
     'partial_rotary_factor': partial_rotary_factor,
     'rope_theta': rope_theta,
     'quantization': {'bits': bits, 'group_size': group_size},
-    'scripts': {
-        'extract_weights': 'scripts/extract_weights.py',
-        'repack_experts': 'scripts/repack_experts.py'
-    },
+    'scripts': scripts,
     'special_tokens': template.get('special_tokens', {
         'eos_1': 248046,
         'eos_2': 248044,
@@ -758,8 +800,8 @@ PYEOF
         return 1
     fi
 
-    python3 << PYEOF
-import json, os, shutil
+    if ! python3 << PYEOF
+import json, os, shutil, sys
 
 with open('$registry_file') as f:
     data = json.load(f)
@@ -780,14 +822,240 @@ with open('$registry_file', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 
-print('Registry updated.')
+print('Registry updated.', file=sys.stderr)
 PYEOF
+    then
+        echo "ERROR: Failed to update model registry." >&2
+        rm -f "$tmp_entry"
+        return 1
+    fi
 
     rm -f "$tmp_entry"
     echo "Model '$model_id' added to registry." >&2
     echo "It will be downloaded on the next run." >&2
     echo "" >&2
     echo "$model_id"
+}
+
+edit_model_registry_entry() {
+    local model_ids=()
+    local model_id name repo
+    local i=0
+
+    echo "" >&2
+    echo "=== Edit Model Registry ===" >&2
+    echo "" >&2
+    print_model_status_list >&2
+    echo "" >&2
+
+    while IFS=$'\t' read -r model_id name repo; do
+        [ -n "$model_id" ] || continue
+        model_ids+=("$model_id")
+    done < <(flashchat_list_models)
+
+    if [ ${#model_ids[@]} -eq 0 ]; then
+        echo "No model registry entries found." >&2
+        return 1
+    fi
+
+    while true; do
+        printf "Select registry entry number or ID to edit: " >&2
+        read -r REPLY
+        echo "" >&2
+        if [ -z "$REPLY" ]; then
+            echo "Cancelled." >&2
+            return 1
+        fi
+        if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+            i=$((REPLY - 1))
+            if [ "$i" -ge 0 ] && [ "$i" -lt ${#model_ids[@]} ]; then
+                model_id="${model_ids[$i]}"
+                break
+            fi
+        elif flashchat_model_exists "$REPLY"; then
+            model_id="$REPLY"
+            break
+        fi
+        echo "Please choose one of the listed models." >&2
+    done
+
+    local registry_file
+    registry_file=$(flashchat_get MODEL_CONFIG)
+
+    python3 - "$registry_file" "$model_id" >&2 <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model_id = sys.argv[2]
+model = data.get("models", {}).get(model_id, {})
+print(f"Model ID: {model_id}")
+for key in [
+    "name", "hf_repo", "source_format", "hidden_size", "num_hidden_layers",
+    "num_attention_heads", "num_key_value_heads", "head_dim",
+    "vocab_size", "rms_norm_eps", "num_experts", "num_experts_per_tok",
+    "mtp_default_predictions", "mtp_max_predictions",
+    "moe_intermediate_size", "shared_expert_intermediate_size",
+    "full_attention_interval", "linear_num_value_heads",
+    "linear_num_key_heads", "linear_key_head_dim",
+    "linear_value_head_dim", "linear_conv_kernel_dim",
+    "partial_rotary_factor", "rope_theta", "default_sampling_profile",
+]:
+    if key in model:
+        print(f"{key}: {model[key]}")
+quant = model.get("quantization", {})
+if quant:
+    print(f"quantization.bits: {quant.get('bits', '')}")
+    print(f"quantization.group_size: {quant.get('group_size', '')}")
+scripts = model.get("scripts", {})
+if scripts:
+    print(f"scripts.extract_weights: {scripts.get('extract_weights', '')}")
+    print(f"scripts.repack_experts: {scripts.get('repack_experts', '')}")
+PY
+
+    printf "Delete registry entry ? [y/N] " >&2
+    read -n 1 -r REPLY
+    echo "" >&2
+    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        if ! python3 - "$registry_file" "$model_id" >&2 <<'PY'
+import json
+import os
+import shutil
+import sys
+
+registry_file, model_id = sys.argv[1], sys.argv[2]
+with open(registry_file) as f:
+    data = json.load(f)
+if model_id not in data.get("models", {}):
+    print(f"ERROR: Model '{model_id}' is not in the registry.")
+    sys.exit(1)
+backup = registry_file + ".backup." + str(os.getpid())
+shutil.copy(registry_file, backup)
+del data["models"][model_id]
+if data.get("default_model") == model_id:
+    data["default_model"] = next(iter(data.get("models", {})), "")
+with open(registry_file, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("Registry entry deleted.")
+PY
+        then
+            echo "ERROR: Failed to delete registry entry." >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    echo "Press Enter to keep the current value." >&2
+    local edit_file
+    edit_file=$(mktemp)
+    python3 - "$registry_file" "$model_id" > "$edit_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model = data.get("models", {}).get(sys.argv[2], {})
+fields = [
+    "name", "hf_repo", "source_format", "hidden_size", "num_hidden_layers",
+    "num_attention_heads", "num_key_value_heads", "head_dim",
+    "vocab_size", "rms_norm_eps", "num_experts", "num_experts_per_tok",
+    "mtp_default_predictions", "mtp_max_predictions",
+    "moe_intermediate_size", "shared_expert_intermediate_size",
+    "full_attention_interval", "linear_num_value_heads",
+    "linear_num_key_heads", "linear_key_head_dim",
+    "linear_value_head_dim", "linear_conv_kernel_dim",
+    "partial_rotary_factor", "rope_theta", "default_sampling_profile",
+]
+for field in fields:
+    print(f"{field}\t{model.get(field, '')}")
+quant = model.get("quantization", {})
+print(f"quantization.bits\t{quant.get('bits', '')}")
+print(f"quantization.group_size\t{quant.get('group_size', '')}")
+scripts = model.get("scripts", {})
+print(f"scripts.extract_weights\t{scripts.get('extract_weights', '')}")
+print(f"scripts.repack_experts\t{scripts.get('repack_experts', '')}")
+PY
+
+    local updates_file
+    updates_file=$(mktemp)
+    exec 3< "$edit_file"
+    while IFS=$'\t' read -r -u 3 field value; do
+        printf "%s [%s]: " "$field" "$value" >&2
+        read -r REPLY
+        if [ -n "$REPLY" ]; then
+            printf "%s\t%s\n" "$field" "$REPLY" >> "$updates_file"
+        fi
+    done
+    exec 3<&-
+
+    rm -f "$edit_file"
+
+    if [ ! -s "$updates_file" ]; then
+        rm -f "$updates_file"
+        echo "No changes made." >&2
+        return 0
+    fi
+
+    if ! python3 - "$registry_file" "$model_id" "$updates_file" >&2 <<'PY'
+import json
+import os
+import shutil
+import sys
+
+registry_file, model_id, updates_file = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(registry_file) as f:
+    data = json.load(f)
+model = data.get("models", {}).get(model_id)
+if model is None:
+    print(f"ERROR: Model '{model_id}' is not in the registry.")
+    sys.exit(1)
+
+int_fields = {
+    "hidden_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "head_dim", "vocab_size", "num_experts",
+    "num_experts_per_tok", "mtp_default_predictions", "mtp_max_predictions",
+    "moe_intermediate_size", "shared_expert_intermediate_size",
+    "full_attention_interval", "linear_num_value_heads",
+    "linear_num_key_heads", "linear_key_head_dim",
+    "linear_value_head_dim", "linear_conv_kernel_dim",
+    "quantization.bits", "quantization.group_size",
+}
+float_fields = {"rms_norm_eps", "partial_rotary_factor", "rope_theta"}
+
+def coerce(field, value):
+    if field in int_fields:
+        return int(value)
+    if field in float_fields:
+        return float(value)
+    return value
+
+with open(updates_file) as f:
+    for line in f:
+        field, value = line.rstrip("\n").split("\t", 1)
+        if field.startswith("quantization."):
+            model.setdefault("quantization", {})[field.split(".", 1)[1]] = coerce(field, value)
+        elif field.startswith("scripts."):
+            model.setdefault("scripts", {})[field.split(".", 1)[1]] = value
+        else:
+            model[field] = coerce(field, value)
+
+backup = registry_file + ".backup." + str(os.getpid())
+shutil.copy(registry_file, backup)
+with open(registry_file, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("Registry entry updated.")
+PY
+    then
+        rm -f "$updates_file"
+        echo "ERROR: Failed to update registry entry." >&2
+        return 1
+    fi
+
+    rm -f "$updates_file"
+    return 0
 }
 
 select_model_from_registry() {
@@ -819,6 +1087,12 @@ select_model_from_registry() {
             echo "$default_model"
             return
         fi
+        if [ "$REPLY" = "E" ]; then
+            edit_model_registry_entry || true
+            print_model_status_list >&2
+            echo "" >&2
+            continue
+        fi
         if [[ "$REPLY" = "0" ]] || [[ "$REPLY" =~ ^[Aa]$ ]]; then
             local added_model
             if added_model=$(add_model_to_registry); then
@@ -847,10 +1121,10 @@ select_model_from_registry() {
 print_sampling_profile_list() {
     local model_id="$1"
     local current_profile="$2"
-    local profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning
+    local profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp
     local i=0
 
-    while IFS=$'\t' read -r profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning; do
+    while IFS=$'\t' read -r profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp; do
         [ -n "$profile_id" ] || continue
         i=$((i + 1))
         local marker=" "
@@ -858,8 +1132,8 @@ print_sampling_profile_list() {
         printf "  [%d]%s %s\n" "$i" "$marker" "$label"
         printf "      ID: %s\n" "$profile_id"
         printf "      %s\n" "$description"
-        printf "      reasoning: %s | temp: %s | top-p: %s | top-k: %s | min-p: %s | presence: %s | repetition: %s\n" \
-            "$reasoning" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
+        printf "      reasoning: %s | MTP: %s | temp: %s | top-p: %s | top-k: %s | min-p: %s | presence: %s | repetition: %s\n" \
+            "$reasoning" "${mtp:-auto}" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
     done < <(flashchat_model_sampling_profiles "$model_id")
     i=$((i + 1))
     local marker=" "
@@ -927,6 +1201,9 @@ write_sampling_profile_config() {
     echo "MIN_P=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "min_p")\"" >> /tmp/flashchat_new_config
     echo "PRESENCE_PENALTY=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "presence_penalty")\"" >> /tmp/flashchat_new_config
     echo "REPETITION_PENALTY=\"$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "repetition_penalty")\"" >> /tmp/flashchat_new_config
+    local profile_mtp
+    profile_mtp=$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "mtp")
+    [ -n "$profile_mtp" ] && echo "MTP=\"$profile_mtp\"" >> /tmp/flashchat_new_config
 }
 
 cmd_models() {
@@ -1681,6 +1958,20 @@ prompt_config_interactive() {
     echo ""
     echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=\"${REPLY:-$default_sys_cache_entries}\"" >> /tmp/flashchat_new_config
 
+    # Multi-token Prediction
+    local default_mtp
+    default_mtp=$(flashchat_get MTP)
+    printf "Multi-token prediction draft budget (auto=registry/profile, 0=disabled) [%s]: " "${default_mtp:-auto}"
+    read -r REPLY
+    echo ""
+    if [[ "$REPLY" =~ ^[Aa][Uu][Tt][Oo]$ ]]; then
+        echo "MTP=\"\"" >> /tmp/flashchat_new_config
+    elif [ -z "$REPLY" ] && [ -z "$default_mtp" ]; then
+        echo "MTP=\"\"" >> /tmp/flashchat_new_config
+    else
+        echo "MTP=\"${REPLY:-$default_mtp}\"" >> /tmp/flashchat_new_config
+    fi
+
     # Show Thinking
     local default_think
     default_think=$(flashchat_get SHOW_THINKING)
@@ -2191,6 +2482,10 @@ prompt_model_restore_or_download() {
 prompt_extract_weights() {
     local weights_dir
     weights_dir=$(flashchat_get WEIGHTS_DIR)
+    local model_id
+    model_id=$(flashchat_get MODEL)
+    local extract_script
+    extract_script=$(model_registry_script "$model_id" "extract_weights" "scripts/extract_weights.py")
     
     echo ""
     echo "=== Extract Non-Expert Weights ==="
@@ -2203,7 +2498,11 @@ prompt_extract_weights() {
     echo ""
     
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
-        if run_python "$SCRIPT_DIR/scripts/extract_weights.py" --model-id "$(flashchat_get MODEL)" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir"; then
+        local cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir")
+        if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
+            cmd+=(--non-experts --include-mtp)
+        fi
+        if run_python "${cmd[@]}"; then
             echo "Weights extracted successfully."
         else
             echo "ERROR: Weights extraction failed." >&2
@@ -2250,6 +2549,8 @@ prompt_extract_experts() {
     # Check if model is supported
     local model_id
     model_id=$(flashchat_get MODEL)
+    local repack_script
+    repack_script=$(model_registry_script "$model_id" "repack_experts" "scripts/repack_experts.py")
     local model_config
     model_config=$(flashchat_get MODEL_CONFIG)
     if [ -f "$model_config" ] && command -v python3 >/dev/null 2>&1; then
@@ -2267,16 +2568,18 @@ prompt_extract_experts() {
     fi
     
     local expert_index_path="$model_path/flashchat/expert_index.json"
-    if [ -f "$expert_index_path" ]; then
-        echo "Using model-specific expert index: $expert_index_path"
-    else
-        echo "Expert index not found: $expert_index_path"
-        echo "Generating expert index from model safetensors..."
-        if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$model_path/flashchat"; then
-            echo "ERROR: Expert index generation failed."
-            return 1
+    if [ "${repack_script##*/}" != "compile_native_qwen.py" ]; then
+        if [ -f "$expert_index_path" ]; then
+            echo "Using model-specific expert index: $expert_index_path"
+        else
+            echo "Expert index not found: $expert_index_path"
+            echo "Generating expert index from model safetensors..."
+            if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$model_path/flashchat"; then
+                echo "ERROR: Expert index generation failed."
+                return 1
+            fi
+            echo "Expert index generated successfully."
         fi
-        echo "Expert index generated successfully."
     fi
     
     echo ""
@@ -2316,7 +2619,18 @@ prompt_extract_experts() {
     echo "Extracting 4-bit experts..."
     echo "Estimated time: 30-60 minutes."
     echo ""
-    if ! run_python "$SCRIPT_DIR/scripts/repack_experts.py" --model-id "$(flashchat_get MODEL)" --index "$expert_index_path"; then
+    local cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id")
+    if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
+        cmd+=(--model "$model_path" --output "$model_path/flashchat" --experts)
+        local mtp_max
+        mtp_max=$(flashchat_model_mtp_max "$model_id")
+        if [ -n "$mtp_max" ] && [ "$mtp_max" -gt 0 ] 2>/dev/null; then
+            cmd+=(--mtp-experts)
+        fi
+    else
+        cmd+=(--index "$expert_index_path")
+    fi
+    if ! run_python "${cmd[@]}"; then
         echo "ERROR: 4-bit expert extraction failed."
         return 1
     fi
@@ -2533,6 +2847,7 @@ server_runtime_signature() {
         echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
         echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
         echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+        echo "MTP=$(flashchat_get MTP)"
         echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
         echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"
         echo "MODEL_CONFIG_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/model_config.h")"
@@ -2974,6 +3289,7 @@ cmd_serve() {
     export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
     export FLASHCHAT_SYSTEM_PROMPT_CACHE="$(flashchat_get SYSTEM_PROMPT_CACHE)"
     export FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+    export FLASHCHAT_MTP="$(flashchat_get MTP)"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"

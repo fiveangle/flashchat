@@ -31,6 +31,7 @@ FLASHCHAT_DEFAULT_SERVER_DEBUG="0"
 FLASHCHAT_DEFAULT_SERVER_HTTP_LOG="0"
 FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE="1"
 FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
+FLASHCHAT_DEFAULT_MTP=""
 FLASHCHAT_DEFAULT_COLOR_OUTPUT="1"
 FLASHCHAT_DEFAULT_SAMPLING_PROFILE=""
 FLASHCHAT_DEFAULT_REASONING="0"
@@ -55,6 +56,7 @@ SERVER_DEBUG=""
 SERVER_HTTP_LOG=""
 SYSTEM_PROMPT_CACHE=""
 SYSTEM_PROMPT_CACHE_MAX_ENTRIES=""
+MTP=""
 COLOR_OUTPUT=""
 SAMPLING_PROFILE=""
 REASONING=""
@@ -160,6 +162,14 @@ flashchat_model_default_sampling_profile() {
     flashchat_model_field "$1" "default_sampling_profile"
 }
 
+flashchat_model_mtp_default() {
+    flashchat_model_field "$1" "mtp_default_predictions"
+}
+
+flashchat_model_mtp_max() {
+    flashchat_model_field "$1" "mtp_max_predictions"
+}
+
 # Resolve the model's trained active-experts (K) from the registry. Returns
 # empty string if the field is missing — caller decides what default to use.
 flashchat_model_active_experts() {
@@ -221,6 +231,7 @@ for profile_id, profile in profiles.items():
         str(profile.get('presence_penalty', '')),
         str(profile.get('repetition_penalty', '')),
         str(profile.get('reasoning', '')),
+        str(profile.get('mtp', '')),
     ]))
 " "$config_file" "$model_id" 2>/dev/null
 }
@@ -315,6 +326,7 @@ flashchat_load_config() {
     SERVER_HTTP_LOG=""
     SYSTEM_PROMPT_CACHE=""
     SYSTEM_PROMPT_CACHE_MAX_ENTRIES=""
+    MTP=""
     COLOR_OUTPUT=""
     SAMPLING_PROFILE=""
     REASONING=""
@@ -354,6 +366,7 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_SERVER_HTTP_LOG" ] && SERVER_HTTP_LOG="$FLASHCHAT_SERVER_HTTP_LOG"
     [ -n "$FLASHCHAT_SYSTEM_PROMPT_CACHE" ] && SYSTEM_PROMPT_CACHE="$FLASHCHAT_SYSTEM_PROMPT_CACHE"
     [ -n "$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES" ] && SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES"
+    [ -n "$FLASHCHAT_MTP" ] && MTP="$FLASHCHAT_MTP"
     [ -n "$FLASHCHAT_COLOR_OUTPUT" ] && COLOR_OUTPUT="$FLASHCHAT_COLOR_OUTPUT"
     [ -n "$FLASHCHAT_SAMPLING_PROFILE" ] && SAMPLING_PROFILE="$FLASHCHAT_SAMPLING_PROFILE"
     [ -n "$FLASHCHAT_HUGGINGFACE_CACHE_DIR" ] && HUGGINGFACE_CACHE_DIR="$FLASHCHAT_HUGGINGFACE_CACHE_DIR"
@@ -397,7 +410,7 @@ flashchat_load_config() {
     default_profile=$(flashchat_model_default_sampling_profile "$MODEL")
     SAMPLING_PROFILE="${SAMPLING_PROFILE:-${default_profile:-$FLASHCHAT_DEFAULT_SAMPLING_PROFILE}}"
     if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ]; then
-        local profile_temperature profile_top_p profile_top_k profile_min_p profile_presence_penalty profile_repetition_penalty profile_reasoning
+        local profile_temperature profile_top_p profile_top_k profile_min_p profile_presence_penalty profile_repetition_penalty profile_reasoning profile_mtp
         profile_temperature=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")
         profile_top_p=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_p")
         profile_top_k=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_k")
@@ -405,6 +418,7 @@ flashchat_load_config() {
         profile_presence_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "presence_penalty")
         profile_repetition_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "repetition_penalty")
         profile_reasoning=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "reasoning")
+        profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp")
         [ -n "$profile_temperature" ] && TEMPERATURE="$profile_temperature"
         [ -n "$profile_top_p" ] && TOP_P="$profile_top_p"
         [ -n "$profile_top_k" ] && TOP_K="$profile_top_k"
@@ -412,6 +426,12 @@ flashchat_load_config() {
         [ -n "$profile_presence_penalty" ] && PRESENCE_PENALTY="$profile_presence_penalty"
         [ -n "$profile_repetition_penalty" ] && REPETITION_PENALTY="$profile_repetition_penalty"
         [ -n "$profile_reasoning" ] && REASONING="$profile_reasoning"
+        [ -z "$MTP" ] && [ -n "$profile_mtp" ] && MTP="$profile_mtp"
+    fi
+    if [ -z "$MTP" ]; then
+        local model_mtp_default
+        model_mtp_default=$(flashchat_model_mtp_default "$MODEL")
+        [ -n "$model_mtp_default" ] && MTP="$model_mtp_default"
     fi
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
@@ -422,6 +442,7 @@ flashchat_load_config() {
     SERVER_HTTP_LOG="${SERVER_HTTP_LOG:-$FLASHCHAT_DEFAULT_SERVER_HTTP_LOG}"
     SYSTEM_PROMPT_CACHE="${SYSTEM_PROMPT_CACHE:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE}"
     SYSTEM_PROMPT_CACHE_MAX_ENTRIES="${SYSTEM_PROMPT_CACHE_MAX_ENTRIES:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}"
+    MTP="${MTP:-$FLASHCHAT_DEFAULT_MTP}"
     COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
     REASONING="${REASONING:-$FLASHCHAT_DEFAULT_REASONING}"
     TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
@@ -462,6 +483,7 @@ flashchat_get() {
         SERVER_HTTP_LOG) echo "$SERVER_HTTP_LOG" ;;
         SYSTEM_PROMPT_CACHE) echo "$SYSTEM_PROMPT_CACHE" ;;
         SYSTEM_PROMPT_CACHE_MAX_ENTRIES) echo "$SYSTEM_PROMPT_CACHE_MAX_ENTRIES" ;;
+        MTP) echo "$MTP" ;;
         COLOR_OUTPUT) echo "$COLOR_OUTPUT" ;;
         SAMPLING_PROFILE) echo "$SAMPLING_PROFILE" ;;
         REASONING) echo "$REASONING" ;;
@@ -519,6 +541,7 @@ SERVER_DEBUG="${SERVER_DEBUG:-$FLASHCHAT_DEFAULT_SERVER_DEBUG}"
 SERVER_HTTP_LOG="${SERVER_HTTP_LOG:-$FLASHCHAT_DEFAULT_SERVER_HTTP_LOG}"
 SYSTEM_PROMPT_CACHE="${SYSTEM_PROMPT_CACHE:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE}"
 SYSTEM_PROMPT_CACHE_MAX_ENTRIES="${SYSTEM_PROMPT_CACHE_MAX_ENTRIES:-$FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}"
+MTP="${MTP:-$FLASHCHAT_DEFAULT_MTP}"
 
 # UI Settings
 SHOW_THINKING="${SHOW_THINKING:-$FLASHCHAT_DEFAULT_SHOW_THINKING}"
@@ -587,6 +610,8 @@ export -f flashchat_model_name
 export -f flashchat_model_repo
 export -f flashchat_model_layers
 export -f flashchat_model_default_sampling_profile
+export -f flashchat_model_mtp_default
+export -f flashchat_model_mtp_max
 export -f flashchat_model_sampling_profile_field
 export -f flashchat_model_sampling_profiles
 export -f flashchat_model_path_for_id

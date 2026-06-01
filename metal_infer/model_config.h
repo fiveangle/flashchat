@@ -96,6 +96,9 @@ typedef struct {
     int think_start_token;
     int think_end_token;
 
+    int mtp_default_predictions;
+    int mtp_max_predictions;
+
     char extract_weights_script[128];
     char repack_experts_script[128];
 } ModelConfig;
@@ -240,6 +243,8 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
 
     CFG_INT(num_experts, "num_experts");
     CFG_INT(num_experts_per_tok, "num_experts_per_tok");
+    CFG_INT(mtp_default_predictions, "mtp_default_predictions");
+    CFG_INT(mtp_max_predictions, "mtp_max_predictions");
     CFG_INT(moe_intermediate, "moe_intermediate_size");
     CFG_INT(shared_intermediate, "shared_expert_intermediate_size");
     CFG_INT(full_attn_interval, "full_attention_interval");
