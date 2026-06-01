@@ -4780,6 +4780,30 @@ static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
     int ok = (aa_o==aa_t)&&(bb_o==bb_t);
     fprintf(stderr,"[mtp-vf2] %s (argmax match is what matters for lossless verify; rel err is fp drift over 40 layers)\n", ok?"PASS: batched forward argmax matches production":"DIVERGE: argmax differs");
 
+    // ---- Amortization timing: batched 2-position forward vs two single forwards ----
+    // (both warm now). This is the per-verify cost ratio that sets the speedup.
+    const int MT = 3;
+    double t = now_ms();
+    for (int m = 0; m < MT; m++) {
+        gpu_snap_restore(&snap, kv);
+        embed_lookup(wf, ta, Hao); prod_forward_1(wf, Hao, P, kv, ls, fds, mmaps, K, la_o);
+        embed_lookup(wf, tb, Hbo); prod_forward_1(wf, Hbo, P+1, kv, ls, fds, mmaps, K, lb_o);
+    }
+    double seq2 = (now_ms() - t) / MT;     // cost of 2 single forwards (2 tokens)
+    t = now_ms();
+    for (int m = 0; m < MT; m++) {
+        gpu_snap_restore(&snap, kv);
+        embed_lookup(wf, ta, Hat); embed_lookup(wf, tb, Hbt);
+        fused_layer_forward_2(wf, Hat, Hbt, kv, fds, P, P+1, la_t, lb_t);
+    }
+    double batched2 = (now_ms() - t) / MT;  // cost of 1 batched forward (2 positions)
+    double cost_ratio = batched2 / seq2;
+    fprintf(stderr, "[mtp-vf2] timing: 2x single=%.1f ms | batched2=%.1f ms | cost_ratio=%.3f\n", seq2, batched2, cost_ratio);
+    for (double A = 0.55; A <= 0.85; A += 0.15) {
+        double speedup = (1.0 + A) * seq2 / (2.0 * batched2);  // (1+A) tokens per batched forward
+        fprintf(stderr, "[mtp-vf2] projected speedup @ acceptance %.0f%% = %.2fx\n", A*100, speedup);
+    }
+
     gpu_snap_free(&snap);
     for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i]) linear_attn_state_free(ls[i]); if(mmaps[i]){struct stat st; fstat(fds[i],&st); munmap(mmaps[i],st.st_size);} if(fds[i]>=0) close(fds[i]); }
     free(fds); free(mmaps); free(kv); free(ls); free(h); free(scratch);
