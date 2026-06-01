@@ -4010,6 +4010,71 @@ static int mtp_bench_moe(WeightFile *wf, const char *model_path) {
     return err < 1e-2 ? 0 : 1;
 }
 
+static void fused_layer_forward(WeightFile *wf, int layer_idx, float *hidden, KVCache *kv,
+                                LinearAttnState *la_state, int pos, const void *mmap_base,
+                                int K, int packed_fd);
+static void complete_deferred_experts(void);
+static void linear_attention_forward(WeightFile *wf, int layer_idx, float *hidden, LinearAttnState *state);
+
+// 4b prerequisite: confirm the CPU-reference blocks (full_attention_forward /
+// linear_attention_forward + moe_block_1) match the PRODUCTION fused_layer_forward
+// for one layer on identical input. If they diverge, a batched forward built from
+// the reference blocks would produce different tokens than normal decode.
+static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vlayer] requires GPU\n"); return 1; }
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int full_layer = g_cfg.full_attn_interval - 1;   // first full-attention layer
+    int lin_layer  = 0;                              // layer 0 is linear attention
+    int layers[2] = { full_layer, lin_layer };
+    const char *labels[2] = { "full-attn", "linear-attn" };
+    int rc = 0;
+
+    for (int t = 0; t < 2; t++) {
+        int layer = layers[t]; int is_full = (t == 0);
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { fprintf(stderr, "[mtp-vlayer] cannot open %s\n", path); rc = 1; continue; }
+        struct stat st; void *mm = MAP_FAILED;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) mm = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+        float *H0 = malloc(H*sizeof(float));
+        for (int i = 0; i < H; i++) H0[i] = sinf((i + layer*3) * 0.01f) * 0.5f;
+        float *Hp = malloc(H*sizeof(float)), *Hc = malloc(H*sizeof(float));
+        memcpy(Hp, H0, H*sizeof(float)); memcpy(Hc, H0, H*sizeof(float));
+
+        // Production path: one fused layer + deferred-expert finalize.
+        KVCache kvp = {0}; LinearAttnState *lsp = NULL;
+        if (is_full) { kvp.k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvp.v_cache = calloc((size_t)64*kv_dim, sizeof(float)); }
+        else lsp = linear_attn_state_new();
+        fused_layer_forward(wf, layer, Hp, is_full ? &kvp : NULL, is_full ? NULL : lsp, 0,
+                            mm != MAP_FAILED ? mm : NULL, K, fd);
+        complete_deferred_experts();
+
+        // Reference path: CPU attention block + moe_block_1.
+        KVCache kvc = {0}; LinearAttnState *lsc = NULL;
+        if (is_full) { kvc.k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvc.v_cache = calloc((size_t)64*kv_dim, sizeof(float));
+                       full_attention_forward(wf, layer, Hc, &kvc, 0); }
+        else { lsc = linear_attn_state_new(); linear_attention_forward(wf, layer, Hc, lsc); }
+        moe_block_1(wf, layer, Hc, fd);
+
+        double err = 0.0, ref = 0.0;
+        for (int i = 0; i < H; i++) { err = fmax(err, fabs(Hp[i]-Hc[i])); ref = fmax(ref, fabs(Hp[i])); }
+        double rel = ref > 0 ? err/ref : err;
+        fprintf(stderr, "[mtp-vlayer] %-11s layer=%d | max_abs_err=%.3e | rel=%.3e | %s\n",
+                labels[t], layer, err, rel, rel < 5e-2 ? "MATCH" : "DIVERGE");
+        if (rel >= 5e-2) rc = 1;
+
+        if (is_full) { free(kvp.k_cache); free(kvp.v_cache); free(kvc.k_cache); free(kvc.v_cache); }
+        else { linear_attn_state_free(lsp); linear_attn_state_free(lsc); }
+        if (mm != MAP_FAILED) munmap(mm, st.st_size);
+        close(fd); free(H0); free(Hp); free(Hc);
+    }
+    fprintf(stderr, "[mtp-vlayer] MATCH => CPU reference blocks are faithful to production (safe to assemble batched forward)\n");
+    return rc;
+}
+
 // ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
@@ -11043,6 +11108,7 @@ enum {
     OPT_MTP_BENCH_MATMUL,
     OPT_MTP_BENCH_ATTN,
     OPT_MTP_BENCH_MOE,
+    OPT_MTP_VERIFY_LAYER,
 };
 
 static void print_usage(const char *prog) {
@@ -11103,6 +11169,7 @@ int main(int argc, char **argv) {
         int mtp_bench_matmul_requested = 0;
         int mtp_bench_attn_requested = 0;
         int mtp_bench_moe_requested = 0;
+        int mtp_verify_layer_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -11295,6 +11362,7 @@ int main(int argc, char **argv) {
             {"mtp-bench-matmul", no_argument,     0, OPT_MTP_BENCH_MATMUL},
             {"mtp-bench-attn", no_argument,       0, OPT_MTP_BENCH_ATTN},
             {"mtp-bench-moe", no_argument,        0, OPT_MTP_BENCH_MOE},
+            {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11340,6 +11408,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
                 case OPT_MTP_BENCH_ATTN: mtp_bench_attn_requested = 1; break;
                 case OPT_MTP_BENCH_MOE: mtp_bench_moe_requested = 1; break;
+                case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11525,6 +11594,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_bench_moe_requested) {
             return mtp_bench_moe(wf, model_path);
+        }
+        if (mtp_verify_layer_requested) {
+            return mtp_verify_layer(wf, model_path);
         }
 
         // ---- Load vocabulary ----
