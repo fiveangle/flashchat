@@ -462,6 +462,90 @@ kernel void dequant_matmulN_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1e-tiled: matmulN with X staged in threadgroup memory (any in_dim).
+// ============================================================================
+// v3 re-reads all of X from device once per output row: the 8 row-simdgroups in
+// a threadgroup each stream the full activation vector. For wide projections
+// (gate/up out_dim 17408) that X traffic dwarfs the weights. v5 (matvec) solved
+// this with x_shared[4096] but can't handle in_dim>4096 (down_proj=17408). Here we
+// TILE the contraction dim: cooperatively stage a tile of X into threadgroup memory
+// (shared by all 8 rows), accumulate, advance. X device reads drop ~8x (once per
+// threadgroup instead of once per row). Tiles align to group_size so scale/bias
+// lookups stay simple. All threads must reach the barriers, so out-of-range rows
+// participate in the loads and skip only the math/store.
+#define MATMULN_TILE_PACK 64        // packed cols per tile = 512 inputs = 8 groups of 64
+#define MATMULN_MAXN 8
+
+kernel void dequant_matmulN_4bit_v4(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    X          [[buffer(3)]],  // [N][in_dim]
+    device float*          OUT        [[buffer(4)]],  // [N][out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         N          [[buffer(8)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint packed_per_group = group_size / 8;
+    bool active = row < out_dim;
+
+    threadgroup float xtile[MATMULN_MAXN][MATMULN_TILE_PACK * 8];
+
+    // Clamp row for pointer math so inactive simdgroups still form valid (unused) addrs.
+    uint srow = active ? row : 0;
+    device const uint32_t* w_row = W_packed + (size_t)srow * packed_cols;
+    device const uint16_t* s_row = scales + (size_t)srow * (in_dim / group_size);
+    device const uint16_t* b_row = biases + (size_t)srow * (in_dim / group_size);
+
+    float acc[MATMULN_MAXN];
+    for (uint n = 0; n < N; n++) acc[n] = 0.0f;
+
+    for (uint tile = 0; tile < packed_cols; tile += MATMULN_TILE_PACK) {
+        uint tile_pack = min((uint)MATMULN_TILE_PACK, packed_cols - tile);
+        uint tile_inputs = tile_pack * 8;
+        // All 256 threads cooperatively stage this tile of X (every n) into threadgroup mem.
+        for (uint n = 0; n < N; n++) {
+            device const float* xn = X + (size_t)n * in_dim + tile * 8;
+            for (uint i = lid; i < tile_inputs; i += 256) xtile[n][i] = xn[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint c = simd_lane; c < tile_pack; c += 32) {
+                uint col = tile + c;
+                uint g = col / packed_per_group;
+                float scale = bf16_to_f32(s_row[g]);
+                float bias  = bf16_to_f32(b_row[g]);
+                uint32_t packed = w_row[col];
+                uint xb = c * 8;
+                for (uint n = 0; n < N; n++) {
+                    threadgroup const float* xn = xtile[n];
+                    for (uint k = 0; k < 8; k++) {
+                        float nib = float((packed >> (k * 4)) & 0xF);
+                        float xv = xn[xb + k];
+                        acc[n] = fma(nib, scale * xv, fma(bias, xv, acc[n]));
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        for (uint n = 0; n < N; n++) {
+            float s = simd_sum(acc[n]);
+            if (simd_lane == 0) OUT[n * out_dim + row] = s;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),

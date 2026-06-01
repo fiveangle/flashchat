@@ -392,6 +392,16 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 // Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
+// matmulN kernel select: 0 = v3 (default, fastest here), 1 = tiled-X v4.
+// v4 staged X in threadgroup memory to cut its re-read traffic, but measured SLOWER
+// (8900->10805 ms): Apple's L2 already absorbs the X re-reads, so tiling only added
+// staging stores + two barriers/tile that serialize the simdgroups. Kept behind an
+// opt-in flag as a documented negative result. Set FLASHCHAT_MATMULN_V4=1 to A/B.
+static int g_matmuln_tiled = -1;
+static inline int matmuln_tiled(void) {
+    if (g_matmuln_tiled < 0) g_matmuln_tiled = getenv("FLASHCHAT_MATMULN_V4") ? 1 : 0;
+    return g_matmuln_tiled;
+}
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -1969,6 +1979,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matmul2_v3;   // batched N=2 (MTP draft/verify)
     id<MTLComputePipelineState> matmulN_v3;    // batched N-wide (depth-N verify)
+    id<MTLComputePipelineState> matmulN_v4;    // tiled-X matmulN (threadgroup X cache)
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2106,6 +2117,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matmul2_v3    = makePipe(@"dequant_matmul2_4bit_v3");
     ctx->matmulN_v3    = makePipe(@"dequant_matmulN_4bit_v3");
+    ctx->matmulN_v4    = makePipe(@"dequant_matmulN_4bit_v4");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -2474,7 +2486,7 @@ static void gpu_dequant_matmulN(
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:ctx->matmulN_v3];
+    [enc setComputePipelineState:matmuln_tiled() ? ctx->matmulN_v4 : ctx->matmulN_v3];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -2531,7 +2543,7 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:ctx->matmulN_v3];
+    [enc setComputePipelineState:matmuln_tiled() ? ctx->matmulN_v4 : ctx->matmulN_v3];
     for (int j = 0; j < nj; j++) {
         NSUInteger w_off = (NSUInteger)((const char *)jobs[j].W - (const char *)[ctx->wf_buf contents]);
         NSUInteger s_off = (NSUInteger)((const char *)jobs[j].S - (const char *)[ctx->wf_buf contents]);
