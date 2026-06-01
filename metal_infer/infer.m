@@ -4248,6 +4248,62 @@ static int mtp_verify_deep(WeightFile *wf, const char *model_path) {
     return rel < 5e-2 ? 0 : 1;
 }
 
+// 4d-ii validation: linear_block_2 (+ moe_block_1) must match production
+// fused_layer_forward for a LINEAR layer. Both share the GPU delta state
+// (buf_delta_state[li]/buf_conv_state[li]); snapshot after prefix, run oracle
+// (2 sequential production forwards), restore, run linear_block_2 (a->b) + MoE.
+static int mtp_verify_linear(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vlin] requires GPU delta-net\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    int layer = 0, li = layer - (layer + 1) / g_cfg.full_attn_interval;  // layer 0 is linear, li=0
+    size_t dsz = 64*128*128*sizeof(float), csz = 3*12288*sizeof(float);
+    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    int fd = open(path, O_RDONLY);
+    void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
+    LinearAttnState *dummy = linear_attn_state_new();
+
+    reset_delta_net_state();
+    float *h = malloc(Hd*sizeof(float)); int P = 5;
+    for (int p = 0; p < P; p++) {
+        for (int i = 0; i < Hd; i++) h[i] = sinf((i + p*5) * 0.01f) * 0.4f;
+        fused_layer_forward(wf, layer, h, NULL, dummy, p, mm!=MAP_FAILED?mm:NULL, K, fd);
+        complete_deferred_experts();
+    }
+    // Snapshot post-prefix GPU state S.
+    float *Sd = malloc(dsz), *Sc = malloc(csz);
+    memcpy(Sd, [g_metal->buf_delta_state[li] contents], dsz);
+    memcpy(Sc, [g_metal->buf_conv_state[li] contents], csz);
+
+    float *Ha = malloc(Hd*sizeof(float)), *Hb = malloc(Hd*sizeof(float));
+    for (int i = 0; i < Hd; i++) { Ha[i] = cosf(i*0.011f)*0.4f; Hb[i] = sinf(i*0.017f+0.7f)*0.4f; }
+
+    // Oracle: two sequential production forwards from S.
+    float *Hao = malloc(Hd*sizeof(float)), *Hbo = malloc(Hd*sizeof(float));
+    memcpy(Hao, Ha, Hd*sizeof(float)); memcpy(Hbo, Hb, Hd*sizeof(float));
+    fused_layer_forward(wf, layer, Hao, NULL, dummy, P,   mm!=MAP_FAILED?mm:NULL, K, fd); complete_deferred_experts();
+    fused_layer_forward(wf, layer, Hbo, NULL, dummy, P+1, mm!=MAP_FAILED?mm:NULL, K, fd); complete_deferred_experts();
+
+    // Restore S, run linear_block_2 (a->b) + per-token MoE.
+    memcpy([g_metal->buf_delta_state[li] contents], Sd, dsz);
+    memcpy([g_metal->buf_conv_state[li] contents], Sc, csz);
+    float *Hat = malloc(Hd*sizeof(float)), *Hbt = malloc(Hd*sizeof(float));
+    memcpy(Hat, Ha, Hd*sizeof(float)); memcpy(Hbt, Hb, Hd*sizeof(float));
+    linear_block_2(wf, layer, Hat, Hbt);
+    moe_block_1(wf, layer, Hat, fd);
+    moe_block_1(wf, layer, Hbt, fd);
+
+    double ea=0, eb=0, ref=0;
+    for (int i = 0; i < Hd; i++) { ea=fmax(ea,fabs(Hao[i]-Hat[i])); eb=fmax(eb,fabs(Hbo[i]-Hbt[i])); ref=fmax(ref,fabs(Hao[i])); }
+    double ra = ref>0?ea/ref:ea, rb = ref>0?eb/ref:eb;
+    fprintf(stderr, "[mtp-vlin] linear layer=%d li=%d | tokenA rel=%.3e tokenB rel=%.3e | %s\n",
+            layer, li, ra, rb, (ra<5e-2 && rb<5e-2) ? "MATCH (linear_block_2 faithful)" : "DIVERGE");
+
+    if (mm!=MAP_FAILED) munmap(mm, st.st_size); if (fd>=0) close(fd);
+    linear_attn_state_free(dummy);
+    free(h); free(Sd); free(Sc); free(Ha); free(Hb); free(Hao); free(Hbo); free(Hat); free(Hbt);
+    return (ra<5e-2 && rb<5e-2) ? 0 : 1;
+}
+
 // Reference single-token forward through all layers + norm + lm_head (CPU blocks).
 static void ref_forward_1(WeightFile *wf, float *h, KVCache **kv, LinearAttnState **ls,
                           int *fds, int pos, float *logits) {
@@ -11706,6 +11762,7 @@ enum {
     OPT_MTP_VERIFY_FORWARD,
     OPT_MTP_VERIFY_ROLLBACK,
     OPT_MTP_VERIFY_DEEP,
+    OPT_MTP_VERIFY_LINEAR,
     OPT_MTP_GENERATE,
     OPT_MTP_GENERATE_GPU,
 };
@@ -11772,6 +11829,7 @@ int main(int argc, char **argv) {
         int mtp_verify_forward_requested = 0;
         int mtp_verify_rollback_requested = 0;
         int mtp_verify_deep_requested = 0;
+        int mtp_verify_linear_requested = 0;
         int mtp_generate_requested = 0;
         int mtp_generate_gpu_requested = 0;
         
@@ -11970,6 +12028,7 @@ int main(int argc, char **argv) {
             {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
             {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
             {"mtp-verify-deep", no_argument,      0, OPT_MTP_VERIFY_DEEP},
+            {"mtp-verify-linear", no_argument,    0, OPT_MTP_VERIFY_LINEAR},
             {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
             {"help",          no_argument,       0, 'h'},
@@ -12021,6 +12080,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
                 case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
                 case OPT_MTP_VERIFY_DEEP: mtp_verify_deep_requested = 1; break;
+                case OPT_MTP_VERIFY_LINEAR: mtp_verify_linear_requested = 1; break;
                 case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
@@ -12220,6 +12280,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_deep_requested) {
             return mtp_verify_deep(wf, model_path);
+        }
+        if (mtp_verify_linear_requested) {
+            return mtp_verify_linear(wf, model_path);
         }
         if (mtp_generate_requested) {
             return mtp_generate(wf, model_path, 48);
