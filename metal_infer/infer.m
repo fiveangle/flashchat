@@ -811,6 +811,13 @@ typedef struct {
 
 static MTPWeightCache g_mtp_cache = {0};
 
+// Persistent KV cache for the single MTP decoder layer's causal self-attention.
+// Built incrementally over accepted (real) tokens during decode, capped at
+// GPU_KV_SEQ. Plain arrays (the KVCache struct is defined later in the file).
+static float *g_mtp_k_cache = NULL;  // [GPU_KV_SEQ * num_kv_heads * head_dim]
+static float *g_mtp_v_cache = NULL;
+static int    g_mtp_kv_len = 0;
+
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps);
 static void fast_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
                                 const float *x, float *out, int out_dim, int in_dim, int group_size);
@@ -990,6 +997,13 @@ static void build_mtp_cache(WeightFile *wf) {
         g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
         g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b &&
         g_mtp_cache.norm_w;
+
+    if (g_mtp_cache.ready && !g_mtp_k_cache) {
+        int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+        g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ * kv_dim, sizeof(float));
+        g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ * kv_dim, sizeof(float));
+    }
+    g_mtp_kv_len = 0;
 }
 
 static int mtp_preflight_forward(WeightFile *wf) {
@@ -1111,11 +1125,40 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         float inv_rms = 1.0f / sqrtf(sum_sq / g_cfg.head_dim + g_cfg.rms_norm_eps);
         for (int i = 0; i < g_cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(g_mtp_cache.k_norm_w[i]);
     }
-    apply_rotary_emb(q, k, 0, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    int mtp_pos = g_mtp_kv_len;
+    apply_rotary_emb(q, k, mtp_pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
 
+    // Append this (accepted) token's K/V to the persistent MTP KV cache, then run
+    // real causal scaled-dot-product attention over the cached context. This
+    // mirrors the backbone full-attention layer and replaces the earlier
+    // context-free copy-V placeholder (which pinned RoPE to position 0).
+    if (g_mtp_k_cache && g_mtp_v_cache && g_mtp_kv_len < GPU_KV_SEQ) {
+        memcpy(g_mtp_k_cache + (size_t)g_mtp_kv_len * kv_dim, k, kv_dim * sizeof(float));
+        memcpy(g_mtp_v_cache + (size_t)g_mtp_kv_len * kv_dim, v, kv_dim * sizeof(float));
+        g_mtp_kv_len++;
+    }
+    const float *kc = g_mtp_k_cache ? g_mtp_k_cache : k;
+    const float *vc = g_mtp_v_cache ? g_mtp_v_cache : v;
+    int ctx_len = g_mtp_kv_len > 0 ? g_mtp_kv_len : 1;
+    float attn_scale = 1.0f / sqrtf((float)g_cfg.head_dim);
     for (int h = 0; h < g_cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
-        memcpy(attn_out + h * g_cfg.head_dim, v + kv_h * g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
+        float *qh = q + h * g_cfg.head_dim;
+        float *scores = malloc(ctx_len * sizeof(float));
+        for (int p = 0; p < ctx_len; p++) {
+            const float *kp = kc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
+            scores[p] = dot * attn_scale;
+        }
+        cpu_softmax(scores, ctx_len);
+        float *oh = attn_out + h * g_cfg.head_dim;
+        for (int d = 0; d < g_cfg.head_dim; d++) oh[d] = 0.0f;
+        for (int p = 0; p < ctx_len; p++) {
+            const float *vp = vc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+            for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+        }
+        free(scores);
     }
     for (int i = 0; i < q_dim; i++) {
         attn_out[i] *= cpu_sigmoid(q_gate[i]);
@@ -10093,6 +10136,7 @@ static void serve_loop(
         int mtp_pending_draft = -1;
         int mtp_shadow_hits = 0;
         int mtp_shadow_checks = 0;
+        g_mtp_kv_len = 0;  // fresh MTP attention context per generation
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
         }
@@ -11131,6 +11175,7 @@ int main(int argc, char **argv) {
         int mtp_pending_draft = -1;
         int mtp_shadow_hits = 0;
         int mtp_shadow_checks = 0;
+        g_mtp_kv_len = 0;  // fresh MTP attention context per generation
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
         }
