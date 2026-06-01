@@ -3516,6 +3516,208 @@ static void full_attention_forward(
 }
 
 // ============================================================================
+// Stage 2: batched (N=2) full-attention block for MTP draft/verify.
+// Processes two consecutive positions in one pass. The weight-bound q/k/v
+// projections are shared via gpu_dequant_matmul2 (one weight read for both
+// tokens); the cheap per-token tail (q/k norm, RoPE, attention, gate, o_proj,
+// residual) mirrors full_attention_forward exactly so results match it. Token b
+// (at pos_b = pos_a+1) attends to token a's freshly-appended K/V. o_proj uses
+// two single matvecs (its in_dim=q_dim>4096 exceeds the matmul2 kernel limit).
+// ============================================================================
+static void attn_block_2(
+    WeightFile *wf, int layer_idx,
+    float *ha, float *hb,     // [hidden_dim] in/out for the two tokens
+    KVCache *kv, int pos_a, int pos_b
+) {
+    char name[256];
+    int q_proj_dim = g_cfg.num_attn_heads * g_cfg.head_dim * 2;
+    int q_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
+    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+
+    float *res_a = malloc(g_cfg.hidden_dim * sizeof(float));
+    float *res_b = malloc(g_cfg.hidden_dim * sizeof(float));
+    memcpy(res_a, ha, g_cfg.hidden_dim * sizeof(float));
+    memcpy(res_b, hb, g_cfg.hidden_dim * sizeof(float));
+
+    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
+    uint16_t *norm_w = get_tensor_ptr(wf, name);
+    float *na = malloc(g_cfg.hidden_dim * sizeof(float));
+    float *nb = malloc(g_cfg.hidden_dim * sizeof(float));
+    cpu_rms_norm(ha, norm_w, na, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, norm_w, nb, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+
+    // ---- Batched Q/K/V projections (shared weight read across both tokens) ----
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
+    uint32_t *qw = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", layer_idx);
+    uint16_t *qs = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", layer_idx);
+    uint16_t *qb_ = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
+    uint32_t *kw = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", layer_idx);
+    uint16_t *ks = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", layer_idx);
+    uint16_t *kb = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
+    uint32_t *vw = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", layer_idx);
+    uint16_t *vs = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", layer_idx);
+    uint16_t *vb = get_tensor_ptr(wf, name);
+
+    float *qp_a = calloc(q_proj_dim, sizeof(float)), *qp_b = calloc(q_proj_dim, sizeof(float));
+    float *k_a = calloc(kv_dim, sizeof(float)), *k_b = calloc(kv_dim, sizeof(float));
+    float *v_a = calloc(kv_dim, sizeof(float)), *v_b = calloc(kv_dim, sizeof(float));
+    gpu_dequant_matmul2(g_metal, qw, qs, qb_, na, nb, qp_a, qp_b, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    gpu_dequant_matmul2(g_metal, kw, ks, kb, na, nb, k_a, k_b, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    gpu_dequant_matmul2(g_metal, vw, vs, vb, na, nb, v_a, v_b, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
+    uint16_t *qnorm_w = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
+    uint16_t *knorm_w = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
+    uint32_t *ow = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", layer_idx);
+    uint16_t *os_ptr = get_tensor_ptr(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
+    uint16_t *ob = get_tensor_ptr(wf, name);
+
+    // Per-token tail. Token a appended first (pos_a), so b (pos_b) attends to it.
+    float *qp[2] = { qp_a, qp_b }; float *kk[2] = { k_a, k_b }; float *vv[2] = { v_a, v_b };
+    float *out_h[2] = { ha, hb }; float *res[2] = { res_a, res_b };
+    int pos[2] = { pos_a, pos_b };
+    for (int t = 0; t < 2; t++) {
+        float *q = calloc(q_dim, sizeof(float));
+        float *q_gate = calloc(q_dim, sizeof(float));
+        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+            float *src = qp[t] + h * (2 * g_cfg.head_dim);
+            memcpy(q + h * g_cfg.head_dim, src, g_cfg.head_dim * sizeof(float));
+            memcpy(q_gate + h * g_cfg.head_dim, src + g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
+        }
+        if (qnorm_w) {
+            for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+                float *qh = q + h * g_cfg.head_dim; float ss = 0.0f;
+                for (int i = 0; i < g_cfg.head_dim; i++) ss += qh[i] * qh[i];
+                float inv = 1.0f / sqrtf(ss / g_cfg.head_dim + g_cfg.rms_norm_eps);
+                for (int i = 0; i < g_cfg.head_dim; i++) qh[i] = qh[i] * inv * bf16_to_f32(qnorm_w[i]);
+            }
+        }
+        if (knorm_w) {
+            for (int h = 0; h < g_cfg.num_kv_heads; h++) {
+                float *kh = kk[t] + h * g_cfg.head_dim; float ss = 0.0f;
+                for (int i = 0; i < g_cfg.head_dim; i++) ss += kh[i] * kh[i];
+                float inv = 1.0f / sqrtf(ss / g_cfg.head_dim + g_cfg.rms_norm_eps);
+                for (int i = 0; i < g_cfg.head_dim; i++) kh[i] = kh[i] * inv * bf16_to_f32(knorm_w[i]);
+            }
+        }
+        apply_rotary_emb(q, kk[t], pos[t], g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+
+        int cache_pos = kv->len;
+        memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, kk[t], kv_dim * sizeof(float));
+        memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, vv[t], kv_dim * sizeof(float));
+        kv->len++;
+
+        float *attn_out = calloc(q_dim, sizeof(float));
+        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+            int kv_h = h / heads_per_kv;
+            float *qh = q + h * g_cfg.head_dim;
+            float *scores = malloc(kv->len * sizeof(float));
+            for (int p = 0; p < kv->len; p++) {
+                float *kp = kv->k_cache + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
+                scores[p] = dot * scale;
+            }
+            cpu_softmax(scores, kv->len);
+            float *oh = attn_out + h * g_cfg.head_dim;
+            for (int p = 0; p < kv->len; p++) {
+                float *vp = kv->v_cache + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+                for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+            }
+            free(scores);
+        }
+        for (int i = 0; i < q_dim; i++) attn_out[i] *= 1.0f / (1.0f + expf(-q_gate[i]));
+
+        float *attn_proj = calloc(g_cfg.hidden_dim, sizeof(float));
+        if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_proj, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
+        for (int i = 0; i < g_cfg.hidden_dim; i++) out_h[t][i] = res[t][i] + attn_proj[i];
+        free(q); free(q_gate); free(attn_out); free(attn_proj);
+    }
+
+    free(res_a); free(res_b); free(na); free(nb);
+    free(qp_a); free(qp_b); free(k_a); free(k_b); free(v_a); free(v_b);
+}
+
+// Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
+// calls (the oracle) on an identical pre-seeded KV cache, and should be faster
+// (q/k/v projections amortized). Gated by --mtp-bench-attn.
+static int mtp_bench_attn(WeightFile *wf) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-attn] requires GPU\n"); return 1; }
+    int layer = g_cfg.full_attn_interval - 1;   // first full-attention layer (0-indexed)
+    int H = g_cfg.hidden_dim;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int cap = 64, P = 5;
+
+    KVCache kv_o = {0}, kv_b = {0};
+    kv_o.k_cache = calloc((size_t)cap * kv_dim, sizeof(float)); kv_o.v_cache = calloc((size_t)cap * kv_dim, sizeof(float));
+    kv_b.k_cache = calloc((size_t)cap * kv_dim, sizeof(float)); kv_b.v_cache = calloc((size_t)cap * kv_dim, sizeof(float));
+
+    for (int p = 0; p < P; p++) {
+        float *h = malloc(H * sizeof(float));
+        for (int i = 0; i < H; i++) h[i] = sinf((i + p * 13) * 0.01f);
+        full_attention_forward(wf, layer, h, &kv_o, p);
+        free(h);
+    }
+    memcpy(kv_b.k_cache, kv_o.k_cache, (size_t)cap * kv_dim * sizeof(float));
+    memcpy(kv_b.v_cache, kv_o.v_cache, (size_t)cap * kv_dim * sizeof(float));
+    kv_b.len = kv_o.len;
+
+    float *ha = malloc(H * sizeof(float)), *hb = malloc(H * sizeof(float));
+    for (int i = 0; i < H; i++) { ha[i] = cosf(i * 0.013f); hb[i] = sinf(i * 0.019f + 1.0f); }
+    int pa = kv_o.len, pb = kv_o.len + 1;
+
+    float *ha_o = malloc(H * sizeof(float)), *hb_o = malloc(H * sizeof(float));
+    float *ha_b = malloc(H * sizeof(float)), *hb_b = malloc(H * sizeof(float));
+    memcpy(ha_o, ha, H * sizeof(float)); memcpy(hb_o, hb, H * sizeof(float));
+    memcpy(ha_b, ha, H * sizeof(float)); memcpy(hb_b, hb, H * sizeof(float));
+
+    full_attention_forward(wf, layer, ha_o, &kv_o, pa);
+    full_attention_forward(wf, layer, hb_o, &kv_o, pb);
+    attn_block_2(wf, layer, ha_b, hb_b, &kv_b, pa, pb);
+
+    double err = 0.0;
+    for (int i = 0; i < H; i++) { err = fmax(err, fabs(ha_o[i] - ha_b[i])); err = fmax(err, fabs(hb_o[i] - hb_b[i])); }
+
+    const int M = 100;
+    double t = now_ms();
+    for (int m = 0; m < M; m++) {
+        kv_o.len = P; memcpy(ha_o, ha, H * sizeof(float)); memcpy(hb_o, hb, H * sizeof(float));
+        full_attention_forward(wf, layer, ha_o, &kv_o, pa);
+        full_attention_forward(wf, layer, hb_o, &kv_o, pb);
+    }
+    double t_single = (now_ms() - t) / M;
+    t = now_ms();
+    for (int m = 0; m < M; m++) {
+        kv_b.len = P; memcpy(ha_b, ha, H * sizeof(float)); memcpy(hb_b, hb, H * sizeof(float));
+        attn_block_2(wf, layer, ha_b, hb_b, &kv_b, pa, pb);
+    }
+    double t_batched = (now_ms() - t) / M;
+
+    fprintf(stderr, "[mtp-attn] layer=%d | 2x single=%.4f ms | batched=%.4f ms | ratio=%.3f | max_err=%.2e\n",
+            layer, t_single, t_batched, t_batched / t_single, err);
+    fprintf(stderr, "[mtp-attn] %s (tolerance ~1e-3 for fp reduction-order differences)\n",
+            err < 1e-2 ? "PASS: batched matches oracle" : "FAIL: outputs diverge");
+
+    free(kv_o.k_cache); free(kv_o.v_cache); free(kv_b.k_cache); free(kv_b.v_cache);
+    free(ha); free(hb); free(ha_o); free(hb_o); free(ha_b); free(hb_b);
+    return err < 1e-2 ? 0 : 1;
+}
+
+// ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
 
@@ -10546,6 +10748,7 @@ enum {
     OPT_NO_MTP,
     OPT_MTP_PREFLIGHT,
     OPT_MTP_BENCH_MATMUL,
+    OPT_MTP_BENCH_ATTN,
 };
 
 static void print_usage(const char *prog) {
@@ -10604,6 +10807,7 @@ int main(int argc, char **argv) {
         int cache_roundtrip_test_requested = 0;
         int mtp_preflight_requested = 0;
         int mtp_bench_matmul_requested = 0;
+        int mtp_bench_attn_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -10794,6 +10998,7 @@ int main(int argc, char **argv) {
             {"no-mtp",        no_argument,       0, OPT_NO_MTP},
             {"mtp-preflight",  no_argument,       0, OPT_MTP_PREFLIGHT},
             {"mtp-bench-matmul", no_argument,     0, OPT_MTP_BENCH_MATMUL},
+            {"mtp-bench-attn", no_argument,       0, OPT_MTP_BENCH_ATTN},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -10837,6 +11042,7 @@ int main(int argc, char **argv) {
                 case OPT_NO_MTP: g_mtp_predictions = 0; break;
                 case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
+                case OPT_MTP_BENCH_ATTN: mtp_bench_attn_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11016,6 +11222,9 @@ int main(int argc, char **argv) {
 
         if (mtp_bench_matmul_requested) {
             return mtp_bench_matmul(wf);
+        }
+        if (mtp_bench_attn_requested) {
+            return mtp_bench_attn(wf);
         }
 
         // ---- Load vocabulary ----
