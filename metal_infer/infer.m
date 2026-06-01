@@ -3718,6 +3718,228 @@ static int mtp_bench_attn(WeightFile *wf) {
 }
 
 // ============================================================================
+// Stage 3: batched (N=2) MoE block for MTP draft/verify.
+// hidden = h_mid + Σ wₖ·expertₖ(norm(h_mid)) + shared(norm(h_mid))·σ(gate).
+// Routed-expert and shared-expert matmuls are amortized via gpu_dequant_matmul2
+// when both tokens hit the same expert; experts hit by only one token fall back
+// to a single matvec. The expert weights are loaded once per unique expert in
+// the union of the two tokens' routes (the I/O the real batched verify pays).
+// ============================================================================
+static int g_moe_last_union = 0;  // |union of the two tokens' routed experts| (diagnostic)
+
+static void expert_slices(void *buf,
+    uint32_t **gw, uint16_t **gs, uint16_t **gb,
+    uint32_t **uw, uint16_t **us, uint16_t **ub,
+    uint32_t **dw, uint16_t **ds, uint16_t **db) {
+    char *p = buf;
+    *gw = (uint32_t *)p; p += g_cfg.gate_w_size;
+    *gs = (uint16_t *)p; p += g_cfg.gate_s_size;
+    *gb = (uint16_t *)p; p += g_cfg.gate_b_size;
+    *uw = (uint32_t *)p; p += g_cfg.up_w_size;
+    *us = (uint16_t *)p; p += g_cfg.up_s_size;
+    *ub = (uint16_t *)p; p += g_cfg.up_b_size;
+    *dw = (uint32_t *)p; p += g_cfg.down_w_size;
+    *ds = (uint16_t *)p; p += g_cfg.down_s_size;
+    *db = (uint16_t *)p;
+}
+
+// Single-token routed expert FFN: out = down(swiglu(gate(x), up(x))).
+static void routed_ffn_1(void *buf, const float *x, float *out) {
+    int H = g_cfg.hidden_dim, MI = g_cfg.moe_intermediate, gsz = g_cfg.group_size;
+    uint32_t *gw, *uw, *dw; uint16_t *gs, *gb, *us, *ub, *ds, *db;
+    expert_slices(buf, &gw, &gs, &gb, &uw, &us, &ub, &dw, &ds, &db);
+    float *eg = malloc(MI * sizeof(float)), *eu = malloc(MI * sizeof(float)), *ea = malloc(MI * sizeof(float));
+    fast_dequant_matvec(gw, gs, gb, x, eg, MI, H, gsz);
+    fast_dequant_matvec(uw, us, ub, x, eu, MI, H, gsz);
+    cpu_swiglu(eg, eu, ea, MI);
+    fast_dequant_matvec(dw, ds, db, ea, out, H, MI, gsz);
+    free(eg); free(eu); free(ea);
+}
+
+// Batched routed expert FFN: one weight read serves both tokens.
+static void routed_ffn_2(void *buf, const float *xa, const float *xb, float *oa, float *ob) {
+    int H = g_cfg.hidden_dim, MI = g_cfg.moe_intermediate, gsz = g_cfg.group_size;
+    uint32_t *gw, *uw, *dw; uint16_t *gs, *gb, *us, *ub, *ds, *db;
+    expert_slices(buf, &gw, &gs, &gb, &uw, &us, &ub, &dw, &ds, &db);
+    float *ega = malloc(MI*sizeof(float)), *egb = malloc(MI*sizeof(float));
+    float *eua = malloc(MI*sizeof(float)), *eub = malloc(MI*sizeof(float));
+    float *eaa = malloc(MI*sizeof(float)), *eab = malloc(MI*sizeof(float));
+    gpu_dequant_matmul2(g_metal, gw, gs, gb, xa, xb, ega, egb, MI, H, gsz);
+    gpu_dequant_matmul2(g_metal, uw, us, ub, xa, xb, eua, eub, MI, H, gsz);
+    cpu_swiglu(ega, eua, eaa, MI);
+    cpu_swiglu(egb, eub, eab, MI);
+    gpu_dequant_matmul2(g_metal, dw, ds, db, eaa, eab, oa, ob, H, MI, gsz);
+    free(ega); free(egb); free(eua); free(eub); free(eaa); free(eab);
+}
+
+// Compute post-attn norm + routing (softmax/topk/normalize) for one token.
+static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_post, int *idx, float *wt) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, gsz = g_cfg.group_size;
+    char nm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", layer);
+    uint16_t *post_w = get_tensor_ptr(wf, nm);
+    cpu_rms_norm(hidden, post_w, h_post, H, g_cfg.rms_norm_eps);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", layer);   uint32_t *gw = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.scales", layer);   uint16_t *gs = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.biases", layer);   uint16_t *gb = get_tensor_ptr(wf, nm);
+    float *scores = malloc(g_cfg.num_experts * sizeof(float));
+    fast_dequant_matvec(gw, gs, gb, h_post, scores, g_cfg.num_experts, H, gsz);
+    cpu_softmax(scores, g_cfg.num_experts);
+    cpu_topk(scores, g_cfg.num_experts, K, idx, wt);
+    cpu_normalize_weights(wt, K);
+    free(scores);
+}
+
+// Shared expert + gate for one token: returns shared_out (gated), needs h_post.
+static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, float *shared_out) {
+    int H = g_cfg.hidden_dim, SI = g_cfg.shared_intermediate, gsz = g_cfg.group_size;
+    char nm[256];
+    #define SW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint32_t *sgw = SW("shared_expert.gate_proj.weight"); uint16_t *sgs = SW("shared_expert.gate_proj.scales"), *sgb = SW("shared_expert.gate_proj.biases");
+    uint32_t *suw = SW("shared_expert.up_proj.weight");   uint16_t *sus = SW("shared_expert.up_proj.scales"),   *sub = SW("shared_expert.up_proj.biases");
+    uint32_t *sdw = SW("shared_expert.down_proj.weight"); uint16_t *sds = SW("shared_expert.down_proj.scales"), *sdb = SW("shared_expert.down_proj.biases");
+    uint32_t *segw = SW("shared_expert_gate.weight");     uint16_t *segs = SW("shared_expert_gate.scales"),     *segb = SW("shared_expert_gate.biases");
+    #undef SW
+    float *sg = malloc(SI*sizeof(float)), *su = malloc(SI*sizeof(float)), *sa = malloc(SI*sizeof(float)), score = 0;
+    fast_dequant_matvec(sgw, sgs, sgb, h_post, sg, SI, H, gsz);
+    fast_dequant_matvec(suw, sus, sub, h_post, su, SI, H, gsz);
+    cpu_swiglu(sg, su, sa, SI);
+    fast_dequant_matvec(sdw, sds, sdb, sa, shared_out, H, SI, gsz);
+    fast_dequant_matvec(segw, segs, segb, h_post, &score, 1, H, gsz);
+    float w = cpu_sigmoid(score);
+    for (int i = 0; i < H; i++) shared_out[i] *= w;
+    free(sg); free(su); free(sa);
+}
+
+// Batched shared expert: always used by both tokens (guaranteed 100% overlap),
+// so every matmul amortizes via matmul2.
+static void shared_expert_2(WeightFile *wf, int layer, const float *hpa, const float *hpb,
+                            float *out_a, float *out_b) {
+    int H = g_cfg.hidden_dim, SI = g_cfg.shared_intermediate, gsz = g_cfg.group_size;
+    char nm[256];
+    #define SW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint32_t *sgw = SW("shared_expert.gate_proj.weight"); uint16_t *sgs = SW("shared_expert.gate_proj.scales"), *sgb = SW("shared_expert.gate_proj.biases");
+    uint32_t *suw = SW("shared_expert.up_proj.weight");   uint16_t *sus = SW("shared_expert.up_proj.scales"),   *sub = SW("shared_expert.up_proj.biases");
+    uint32_t *sdw = SW("shared_expert.down_proj.weight"); uint16_t *sds = SW("shared_expert.down_proj.scales"), *sdb = SW("shared_expert.down_proj.biases");
+    uint32_t *segw = SW("shared_expert_gate.weight");     uint16_t *segs = SW("shared_expert_gate.scales"),     *segb = SW("shared_expert_gate.biases");
+    #undef SW
+    float *sga = malloc(SI*sizeof(float)), *sgb_ = malloc(SI*sizeof(float));
+    float *sua = malloc(SI*sizeof(float)), *sub_ = malloc(SI*sizeof(float));
+    float *saa = malloc(SI*sizeof(float)), *sab = malloc(SI*sizeof(float));
+    float scorea = 0, scoreb = 0;
+    gpu_dequant_matmul2(g_metal, sgw, sgs, sgb, hpa, hpb, sga, sgb_, SI, H, gsz);
+    gpu_dequant_matmul2(g_metal, suw, sus, sub, hpa, hpb, sua, sub_, SI, H, gsz);
+    cpu_swiglu(sga, sua, saa, SI);
+    cpu_swiglu(sgb_, sub_, sab, SI);
+    gpu_dequant_matmul2(g_metal, sdw, sds, sdb, saa, sab, out_a, out_b, H, SI, gsz);
+    gpu_dequant_matmul2(g_metal, segw, segs, segb, hpa, hpb, &scorea, &scoreb, 1, H, gsz);
+    float wa = cpu_sigmoid(scorea), wb = cpu_sigmoid(scoreb);
+    for (int i = 0; i < H; i++) { out_a[i] *= wa; out_b[i] *= wb; }
+    free(sga); free(sgb_); free(sua); free(sub_); free(saa); free(sab);
+}
+
+static void moe_block_1(WeightFile *wf, int layer, float *hidden, int packed_fd) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    float *h_post = malloc(H * sizeof(float));
+    int idx[64]; float wt[64];
+    moe_route(wf, layer, hidden, h_post, idx, wt);
+    float *moe_out = calloc(H, sizeof(float));
+    void *buf = malloc(active_expert_size());
+    float *eo = malloc(H * sizeof(float));
+    for (int k = 0; k < K; k++) {
+        if (pread(packed_fd, buf, active_expert_size(), (off_t)idx[k] * active_expert_size()) != (ssize_t)active_expert_size()) continue;
+        routed_ffn_1(buf, h_post, eo);
+        cpu_vec_madd(moe_out, eo, wt[k], H);
+    }
+    float *shared_out = malloc(H * sizeof(float));
+    shared_expert_1(wf, layer, h_post, shared_out);
+    for (int i = 0; i < H; i++) hidden[i] = hidden[i] + moe_out[i] + shared_out[i];
+    free(h_post); free(moe_out); free(buf); free(eo); free(shared_out);
+}
+
+static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int packed_fd) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    float *hpa = malloc(H*sizeof(float)), *hpb = malloc(H*sizeof(float));
+    int ia[64], ib[64]; float wa[64], wb[64];
+    moe_route(wf, layer, ha, hpa, ia, wa);
+    moe_route(wf, layer, hb, hpb, ib, wb);
+    float *moe_a = calloc(H, sizeof(float)), *moe_b = calloc(H, sizeof(float));
+    void *buf = malloc(active_expert_size());
+    float *oa = malloc(H*sizeof(float)), *ob = malloc(H*sizeof(float));
+
+    // Union of the two routes: load each unique expert once.
+    int seen[1024]; int n_union = 0; int uni[128];
+    for (int e = 0; e < g_cfg.num_experts && e < 1024; e++) seen[e] = 0;
+    for (int k = 0; k < K; k++) { if (!seen[ia[k]]) { seen[ia[k]] = 1; uni[n_union++] = ia[k]; } }
+    for (int k = 0; k < K; k++) { if (!seen[ib[k]]) { seen[ib[k]] = 1; uni[n_union++] = ib[k]; } }
+    g_moe_last_union = n_union;
+
+    for (int u = 0; u < n_union; u++) {
+        int e = uni[u];
+        if (pread(packed_fd, buf, active_expert_size(), (off_t)e * active_expert_size()) != (ssize_t)active_expert_size()) continue;
+        int ka = -1, kb = -1;
+        for (int k = 0; k < K; k++) { if (ia[k] == e) ka = k; if (ib[k] == e) kb = k; }
+        if (ka >= 0 && kb >= 0) {
+            routed_ffn_2(buf, hpa, hpb, oa, ob);
+            cpu_vec_madd(moe_a, oa, wa[ka], H);
+            cpu_vec_madd(moe_b, ob, wb[kb], H);
+        } else if (ka >= 0) {
+            routed_ffn_1(buf, hpa, oa);
+            cpu_vec_madd(moe_a, oa, wa[ka], H);
+        } else if (kb >= 0) {
+            routed_ffn_1(buf, hpb, ob);
+            cpu_vec_madd(moe_b, ob, wb[kb], H);
+        }
+    }
+    float *sa = malloc(H*sizeof(float)), *sb = malloc(H*sizeof(float));
+    shared_expert_2(wf, layer, hpa, hpb, sa, sb);
+    for (int i = 0; i < H; i++) { ha[i] = ha[i] + moe_a[i] + sa[i]; hb[i] = hb[i] + moe_b[i] + sb[i]; }
+    free(hpa); free(hpb); free(moe_a); free(moe_b); free(buf); free(oa); free(ob); free(sa); free(sb);
+}
+
+// Stage 3 unit test: moe_block_2 must match two independent moe_block_1 calls.
+static int mtp_bench_moe(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-moe] requires GPU\n"); return 1; }
+    int layer = 0, H = g_cfg.hidden_dim;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "[mtp-moe] cannot open %s\n", path); return 1; }
+
+    float *ha = malloc(H*sizeof(float)), *hb = malloc(H*sizeof(float));
+    for (int i = 0; i < H; i++) { ha[i] = sinf(i*0.011f); hb[i] = cosf(i*0.017f + 0.5f); }
+    float *ha_o = malloc(H*sizeof(float)), *hb_o = malloc(H*sizeof(float));
+    float *ha_b = malloc(H*sizeof(float)), *hb_b = malloc(H*sizeof(float));
+    memcpy(ha_o, ha, H*sizeof(float)); memcpy(hb_o, hb, H*sizeof(float));
+    memcpy(ha_b, ha, H*sizeof(float)); memcpy(hb_b, hb, H*sizeof(float));
+
+    moe_block_1(wf, layer, ha_o, fd);
+    moe_block_1(wf, layer, hb_o, fd);
+    moe_block_2(wf, layer, ha_b, hb_b, fd);
+    double err = 0.0;
+    for (int i = 0; i < H; i++) { err = fmax(err, fabs(ha_o[i]-ha_b[i])); err = fmax(err, fabs(hb_o[i]-hb_b[i])); }
+
+    const int M = 50;
+    for (int w = 0; w < 3; w++) { memcpy(ha_o,ha,H*4); memcpy(hb_o,hb,H*4); moe_block_1(wf,layer,ha_o,fd); moe_block_1(wf,layer,hb_o,fd);
+                                  memcpy(ha_b,ha,H*4); memcpy(hb_b,hb,H*4); moe_block_2(wf,layer,ha_b,hb_b,fd); }
+    double t = now_ms();
+    for (int m = 0; m < M; m++) { memcpy(ha_o,ha,H*sizeof(float)); memcpy(hb_o,hb,H*sizeof(float)); moe_block_1(wf,layer,ha_o,fd); moe_block_1(wf,layer,hb_o,fd); }
+    double t_single = (now_ms()-t)/M;
+    t = now_ms();
+    for (int m = 0; m < M; m++) { memcpy(ha_b,ha,H*sizeof(float)); memcpy(hb_b,hb,H*sizeof(float)); moe_block_2(wf,layer,ha_b,hb_b,fd); }
+    double t_batched = (now_ms()-t)/M;
+
+    fprintf(stderr, "[mtp-moe] layer=%d K=%d union=%d/%d | 2x single=%.4f ms | batched=%.4f ms | ratio=%.3f | max_err=%.2e\n",
+            layer, g_cfg.num_experts_per_tok, g_moe_last_union, 2 * g_cfg.num_experts_per_tok,
+            t_single, t_batched, t_batched/t_single, err);
+    fprintf(stderr, "[mtp-moe] %s (lower ratio = more expert overlap amortized)\n",
+            err < 1e-2 ? "PASS: batched matches oracle" : "FAIL: outputs diverge");
+    close(fd);
+    free(ha); free(hb); free(ha_o); free(hb_o); free(ha_b); free(hb_b);
+    return err < 1e-2 ? 0 : 1;
+}
+
+// ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
 
@@ -10749,6 +10971,7 @@ enum {
     OPT_MTP_PREFLIGHT,
     OPT_MTP_BENCH_MATMUL,
     OPT_MTP_BENCH_ATTN,
+    OPT_MTP_BENCH_MOE,
 };
 
 static void print_usage(const char *prog) {
@@ -10808,6 +11031,7 @@ int main(int argc, char **argv) {
         int mtp_preflight_requested = 0;
         int mtp_bench_matmul_requested = 0;
         int mtp_bench_attn_requested = 0;
+        int mtp_bench_moe_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -10999,6 +11223,7 @@ int main(int argc, char **argv) {
             {"mtp-preflight",  no_argument,       0, OPT_MTP_PREFLIGHT},
             {"mtp-bench-matmul", no_argument,     0, OPT_MTP_BENCH_MATMUL},
             {"mtp-bench-attn", no_argument,       0, OPT_MTP_BENCH_ATTN},
+            {"mtp-bench-moe", no_argument,        0, OPT_MTP_BENCH_MOE},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11043,6 +11268,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
                 case OPT_MTP_BENCH_ATTN: mtp_bench_attn_requested = 1; break;
+                case OPT_MTP_BENCH_MOE: mtp_bench_moe_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11225,6 +11451,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_bench_attn_requested) {
             return mtp_bench_attn(wf);
+        }
+        if (mtp_bench_moe_requested) {
+            return mtp_bench_moe(wf, model_path);
         }
 
         // ---- Load vocabulary ----
