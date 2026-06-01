@@ -999,8 +999,9 @@ static int mtp_preflight_forward(WeightFile *wf) {
 
     cpu_rms_norm(hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     cpu_rms_norm(embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
-    memcpy(fc_in, hidden_norm, g_cfg.hidden_dim * sizeof(float));
-    memcpy(fc_in + g_cfg.hidden_dim, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    // Fusion order matches Qwen3-Next MTP reference: cat([norm_embedding, norm_hidden]).
+    memcpy(fc_in, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    memcpy(fc_in + g_cfg.hidden_dim, hidden_norm, g_cfg.hidden_dim * sizeof(float));
     fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
                         fc_in, fc_out, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
 
@@ -1057,8 +1058,9 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
 
     cpu_rms_norm(input_hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     cpu_rms_norm(next_embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
-    memcpy(fc_in, hidden_norm, g_cfg.hidden_dim * sizeof(float));
-    memcpy(fc_in + g_cfg.hidden_dim, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    // Fusion order matches Qwen3-Next MTP reference: cat([norm_embedding, norm_hidden]).
+    memcpy(fc_in, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    memcpy(fc_in + g_cfg.hidden_dim, hidden_norm, g_cfg.hidden_dim * sizeof(float));
     fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
                         fc_in, x, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
     memcpy(residual, x, g_cfg.hidden_dim * sizeof(float));
