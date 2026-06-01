@@ -14,6 +14,12 @@
 #   make cli-smoke — run Flashchat CLI smoke test
 #   make manage-smoke — run model management storage smoke test
 #   make tool-template-smoke — run native tool template render/parser smoke test
+#   make quant-helper-smoke — run native checkpoint quantization helper tests
+#   make tokenizer-export-smoke — run tokenizer export helper tests
+#   make native-qwen-compile-smoke — run native Qwen BF16 compiler smoke test
+#   make mtp-config-smoke — run MTP config/profile precedence smoke test
+#   make model-add-config-smoke — run add-model configuration smoke test
+#   make model-edit-config-smoke — run edit-model registry smoke test
 #   make test      — run all functional smoke tests
 #   make help      — list available targets
 #   make clean     — remove build artifacts
@@ -103,7 +109,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke test
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -171,6 +177,12 @@ help:
 	@printf "  make manage-smoke  Run model management storage smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
 	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
+	@printf "  make quant-helper-smoke  Run native checkpoint quantization helper tests\n"
+	@printf "  make tokenizer-export-smoke  Run tokenizer export helper tests\n"
+	@printf "  make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test\n"
+	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
+	@printf "  make model-add-config-smoke  Run add-model configuration smoke test\n"
+	@printf "  make model-edit-config-smoke  Run edit-model registry smoke test\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "\n"
@@ -296,4 +308,22 @@ tool-template-smoke: $(INFER_TARGET)
 cache-roundtrip-smoke: $(INFER_TARGET)
 	bash tests/test_disk_cache_roundtrip.sh
 
-test: cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke api-smoke
+quant-helper-smoke:
+	python3 tests/test_flashchat_quant.py
+
+tokenizer-export-smoke:
+	python3 tests/test_tokenizer_export.py
+
+native-qwen-compile-smoke: $(INFER_TARGET)
+	bash tests/test_native_qwen_compile.sh
+
+mtp-config-smoke:
+	bash tests/test_mtp_config.sh
+
+model-add-config-smoke:
+	bash tests/test_model_add_config.sh
+
+model-edit-config-smoke:
+	bash tests/test_model_edit_config.sh
+
+test: cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke api-smoke
