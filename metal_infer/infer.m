@@ -116,6 +116,7 @@ static int g_server_http_log_enabled = 0;
 static int g_show_thinking_enabled = 0;
 static int g_system_prompt_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
+static int g_mtp_predictions = -1;
 static float g_default_temperature = 0.7f;
 static float g_default_top_p = 0.8f;
 static int g_default_top_k = 20;
@@ -187,6 +188,27 @@ static int server_flag_enabled(const char *value) {
            strcasecmp(value, "false") != 0 &&
            strcasecmp(value, "off") != 0 &&
            strcasecmp(value, "no") != 0;
+}
+
+static int parse_mtp_predictions(const char *value) {
+    if (!value || !value[0]) return -1;
+    if (strcasecmp(value, "auto") == 0) return -1;
+    if (strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "off") == 0 ||
+        strcasecmp(value, "no") == 0) {
+        return 0;
+    }
+    if (strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "yes") == 0) {
+        return 1;
+    }
+    char *end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value) return 0;
+    if (v < 0) return -1;
+    if (v > 16) return 16;
+    return (int)v;
 }
 
 static void server_log_open(void) {
@@ -739,6 +761,55 @@ typedef struct {
     TensorManifest *manifest;
 } WeightFile;
 
+typedef struct {
+    int manifest_layers;
+    int tensors_present;
+    int packed_experts_present;
+    int enabled;
+    char packed_dir[PATH_MAX];
+} MTPArtifacts;
+
+typedef struct {
+    uint16_t *pre_fc_norm_hidden_w;
+    uint16_t *pre_fc_norm_embedding_w;
+    uint32_t *fc_w; uint16_t *fc_s, *fc_b;
+    uint16_t *layer_input_norm_w;
+    uint32_t *q_w; uint16_t *q_s, *q_b;
+    uint32_t *k_w; uint16_t *k_s, *k_b;
+    uint32_t *v_w; uint16_t *v_s, *v_b;
+    uint32_t *o_w; uint16_t *o_s, *o_b;
+    uint16_t *q_norm_w;
+    uint16_t *k_norm_w;
+    uint16_t *post_attn_norm_w;
+    uint32_t *gate_w; uint16_t *gate_s, *gate_b;
+    uint32_t *sg_w;   uint16_t *sg_s, *sg_b;
+    uint32_t *su_w;   uint16_t *su_s, *su_b;
+    uint32_t *sd_w;   uint16_t *sd_s, *sd_b;
+    uint32_t *seg_w;  uint16_t *seg_s, *seg_b;
+    uint16_t *norm_w;
+    int ready;
+} MTPWeightCache;
+
+static MTPWeightCache g_mtp_cache = {0};
+
+static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps);
+static void fast_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+                                const float *x, float *out, int out_dim, int in_dim, int group_size);
+static void cpu_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+                               const float *x, float *out, int out_dim, int in_dim, int group_size);
+static float vec_rms(const float *v, int n);
+static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
+                              int head_dim, int rotary_dim);
+static void cpu_softmax(float *x, int dim);
+static void cpu_topk(const float *scores, int dim, int K, int *indices, float *values);
+static void cpu_normalize_weights(float *weights, int K);
+static void cpu_swiglu(const float *gate, const float *up, float *out, int dim);
+static float cpu_sigmoid(float x);
+static void cpu_vec_madd(float *dst, const float *src, float scale, int dim);
+static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits);
+static int cpu_argmax(const float *x, int dim);
+static void embed_lookup(WeightFile *wf, int token_id, float *out);
+
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     // mmap the binary file
     int fd = open(bin_path, O_RDONLY);
@@ -787,6 +858,428 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
     return find_tensor(wf->manifest, name);
+}
+
+static void *get_tensor_ptr_optional(WeightFile *wf, const char *name) {
+    TensorInfo *t = find_tensor(wf->manifest, name);
+    return t ? (char *)wf->data + t->offset : NULL;
+}
+
+static int manifest_has_tensor(WeightFile *wf, const char *name) {
+    return get_tensor_info(wf, name) != NULL;
+}
+
+static int read_mtp_packed_layers(const char *model_path) {
+    @autoreleasepool {
+        char layout_path[PATH_MAX];
+        snprintf(layout_path, sizeof(layout_path), "%s/flashchat/packed_mtp_experts/layout.json", model_path);
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:layout_path]];
+        if (!data) return 0;
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if (!root) return 0;
+        NSNumber *layers = root[@"num_layers"];
+        return layers ? [layers intValue] : 0;
+    }
+}
+
+static MTPArtifacts detect_mtp_artifacts(WeightFile *wf, const char *model_path) {
+    MTPArtifacts mtp = {0};
+    mtp.enabled = g_mtp_predictions > 0;
+    snprintf(mtp.packed_dir, sizeof(mtp.packed_dir), "%s/flashchat/packed_mtp_experts", model_path);
+
+    mtp.tensors_present =
+        manifest_has_tensor(wf, "mtp.fc.weight") &&
+        manifest_has_tensor(wf, "mtp.fc.scales") &&
+        manifest_has_tensor(wf, "mtp.fc.biases") &&
+        manifest_has_tensor(wf, "mtp.pre_fc_norm_hidden.weight") &&
+        manifest_has_tensor(wf, "mtp.pre_fc_norm_embedding.weight") &&
+        manifest_has_tensor(wf, "mtp.layers.0.input_layernorm.weight") &&
+        manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.weight") &&
+        manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.scales") &&
+        manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.biases") &&
+        manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.weight") &&
+        manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.scales") &&
+        manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.biases") &&
+        manifest_has_tensor(wf, "mtp.norm.weight");
+
+    mtp.manifest_layers = mtp.tensors_present ? 1 : 0;
+
+    int packed_layers = read_mtp_packed_layers(model_path);
+    if (packed_layers > 0) {
+        char layer_path[PATH_MAX];
+        snprintf(layer_path, sizeof(layer_path), "%s/layer_00.bin", mtp.packed_dir);
+        mtp.packed_experts_present = access(layer_path, R_OK) == 0;
+    }
+
+    return mtp;
+}
+
+static void build_mtp_cache(WeightFile *wf) {
+    memset(&g_mtp_cache, 0, sizeof(g_mtp_cache));
+    g_mtp_cache.pre_fc_norm_hidden_w = get_tensor_ptr_optional(wf, "mtp.pre_fc_norm_hidden.weight");
+    g_mtp_cache.pre_fc_norm_embedding_w = get_tensor_ptr_optional(wf, "mtp.pre_fc_norm_embedding.weight");
+    g_mtp_cache.fc_w = get_tensor_ptr_optional(wf, "mtp.fc.weight");
+    g_mtp_cache.fc_s = get_tensor_ptr_optional(wf, "mtp.fc.scales");
+    g_mtp_cache.fc_b = get_tensor_ptr_optional(wf, "mtp.fc.biases");
+    g_mtp_cache.layer_input_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.input_layernorm.weight");
+    g_mtp_cache.q_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.weight");
+    g_mtp_cache.q_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.scales");
+    g_mtp_cache.q_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.biases");
+    g_mtp_cache.k_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.weight");
+    g_mtp_cache.k_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.scales");
+    g_mtp_cache.k_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.biases");
+    g_mtp_cache.v_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.weight");
+    g_mtp_cache.v_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.scales");
+    g_mtp_cache.v_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.biases");
+    g_mtp_cache.o_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.weight");
+    g_mtp_cache.o_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.scales");
+    g_mtp_cache.o_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.biases");
+    g_mtp_cache.q_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_norm.weight");
+    g_mtp_cache.k_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_norm.weight");
+    g_mtp_cache.post_attn_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.post_attention_layernorm.weight");
+    g_mtp_cache.gate_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.weight");
+    g_mtp_cache.gate_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.scales");
+    g_mtp_cache.gate_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.biases");
+    g_mtp_cache.sg_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.weight");
+    g_mtp_cache.sg_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.scales");
+    g_mtp_cache.sg_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.biases");
+    g_mtp_cache.su_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.weight");
+    g_mtp_cache.su_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.scales");
+    g_mtp_cache.su_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.biases");
+    g_mtp_cache.sd_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.weight");
+    g_mtp_cache.sd_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.scales");
+    g_mtp_cache.sd_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.biases");
+    g_mtp_cache.seg_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.weight");
+    g_mtp_cache.seg_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.scales");
+    g_mtp_cache.seg_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
+    g_mtp_cache.norm_w = get_tensor_ptr_optional(wf, "mtp.norm.weight");
+    g_mtp_cache.ready =
+        g_mtp_cache.pre_fc_norm_hidden_w &&
+        g_mtp_cache.pre_fc_norm_embedding_w &&
+        g_mtp_cache.fc_w && g_mtp_cache.fc_s && g_mtp_cache.fc_b &&
+        g_mtp_cache.layer_input_norm_w &&
+        g_mtp_cache.q_w && g_mtp_cache.q_s && g_mtp_cache.q_b &&
+        g_mtp_cache.k_w && g_mtp_cache.k_s && g_mtp_cache.k_b &&
+        g_mtp_cache.v_w && g_mtp_cache.v_s && g_mtp_cache.v_b &&
+        g_mtp_cache.o_w && g_mtp_cache.o_s && g_mtp_cache.o_b &&
+        g_mtp_cache.q_norm_w && g_mtp_cache.k_norm_w &&
+        g_mtp_cache.post_attn_norm_w &&
+        g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
+        g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
+        g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
+        g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
+        g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b &&
+        g_mtp_cache.norm_w;
+}
+
+static int mtp_preflight_forward(WeightFile *wf) {
+    (void)wf;
+    if (!g_mtp_cache.ready) {
+        fprintf(stderr, "[mtp] preflight failed: MTP weight cache is incomplete\n");
+        return 1;
+    }
+
+    float *hidden = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *embedding = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *hidden_norm = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *embedding_norm = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *fc_in = calloc(g_cfg.hidden_dim * 2, sizeof(float));
+    float *fc_out = calloc(g_cfg.hidden_dim, sizeof(float));
+    if (!hidden || !embedding || !hidden_norm || !embedding_norm || !fc_in || !fc_out) {
+        fprintf(stderr, "[mtp] preflight failed: allocation failure\n");
+        free(hidden); free(embedding); free(hidden_norm); free(embedding_norm); free(fc_in); free(fc_out);
+        return 1;
+    }
+
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
+        hidden[i] = sinf((float)i * 0.001f);
+        embedding[i] = cosf((float)i * 0.001f);
+    }
+
+    cpu_rms_norm(hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    cpu_rms_norm(embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    memcpy(fc_in, hidden_norm, g_cfg.hidden_dim * sizeof(float));
+    memcpy(fc_in + g_cfg.hidden_dim, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
+                        fc_in, fc_out, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
+
+    float rms = vec_rms(fc_out, g_cfg.hidden_dim);
+    int ok = isfinite(rms) && rms > 0.0f;
+    fprintf(stderr, "[mtp] preflight fc_out_rms=%.6f\n", rms);
+
+    free(hidden); free(embedding); free(hidden_norm); free(embedding_norm); free(fc_in); free(fc_out);
+    return ok ? 0 : 1;
+}
+
+static int mtp_forward(WeightFile *wf, const char *model_path,
+                       const float *input_hidden, const float *next_embedding,
+                       float *out_hidden, int *out_draft_token, int log_details) {
+    if (!g_mtp_cache.ready) {
+        fprintf(stderr, "[mtp] forward failed: MTP weight cache is incomplete\n");
+        return 1;
+    }
+
+    int rc = 1;
+    int q_proj_dim = g_cfg.num_attn_heads * g_cfg.head_dim * 2;
+    int q_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
+
+    float *hidden_norm = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *embedding_norm = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *fc_in = calloc(g_cfg.hidden_dim * 2, sizeof(float));
+    float *x = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *residual = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *normed = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *q_proj = calloc(q_proj_dim, sizeof(float));
+    float *k = calloc(kv_dim, sizeof(float));
+    float *v = calloc(kv_dim, sizeof(float));
+    float *q = calloc(q_dim, sizeof(float));
+    float *q_gate = calloc(q_dim, sizeof(float));
+    float *attn_out = calloc(q_dim, sizeof(float));
+    float *attn_projected = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *h_post = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *gate_scores = calloc(g_cfg.num_experts, sizeof(float));
+    float *shared_gate = calloc(g_cfg.shared_intermediate, sizeof(float));
+    float *shared_up = calloc(g_cfg.shared_intermediate, sizeof(float));
+    float *shared_act = calloc(g_cfg.shared_intermediate, sizeof(float));
+    float *shared_out = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *moe_out = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *final_normed = calloc(g_cfg.hidden_dim, sizeof(float));
+    if (!input_hidden || !next_embedding || !hidden_norm || !embedding_norm || !fc_in || !x ||
+        !residual || !normed || !q_proj || !k || !v || !q || !q_gate || !attn_out ||
+        !attn_projected || !h_post || !gate_scores || !shared_gate || !shared_up ||
+        !shared_act || !shared_out || !moe_out || !final_normed) {
+        fprintf(stderr, "[mtp] forward failed: allocation failure\n");
+        goto cleanup;
+    }
+
+    cpu_rms_norm(input_hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    cpu_rms_norm(next_embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    memcpy(fc_in, hidden_norm, g_cfg.hidden_dim * sizeof(float));
+    memcpy(fc_in + g_cfg.hidden_dim, embedding_norm, g_cfg.hidden_dim * sizeof(float));
+    fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
+                        fc_in, x, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
+    memcpy(residual, x, g_cfg.hidden_dim * sizeof(float));
+
+    cpu_rms_norm(x, g_mtp_cache.layer_input_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    fast_dequant_matvec(g_mtp_cache.q_w, g_mtp_cache.q_s, g_mtp_cache.q_b,
+                        normed, q_proj, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    fast_dequant_matvec(g_mtp_cache.k_w, g_mtp_cache.k_s, g_mtp_cache.k_b,
+                        normed, k, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    fast_dequant_matvec(g_mtp_cache.v_w, g_mtp_cache.v_s, g_mtp_cache.v_b,
+                        normed, v, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+
+    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+        float *src = q_proj + h * (2 * g_cfg.head_dim);
+        memcpy(q + h * g_cfg.head_dim, src, g_cfg.head_dim * sizeof(float));
+        memcpy(q_gate + h * g_cfg.head_dim, src + g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
+    }
+    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+        float *qh = q + h * g_cfg.head_dim;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < g_cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
+        float inv_rms = 1.0f / sqrtf(sum_sq / g_cfg.head_dim + g_cfg.rms_norm_eps);
+        for (int i = 0; i < g_cfg.head_dim; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(g_mtp_cache.q_norm_w[i]);
+    }
+    for (int h = 0; h < g_cfg.num_kv_heads; h++) {
+        float *kh = k + h * g_cfg.head_dim;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < g_cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
+        float inv_rms = 1.0f / sqrtf(sum_sq / g_cfg.head_dim + g_cfg.rms_norm_eps);
+        for (int i = 0; i < g_cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(g_mtp_cache.k_norm_w[i]);
+    }
+    apply_rotary_emb(q, k, 0, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+
+    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+        int kv_h = h / heads_per_kv;
+        memcpy(attn_out + h * g_cfg.head_dim, v + kv_h * g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
+    }
+    for (int i = 0; i < q_dim; i++) {
+        attn_out[i] *= cpu_sigmoid(q_gate[i]);
+    }
+    fast_dequant_matvec(g_mtp_cache.o_w, g_mtp_cache.o_s, g_mtp_cache.o_b,
+                        attn_out, attn_projected, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
+    for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = residual[i] + attn_projected[i];
+
+    cpu_rms_norm(x, g_mtp_cache.post_attn_norm_w, h_post, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    fast_dequant_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
+                        h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size);
+    fast_dequant_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
+                        h_post, shared_gate, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+    fast_dequant_matvec(g_mtp_cache.su_w, g_mtp_cache.su_s, g_mtp_cache.su_b,
+                        h_post, shared_up, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+    fast_dequant_matvec(g_mtp_cache.seg_w, g_mtp_cache.seg_s, g_mtp_cache.seg_b,
+                        h_post, &shared_act[0], 1, g_cfg.hidden_dim, g_cfg.group_size);
+    float shared_gate_score = shared_act[0];
+
+    cpu_softmax(gate_scores, g_cfg.num_experts);
+    int expert_index = 0;
+    float expert_weight = 1.0f;
+    cpu_topk(gate_scores, g_cfg.num_experts, 1, &expert_index, &expert_weight);
+    cpu_normalize_weights(&expert_weight, 1);
+
+    char packed_path[PATH_MAX];
+    snprintf(packed_path, sizeof(packed_path), "%s/flashchat/packed_mtp_experts/layer_00.bin", model_path);
+    int fd = open(packed_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[mtp] forward failed: cannot open %s: %s\n", packed_path, strerror(errno));
+        goto cleanup;
+    }
+    size_t esz = active_expert_size();
+    void *expert_data = malloc(esz);
+    if (!expert_data) {
+        close(fd);
+        fprintf(stderr, "[mtp] forward failed: expert allocation failure\n");
+        goto cleanup;
+    }
+    ssize_t nread = pread(fd, expert_data, esz, (off_t)expert_index * esz);
+    close(fd);
+    if (nread != (ssize_t)esz) {
+        memset(expert_data, 0, esz);
+        expert_index = 0;
+        fd = open(packed_path, O_RDONLY);
+        nread = fd >= 0 ? pread(fd, expert_data, esz, 0) : -1;
+        if (fd >= 0) close(fd);
+    }
+    if (nread == (ssize_t)esz) {
+        uint32_t *gw = (uint32_t *)expert_data;
+        uint16_t *gs_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size);
+        uint16_t *gb_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size);
+        uint32_t *uw = (uint32_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size);
+        uint16_t *us_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size);
+        uint16_t *ub_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size);
+        uint32_t *dw = (uint32_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size);
+        uint16_t *ds_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size);
+        uint16_t *db_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size);
+        float *eg = calloc(g_cfg.moe_intermediate, sizeof(float));
+        float *eu = calloc(g_cfg.moe_intermediate, sizeof(float));
+        float *ea = calloc(g_cfg.moe_intermediate, sizeof(float));
+        float *eo = calloc(g_cfg.hidden_dim, sizeof(float));
+        if (eg && eu && ea && eo) {
+            cpu_dequant_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+            cpu_dequant_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+            cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
+            cpu_dequant_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
+            cpu_vec_madd(moe_out, eo, expert_weight, g_cfg.hidden_dim);
+        }
+        free(eg); free(eu); free(ea); free(eo);
+    }
+    free(expert_data);
+
+    cpu_swiglu(shared_gate, shared_up, shared_act, g_cfg.shared_intermediate);
+    fast_dequant_matvec(g_mtp_cache.sd_w, g_mtp_cache.sd_s, g_mtp_cache.sd_b,
+                        shared_act, shared_out, g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
+    float shared_weight = cpu_sigmoid(shared_gate_score);
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
+        x[i] = x[i] + moe_out[i] + shared_out[i] * shared_weight;
+    }
+    cpu_rms_norm(x, g_mtp_cache.norm_w, final_normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+
+    float fc_rms = vec_rms(residual, g_cfg.hidden_dim);
+    float layer_rms = vec_rms(x, g_cfg.hidden_dim);
+    float final_rms = vec_rms(final_normed, g_cfg.hidden_dim);
+    if (log_details) {
+        fprintf(stderr, "[mtp] decoder preflight fc_rms=%.6f layer_rms=%.6f final_rms=%.6f expert=%d\n",
+                fc_rms, layer_rms, final_rms, expert_index);
+    }
+    if (out_hidden) {
+        memcpy(out_hidden, final_normed, g_cfg.hidden_dim * sizeof(float));
+    }
+    if (out_draft_token) {
+        *out_draft_token = -1;
+    }
+    if (get_tensor_info(wf, "lm_head.weight") &&
+        get_tensor_info(wf, "lm_head.scales") &&
+        get_tensor_info(wf, "lm_head.biases")) {
+        float *logits = calloc(g_cfg.vocab_size, sizeof(float));
+        if (logits) {
+            lm_head_forward(wf, final_normed, logits);
+            int draft_token = cpu_argmax(logits, g_cfg.vocab_size);
+            if (out_draft_token) {
+                *out_draft_token = draft_token;
+            }
+            if (log_details) {
+                fprintf(stderr, "[mtp] decoder preflight draft_token=%d draft_logit=%.6f\n",
+                        draft_token, logits[draft_token]);
+            }
+            free(logits);
+        }
+    } else if (log_details) {
+        fprintf(stderr, "[mtp] decoder preflight draft logits skipped; lm_head tensors not present\n");
+    }
+    rc = (isfinite(final_rms) && final_rms > 0.0f) ? 0 : 1;
+
+cleanup:
+    free(hidden_norm); free(embedding_norm); free(fc_in); free(x);
+    free(residual); free(normed); free(q_proj); free(k); free(v); free(q); free(q_gate);
+    free(attn_out); free(attn_projected); free(h_post); free(gate_scores); free(shared_gate);
+    free(shared_up); free(shared_act); free(shared_out); free(moe_out); free(final_normed);
+    return rc;
+}
+
+static int mtp_preflight_decoder_layer(WeightFile *wf, const char *model_path) {
+    float *hidden = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *embedding = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *out_hidden = calloc(g_cfg.hidden_dim, sizeof(float));
+    if (!hidden || !embedding || !out_hidden) {
+        fprintf(stderr, "[mtp] decoder preflight failed: allocation failure\n");
+        free(hidden); free(embedding); free(out_hidden);
+        return 1;
+    }
+
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
+        hidden[i] = sinf((float)i * 0.001f);
+        embedding[i] = cosf((float)i * 0.001f);
+    }
+
+    int draft_token = -1;
+    int rc = mtp_forward(wf, model_path, hidden, embedding, out_hidden, &draft_token, 1);
+    float out_rms = vec_rms(out_hidden, g_cfg.hidden_dim);
+    fprintf(stderr, "[mtp] reusable forward preflight out_rms=%.6f draft_token=%d\n",
+            out_rms, draft_token);
+
+    free(hidden);
+    free(embedding);
+    free(out_hidden);
+    return rc;
+}
+
+static int mtp_can_shadow_draft(WeightFile *wf) {
+    return g_mtp_predictions > 0 && g_mtp_cache.ready &&
+           get_tensor_info(wf, "lm_head.weight") &&
+           get_tensor_info(wf, "lm_head.scales") &&
+           get_tensor_info(wf, "lm_head.biases") &&
+           get_tensor_info(wf, "model.embed_tokens.weight") &&
+           get_tensor_info(wf, "model.embed_tokens.scales") &&
+           get_tensor_info(wf, "model.embed_tokens.biases");
+}
+
+static int mtp_shadow_draft_token(WeightFile *wf, const char *model_path,
+                                  const float *backbone_hidden, int accepted_token,
+                                  int *out_draft_token) {
+    if (!mtp_can_shadow_draft(wf) || accepted_token < 0 || accepted_token >= g_cfg.vocab_size) {
+        if (out_draft_token) *out_draft_token = -1;
+        return -1;
+    }
+
+    float *embedding = calloc(g_cfg.hidden_dim, sizeof(float));
+    float *mtp_hidden = calloc(g_cfg.hidden_dim, sizeof(float));
+    if (!embedding || !mtp_hidden) {
+        free(embedding);
+        free(mtp_hidden);
+        if (out_draft_token) *out_draft_token = -1;
+        return -1;
+    }
+
+    embed_lookup(wf, accepted_token, embedding);
+    int draft_token = -1;
+    int rc = mtp_forward(wf, model_path, backbone_hidden, embedding, mtp_hidden, &draft_token, 0);
+    free(embedding);
+    free(mtp_hidden);
+    if (out_draft_token) *out_draft_token = draft_token;
+    return rc == 0 && draft_token >= 0 ? 0 : -1;
 }
 
 // ============================================================================
@@ -9522,6 +10015,15 @@ static void serve_loop(
             saw_tool_call_start = 1;
         }
 
+        float mtp_backbone_hidden[g_cfg.hidden_dim];
+        int mtp_shadow_available = mtp_can_shadow_draft(wf);
+        int mtp_pending_draft = -1;
+        int mtp_shadow_hits = 0;
+        int mtp_shadow_checks = 0;
+        if (mtp_shadow_available) {
+            memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+        }
+
         if (final_norm_w) {
             float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
             cpu_rms_norm(hidden, final_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
@@ -9541,6 +10043,14 @@ static void serve_loop(
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
+        if (mtp_shadow_available) {
+            int draft_token = -1;
+            if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
+                server_log_errorf("[mtp] %s shadow draft after token=%d -> %d\n",
+                                  request_id, next_token, draft_token);
+                mtp_pending_draft = draft_token;
+            }
+        }
         server_log_errorf("[serve] %s first_token=%d%s\n", request_id, next_token,
                           (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
 
@@ -9575,6 +10085,17 @@ static void serve_loop(
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
+            if (gen > 0 && mtp_pending_draft >= 0) {
+                mtp_shadow_checks++;
+                if (mtp_pending_draft == next_token) {
+                    mtp_shadow_hits++;
+                    server_log_errorf("[mtp] %s shadow hit token=%d\n", request_id, next_token);
+                } else {
+                    server_log_errorf("[mtp] %s shadow miss draft=%d actual=%d\n",
+                                      request_id, mtp_pending_draft, next_token);
+                }
+                mtp_pending_draft = -1;
+            }
             if (next_token == g_cfg.think_start_token) in_think = 1;
             if (next_token == g_cfg.think_end_token) in_think = 0;
             if (in_think) think_tokens++;
@@ -9686,6 +10207,10 @@ tool_call_checked:
             complete_deferred_experts();
             pos++;
 
+            if (mtp_shadow_available) {
+                memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+            }
+
             if (final_norm_w) {
                 float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
                 cpu_rms_norm(hidden, final_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
@@ -9704,6 +10229,20 @@ tool_call_checked:
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
+            if (mtp_shadow_available) {
+                int draft_token = -1;
+                if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
+                    server_log_errorf("[mtp] %s shadow draft after token=%d -> %d\n",
+                                      request_id, next_token, draft_token);
+                    mtp_pending_draft = draft_token;
+                }
+            }
+        }
+
+        if (mtp_shadow_checks > 0) {
+            double hit_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
+            server_log_errorf("[mtp] %s shadow summary hits=%d checks=%d rate=%.1f%%\n",
+                              request_id, mtp_shadow_hits, mtp_shadow_checks, hit_rate);
         }
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
@@ -9770,6 +10309,9 @@ enum {
     OPT_RENDER_KIND,
     OPT_PARSE_TOOL_CALL,
     OPT_CACHE_ROUNDTRIP_TEST,
+    OPT_MTP,
+    OPT_NO_MTP,
+    OPT_MTP_PREFLIGHT,
 };
 
 static void print_usage(const char *prog) {
@@ -9799,6 +10341,9 @@ static void print_usage(const char *prog) {
     printf("  --render-kind KIND   Render kind: auto, chat, responses (default: auto)\n");
     printf("  --parse-tool-call F  Parse native XML tool-call text and exit\n");
     printf("  --cache-roundtrip-test  Run synthetic disk-cache save/load roundtrip self-test and exit\n");
+    printf("  --mtp                Enable experimental multi-token prediction artifact path\n");
+    printf("  --no-mtp             Disable experimental multi-token prediction (default)\n");
+    printf("  --mtp-preflight      Load MTP artifacts, run pre-FC smoke computation, and exit\n");
     printf("  --help               This message\n");
 }
 
@@ -9823,6 +10368,7 @@ int main(int argc, char **argv) {
         const char *render_kind = "auto";
         const char *parse_tool_call_path = NULL;
         int cache_roundtrip_test_requested = 0;
+        int mtp_preflight_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -9839,6 +10385,7 @@ int main(int argc, char **argv) {
         const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
         const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
         const char *env_system_prompt_cache_max_entries = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES");
+        const char *env_mtp = getenv("FLASHCHAT_MTP");
         if (env_temperature && env_temperature[0]) g_default_temperature = strtof(env_temperature, NULL);
         if (env_top_p && env_top_p[0]) g_default_top_p = strtof(env_top_p, NULL);
         if (env_top_k && env_top_k[0]) g_default_top_k = atoi(env_top_k);
@@ -9875,6 +10422,9 @@ int main(int argc, char **argv) {
         if (env_system_prompt_cache_max_entries && env_system_prompt_cache_max_entries[0]) {
             g_system_prompt_cache_max_entries = atoi(env_system_prompt_cache_max_entries);
             if (g_system_prompt_cache_max_entries < 0) g_system_prompt_cache_max_entries = 0;
+        }
+        if (env_mtp && env_mtp[0]) {
+            g_mtp_predictions = parse_mtp_predictions(env_mtp);
         }
 
         // Also try to read config from ~/.config/flashchat/config if env vars not set
@@ -9964,6 +10514,15 @@ int main(int argc, char **argv) {
                             if (g_system_prompt_cache_max_entries < 0) g_system_prompt_cache_max_entries = 0;
                         }
                     }
+                    if (!env_mtp && strncmp(line, "MTP=", 4) == 0) {
+                        char *val = line + 4;
+                        char *quote = strchr(val, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            g_mtp_predictions = parse_mtp_predictions(quote + 1);
+                        }
+                    }
                 }
                 fclose(cfg);
             }
@@ -9996,6 +10555,9 @@ int main(int argc, char **argv) {
             {"render-kind",    required_argument, 0, OPT_RENDER_KIND},
             {"parse-tool-call", required_argument, 0, OPT_PARSE_TOOL_CALL},
             {"cache-roundtrip-test", no_argument,  0, OPT_CACHE_ROUNDTRIP_TEST},
+            {"mtp",           no_argument,       0, OPT_MTP},
+            {"no-mtp",        no_argument,       0, OPT_NO_MTP},
+            {"mtp-preflight",  no_argument,       0, OPT_MTP_PREFLIGHT},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -10035,6 +10597,9 @@ int main(int argc, char **argv) {
                 case OPT_RENDER_KIND: render_kind = optarg; break;
                 case OPT_PARSE_TOOL_CALL: parse_tool_call_path = optarg; break;
                 case OPT_CACHE_ROUNDTRIP_TEST: cache_roundtrip_test_requested = 1; break;
+                case OPT_MTP: g_mtp_predictions = 1; break;
+                case OPT_NO_MTP: g_mtp_predictions = 0; break;
+                case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -10064,6 +10629,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         kApiModelId = g_cfg.model_id;
+        if (g_mtp_predictions < 0) {
+            g_mtp_predictions = g_cfg.mtp_default_predictions > 0 ? g_cfg.mtp_default_predictions : 0;
+        }
+        if (g_cfg.mtp_max_predictions > 0 && g_mtp_predictions > g_cfg.mtp_max_predictions) {
+            fprintf(stderr, "[mtp] requested draft budget %d exceeds model max %d; clamping\n",
+                    g_mtp_predictions, g_cfg.mtp_max_predictions);
+            g_mtp_predictions = g_cfg.mtp_max_predictions;
+        }
 
         // K (active experts per token) defaults to the model's num_experts_per_tok
         // from config — i.e. exactly what the model was trained with. Previously
@@ -10162,6 +10735,33 @@ int main(int argc, char **argv) {
         if (!wf) {
             fprintf(stderr, "ERROR: Failed to load weights\n");
             return 1;
+        }
+
+        MTPArtifacts mtp = detect_mtp_artifacts(wf, model_path);
+        if (g_mtp_predictions > 0) {
+            if (mtp.tensors_present && mtp.packed_experts_present) {
+                fprintf(stderr, "[mtp] enabled; draft budget=%d; artifacts detected (%s)\n",
+                        g_mtp_predictions, mtp.packed_dir);
+                fprintf(stderr, "[mtp] draft/verify decode is not active yet; using shadow path\n");
+                if (g_mtp_predictions > 1) {
+                    fprintf(stderr, "[mtp] shadow path currently evaluates one draft token; extra budget is reserved for verify decode\n");
+                }
+            } else {
+                fprintf(stderr, "[mtp] requested but artifacts are incomplete; using existing decode path\n");
+                fprintf(stderr, "[mtp] tensors=%s packed_experts=%s\n",
+                        mtp.tensors_present ? "yes" : "no",
+                        mtp.packed_experts_present ? "yes" : "no");
+            }
+        } else if (mtp.tensors_present || mtp.packed_experts_present) {
+            fprintf(stderr, "[mtp] artifacts detected but disabled; using existing decode path\n");
+        }
+        if (g_mtp_predictions > 0) {
+            build_mtp_cache(wf);
+        }
+        if (mtp_preflight_requested) {
+            int rc_fc = mtp_preflight_forward(wf);
+            int rc_layer = mtp_preflight_decoder_layer(wf, model_path);
+            return rc_fc == 0 && rc_layer == 0 ? 0 : 1;
         }
 
         // Wrap weight file for Metal GPU access
@@ -10442,6 +11042,15 @@ int main(int argc, char **argv) {
 
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
 
+        float mtp_backbone_hidden[g_cfg.hidden_dim];
+        int mtp_shadow_available = mtp_can_shadow_draft(wf);
+        int mtp_pending_draft = -1;
+        int mtp_shadow_hits = 0;
+        int mtp_shadow_checks = 0;
+        if (mtp_shadow_available) {
+            memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+        }
+
         // ---- Final norm ----
         if (final_norm_w) {
             float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
@@ -10457,6 +11066,13 @@ int main(int argc, char **argv) {
 
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, g_cfg.vocab_size);
+        if (mtp_shadow_available) {
+            int draft_token = -1;
+            if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
+                fprintf(stderr, "[mtp] shadow draft after token=%d -> %d\n", next_token, draft_token);
+                mtp_pending_draft = draft_token;
+            }
+        }
         double ttft_ms = now_ms() - t0;
 
         if (g_timing_enabled) {
@@ -10526,6 +11142,10 @@ int main(int argc, char **argv) {
             complete_deferred_experts();
             pos++;
 
+            if (mtp_shadow_available) {
+                memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+            }
+
             // Final norm
             if (final_norm_w) {
                 float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
@@ -10539,6 +11159,23 @@ int main(int argc, char **argv) {
 
             // Greedy sample
             next_token = cpu_argmax(logits, g_cfg.vocab_size);
+            if (mtp_pending_draft >= 0) {
+                mtp_shadow_checks++;
+                if (mtp_pending_draft == next_token) {
+                    mtp_shadow_hits++;
+                    fprintf(stderr, "[mtp] shadow hit token=%d\n", next_token);
+                } else {
+                    fprintf(stderr, "[mtp] shadow miss draft=%d actual=%d\n", mtp_pending_draft, next_token);
+                }
+                mtp_pending_draft = -1;
+            }
+            if (mtp_shadow_available) {
+                int draft_token = -1;
+                if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
+                    fprintf(stderr, "[mtp] shadow draft after token=%d -> %d\n", next_token, draft_token);
+                    mtp_pending_draft = draft_token;
+                }
+            }
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
@@ -10559,6 +11196,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
                         gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
             }
+        }
+
+        if (mtp_shadow_checks > 0) {
+            double hit_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
+            fprintf(stderr, "[mtp] shadow summary hits=%d checks=%d rate=%.1f%%\n",
+                    mtp_shadow_hits, mtp_shadow_checks, hit_rate);
         }
 
         if (g_timing_enabled) timing_print();
