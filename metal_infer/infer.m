@@ -4925,8 +4925,28 @@ static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next) {
     for (int h=0;h<g_cfg.num_attn_heads;h++){ float*s=qp+h*2*g_cfg.head_dim; memcpy(q+h*g_cfg.head_dim,s,g_cfg.head_dim*4); memcpy(qg+h*g_cfg.head_dim,s+g_cfg.head_dim,g_cfg.head_dim*4); }
     for (int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*inv*bf16_to_f32(qn[i]); }
     for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
-    apply_rotary_emb(q, k, 0, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
-    for (int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; memcpy(ao+h*g_cfg.head_dim, v+kvh*g_cfg.head_dim, g_cfg.head_dim*4); }
+    // Real causal self-attention over a persistent MTP KV cache (replaces copy-V):
+    // append this token's K/V, attend over [0..len]. Built from accepted tokens only.
+    int mtp_pos = g_mtp_kv_len;
+    apply_rotary_emb(q, k, mtp_pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    if (g_mtp_k_cache && g_mtp_v_cache && g_mtp_kv_len < GPU_KV_SEQ) {
+        memcpy(g_mtp_k_cache + (size_t)g_mtp_kv_len*kvd, k, kvd*4);
+        memcpy(g_mtp_v_cache + (size_t)g_mtp_kv_len*kvd, v, kvd*4);
+        g_mtp_kv_len++;
+    }
+    int ctx = g_mtp_kv_len > 0 ? g_mtp_kv_len : 1;
+    const float *kc = g_mtp_k_cache ? g_mtp_k_cache : k;
+    const float *vc = g_mtp_v_cache ? g_mtp_v_cache : v;
+    float ascale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    for (int h=0;h<g_cfg.num_attn_heads;h++){
+        int kvh=h/hpk; float *qh=q+h*g_cfg.head_dim;
+        float *sc=malloc(ctx*sizeof(float));
+        for (int p=0;p<ctx;p++){ const float *kp=kc+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale; }
+        cpu_softmax(sc, ctx);
+        float *oh=ao+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
+        for (int p=0;p<ctx;p++){ const float *vp=vc+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d]; }
+        free(sc);
+    }
     for (int i=0;i<qd;i++) ao[i]*=cpu_sigmoid(qg[i]);
     fast_dequant_matvec(ow,os,ob, ao, ap, H, qd, gsz);
     for (int i=0;i<H;i++) x[i]=res[i]+ap[i];
@@ -4945,6 +4965,35 @@ static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next) {
     free(qp);free(k);free(v);free(q);free(qg);free(ao);free(ap);
     free(hp);free(g);free(u);free(a);free(o);free(fn);free(logits);
     return draft;
+}
+
+// Lightweight MTP-KV advance: append a committed token's K/V to the MTP cache
+// without the draft's lm_head/mlp/attention/o_proj. Used on accept (for the
+// accepted draft d) to keep the MTP attention context gap-free, cheaply.
+static void dense_mtp_advance(WeightFile *wf, const float *hcur, int t) {
+    if (!g_mtp_k_cache || g_mtp_kv_len >= GPU_KV_SEQ) return;
+    int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, qd=g_cfg.num_attn_heads*g_cfg.head_dim;
+    float eps=g_cfg.rms_norm_eps;
+    #define MG(n) get_tensor_ptr(wf, "mtp." n)
+    uint16_t *pfh=MG("pre_fc_norm_hidden.weight"), *pfe=MG("pre_fc_norm_embedding.weight"), *iln=MG("layers.0.input_layernorm.weight"), *kn=MG("layers.0.self_attn.k_norm.weight");
+    uint32_t *fcw=MG("fc.weight"); uint16_t *fcs=MG("fc.scales"),*fcb=MG("fc.biases");
+    uint32_t *kw=MG("layers.0.self_attn.k_proj.weight"); uint16_t *ks=MG("layers.0.self_attn.k_proj.scales"),*kb=MG("layers.0.self_attn.k_proj.biases");
+    uint32_t *vw=MG("layers.0.self_attn.v_proj.weight"); uint16_t *vs=MG("layers.0.self_attn.v_proj.scales"),*vb=MG("layers.0.self_attn.v_proj.biases");
+    #undef MG
+    float *emb=malloc(H*4),*hn=malloc(H*4),*en=malloc(H*4),*fc_in=malloc(2*H*4),*x=malloc(H*4),*normed=malloc(H*4),*k=malloc(kvd*4),*v=malloc(kvd*4),*qdum=calloc(qd,4);
+    embed_lookup(wf, t, emb);
+    cpu_rms_norm(hcur,pfh,hn,H,eps); cpu_rms_norm(emb,pfe,en,H,eps);
+    memcpy(fc_in,en,H*4); memcpy(fc_in+H,hn,H*4);
+    fast_dequant_matvec(fcw,fcs,fcb, fc_in, x, H, 2*H, gsz);
+    cpu_rms_norm(x, iln, normed, H, eps);
+    fast_dequant_matvec(kw,ks,kb,normed,k,kvd,H,gsz);
+    fast_dequant_matvec(vw,vs,vb,normed,v,kvd,H,gsz);
+    for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
+    apply_rotary_emb(qdum, k, g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    memcpy(g_mtp_k_cache+(size_t)g_mtp_kv_len*kvd, k, kvd*4);
+    memcpy(g_mtp_v_cache+(size_t)g_mtp_kv_len*kvd, v, kvd*4);
+    g_mtp_kv_len++;
+    free(emb);free(hn);free(en);free(fc_in);free(x);free(normed);free(k);free(v);free(qdum);
 }
 
 // THE FINISH LINE: dense MTP speculative decode end-to-end. Baseline greedy vs
@@ -4974,6 +5023,10 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
     for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
     int t_next=cpu_argmax(logits,V); float *hcur=malloc(Hd*4); memcpy(hcur,h,Hd*4); pos=np;
+    // MTP self-attention KV cache (built from accepted tokens; one append per committed token)
+    int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
+    if (!g_mtp_k_cache) { g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); }
+    g_mtp_kv_len = 0;
     GpuStateSnap snap; gpu_snap_alloc(&snap);
     float *ha=malloc(Hd*4),*hb=malloc(Hd*4),*la=malloc(V*4),*lb=malloc(V*4);
     int mn=0,accepts=0,checks=0; double t1=now_ms();
@@ -4984,7 +5037,7 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
         embed_lookup(wf,t_next,ha); embed_lookup(wf,d,hb);
         fused_layer_forward_2(wf,ha,hb,kv,fds,pos,pos+1,la,lb,&snap);  // captures post-a rollback state
         int t_v1=cpu_argmax(la,V); mtp_tok[mn++]=t_next; checks++;
-        if(t_v1==d){ accepts++; if(mn<max_new) mtp_tok[mn++]=d; memcpy(hcur,hb,Hd*4); t_next=cpu_argmax(lb,V); pos+=2; }
+        if(t_v1==d){ accepts++; if(mn<max_new) mtp_tok[mn++]=d; dense_mtp_advance(wf,ha,d); /* advance MTP KV for accepted draft d (cheap) */ memcpy(hcur,hb,Hd*4); t_next=cpu_argmax(lb,V); pos+=2; }
         else { batched_rollback_apply(&snap,kv); memcpy(hcur,ha,Hd*4); t_next=t_v1; pos++; }  // drop b, keep a — no re-forward
     }
     double mtp_ms=now_ms()-t1;
