@@ -4354,6 +4354,10 @@ static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
         if (t_v1 == d) {  // accept draft
             accepts++;
             if (mn < max_new) mtp_tok[mn++] = d;
+            // Advance the MTP KV for the accepted draft's position (input h(pos), token d)
+            // so the MTP attention context has no gap. Each committed token must be
+            // appended to the MTP KV exactly once, in order.
+            { int dummy = -1; mtp_shadow_draft_token(wf, model_path, ha, d, &dummy); }
             memcpy(hcur, hb, Hd*sizeof(float)); t_next = cpu_argmax(lb, V); pos += 2;
         } else {          // reject: undo b, emit verified token next
             verify_rollback_apply(&rb, kv, ls);
