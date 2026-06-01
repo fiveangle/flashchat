@@ -390,6 +390,8 @@ typedef struct {
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
+// Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
+static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -2458,6 +2460,7 @@ static void gpu_dequant_matmulN(
     const float *X, float *OUT,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size, uint32_t N
 ) {
+    double _t_mm = now_ms();
     static id<MTLBuffer> xbuf = nil, obuf = nil;
     size_t xs = (size_t)N * in_dim * sizeof(float);
     size_t os = (size_t)N * out_dim * sizeof(float);
@@ -2487,6 +2490,114 @@ static void gpu_dequant_matmulN(
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
     memcpy(OUT, [obuf contents], os);
+    g_prof_matmulN += now_ms() - _t_mm;
+}
+
+// One matmulN "job": dequant matmul of N input columns through one weight matrix.
+typedef struct {
+    const void *W, *S, *B;   // packed weights / scales / biases (inside wf_buf)
+    const float *X;          // host input  [N][in_dim]
+    float *OUT;              // host output [N][out_dim]
+    uint32_t out_dim, in_dim, group_size, N;
+} MMJob;
+
+// Batched matmulN: encode several independent matmulN jobs into ONE command buffer
+// (one encoder, one commit, one waitUntilCompleted) instead of paying a synchronous
+// CPU<->GPU round-trip per matmul. Used for the projection groups whose inputs are
+// already in hand and whose outputs are independent (QKV, linear in_proj_*, gate+up).
+// Profiling showed ~80% of the dense MTP forward sat in matmulN, running at ~50 GB/s
+// (1/8 of bandwidth) — the cost was dispatch/commit latency across ~480 round-trips
+// per forward, not compute. Batching the independent groups roughly halves that count.
+static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
+    if (nj <= 0) return;
+    if (nj == 1) { // no batching benefit; reuse the single path
+        gpu_dequant_matmulN(ctx, jobs[0].W, jobs[0].S, jobs[0].B, jobs[0].X, jobs[0].OUT,
+                            jobs[0].out_dim, jobs[0].in_dim, jobs[0].group_size, jobs[0].N);
+        return;
+    }
+    double _t_mm = now_ms();
+    enum { MAX_BATCH = 8 };
+    if (nj > MAX_BATCH) nj = MAX_BATCH; // callers stay well under this
+    static id<MTLBuffer> xbufs[MAX_BATCH] = {nil}, obufs[MAX_BATCH] = {nil};
+
+    // Grow/allocate per-slot in/out buffers and copy inputs in.
+    for (int j = 0; j < nj; j++) {
+        size_t xs = (size_t)jobs[j].N * jobs[j].in_dim * sizeof(float);
+        size_t osz = (size_t)jobs[j].N * jobs[j].out_dim * sizeof(float);
+        if (!xbufs[j] || (size_t)[xbufs[j] length] < xs) xbufs[j] = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
+        if (!obufs[j] || (size_t)[obufs[j] length] < osz) obufs[j] = [ctx->device newBufferWithLength:osz options:MTLResourceStorageModeShared];
+        memcpy([xbufs[j] contents], jobs[j].X, xs);
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matmulN_v3];
+    for (int j = 0; j < nj; j++) {
+        NSUInteger w_off = (NSUInteger)((const char *)jobs[j].W - (const char *)[ctx->wf_buf contents]);
+        NSUInteger s_off = (NSUInteger)((const char *)jobs[j].S - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off = (NSUInteger)((const char *)jobs[j].B - (const char *)[ctx->wf_buf contents]);
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+        [enc setBuffer:xbufs[j] offset:0 atIndex:3];
+        [enc setBuffer:obufs[j] offset:0 atIndex:4];
+        [enc setBytes:&jobs[j].out_dim length:4 atIndex:5];
+        [enc setBytes:&jobs[j].in_dim  length:4 atIndex:6];
+        [enc setBytes:&jobs[j].group_size length:4 atIndex:7];
+        [enc setBytes:&jobs[j].N length:4 atIndex:8];
+        uint32_t num_tgs = (jobs[j].out_dim + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+    for (int j = 0; j < nj; j++)
+        memcpy(jobs[j].OUT, [obufs[j] contents], (size_t)jobs[j].N * jobs[j].out_dim * sizeof(float));
+    g_prof_matmulN += now_ms() - _t_mm;
+}
+
+// matmul2 form of a job: two separate input/output columns (the depth-2 verify blocks
+// carry token a / token b as distinct host buffers).
+typedef struct {
+    const void *W, *S, *B;
+    const float *x0, *x1;
+    float *out0, *out1;
+    uint32_t out_dim, in_dim, group_size;
+} MM2Job;
+
+// Batched matmul2: same single-command-buffer win as gpu_dequant_matmulN_batch, for the
+// depth-2 verify blocks (attn_block_2 / linear_block_2 / dense_mlp_block_2). When every
+// job's in_dim>4096 (the dense-27B case: hidden 5120, intermediate 17408) each pair packs
+// into a contiguous [2][in_dim] and the group goes through one matmulN command buffer.
+// If any job is in_dim<=4096 it falls back to per-job matmul2 so the small-model x_shared
+// kernel path stays bit-exact.
+static void gpu_dequant_matmul2_batch(MetalCtx *ctx, MM2Job *jobs, int nj) {
+    if (nj <= 0) return;
+    int all_large = 1;
+    for (int j = 0; j < nj; j++) if (jobs[j].in_dim <= 4096) all_large = 0;
+    if (!all_large || nj == 1) {
+        for (int j = 0; j < nj; j++)
+            gpu_dequant_matmul2(ctx, jobs[j].W, jobs[j].S, jobs[j].B, jobs[j].x0, jobs[j].x1,
+                                jobs[j].out0, jobs[j].out1, jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size);
+        return;
+    }
+    enum { MAX_B2 = 8 };
+    if (nj > MAX_B2) nj = MAX_B2;
+    MMJob mj[MAX_B2]; float *Xs[MAX_B2], *Os[MAX_B2];
+    for (int j = 0; j < nj; j++) {
+        Xs[j] = malloc((size_t)2 * jobs[j].in_dim * sizeof(float));
+        Os[j] = malloc((size_t)2 * jobs[j].out_dim * sizeof(float));
+        memcpy(Xs[j], jobs[j].x0, jobs[j].in_dim * sizeof(float));
+        memcpy(Xs[j] + jobs[j].in_dim, jobs[j].x1, jobs[j].in_dim * sizeof(float));
+        mj[j] = (MMJob){ jobs[j].W, jobs[j].S, jobs[j].B, Xs[j], Os[j],
+                         jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size, 2 };
+    }
+    gpu_dequant_matmulN_batch(ctx, mj, nj);
+    for (int j = 0; j < nj; j++) {
+        memcpy(jobs[j].out0, Os[j], jobs[j].out_dim * sizeof(float));
+        memcpy(jobs[j].out1, Os[j] + jobs[j].out_dim, jobs[j].out_dim * sizeof(float));
+        free(Xs[j]); free(Os[j]);
+    }
 }
 
 // Stage 1 microbench: does one weight read serve two tokens? Times two separate
@@ -3668,9 +3779,11 @@ static void attn_block_2(
     float *qp_a = calloc(q_proj_dim, sizeof(float)), *qp_b = calloc(q_proj_dim, sizeof(float));
     float *k_a = calloc(kv_dim, sizeof(float)), *k_b = calloc(kv_dim, sizeof(float));
     float *v_a = calloc(kv_dim, sizeof(float)), *v_b = calloc(kv_dim, sizeof(float));
-    gpu_dequant_matmul2(g_metal, qw, qs, qb_, na, nb, qp_a, qp_b, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size);
-    gpu_dequant_matmul2(g_metal, kw, ks, kb, na, nb, k_a, k_b, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
-    gpu_dequant_matmul2(g_metal, vw, vs, vb, na, nb, v_a, v_b, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    { MM2Job qkv_jobs[3] = {
+        {qw,qs,qb_,na,nb,qp_a,qp_b,(uint32_t)q_proj_dim,(uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size},
+        {kw,ks,kb, na,nb,k_a,k_b,  (uint32_t)kv_dim,    (uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size},
+        {vw,vs,vb, na,nb,v_a,v_b,  (uint32_t)kv_dim,    (uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size} };
+      gpu_dequant_matmul2_batch(g_metal, qkv_jobs, 3); }
 
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
     uint16_t *qnorm_w = get_tensor_ptr(wf, name);
@@ -3719,6 +3832,7 @@ static void attn_block_2(
         kv->len++;
 
         float *attn_out = calloc(q_dim, sizeof(float));
+        double _t_at = now_ms();
         for (int h = 0; h < g_cfg.num_attn_heads; h++) {
             int kv_h = h / heads_per_kv;
             float *qh = q + h * g_cfg.head_dim;
@@ -3737,6 +3851,7 @@ static void attn_block_2(
             }
             free(scores);
         }
+        g_prof_attncpu += now_ms() - _t_at;
         for (int i = 0; i < q_dim; i++) attn_out[i] *= 1.0f / (1.0f + expf(-q_gate[i]));
 
         float *attn_proj = calloc(g_cfg.hidden_dim, sizeof(float));
@@ -3788,10 +3903,12 @@ static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb, GpuS
     float *z_a=malloc(z_dim*sizeof(float)),*z_b=malloc(z_dim*sizeof(float));
     float *be_a=malloc(nvh*sizeof(float)),*be_b=malloc(nvh*sizeof(float));
     float *al_a=malloc(nvh*sizeof(float)),*al_b=malloc(nvh*sizeof(float));
-    gpu_dequant_matmul2(g_metal, qkvw,qkvs,qkvb, na,nb, qkv_a,qkv_b, qkv_dim, Hd, gsz);
-    gpu_dequant_matmul2(g_metal, zw,zs,zb,       na,nb, z_a,z_b,     z_dim,   Hd, gsz);
-    gpu_dequant_matmul2(g_metal, bw,bs,bb_,      na,nb, be_a,be_b,   nvh,     Hd, gsz);
-    gpu_dequant_matmul2(g_metal, aw,as_,ab,      na,nb, al_a,al_b,   nvh,     Hd, gsz);
+    { MM2Job in_jobs[4] = {
+        {qkvw,qkvs,qkvb,na,nb,qkv_a,qkv_b,(uint32_t)qkv_dim,(uint32_t)Hd,(uint32_t)gsz},
+        {zw,zs,zb,      na,nb,z_a,z_b,    (uint32_t)z_dim,  (uint32_t)Hd,(uint32_t)gsz},
+        {bw,bs,bb_,     na,nb,be_a,be_b,  (uint32_t)nvh,    (uint32_t)Hd,(uint32_t)gsz},
+        {aw,as_,ab,     na,nb,al_a,al_b,  (uint32_t)nvh,    (uint32_t)Hd,(uint32_t)gsz} };
+      gpu_dequant_matmul2_batch(g_metal, in_jobs, 4); }
 
     NSUInteger conv_off = (NSUInteger)((const char*)conv1d_w - (const char*)[g_metal->wf_buf contents]);
     NSUInteger alog_off = (NSUInteger)((const char*)A_log   - (const char*)[g_metal->wf_buf contents]);
@@ -3864,7 +3981,9 @@ static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb, GpuS
           [e setBytes:&value_dim length:4 atIndex:4]; [e setBytes:&eps length:4 atIndex:5];
           [e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(value_dim,1,1)];
           [e endEncoding]; }
+        double _t_dl = now_ms();
         [cmd commit]; [cmd waitUntilCompleted];
+        g_prof_delta += now_ms() - _t_dl;
         memcpy(gated_t[t], [g_metal->batch_out[6] contents], z_dim*sizeof(float));
         // Capture post-token-a recurrent state (before token b) for reject-rollback.
         if (rb && t == 0) {
@@ -3899,8 +4018,10 @@ static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
     cpu_rms_norm(ha, post_w, hp,     H, g_cfg.rms_norm_eps);
     cpu_rms_norm(hb, post_w, hp + H, H, g_cfg.rms_norm_eps);
     float *g2 = malloc((size_t)2*inter*sizeof(float)), *u2 = malloc((size_t)2*inter*sizeof(float)), *a2 = malloc((size_t)2*inter*sizeof(float));
-    gpu_dequant_matmulN(g_metal, gw, gs, gb, hp, g2, inter, H, gsz, 2);
-    gpu_dequant_matmulN(g_metal, uw, us, ub, hp, u2, inter, H, gsz, 2);
+    { MMJob gu_jobs[2] = {
+        {gw,gs,gb,hp,g2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2},
+        {uw,us,ub,hp,u2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2} };
+      gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
     cpu_swiglu(g2,         u2,         a2,         inter);
     cpu_swiglu(g2 + inter, u2 + inter, a2 + inter, inter);
     float *o2 = malloc((size_t)2*H*sizeof(float));
@@ -3932,9 +4053,11 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         uint32_t *ow=LW("self_attn.o_proj.weight");uint16_t *os=LW("self_attn.o_proj.scales"),*ob=LW("self_attn.o_proj.biases");
         uint16_t *qn=LW("self_attn.q_norm.weight"),*kn=LW("self_attn.k_norm.weight");
         float *qp=malloc((size_t)N*qpd*4),*kk=malloc((size_t)N*kvd*4),*vv=malloc((size_t)N*kvd*4),*ao=malloc((size_t)N*qd*4);
-        gpu_dequant_matmulN(g_metal,qw,qs,qb,nmd,qp,qpd,H,gsz,N);
-        gpu_dequant_matmulN(g_metal,kw,ks,kb,nmd,kk,kvd,H,gsz,N);
-        gpu_dequant_matmulN(g_metal,vw,vs,vb,nmd,vv,kvd,H,gsz,N);
+        { MMJob qkv_jobs[3] = {
+            {qw,qs,qb,nmd,qp,(uint32_t)qpd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {kw,ks,kb,nmd,kk,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {vw,vs,vb,nmd,vv,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
+          gpu_dequant_matmulN_batch(g_metal, qkv_jobs, 3); }
         float ascale=1.f/sqrtf((float)g_cfg.head_dim);
         for (int t=0;t<N;t++){
             float *q=malloc(qd*4),*qg=malloc(qd*4); float *kt=kk+(size_t)t*kvd,*vt=vv+(size_t)t*kvd;
@@ -3963,10 +4086,12 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         uint32_t *olw=LW("linear_attn.out_proj.weight");uint16_t *ols=LW("linear_attn.out_proj.scales"),*olb=LW("linear_attn.out_proj.biases");
         uint16_t *convw=LW("linear_attn.conv1d.weight"),*gnw=LW("linear_attn.norm.weight"); float *Alog=(float*)LW("linear_attn.A_log"); uint16_t *dtb=LW("linear_attn.dt_bias");
         float *qkv=malloc((size_t)N*qkv_dim*4),*z=malloc((size_t)N*z_dim*4),*be=malloc((size_t)N*nvh*4),*al=malloc((size_t)N*nvh*4),*gated=malloc((size_t)N*z_dim*4);
-        gpu_dequant_matmulN(g_metal,qkvw,qkvs,qkvb,nmd,qkv,qkv_dim,H,gsz,N);
-        gpu_dequant_matmulN(g_metal,zw,zs,zb,nmd,z,z_dim,H,gsz,N);
-        gpu_dequant_matmulN(g_metal,bw,bs,bb_,nmd,be,nvh,H,gsz,N);
-        gpu_dequant_matmulN(g_metal,aw,as_,ab,nmd,al,nvh,H,gsz,N);
+        { MMJob in_jobs[4] = {
+            {qkvw,qkvs,qkvb,nmd,qkv,(uint32_t)qkv_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {zw,zs,zb,nmd,z,(uint32_t)z_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {bw,bs,bb_,nmd,be,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {aw,as_,ab,nmd,al,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
+          gpu_dequant_matmulN_batch(g_metal, in_jobs, 4); }
         NSUInteger cvo=(NSUInteger)((const char*)convw-(const char*)[g_metal->wf_buf contents]),alo=(NSUInteger)((const char*)Alog-(const char*)[g_metal->wf_buf contents]),dto=(NSUInteger)((const char*)dtb-(const char*)[g_metal->wf_buf contents]),gno=(NSUInteger)((const char*)gnw-(const char*)[g_metal->wf_buf contents]);
         uint32_t cd=g_cfg.linear_conv_dim,kd=g_cfg.linear_key_dim,vd2=g_cfg.linear_value_dim,khpv=(uint32_t)(nvh/nkh); float invs=1.f/sqrtf((float)g_cfg.linear_key_dim);
         for (int t=0;t<N;t++){
@@ -3992,8 +4117,10 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     #undef LW
     float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
     float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4),*oN=malloc((size_t)N*H*4);
-    gpu_dequant_matmulN(g_metal,gw,gs,gb,hp,gN,inter,H,gsz,N);
-    gpu_dequant_matmulN(g_metal,uw,us,ub,hp,uN,inter,H,gsz,N);
+    { MMJob gu_jobs[2] = {
+        {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+        {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
+      gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
     for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
     gpu_dequant_matmulN(g_metal,dw,ds,db,aN,oN,H,inter,gsz,N);
     for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
@@ -5131,6 +5258,7 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     g_mtp_kv_len = 0;
     GpuStateSnap snap; gpu_snap_alloc(&snap);
     float *ha=malloc(Hd*4),*hb=malloc(Hd*4),*la=malloc(V*4),*lb=malloc(V*4);
+    g_prof_matmulN=g_prof_attncpu=g_prof_delta=0;  // reset profiler for the depth-2 MTP run
     int mn=0,accepts=0,checks=0; double t1=now_ms();
     while(mn<max_new){
         if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
@@ -5148,6 +5276,9 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     fprintf(stderr,"[mtp-dense] baseline: %d tok %.0f ms (%.2f tok/s)\n",bn,base_ms,1000.0*bn/base_ms);
     fprintf(stderr,"[mtp-dense] mtp:      %d tok %.0f ms (%.2f tok/s) | acceptance=%.1f%% (%d/%d)\n",mn,mtp_ms,1000.0*mn/mtp_ms,acc,accepts,checks);
     fprintf(stderr,"[mtp-dense] SPEEDUP=%.2fx | lossless: %d/%d match %s\n", base_ms>0&&mtp_ms>0?(1000.0*mn/mtp_ms)/(1000.0*bn/base_ms):0, n-mism,n, mism==0?"PASS":"FAIL");
+    double prof_acct=g_prof_matmulN+g_prof_attncpu+g_prof_delta;
+    fprintf(stderr,"[mtp-prof] over MTP run: GPU matmulN=%.0f ms (%.1f%%) | CPU full-attn=%.0f ms (%.1f%%) | GPU delta-net=%.0f ms (%.1f%%) | other=%.0f ms\n",
+        g_prof_matmulN,100.0*g_prof_matmulN/mtp_ms, g_prof_attncpu,100.0*g_prof_attncpu/mtp_ms, g_prof_delta,100.0*g_prof_delta/mtp_ms, mtp_ms-prof_acct);
     gpu_snap_free(&snap);
     for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
     free(fds);free(mmaps);free(kv);free(ls);free(h);free(logits);free(base_tok);free(mtp_tok);free(hcur);free(ha);free(hb);free(la);free(lb);
@@ -5232,6 +5363,7 @@ static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int 
     GpuStateSnap snap; gpu_snap_alloc(&snap);
     int *drafts=malloc(D*4); float *mh=malloc((size_t)D*Hd*4);
     float *hs=malloc((size_t)(D+1)*Hd*4),*ln=malloc((size_t)(D+1)*V*4); int *posv=malloc((D+1)*4);
+    g_prof_matmulN=g_prof_attncpu=g_prof_delta=0;  // reset profiler for the depth-3 MTP run
     int mn=0,accepts=0,checks=0; double t1=now_ms();
     while(mn<max_new){
         if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
