@@ -176,6 +176,14 @@ flashchat_model_active_experts() {
     flashchat_model_field "$1" "num_experts_per_tok"
 }
 
+# Total routed experts. 0 (or empty) => dense model: no packed_experts/ or
+# expert_index.json runtime artifacts (the MLP is quantized into model_weights.bin).
+flashchat_model_num_experts() {
+    local n
+    n=$(flashchat_model_field "$1" "num_experts")
+    echo "${n:-0}"
+}
+
 # Resolve the *effective* active-experts value: $FLASHCHAT_ACTIVE_EXPERTS env
 # override if set and >0, else the model's trained num_experts_per_tok from
 # the registry. The env var is the user's escape hatch (e.g. for sweeping K

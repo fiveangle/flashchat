@@ -1286,6 +1286,7 @@ model_runtime_ready_for_snapshot() {
     local snapshot="$2"
     local runtime_dir="${snapshot}/flashchat"
     local experts_dir="${runtime_dir}/packed_experts"
+    local num_experts
     local layers
     local i
 
@@ -1293,14 +1294,19 @@ model_runtime_ready_for_snapshot() {
     [ -f "${runtime_dir}/model_weights.bin" ] || return 1
     [ -f "${runtime_dir}/model_weights.json" ] || return 1
     [ -f "${runtime_dir}/vocab.bin" ] || return 1
-    [ -f "${runtime_dir}/expert_index.json" ] || return 1
 
-    layers=$(flashchat_model_layers "$model_id")
-    i=0
-    while [ "$i" -lt "$layers" ]; do
-        [ -f "${experts_dir}/layer_$(printf "%02d" "$i").bin" ] || return 1
-        i=$((i + 1))
-    done
+    # Dense models (num_experts=0) quantize the MLP into model_weights.bin and have
+    # no expert_index.json / packed_experts/ — only MoE models stream per-layer experts.
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        [ -f "${runtime_dir}/expert_index.json" ] || return 1
+        layers=$(flashchat_model_layers "$model_id")
+        i=0
+        while [ "$i" -lt "$layers" ]; do
+            [ -f "${experts_dir}/layer_$(printf "%02d" "$i").bin" ] || return 1
+            i=$((i + 1))
+        done
+    fi
 }
 
 model_runtime_status_for_repo() {
@@ -2038,13 +2044,20 @@ check_model_downloaded() {
        ! [ -f "$weights_dir/vocab.bin" ]; then
         return 1
     fi
-    
+
+    # Dense models (num_experts=0) have no packed_experts/ — weights+vocab is complete.
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$(flashchat_get MODEL)")
+    if ! [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        return 0
+    fi
+
     local last_layer
     last_layer=$(get_last_layer_index)
     local experts_dir
     experts_dir=$(flashchat_get EXPERTS_DIR)
     [ -f "$experts_dir/layer_${last_layer}.bin" ] && return 0
-    
+
     return 1
 }
 
@@ -2168,6 +2181,11 @@ check_vocab_exported() {
 }
 
 check_experts_extracted() {
+    # Dense models (num_experts=0) have no experts to extract — nothing to do.
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$(flashchat_get MODEL)")
+    [ "${num_experts:-0}" -gt 0 ] 2>/dev/null || return 0
+
     local experts_dir
     experts_dir=$(flashchat_get EXPERTS_DIR)
     if [[ "$experts_dir" != /* ]]; then
