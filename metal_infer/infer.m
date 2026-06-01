@@ -3723,6 +3723,133 @@ static void attn_block_2(
     free(qp_a); free(qp_b); free(k_a); free(k_b); free(v_a); free(v_b);
 }
 
+// Stage 4d-ii: batched (N=2) GPU linear-attention block for MTP verify.
+// in_proj amortized via matmul2; the production 5-encoder delta-net recurrence is
+// driven per-token (a updates buf_conv_state/buf_delta_state[li], then b reads them
+// — faithful to production, recurrence is sequential anyway); out_proj amortized.
+// hidden = residual + out_proj(gated_delta_output). Mirrors attn_block_2's contract.
+__attribute__((unused))
+static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
+    int Hd = g_cfg.hidden_dim, gsz = g_cfg.group_size;
+    int li = layer - (layer + 1) / g_cfg.full_attn_interval;   // linear_layer_idx
+    int qkv_dim = g_cfg.linear_conv_dim;
+    int z_dim = g_cfg.linear_total_value;
+    int nvh = g_cfg.linear_num_v_heads, nkh = g_cfg.linear_num_k_heads;
+    char nm[256];
+    #define LN(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn." suf,layer), get_tensor_ptr(wf,nm))
+    uint16_t *innorm = (snprintf(nm,sizeof(nm),"model.layers.%d.input_layernorm.weight",layer), get_tensor_ptr(wf,nm));
+    uint32_t *qkvw=LN("in_proj_qkv.weight"); uint16_t *qkvs=LN("in_proj_qkv.scales"),*qkvb=LN("in_proj_qkv.biases");
+    uint32_t *zw=LN("in_proj_z.weight");     uint16_t *zs=LN("in_proj_z.scales"),*zb=LN("in_proj_z.biases");
+    uint32_t *bw=LN("in_proj_b.weight");     uint16_t *bs=LN("in_proj_b.scales"),*bb_=LN("in_proj_b.biases");
+    uint32_t *aw=LN("in_proj_a.weight");     uint16_t *as_=LN("in_proj_a.scales"),*ab=LN("in_proj_a.biases");
+    uint32_t *ow=LN("out_proj.weight");      uint16_t *os=LN("out_proj.scales"),*ob_=LN("out_proj.biases");
+    uint16_t *conv1d_w = LN("conv1d.weight");
+    float    *A_log    = (float *)LN("A_log");
+    uint16_t *dt_bias  = LN("dt_bias");
+    uint16_t *gnorm_w  = LN("norm.weight");
+    #undef LN
+
+    float *res_a = malloc(Hd*sizeof(float)), *res_b = malloc(Hd*sizeof(float));
+    memcpy(res_a, ha, Hd*sizeof(float)); memcpy(res_b, hb, Hd*sizeof(float));
+    float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
+    cpu_rms_norm(ha, innorm, na, Hd, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, innorm, nb, Hd, g_cfg.rms_norm_eps);
+
+    // in_proj (amortized, in_dim=hidden<=4096)
+    float *qkv_a=malloc(qkv_dim*sizeof(float)),*qkv_b=malloc(qkv_dim*sizeof(float));
+    float *z_a=malloc(z_dim*sizeof(float)),*z_b=malloc(z_dim*sizeof(float));
+    float *be_a=malloc(nvh*sizeof(float)),*be_b=malloc(nvh*sizeof(float));
+    float *al_a=malloc(nvh*sizeof(float)),*al_b=malloc(nvh*sizeof(float));
+    gpu_dequant_matmul2(g_metal, qkvw,qkvs,qkvb, na,nb, qkv_a,qkv_b, qkv_dim, Hd, gsz);
+    gpu_dequant_matmul2(g_metal, zw,zs,zb,       na,nb, z_a,z_b,     z_dim,   Hd, gsz);
+    gpu_dequant_matmul2(g_metal, bw,bs,bb_,      na,nb, be_a,be_b,   nvh,     Hd, gsz);
+    gpu_dequant_matmul2(g_metal, aw,as_,ab,      na,nb, al_a,al_b,   nvh,     Hd, gsz);
+
+    NSUInteger conv_off = (NSUInteger)((const char*)conv1d_w - (const char*)[g_metal->wf_buf contents]);
+    NSUInteger alog_off = (NSUInteger)((const char*)A_log   - (const char*)[g_metal->wf_buf contents]);
+    NSUInteger dtb_off  = (NSUInteger)((const char*)dt_bias - (const char*)[g_metal->wf_buf contents]);
+    NSUInteger gn_off   = (NSUInteger)((const char*)gnorm_w - (const char*)[g_metal->wf_buf contents]);
+    uint32_t conv_dim = g_cfg.linear_conv_dim, key_dim = g_cfg.linear_key_dim, value_dim = g_cfg.linear_value_dim;
+    float inv_scale = 1.0f / sqrtf((float)g_cfg.linear_key_dim), eps = g_cfg.rms_norm_eps;
+    uint32_t khpv = (uint32_t)(nvh / nkh);
+
+    float *qkv_t[2] = { qkv_a, qkv_b }; float *z_t[2] = { z_a, z_b };
+    float *be_t[2] = { be_a, be_b }; float *al_t[2] = { al_a, al_b };
+    float *gated_a = malloc(z_dim*sizeof(float)), *gated_b = malloc(z_dim*sizeof(float));
+    float *gated_t[2] = { gated_a, gated_b };
+
+    for (int t = 0; t < 2; t++) {
+        memcpy([g_metal->batch_out[0] contents], qkv_t[t], qkv_dim*sizeof(float));
+        memcpy([g_metal->batch_out[1] contents], z_t[t],   z_dim*sizeof(float));
+        memcpy([g_metal->batch_out[2] contents], be_t[t],  nvh*sizeof(float));
+        memcpy([g_metal->batch_out[3] contents], al_t[t],  nvh*sizeof(float));
+        id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+        // L1: conv1d_step
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:g_metal->conv1d_step];
+          [e setBuffer:g_metal->buf_conv_state[li] offset:0 atIndex:0];
+          [e setBuffer:g_metal->batch_out[0] offset:0 atIndex:1];
+          [e setBuffer:g_metal->wf_buf offset:conv_off atIndex:2];
+          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:3];
+          [e setBytes:&conv_dim length:4 atIndex:4];
+          [e dispatchThreadgroups:MTLSizeMake((conv_dim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+          [e endEncoding]; }
+        // L2: rms_norm_qk
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:g_metal->rms_norm_qk];
+          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];
+          [e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*sizeof(float) atIndex:1];
+          [e setBytes:&key_dim length:4 atIndex:2]; [e setBytes:&inv_scale length:4 atIndex:3];
+          [e dispatchThreadgroups:MTLSizeMake(nkh,1,1) threadsPerThreadgroup:MTLSizeMake(key_dim,1,1)];
+          [e endEncoding]; }
+        // L3: compute_decay_beta
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:g_metal->compute_decay_beta];
+          [e setBuffer:g_metal->batch_out[3] offset:0 atIndex:0];
+          [e setBuffer:g_metal->batch_out[2] offset:0 atIndex:1];
+          [e setBuffer:g_metal->wf_buf offset:alog_off atIndex:2];
+          [e setBuffer:g_metal->wf_buf offset:dtb_off atIndex:3];
+          [e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
+          [e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];
+          [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(nvh,1,1)];
+          [e endEncoding]; }
+        // L4: gated_delta_net_step
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:g_metal->delta_net_step];
+          [e setBuffer:g_metal->buf_delta_state[li] offset:0 atIndex:0];
+          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];
+          [e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*sizeof(float) atIndex:2];
+          [e setBuffer:g_metal->buf_conv_output offset:2*g_cfg.linear_total_key*sizeof(float) atIndex:3];
+          [e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
+          [e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];
+          [e setBuffer:g_metal->buf_delta_output offset:0 atIndex:6];
+          [e setBytes:&khpv length:sizeof(khpv) atIndex:7];
+          [e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+          [e endEncoding]; }
+        // L5: gated_rms_norm -> batch_out[6]
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:g_metal->gated_rms_norm];
+          [e setBuffer:g_metal->buf_delta_output offset:0 atIndex:0];
+          [e setBuffer:g_metal->batch_out[1] offset:0 atIndex:1];
+          [e setBuffer:g_metal->wf_buf offset:gn_off atIndex:2];
+          [e setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];
+          [e setBytes:&value_dim length:4 atIndex:4]; [e setBytes:&eps length:4 atIndex:5];
+          [e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(value_dim,1,1)];
+          [e endEncoding]; }
+        [cmd commit]; [cmd waitUntilCompleted];
+        memcpy(gated_t[t], [g_metal->batch_out[6] contents], z_dim*sizeof(float));
+    }
+
+    // out_proj (amortized, in_dim=linear_total_value=4096 fits matmul2)
+    float *oa = malloc(Hd*sizeof(float)), *ob_out = malloc(Hd*sizeof(float));
+    gpu_dequant_matmul2(g_metal, ow,os,ob_, gated_a,gated_b, oa,ob_out, Hd, z_dim, gsz);
+    for (int i = 0; i < Hd; i++) { ha[i] = res_a[i] + oa[i]; hb[i] = res_b[i] + ob_out[i]; }
+
+    free(res_a); free(res_b); free(na); free(nb);
+    free(qkv_a); free(qkv_b); free(z_a); free(z_b); free(be_a); free(be_b); free(al_a); free(al_b);
+    free(gated_a); free(gated_b); free(oa); free(ob_out);
+}
+
 // Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
 // calls (the oracle) on an identical pre-seeded KV cache, and should be faster
 // (q/k/v projections amortized). Gated by --mtp-bench-attn.
