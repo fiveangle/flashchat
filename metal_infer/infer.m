@@ -4075,6 +4075,108 @@ static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
     return rc;
 }
 
+// Reference single-token forward through all layers + norm + lm_head (CPU blocks).
+static void ref_forward_1(WeightFile *wf, float *h, KVCache **kv, LinearAttnState **ls,
+                          int *fds, int pos, float *logits) {
+    int Hd = g_cfg.hidden_dim;
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+        if (is_full) full_attention_forward(wf, layer, h, kv[layer], pos);
+        else         linear_attention_forward(wf, layer, h, ls[layer]);
+        moe_block_1(wf, layer, h, fds[layer]);
+    }
+    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
+    float *n = malloc(Hd * sizeof(float));
+    cpu_rms_norm(h, norm_w, n, Hd, g_cfg.rms_norm_eps);
+    lm_head_forward(wf, n, logits);
+    free(n);
+}
+
+// 4b: full batched 2-position backbone forward. Layer-by-layer so token b sees
+// token a's freshly-written KV (full attn) and a-updated recurrent state (linear).
+static void backbone_forward_2(WeightFile *wf, float *ha, float *hb,
+                               KVCache **kv, LinearAttnState **ls, int *fds,
+                               int pos_a, int pos_b, float *log_a, float *log_b) {
+    int Hd = g_cfg.hidden_dim;
+    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+        if (is_full) {
+            attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
+        } else {
+            // Linear recurrence is sequential: a updates the state, then b reads it.
+            linear_attention_forward(wf, layer, ha, ls[layer]);
+            linear_attention_forward(wf, layer, hb, ls[layer]);
+        }
+        moe_block_2(wf, layer, ha, hb, fds[layer]);
+    }
+    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
+    float *na = malloc(Hd * sizeof(float)), *nb = malloc(Hd * sizeof(float));
+    cpu_rms_norm(ha, norm_w, na, Hd, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, norm_w, nb, Hd, g_cfg.rms_norm_eps);
+    TensorInfo *wi = get_tensor_info(wf, "lm_head.weight");
+    TensorInfo *si = get_tensor_info(wf, "lm_head.scales");
+    TensorInfo *bi = get_tensor_info(wf, "lm_head.biases");
+    uint32_t *W = (uint32_t *)((char *)wf->data + wi->offset);
+    uint16_t *S = (uint16_t *)((char *)wf->data + si->offset);
+    uint16_t *B = (uint16_t *)((char *)wf->data + bi->offset);
+    gpu_dequant_matmul2(g_metal, W, S, B, na, nb, log_a, log_b, g_cfg.vocab_size, Hd, g_cfg.group_size);
+    free(na); free(nb);
+}
+
+// 4b validation: backbone_forward_2 must equal two reference single forwards
+// (same CPU blocks, just batched), on fresh caches at positions 0 and 1.
+static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vfwd] requires GPU\n"); return 1; }
+    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    int L = g_cfg.num_layers;
+
+    int *fds = malloc(L * sizeof(int));
+    KVCache **kvr = calloc(L, sizeof(KVCache*)), **kvb = calloc(L, sizeof(KVCache*));
+    LinearAttnState **lsr = calloc(L, sizeof(LinearAttnState*)), **lsb = calloc(L, sizeof(LinearAttnState*));
+    for (int i = 0; i < L; i++) {
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        fds[i] = open(p, O_RDONLY);
+        int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
+        if (is_full) {
+            kvr[i] = calloc(1, sizeof(KVCache)); kvr[i]->k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvr[i]->v_cache = calloc((size_t)64*kv_dim, sizeof(float));
+            kvb[i] = calloc(1, sizeof(KVCache)); kvb[i]->k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvb[i]->v_cache = calloc((size_t)64*kv_dim, sizeof(float));
+        } else { lsr[i] = linear_attn_state_new(); lsb[i] = linear_attn_state_new(); }
+    }
+
+    int tok_a = 100, tok_b = 200;  // arbitrary real token ids
+    float *log_a_r = malloc(V*sizeof(float)), *log_b_r = malloc(V*sizeof(float));
+    float *log_a_b = malloc(V*sizeof(float)), *log_b_b = malloc(V*sizeof(float));
+    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float));
+
+    // Reference: two single forwards (a updates state at pos 0, then b at pos 1).
+    embed_lookup(wf, tok_a, ha); ref_forward_1(wf, ha, kvr, lsr, fds, 0, log_a_r);
+    embed_lookup(wf, tok_b, hb); ref_forward_1(wf, hb, kvr, lsr, fds, 1, log_b_r);
+
+    // Batched: one 2-position forward on fresh caches.
+    embed_lookup(wf, tok_a, ha); embed_lookup(wf, tok_b, hb);
+    backbone_forward_2(wf, ha, hb, kvb, lsb, fds, 0, 1, log_a_b, log_b_b);
+
+    double err_a = 0, err_b = 0;
+    for (int i = 0; i < V; i++) { err_a = fmax(err_a, fabs(log_a_r[i]-log_a_b[i])); err_b = fmax(err_b, fabs(log_b_r[i]-log_b_b[i])); }
+    int am_r = cpu_argmax(log_a_r, V), am_b = cpu_argmax(log_a_b, V);
+    int bm_r = cpu_argmax(log_b_r, V), bm_b = cpu_argmax(log_b_b, V);
+    fprintf(stderr, "[mtp-vfwd] tokenA argmax ref=%d batched=%d | logit max_err=%.3e\n", am_r, am_b, err_a);
+    fprintf(stderr, "[mtp-vfwd] tokenB argmax ref=%d batched=%d | logit max_err=%.3e\n", bm_r, bm_b, err_b);
+    int ok = (am_r == am_b) && (bm_r == bm_b) && err_a < 1e-2 && err_b < 1e-2;
+    fprintf(stderr, "[mtp-vfwd] %s\n", ok ? "PASS: batched forward == reference (assembly correct)" : "FAIL: batched forward diverges");
+
+    for (int i = 0; i < L; i++) {
+        if (kvr[i]) { free(kvr[i]->k_cache); free(kvr[i]->v_cache); free(kvr[i]); }
+        if (kvb[i]) { free(kvb[i]->k_cache); free(kvb[i]->v_cache); free(kvb[i]); }
+        if (lsr[i]) linear_attn_state_free(lsr[i]);
+        if (lsb[i]) linear_attn_state_free(lsb[i]);
+        if (fds[i] >= 0) close(fds[i]);
+    }
+    free(fds); free(kvr); free(kvb); free(lsr); free(lsb);
+    free(log_a_r); free(log_b_r); free(log_a_b); free(log_b_b); free(ha); free(hb);
+    return ok ? 0 : 1;
+}
+
 // ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
 // ============================================================================
@@ -11109,6 +11211,7 @@ enum {
     OPT_MTP_BENCH_ATTN,
     OPT_MTP_BENCH_MOE,
     OPT_MTP_VERIFY_LAYER,
+    OPT_MTP_VERIFY_FORWARD,
 };
 
 static void print_usage(const char *prog) {
@@ -11170,6 +11273,7 @@ int main(int argc, char **argv) {
         int mtp_bench_attn_requested = 0;
         int mtp_bench_moe_requested = 0;
         int mtp_verify_layer_requested = 0;
+        int mtp_verify_forward_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -11363,6 +11467,7 @@ int main(int argc, char **argv) {
             {"mtp-bench-attn", no_argument,       0, OPT_MTP_BENCH_ATTN},
             {"mtp-bench-moe", no_argument,        0, OPT_MTP_BENCH_MOE},
             {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
+            {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -11409,6 +11514,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_BENCH_ATTN: mtp_bench_attn_requested = 1; break;
                 case OPT_MTP_BENCH_MOE: mtp_bench_moe_requested = 1; break;
                 case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
+                case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -11597,6 +11703,9 @@ int main(int argc, char **argv) {
         }
         if (mtp_verify_layer_requested) {
             return mtp_verify_layer(wf, model_path);
+        }
+        if (mtp_verify_forward_requested) {
+            return mtp_verify_forward(wf, model_path);
         }
 
         // ---- Load vocabulary ----
