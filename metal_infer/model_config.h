@@ -49,6 +49,7 @@ typedef struct {
     int num_experts_per_tok;
     int moe_intermediate;
     int shared_intermediate;
+    int dense_intermediate;   // dense FFN intermediate size (num_experts==0 => dense model)
     int full_attn_interval;
     int num_full_attn_layers;
     int num_linear_layers;
@@ -247,6 +248,7 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_INT(mtp_max_predictions, "mtp_max_predictions");
     CFG_INT(moe_intermediate, "moe_intermediate_size");
     CFG_INT(shared_intermediate, "shared_expert_intermediate_size");
+    CFG_INT(dense_intermediate, "intermediate_size");
     CFG_INT(full_attn_interval, "full_attention_interval");
 
     p = json_find_key(model_start, "quantization");

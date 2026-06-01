@@ -6449,6 +6449,28 @@ static void init_layer_scratch(void) {
     s_gated_out  = calloc(g_cfg.linear_total_value, sizeof(float));
 }
 
+// Dense FFN (Qwen3.6-27B dense model, num_experts==0): no routing, no experts,
+// no shared expert — just hidden = h_mid + down_proj(swiglu(gate_proj(h_post), up_proj(h_post))).
+// All matvecs use matvec_fast (in_dim 5120/17408 > 4096 v3 limit). h_post is the
+// post-attention-norm of h_mid; output written into hidden_out.
+static void dense_mlp_forward(WeightFile *wf, int layer, const float *h_post,
+                              const float *h_mid, float *hidden_out) {
+    int H = g_cfg.hidden_dim, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
+    char nm[256];
+    #define DW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint32_t *gw=DW("gate_proj.weight"); uint16_t *gs=DW("gate_proj.scales"),*gb=DW("gate_proj.biases");
+    uint32_t *uw=DW("up_proj.weight");   uint16_t *us=DW("up_proj.scales"),  *ub=DW("up_proj.biases");
+    uint32_t *dw=DW("down_proj.weight"); uint16_t *ds=DW("down_proj.scales"),*db=DW("down_proj.biases");
+    #undef DW
+    float *g=malloc(inter*sizeof(float)),*u=malloc(inter*sizeof(float)),*a=malloc(inter*sizeof(float)),*o=malloc(H*sizeof(float));
+    fast_dequant_matvec(gw,gs,gb,h_post,g,inter,H,gsz);
+    fast_dequant_matvec(uw,us,ub,h_post,u,inter,H,gsz);
+    cpu_swiglu(g,u,a,inter);
+    fast_dequant_matvec(dw,ds,db,a,o,H,inter,gsz);
+    for (int i=0;i<H;i++) hidden_out[i] = h_mid[i] + o[i];
+    free(g); free(u); free(a); free(o);
+}
+
 static void fused_layer_forward(
     WeightFile *wf,
     int layer_idx,
@@ -7236,7 +7258,8 @@ static void fused_layer_forward(
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ
+                         && g_cfg.num_experts > 0);  // dense: no MoE-fused CMD2, use CPU attn + fallback
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
@@ -7481,6 +7504,14 @@ static void fused_layer_forward(
             fast_batch_matvec(h_post, g_cfg.hidden_dim, moe_specs, 4);
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
+    }
+
+    // ---- DENSE FFN branch (num_experts==0): no routing/experts/CMD3 ----
+    // h_mid (=residual+o_proj) and h_post (=post_attn_norm) are computed above.
+    if (g_cfg.num_experts == 0) {
+        dense_mlp_forward(wf, layer_idx, h_post, h_mid, hidden);
+        if (g_timing_enabled) { g_timing.total += now_ms() - t_layer_start; g_timing.count++; }
+        return;
     }
 
     // ---- Softmax + top-K (CPU) ----

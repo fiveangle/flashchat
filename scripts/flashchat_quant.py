@@ -5,11 +5,14 @@ import numpy as np
 
 
 def bf16_to_f32(data):
-    arr = np.asarray(data)
-    if arr.dtype == np.uint16:
-        u16 = arr
-    else:
+    # bytes/buffer inputs (e.g. raw tensor bytes >2GB) must use frombuffer directly:
+    # np.asarray(bytes) builds a 0-d bytestring array and fails past numpy's 2GB limit
+    # (hit by the 27B lm_head/embed: 248320*5120*2 = 2.54GB).
+    if isinstance(data, (bytes, bytearray, memoryview)):
         u16 = np.frombuffer(data, dtype=np.uint16)
+    else:
+        arr = np.asarray(data)
+        u16 = arr if arr.dtype == np.uint16 else np.frombuffer(arr, dtype=np.uint16)
     u32 = u16.astype(np.uint32) << 16
     return u32.view(np.float32)
 
