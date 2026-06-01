@@ -339,6 +339,72 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1e: BATCHED (N=2) 4-bit dequant matmul — MTP draft/verify foundation.
+// Reads each packed weight word ONCE and applies it to two input vectors,
+// amortizing the (bandwidth-bound) weight read across both tokens. This is the
+// whole premise of batched speculative verify on this engine.
+// x0 is cached in threadgroup memory; x1 is read from device (small + hot).
+// ============================================================================
+kernel void dequant_matmul2_4bit_v3(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x0         [[buffer(3)]],  // [in_dim]  token 0
+    device float*          out0       [[buffer(4)]],  // [out_dim] token 0
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    device const float*    x1         [[buffer(8)]],  // [in_dim]  token 1
+    device float*          out1       [[buffer(9)]],  // [out_dim] token 1
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x0[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];   // ONE weight read, shared by both tokens
+        uint x_base = col * 8;
+
+        for (uint n = 0; n < 8; n++) {
+            float nib = float((packed >> (n * 4)) & 0xF);
+            float xv0 = x_shared[x_base + n];
+            float xv1 = x1[x_base + n];
+            acc0 += fma(nib, scale * xv0, bias * xv0);
+            acc1 += fma(nib, scale * xv1, bias * xv1);
+        }
+    }
+
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+    if (simd_lane == 0) {
+        out0[row] = sum0;
+        out1[row] = sum1;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),

@@ -1965,6 +1965,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
+    id<MTLComputePipelineState> matmul2_v3;   // batched N=2 (MTP draft/verify)
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2100,6 +2101,7 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matmul2_v3    = makePipe(@"dequant_matmul2_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -2376,6 +2378,117 @@ static void gpu_dequant_matvec(
 
     // Copy result back
     memcpy(out_f32, [o_buf contents], o_size);
+}
+
+// Batched N=2 dequant matmul: one weight read serves two input vectors.
+// Foundation for MTP draft/verify. Requires in_dim <= 4096 (v3 x_shared limit).
+static void gpu_dequant_matmul2(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *x0_f32, const float *x1_f32, float *out0_f32, float *out1_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+) {
+    static id<MTLBuffer> in0 = nil, in1 = nil, o0 = nil, o1 = nil;
+    size_t i_size = (size_t)in_dim * sizeof(float);
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    if (!in0 || (size_t)[in0 length] < i_size) in0 = [ctx->device newBufferWithLength:i_size options:MTLResourceStorageModeShared];
+    if (!in1 || (size_t)[in1 length] < i_size) in1 = [ctx->device newBufferWithLength:i_size options:MTLResourceStorageModeShared];
+    if (!o0  || (size_t)[o0 length]  < o_size) o0  = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    if (!o1  || (size_t)[o1 length]  < o_size) o1  = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+
+    memcpy([in0 contents], x0_f32, i_size);
+    memcpy([in1 contents], x1_f32, i_size);
+
+    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->matmul2_v3];
+    [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+    [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+    [enc setBuffer:in0 offset:0 atIndex:3];
+    [enc setBuffer:o0  offset:0 atIndex:4];
+    [enc setBytes:&out_dim length:4 atIndex:5];
+    [enc setBytes:&in_dim  length:4 atIndex:6];
+    [enc setBytes:&group_size length:4 atIndex:7];
+    [enc setBuffer:in1 offset:0 atIndex:8];
+    [enc setBuffer:o1  offset:0 atIndex:9];
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out0_f32, [o0 contents], o_size);
+    memcpy(out1_f32, [o1 contents], o_size);
+}
+
+// Stage 1 microbench: does one weight read serve two tokens? Times two separate
+// single-token matvecs vs one batched N=2 matmul on real weight matrices, and
+// verifies the batched output matches. The ratio (batched / 2×single) is the
+// per-layer cost multiplier that decides whether batched MTP verify can win.
+static int mtp_bench_matmul(WeightFile *wf) {
+    if (!g_metal || !g_metal->wf_buf) {
+        fprintf(stderr, "[mtp-bench] requires GPU weight buffer\n");
+        return 1;
+    }
+    struct { const char *w; const char *s; const char *b; uint32_t out_dim; uint32_t in_dim; const char *label; } cases[] = {
+        { "lm_head.weight", "lm_head.scales", "lm_head.biases", (uint32_t)g_cfg.vocab_size, (uint32_t)g_cfg.hidden_dim, "lm_head" },
+        { "mtp.layers.0.self_attn.q_proj.weight", "mtp.layers.0.self_attn.q_proj.scales", "mtp.layers.0.self_attn.q_proj.biases",
+          (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim * 2), (uint32_t)g_cfg.hidden_dim, "q_proj" },
+    };
+    const int M = 100;
+    for (int c = 0; c < 2; c++) {
+        TensorInfo *wi = get_tensor_info(wf, cases[c].w);
+        TensorInfo *si = get_tensor_info(wf, cases[c].s);
+        TensorInfo *bi = get_tensor_info(wf, cases[c].b);
+        if (!wi || !si || !bi) { fprintf(stderr, "[mtp-bench] %s: tensors missing, skip\n", cases[c].label); continue; }
+        uint32_t out_dim = cases[c].out_dim, in_dim = cases[c].in_dim, gs = (uint32_t)g_cfg.group_size;
+        if (in_dim > 4096) { fprintf(stderr, "[mtp-bench] %s: in_dim %u > 4096, skip\n", cases[c].label, in_dim); continue; }
+        uint32_t *W = (uint32_t *)((char *)wf->data + wi->offset);
+        uint16_t *S = (uint16_t *)((char *)wf->data + si->offset);
+        uint16_t *B = (uint16_t *)((char *)wf->data + bi->offset);
+        float *x0 = malloc(in_dim * sizeof(float)), *x1 = malloc(in_dim * sizeof(float));
+        float *r0 = malloc(out_dim * sizeof(float)), *r1 = malloc(out_dim * sizeof(float));
+        float *b0 = malloc(out_dim * sizeof(float)), *b1 = malloc(out_dim * sizeof(float));
+        for (uint32_t i = 0; i < in_dim; i++) { x0[i] = sinf(i * 0.01f); x1[i] = cosf(i * 0.017f); }
+
+        // Correctness: batched must match two singles.
+        gpu_dequant_matvec(g_metal, W, S, B, x0, r0, out_dim, in_dim, gs);
+        gpu_dequant_matvec(g_metal, W, S, B, x1, r1, out_dim, in_dim, gs);
+        gpu_dequant_matmul2(g_metal, W, S, B, x0, x1, b0, b1, out_dim, in_dim, gs);
+        double max_err = 0.0;
+        for (uint32_t i = 0; i < out_dim; i++) {
+            max_err = fmax(max_err, fabs(b0[i] - r0[i]));
+            max_err = fmax(max_err, fabs(b1[i] - r1[i]));
+        }
+
+        for (int w = 0; w < 5; w++) {  // warmup
+            gpu_dequant_matvec(g_metal, W, S, B, x0, r0, out_dim, in_dim, gs);
+            gpu_dequant_matmul2(g_metal, W, S, B, x0, x1, b0, b1, out_dim, in_dim, gs);
+        }
+        double t = now_ms();
+        for (int m = 0; m < M; m++) {
+            gpu_dequant_matvec(g_metal, W, S, B, x0, r0, out_dim, in_dim, gs);
+            gpu_dequant_matvec(g_metal, W, S, B, x1, r1, out_dim, in_dim, gs);
+        }
+        double t_two_single = (now_ms() - t) / M;
+        t = now_ms();
+        for (int m = 0; m < M; m++) {
+            gpu_dequant_matmul2(g_metal, W, S, B, x0, x1, b0, b1, out_dim, in_dim, gs);
+        }
+        double t_batched = (now_ms() - t) / M;
+
+        fprintf(stderr, "[mtp-bench] %-8s out=%u in=%u | 2x single=%.4f ms | batched2=%.4f ms | ratio=%.3f | max_err=%.2e\n",
+                cases[c].label, out_dim, in_dim, t_two_single, t_batched, t_batched / t_two_single, max_err);
+        free(x0); free(x1); free(r0); free(r1); free(b0); free(b1);
+    }
+    fprintf(stderr, "[mtp-bench] ratio < 1.0 means batching amortizes the weight read (lower = better; 0.5 = ideal 2x)\n");
+    return 0;
 }
 
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
@@ -10432,6 +10545,7 @@ enum {
     OPT_MTP,
     OPT_NO_MTP,
     OPT_MTP_PREFLIGHT,
+    OPT_MTP_BENCH_MATMUL,
 };
 
 static void print_usage(const char *prog) {
@@ -10489,6 +10603,7 @@ int main(int argc, char **argv) {
         const char *parse_tool_call_path = NULL;
         int cache_roundtrip_test_requested = 0;
         int mtp_preflight_requested = 0;
+        int mtp_bench_matmul_requested = 0;
         
         // Support FLASHCHAT_SERVER_PORT environment variable
         const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
@@ -10678,6 +10793,7 @@ int main(int argc, char **argv) {
             {"mtp",           no_argument,       0, OPT_MTP},
             {"no-mtp",        no_argument,       0, OPT_NO_MTP},
             {"mtp-preflight",  no_argument,       0, OPT_MTP_PREFLIGHT},
+            {"mtp-bench-matmul", no_argument,     0, OPT_MTP_BENCH_MATMUL},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -10720,6 +10836,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP: g_mtp_predictions = 1; break;
                 case OPT_NO_MTP: g_mtp_predictions = 0; break;
                 case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -10895,6 +11012,10 @@ int main(int argc, char **argv) {
         // Wrap weight file for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
+        }
+
+        if (mtp_bench_matmul_requested) {
+            return mtp_bench_matmul(wf);
         }
 
         // ---- Load vocabulary ----
