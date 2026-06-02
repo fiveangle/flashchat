@@ -436,6 +436,36 @@ static inline int dense_gpu_attn_enabled(void) {
     if (g_dense_gpu_attn < 0) g_dense_gpu_attn = getenv("FLASHCHAT_DENSE_GPU_ATTN") ? 1 : 0;
     return g_dense_gpu_attn;
 }
+
+// Architecture-aware performance defaults. Derives the fastest CORRECT runtime config from
+// the loaded model's architecture (dense vs MoE) so each model auto-gets its best settings
+// without hand-tuning env vars. Explicit env vars still override. Call once after the model
+// config is loaded (g_cfg populated). Resolves the toggle globals up-front so the per-call
+// helpers return these values instead of their generic env defaults.
+static void configure_arch_perf(void) {
+    int dense = (g_cfg.num_experts == 0);
+    // Batched chunked prefill: faithful only for dense (the chunked MoE forward diverges).
+    g_batched_prefill = getenv("FLASHCHAT_NO_BATCHED_PREFILL") ? 0 : (dense ? 1 : 0);
+    // Delta-net dispatch batching: both architectures have linear-attn layers -> always on.
+    g_delta_dispatch_batch = getenv("FLASHCHAT_NO_DELTA_DISPATCH_BATCH") ? 0 : 1;
+    // GPU full-attention: MoE already runs GPU attention via the fused CMD2 path; for dense
+    // it's the standalone gpu_full_attention[_batch] path -> AUTO-ON for dense. It never
+    // degrades (faster at long context, equal at short) and stays coherent. Dense attention is
+    // unified on GPU across baseline (fused_layer_forward), depth-2 verify (attn_block_2) and
+    // depth-N verify (dense_layer_forward_N) — all use the same kernels at every position — so
+    // the MTP verify bit-matches the baseline (lossless) AND the verify also runs on GPU.
+    if (getenv("FLASHCHAT_NO_DENSE_GPU_ATTN"))    g_dense_gpu_attn = 0;
+    else if (getenv("FLASHCHAT_DENSE_GPU_ATTN"))  g_dense_gpu_attn = 1;
+    else                                          g_dense_gpu_attn = dense ? 1 : 0;
+    (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
+    fprintf(stderr,
+        "[perf] arch=%s experts=%d | batched_prefill=%d delta_batch=%d dense_gpu_attn=%d matmulN=v%d | "
+        "mtp=%s\n",
+        dense ? "dense" : "moe", g_cfg.num_experts,
+        g_batched_prefill, g_delta_dispatch_batch, g_dense_gpu_attn,
+        matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
+        dense ? "faithful (dense)" : "shadow-only (MoE speculative is not faithful)");
+}
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
 static inline uint32_t matmuln_rows_per_tg(void) { return matmuln_mode() == 2 ? 8 * 4 : 8; }
@@ -13543,6 +13573,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         kApiModelId = g_cfg.model_id;
+        configure_arch_perf();   // auto-derive fastest correct perf toggles from architecture
         if (g_mtp_predictions < 0) {
             g_mtp_predictions = g_cfg.mtp_default_predictions > 0 ? g_cfg.mtp_default_predictions : 0;
         }
