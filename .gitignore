@@ -42,3 +42,6 @@ debug/
 
 # Claude worktrees (why, Antropic ?)
 ./claud/worktrees
+
+# nanocoder data
+.nanocoder
