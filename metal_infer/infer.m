@@ -1852,17 +1852,18 @@ static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
 // CPU computation kernels
 // ============================================================================
 
-// 4-bit dequant matvec: out[out_dim] = W * x[in_dim]
-// W is stored as packed uint32 (8 x 4-bit values per uint32)
+// Affine dequant matvec: out[out_dim] = W * x[in_dim]
 // scales/biases are bfloat16 per group
 static void cpu_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
+    int bits = (g_cfg.bits == 8) ? 8 : 4;
+    int values_per_word = 32 / bits;
     int num_groups = in_dim / group_size;
-    int packed_per_group = group_size / 8;
-    int packed_cols = in_dim / 8;
+    int packed_per_group = group_size / values_per_word;
+    int packed_cols = in_dim / values_per_word;
 
     for (int row = 0; row < out_dim; row++) {
         float acc = 0.0f;
@@ -1878,11 +1879,18 @@ static void cpu_dequant_matvec(
 
             for (int p = 0; p < packed_per_group; p++) {
                 uint32_t packed = w_row[base_packed + p];
-                int x_base = base_x + p * 8;
+                int x_base = base_x + p * values_per_word;
 
-                for (int n = 0; n < 8; n++) {
-                    uint32_t nibble = (packed >> (n * 4)) & 0xF;
-                    acc += ((float)nibble * scale + bias) * x[x_base + n];
+                if (bits == 8) {
+                    for (int n = 0; n < 4; n++) {
+                        uint32_t byte = (packed >> (n * 8)) & 0xFF;
+                        acc += ((float)byte * scale + bias) * x[x_base + n];
+                    }
+                } else {
+                    for (int n = 0; n < 8; n++) {
+                        uint32_t nibble = (packed >> (n * 4)) & 0xF;
+                        acc += ((float)nibble * scale + bias) * x[x_base + n];
+                    }
                 }
             }
         }
@@ -2360,12 +2368,18 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec8_v3    = makePipe(@"dequant_matvec_8bit_v3");
     ctx->matmul2_v3    = makePipe(@"dequant_matmul2_4bit_v3");
+    ctx->matmul2_8_v3  = makePipe(@"dequant_matmul2_8bit_v3");
     ctx->matmulN_v3    = makePipe(@"dequant_matmulN_4bit_v3");
     ctx->matmulN_v4    = makePipe(@"dequant_matmulN_4bit_v4");
     ctx->matmulN_v5    = makePipe(@"dequant_matmulN_4bit_v5");
+    ctx->matmulN_8_v3  = makePipe(@"dequant_matmulN_8bit_v3");
+    ctx->matmulN_8_v4  = makePipe(@"dequant_matmulN_8bit_v4");
+    ctx->matmulN_8_v5  = makePipe(@"dequant_matmulN_8bit_v5");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->matvec8_fast  = makePipe(@"dequant_matvec_8bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -2390,6 +2404,11 @@ static MetalCtx *metal_setup(void) {
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
+        free(ctx); return NULL;
+    }
+    if (g_cfg.bits == 8 && (!ctx->matvec8_v3 || !ctx->matvec8_fast || !ctx->matmul2_8_v3 ||
+                            !ctx->matmulN_8_v3 || !ctx->matmulN_8_v4 || !ctx->matmulN_8_v5)) {
+        fprintf(stderr, "ERROR: Required 8-bit Metal pipeline missing\n");
         free(ctx); return NULL;
     }
 
@@ -2818,7 +2837,7 @@ static void gpu_dequant_matvec(
     // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
     [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -2890,7 +2909,7 @@ static void gpu_dequant_matmul2(
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:ctx->matmul2_v3];
+    [enc setComputePipelineState:matmul2_pipe(ctx)];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -2915,6 +2934,7 @@ static void gpu_dequant_matmul2(
 // Active matmulN pipeline for the selected mode (see matmuln_mode()).
 static inline id<MTLComputePipelineState> matmuln_pipe(MetalCtx *ctx) {
     int m = matmuln_mode();
+    if (g_cfg.bits == 8) return m == 2 ? ctx->matmulN_8_v5 : (m == 1 ? ctx->matmulN_8_v4 : ctx->matmulN_8_v3);
     return m == 2 ? ctx->matmulN_v5 : (m == 1 ? ctx->matmulN_v4 : ctx->matmulN_v3);
 }
 
@@ -3219,7 +3239,7 @@ static void gpu_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -3273,7 +3293,7 @@ static void gpu_encode_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -3321,7 +3341,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -3363,7 +3383,7 @@ static void gpu_encode_expert_forward_slot(
     down_w_off = up_b_off + g_cfg.up_b_size;
     down_s_off = down_w_off + g_cfg.down_w_size;
     down_b_off = down_s_off + g_cfg.down_s_size;
-    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
 
     uint32_t gate_up_out = g_cfg.moe_intermediate;
     uint32_t gate_up_in  = g_cfg.hidden_dim;
@@ -3460,7 +3480,7 @@ static void gpu_encode_expert_forward_slot_buf(
     down_w_off = up_b_off + g_cfg.up_b_size;
     down_s_off = down_w_off + g_cfg.down_w_size;
     down_b_off = down_s_off + g_cfg.down_s_size;
-    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
 
     uint32_t gate_up_out = g_cfg.moe_intermediate;
     uint32_t gate_up_in  = g_cfg.hidden_dim;
@@ -3559,7 +3579,7 @@ static void gpu_encode_experts_batched(
     down_w_off = up_b_off + g_cfg.up_b_size;
     down_s_off = down_w_off + g_cfg.down_w_size;
     down_b_off = down_s_off + g_cfg.down_s_size;
-    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
 
     uint32_t gate_up_out = g_cfg.moe_intermediate;
     uint32_t gate_up_in  = g_cfg.hidden_dim;
@@ -3657,7 +3677,7 @@ static void gpu_encode_expert_forward(
     // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:matvec_v3_pipe(ctx)];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
@@ -3674,7 +3694,7 @@ static void gpu_encode_expert_forward(
     // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:matvec_v3_pipe(ctx)];
         [enc setBuffer:ctx->buf_expert_data  offset:up_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data  offset:up_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data  offset:up_b_off  atIndex:2];
@@ -3704,7 +3724,7 @@ static void gpu_encode_expert_forward(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setComputePipelineState:matvec_v3_pipe(ctx)];
         [enc setBuffer:ctx->buf_expert_data offset:down_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data offset:down_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data offset:down_b_off  atIndex:2];
@@ -3766,7 +3786,7 @@ static void gpu_expert_forward(
     down_w_off = up_b_off + g_cfg.up_b_size;
     down_s_off = down_w_off + g_cfg.down_w_size;
     down_b_off = down_s_off + g_cfg.down_s_size;
-    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -6477,11 +6497,6 @@ static void moe_forward(
 // ============================================================================
 
 static void embed_lookup(WeightFile *wf, int token_id, float *out) {
-    // Embedding: weight[vocab_size, hidden_dim/8] (U32), scales[vocab_size, groups], biases[vocab_size, groups]
-    // For embedding lookup, we just need one row.
-    // But the embedding is quantized: each row has hidden_dim/8 uint32 values (packed 4-bit)
-    // plus scales and biases per group
-
     TensorInfo *w_info = get_tensor_info(wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(wf, "model.embed_tokens.biases");
@@ -6492,9 +6507,10 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
         return;
     }
 
-    // w shape: [248320, 512] U32 -> each row has 512 uint32 = 4096 packed 4-bit values
-    int packed_cols = w_info->shape[1];  // 512
-    int num_groups = s_info->shape[1];   // 64
+    int bits = (g_cfg.bits == 8) ? 8 : 4;
+    int values_per_word = 32 / bits;
+    int packed_cols = w_info->shape[1];
+    int num_groups = s_info->shape[1];
 
     uint32_t *W = (uint32_t *)((char *)wf->data + w_info->offset);
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
@@ -6504,8 +6520,8 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = g_cfg.hidden_dim / num_groups;  // 4096/64 = 64
-    int packed_per_group = group_size / 8;     // 8
+    int group_size = g_cfg.hidden_dim / num_groups;
+    int packed_per_group = group_size / values_per_word;
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
@@ -6513,11 +6529,18 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 
         for (int p = 0; p < packed_per_group; p++) {
             uint32_t packed = w_row[g * packed_per_group + p];
-            int base = g * group_size + p * 8;
+            int base = g * group_size + p * values_per_word;
 
-            for (int n = 0; n < 8; n++) {
-                uint32_t nibble = (packed >> (n * 4)) & 0xF;
-                out[base + n] = (float)nibble * scale + bias;
+            if (bits == 8) {
+                for (int n = 0; n < 4; n++) {
+                    uint32_t byte = (packed >> (n * 8)) & 0xFF;
+                    out[base + n] = (float)byte * scale + bias;
+                }
+            } else {
+                for (int n = 0; n < 8; n++) {
+                    uint32_t nibble = (packed >> (n * 4)) & 0xF;
+                    out[base + n] = (float)nibble * scale + bias;
+                }
             }
         }
     }
@@ -8566,7 +8589,10 @@ static void fused_layer_forward(
             uint32_t o_out_dim = g_cfg.hidden_dim;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = g_cfg.group_size;
-            [enc setComputePipelineState:g_metal->matvec_fast];
+            // Bits-aware: o_proj weights are 8-bit when cfg->bits==8 (was hardcoded 4-bit
+            // matvec_fast -> dequantized 8-bit weights as 4-bit every full-attn layer ->
+            // garbage. The lone ungated dispatch; all other fused encoders use *_pipe).
+            [enc setComputePipelineState:matvec_fast_pipe(g_metal)];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
             [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
             [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
