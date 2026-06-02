@@ -413,6 +413,29 @@ static inline int matmuln_mode(void) {
                          getenv("FLASHCHAT_MATMULN_V3") ? 0 : 2; // default v5
     return g_matmuln_mode;
 }
+// Dense batched (chunked) prefill toggle. Default on; FLASHCHAT_NO_BATCHED_PREFILL=1 to A/B.
+static int g_batched_prefill = -1;
+static inline int batched_prefill_enabled(void) {
+    if (g_batched_prefill < 0) g_batched_prefill = getenv("FLASHCHAT_NO_BATCHED_PREFILL") ? 0 : 1;
+    return g_batched_prefill;
+}
+static int g_delta_dispatch_batch = -1;
+static inline int delta_dispatch_batch_enabled(void) {
+    if (g_delta_dispatch_batch < 0) g_delta_dispatch_batch = getenv("FLASHCHAT_NO_DELTA_DISPATCH_BATCH") ? 0 : 1;
+    return g_delta_dispatch_batch;
+}
+// GPU full-attention for DENSE (default OFF; FLASHCHAT_DENSE_GPU_ATTN=1 to enable).
+// DOCUMENTED NEGATIVE for prefill: dense prefill is bound by the COUNT of synchronous
+// per-token GPU commit+waits (delta-net across the linear layers + attention), not by
+// attention compute. Swapping CPU->GPU attention doesn't cut that count (it adds round-
+// trips), so a 2111-token prefill stayed >250s either way. Kept gated for the decode path
+// / future commit+wait-batched prefill. The real lever is batching the per-token
+// delta-net + attention dispatches into one command buffer per chunk.
+static int g_dense_gpu_attn = -1;
+static inline int dense_gpu_attn_enabled(void) {
+    if (g_dense_gpu_attn < 0) g_dense_gpu_attn = getenv("FLASHCHAT_DENSE_GPU_ATTN") ? 1 : 0;
+    return g_dense_gpu_attn;
+}
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
 static inline uint32_t matmuln_rows_per_tg(void) { return matmuln_mode() == 2 ? 8 * 4 : 8; }
@@ -2178,18 +2201,25 @@ static void cpu_conv1d_step(
 // Maximum number of batched matmul output slots.
 // Used for encoding multiple matmuls into one command buffer.
 #define MAX_BATCH_SLOTS 8
+#define MAX_DELTA_BATCH_SLOTS 8
 
 typedef struct {
     id<MTLDevice>               device;
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
+    id<MTLComputePipelineState> matvec8_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
+    id<MTLComputePipelineState> matvec8_fast;
     id<MTLComputePipelineState> matmul2_v3;   // batched N=2 (MTP draft/verify)
+    id<MTLComputePipelineState> matmul2_8_v3;
     id<MTLComputePipelineState> matmulN_v3;    // batched N-wide (depth-N verify)
     id<MTLComputePipelineState> matmulN_v4;    // tiled-X matmulN (threadgroup X cache)
     id<MTLComputePipelineState> matmulN_v5;    // multi-row-per-simdgroup matmulN (ILP)
+    id<MTLComputePipelineState> matmulN_8_v3;
+    id<MTLComputePipelineState> matmulN_8_v4;
+    id<MTLComputePipelineState> matmulN_8_v5;
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2270,6 +2300,11 @@ typedef struct {
     id<MTLBuffer> buf_delta_output;   // [8192] float
     id<MTLBuffer> buf_conv_input;     // [12288] float
     id<MTLBuffer> buf_conv_output;    // [12288] float
+    id<MTLBuffer> buf_delta_qkv_batch;
+    id<MTLBuffer> buf_delta_z_batch;
+    id<MTLBuffer> buf_delta_beta_batch;
+    id<MTLBuffer> buf_delta_alpha_batch;
+    id<MTLBuffer> buf_delta_gated_batch;
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -2498,6 +2533,11 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
         ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_qkv_batch   = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_conv_dim      * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_z_batch     = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_total_value   * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta_batch  = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_num_v_heads   * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_alpha_batch = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_num_v_heads   * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_gated_batch = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_total_value   * sizeof(float) options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                g_cfg.num_linear_layers,
                g_cfg.num_linear_layers * (64*128*128*4 + 3*12288*4) / 1e6,
@@ -2521,6 +2561,203 @@ static void reset_delta_net_state(void) {
         if (g_metal->buf_conv_state[i])
             memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
     }
+}
+
+static inline id<MTLComputePipelineState> matmuln_pipe(MetalCtx *ctx);
+
+static int gpu_linear_delta_dispatch_batch(
+    MetalCtx *ctx,
+    int linear_layer_idx,
+    int n,
+    const float *qkv,
+    const float *z,
+    const float *beta,
+    const float *alpha,
+    const uint16_t *conv_w,
+    const float *A_log,
+    const uint16_t *dt_bias,
+    const uint16_t *gated_norm_w,
+    float *gated,
+    const void *out_w,
+    const void *out_s,
+    const void *out_b,
+    float *out_projected,
+    uint32_t out_dim,
+    uint32_t out_group_size
+) {
+    if (!ctx || !delta_dispatch_batch_enabled() || n <= 0 || n > MAX_DELTA_BATCH_SLOTS) return 0;
+    if (linear_layer_idx < 0 || linear_layer_idx >= g_cfg.num_linear_layers) return 0;
+    if (!qkv || !z || !beta || !alpha || !conv_w || !A_log || !dt_bias || !gated_norm_w) return 0;
+    if (!gated && !out_projected) return 0;
+    if (out_projected && (!out_w || !out_s || !out_b || out_dim == 0 || out_group_size == 0)) return 0;
+    if (!ctx->wf_buf || !ctx->conv1d_step || !ctx->rms_norm_qk || !ctx->compute_decay_beta ||
+        !ctx->delta_net_step || !ctx->gated_rms_norm || !ctx->buf_delta_qkv_batch ||
+        !ctx->buf_delta_z_batch || !ctx->buf_delta_beta_batch || !ctx->buf_delta_alpha_batch ||
+        !ctx->buf_delta_gated_batch || !ctx->buf_conv_output || !ctx->buf_delta_g_decay ||
+        !ctx->buf_delta_beta || !ctx->buf_delta_output || !ctx->buf_delta_state[linear_layer_idx] ||
+        !ctx->buf_conv_state[linear_layer_idx]) {
+        return 0;
+    }
+
+    size_t qkv_stride = (size_t)g_cfg.linear_conv_dim * sizeof(float);
+    size_t z_stride = (size_t)g_cfg.linear_total_value * sizeof(float);
+    size_t head_stride = (size_t)g_cfg.linear_num_v_heads * sizeof(float);
+    if ((size_t)[ctx->buf_delta_qkv_batch length] < qkv_stride * (size_t)n ||
+        (size_t)[ctx->buf_delta_z_batch length] < z_stride * (size_t)n ||
+        (size_t)[ctx->buf_delta_beta_batch length] < head_stride * (size_t)n ||
+        (size_t)[ctx->buf_delta_alpha_batch length] < head_stride * (size_t)n ||
+        (size_t)[ctx->buf_delta_gated_batch length] < z_stride * (size_t)n) {
+        return 0;
+    }
+    id<MTLComputePipelineState> out_pipe = nil;
+    if (out_projected) {
+        if (!ctx->buf_output || (size_t)[ctx->buf_output length] < (size_t)n * out_dim * sizeof(float)) return 0;
+        out_pipe = matmuln_pipe(ctx);
+        if (!out_pipe) return 0;
+    }
+
+    memcpy([ctx->buf_delta_qkv_batch contents], qkv, qkv_stride * (size_t)n);
+    memcpy([ctx->buf_delta_z_batch contents], z, z_stride * (size_t)n);
+    memcpy([ctx->buf_delta_beta_batch contents], beta, head_stride * (size_t)n);
+    memcpy([ctx->buf_delta_alpha_batch contents], alpha, head_stride * (size_t)n);
+
+    NSUInteger conv_w_off = (NSUInteger)((const char *)conv_w - (const char *)[ctx->wf_buf contents]);
+    NSUInteger a_log_off = (NSUInteger)((const char *)A_log - (const char *)[ctx->wf_buf contents]);
+    NSUInteger dt_bias_off = (NSUInteger)((const char *)dt_bias - (const char *)[ctx->wf_buf contents]);
+    NSUInteger gnorm_w_off = (NSUInteger)((const char *)gated_norm_w - (const char *)[ctx->wf_buf contents]);
+    NSUInteger out_w_off = 0, out_s_off = 0, out_b_off = 0;
+    if (out_projected) {
+        out_w_off = (NSUInteger)((const char *)out_w - (const char *)[ctx->wf_buf contents]);
+        out_s_off = (NSUInteger)((const char *)out_s - (const char *)[ctx->wf_buf contents]);
+        out_b_off = (NSUInteger)((const char *)out_b - (const char *)[ctx->wf_buf contents]);
+    }
+
+    uint32_t conv_dim = (uint32_t)g_cfg.linear_conv_dim;
+    uint32_t key_dim = (uint32_t)g_cfg.linear_key_dim;
+    uint32_t value_dim = (uint32_t)g_cfg.linear_value_dim;
+    uint32_t num_k_heads = (uint32_t)g_cfg.linear_num_k_heads;
+    uint32_t num_v_heads = (uint32_t)g_cfg.linear_num_v_heads;
+    uint32_t khpv = (uint32_t)(g_cfg.linear_num_v_heads / g_cfg.linear_num_k_heads);
+    float inv_scale = 1.0f / sqrtf((float)g_cfg.linear_key_dim);
+    float eps = g_cfg.rms_norm_eps;
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    double t0 = now_ms();
+
+    for (int t = 0; t < n; t++) {
+        NSUInteger qkv_off = (NSUInteger)((size_t)t * qkv_stride);
+        NSUInteger z_off = (NSUInteger)((size_t)t * z_stride);
+        NSUInteger head_off = (NSUInteger)((size_t)t * head_stride);
+        NSUInteger gated_off = (NSUInteger)((size_t)t * z_stride);
+
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:ctx->conv1d_step];
+            [enc setBuffer:ctx->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_delta_qkv_batch offset:qkv_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf offset:conv_w_off atIndex:2];
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:3];
+            [enc setBytes:&conv_dim length:4 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((conv_dim + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:ctx->rms_norm_qk];
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_conv_output offset:g_cfg.linear_total_key * sizeof(float) atIndex:1];
+            [enc setBytes:&key_dim length:4 atIndex:2];
+            [enc setBytes:&inv_scale length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(num_k_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(g_cfg.linear_key_dim, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:ctx->compute_decay_beta];
+            [enc setBuffer:ctx->buf_delta_alpha_batch offset:head_off atIndex:0];
+            [enc setBuffer:ctx->buf_delta_beta_batch offset:head_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf offset:a_log_off atIndex:2];
+            [enc setBuffer:ctx->wf_buf offset:dt_bias_off atIndex:3];
+            [enc setBuffer:ctx->buf_delta_g_decay offset:0 atIndex:4];
+            [enc setBuffer:ctx->buf_delta_beta offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(num_v_heads, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:ctx->delta_net_step];
+            [enc setBuffer:ctx->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_conv_output offset:g_cfg.linear_total_key * sizeof(float) atIndex:2];
+            [enc setBuffer:ctx->buf_conv_output offset:2 * g_cfg.linear_total_key * sizeof(float) atIndex:3];
+            [enc setBuffer:ctx->buf_delta_g_decay offset:0 atIndex:4];
+            [enc setBuffer:ctx->buf_delta_beta offset:0 atIndex:5];
+            [enc setBuffer:ctx->buf_delta_output offset:0 atIndex:6];
+            [enc setBytes:&khpv length:sizeof(khpv) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:ctx->gated_rms_norm];
+            [enc setBuffer:ctx->buf_delta_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_delta_z_batch offset:z_off atIndex:1];
+            [enc setBuffer:ctx->wf_buf offset:gnorm_w_off atIndex:2];
+            [enc setBuffer:ctx->buf_delta_gated_batch offset:gated_off atIndex:3];
+            [enc setBytes:&value_dim length:4 atIndex:4];
+            [enc setBytes:&eps length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(g_cfg.linear_value_dim, 1, 1)];
+            [enc endEncoding];
+        }
+    }
+
+    if (out_projected) {
+        uint32_t in_dim = (uint32_t)g_cfg.linear_total_value;
+        uint32_t batch_n = (uint32_t)n;
+        uint32_t rpt = matmuln_rows_per_tg();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:out_pipe];
+        [enc setBuffer:ctx->wf_buf offset:out_w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:out_s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf offset:out_b_off atIndex:2];
+        [enc setBuffer:ctx->buf_delta_gated_batch offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_output offset:0 atIndex:4];
+        [enc setBytes:&out_dim length:4 atIndex:5];
+        [enc setBytes:&in_dim length:4 atIndex:6];
+        [enc setBytes:&out_group_size length:4 atIndex:7];
+        [enc setBytes:&batch_n length:4 atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + rpt - 1) / rpt, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    g_prof_delta += now_ms() - t0;
+    if (out_projected) {
+        memcpy(out_projected, [ctx->buf_output contents], (size_t)n * out_dim * sizeof(float));
+    }
+    if (gated) {
+        memcpy(gated, [ctx->buf_delta_gated_batch contents], z_stride * (size_t)n);
+    }
+    return 1;
+}
+
+static inline id<MTLComputePipelineState> matvec_v3_pipe(MetalCtx *ctx) {
+    return g_cfg.bits == 8 ? ctx->matvec8_v3 : ctx->matvec_v3;
+}
+
+static inline id<MTLComputePipelineState> matvec_fast_pipe(MetalCtx *ctx) {
+    return g_cfg.bits == 8 ? ctx->matvec8_fast : ctx->matvec_fast;
+}
+
+static inline id<MTLComputePipelineState> matmul2_pipe(MetalCtx *ctx) {
+    return g_cfg.bits == 8 ? ctx->matmul2_8_v3 : ctx->matmul2_v3;
 }
 
 // Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
@@ -4265,6 +4502,40 @@ static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
 // layer (attention + dense MLP). All weight-bound matmuls amortized via matmulN;
 // attention/delta-net run per-position (sequential, so position i sees earlier ones).
 // pos[i] = absolute sequence position of token i. Dense models only (num_experts==0).
+// Standalone GPU full-attention for ONE query position over buf_kv_k/v[fa_idx] (seq_len
+// positions in the GPU KV mirror): scores -> softmax -> values -> sigmoid-gate, producing
+// the gated attention output (q_dim floats) in `out`. Mirrors the production fused-CMD2
+// attention encoders (Enc A1-A4) as a self-contained commit+wait, so the DENSE path (which
+// never takes the MoE CMD2) can use GPU attention instead of O(seq^2) CPU attention. The
+// caller must have written this position's K/V into buf_kv_k/v[fa_idx] first.
+static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const float *q_gate, float *out) {
+    MetalCtx *ctx = g_metal;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    uint32_t hd = (uint32_t)g_cfg.head_dim, kvd = (uint32_t)kv_dim, sl = (uint32_t)seq_len;
+    uint32_t seq_stride = GPU_KV_SEQ, hpkv = (uint32_t)(g_cfg.num_attn_heads / g_cfg.num_kv_heads);
+    uint32_t qdim = (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim);
+    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    memcpy([ctx->buf_attn_q contents], q, qdim * sizeof(float));
+    memcpy([ctx->buf_attn_gate contents], q_gate, qdim * sizeof(float));
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_scores_pipe];
+      [e setBuffer:ctx->buf_attn_q offset:0 atIndex:0]; [e setBuffer:ctx->buf_kv_k[fa_idx] offset:0 atIndex:1]; [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&scale length:4 atIndex:7];[e setBytes:&hpkv length:4 atIndex:8];[e setBytes:&sl length:4 atIndex:9];
+      [e dispatchThreadgroups:MTLSizeMake(sl*g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_softmax_pipe];
+      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBytes:&sl length:4 atIndex:1];[e setBytes:&seq_stride length:4 atIndex:2];
+      [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
+      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out offset:0 atIndex:2];
+      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
+      uint32_t tt=(uint32_t)(g_cfg.head_dim*g_cfg.num_attn_heads); [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
+      [e setBuffer:ctx->buf_attn_out offset:0 atIndex:0];[e setBuffer:ctx->buf_attn_gate offset:0 atIndex:1];[e setBytes:&qdim length:4 atIndex:2];
+      [e dispatchThreadgroups:MTLSizeMake((qdim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    [cmd commit]; [cmd waitUntilCompleted];
+    memcpy(out, [ctx->buf_attn_out contents], qdim * sizeof(float));
+}
+
 static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos) {
     int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, inter=g_cfg.dense_intermediate, eps_layer=0; (void)eps_layer;
     float eps=g_cfg.rms_norm_eps;
@@ -4278,6 +4549,8 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
 
     if (is_full) {
         int qpd=g_cfg.num_attn_heads*g_cfg.head_dim*2, qd=g_cfg.num_attn_heads*g_cfg.head_dim, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, hpk=g_cfg.num_attn_heads/g_cfg.num_kv_heads;
+        int fa_idx=(layer+1)/g_cfg.full_attn_interval-1;   // GPU KV mirror slot for this full-attn layer
+        int dgpu = dense_gpu_attn_enabled() && g_metal && g_metal->attn_scores_pipe && fa_idx>=0 && fa_idx<g_cfg.num_full_attn_layers;
         uint32_t *qw=LW("self_attn.q_proj.weight");uint16_t *qs=LW("self_attn.q_proj.scales"),*qb=LW("self_attn.q_proj.biases");
         uint32_t *kw=LW("self_attn.k_proj.weight");uint16_t *ks=LW("self_attn.k_proj.scales"),*kb=LW("self_attn.k_proj.biases");
         uint32_t *vw=LW("self_attn.v_proj.weight");uint16_t *vs=LW("self_attn.v_proj.scales"),*vb=LW("self_attn.v_proj.biases");
@@ -4296,13 +4569,23 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
             for(int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*iv*bf16_to_f32(qn[i]);}
             for(int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=kt+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*iv*bf16_to_f32(kn[i]);}
             apply_rotary_emb(q,kt,pos[t],g_cfg.num_attn_heads,g_cfg.num_kv_heads,g_cfg.head_dim,g_cfg.rotary_dim);
-            int cp=kv->len; memcpy(kv->k_cache+(size_t)cp*kvd,kt,kvd*4); memcpy(kv->v_cache+(size_t)cp*kvd,vt,kvd*4); kv->len++;
+            int cp=kv->len; memcpy(kv->k_cache+(size_t)cp*kvd,kt,kvd*4); memcpy(kv->v_cache+(size_t)cp*kvd,vt,kvd*4);
+            if (dgpu && cp < GPU_KV_SEQ) {  // keep the GPU KV mirror in sync for GPU attention
+                memcpy((float*)[g_metal->buf_kv_k[fa_idx] contents]+(size_t)cp*kvd, kt, (size_t)kvd*4);
+                memcpy((float*)[g_metal->buf_kv_v[fa_idx] contents]+(size_t)cp*kvd, vt, (size_t)kvd*4);
+            }
+            kv->len++;
             float *aot=ao+(size_t)t*qd;
-            for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(kv->len*4);
-                for(int p=0;p<kv->len;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
-                cpu_softmax(sc,kv->len); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
-                for(int p=0;p<kv->len;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
-            for(int i=0;i<qd;i++)aot[i]*=cpu_sigmoid(qg[i]);
+            if (dgpu && kv->len>=32 && kv->len<GPU_KV_SEQ) {
+                // GPU attention (scores+softmax+values+sigmoid-gate) -> aot (already gated)
+                gpu_full_attention(fa_idx, kv->len, q, qg, aot);
+            } else {
+                for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(kv->len*4);
+                    for(int p=0;p<kv->len;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
+                    cpu_softmax(sc,kv->len); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
+                    for(int p=0;p<kv->len;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
+                for(int i=0;i<qd;i++)aot[i]*=cpu_sigmoid(qg[i]);
+            }
             free(q);free(qg);
         }
         float *ap=malloc((size_t)N*H*4); gpu_dequant_matmulN(g_metal,ow,os,ob,ao,ap,H,qd,gsz,N);
@@ -4325,19 +4608,25 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
           gpu_dequant_matmulN_batch(g_metal, in_jobs, 4); }
         NSUInteger cvo=(NSUInteger)((const char*)convw-(const char*)[g_metal->wf_buf contents]),alo=(NSUInteger)((const char*)Alog-(const char*)[g_metal->wf_buf contents]),dto=(NSUInteger)((const char*)dtb-(const char*)[g_metal->wf_buf contents]),gno=(NSUInteger)((const char*)gnw-(const char*)[g_metal->wf_buf contents]);
         uint32_t cd=g_cfg.linear_conv_dim,kd=g_cfg.linear_key_dim,vd2=g_cfg.linear_value_dim,khpv=(uint32_t)(nvh/nkh); float invs=1.f/sqrtf((float)g_cfg.linear_key_dim);
-        for (int t=0;t<N;t++){
-            memcpy([g_metal->batch_out[0] contents],qkv+(size_t)t*qkv_dim,qkv_dim*4); memcpy([g_metal->batch_out[1] contents],z+(size_t)t*z_dim,z_dim*4);
-            memcpy([g_metal->batch_out[2] contents],be+(size_t)t*nvh,nvh*4); memcpy([g_metal->batch_out[3] contents],al+(size_t)t*nvh,nvh*4);
-            id<MTLCommandBuffer> cmd=[g_metal->queue commandBuffer];
-            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->conv1d_step];[e setBuffer:g_metal->buf_conv_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[0] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:cvo atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:3];[e setBytes:&cd length:4 atIndex:4];[e dispatchThreadgroups:MTLSizeMake((cd+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];}
-            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->rms_norm_qk];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:1];[e setBytes:&kd length:4 atIndex:2];[e setBytes:&invs length:4 atIndex:3];[e dispatchThreadgroups:MTLSizeMake(nkh,1,1) threadsPerThreadgroup:MTLSizeMake(kd,1,1)];[e endEncoding];}
-            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->compute_decay_beta];[e setBuffer:g_metal->batch_out[3] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[2] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:alo atIndex:2];[e setBuffer:g_metal->wf_buf offset:dto atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(nvh,1,1)];[e endEncoding];}
-            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->delta_net_step];[e setBuffer:g_metal->buf_delta_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:2*g_cfg.linear_total_key*4 atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:6];[e setBytes:&khpv length:sizeof(khpv) atIndex:7];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];[e endEncoding];}
-            {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->gated_rms_norm];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[1] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:gno atIndex:2];[e setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];[e setBytes:&vd2 length:4 atIndex:4];[e setBytes:&eps length:4 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(vd2,1,1)];[e endEncoding];}
-            [cmd commit];[cmd waitUntilCompleted];
-            memcpy(gated+(size_t)t*z_dim,[g_metal->batch_out[6] contents],z_dim*4);
+        float *ap=malloc((size_t)N*H*4);
+        if (!gpu_linear_delta_dispatch_batch(g_metal, li, N, qkv, z, be, al, convw, Alog, dtb, gnw,
+                                             NULL, olw, ols, olb, ap, (uint32_t)H, (uint32_t)gsz)) {
+            for (int t=0;t<N;t++){
+                memcpy([g_metal->batch_out[0] contents],qkv+(size_t)t*qkv_dim,qkv_dim*4); memcpy([g_metal->batch_out[1] contents],z+(size_t)t*z_dim,z_dim*4);
+                memcpy([g_metal->batch_out[2] contents],be+(size_t)t*nvh,nvh*4); memcpy([g_metal->batch_out[3] contents],al+(size_t)t*nvh,nvh*4);
+                id<MTLCommandBuffer> cmd=[g_metal->queue commandBuffer];
+                {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->conv1d_step];[e setBuffer:g_metal->buf_conv_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[0] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:cvo atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:3];[e setBytes:&cd length:4 atIndex:4];[e dispatchThreadgroups:MTLSizeMake((cd+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];}
+                {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->rms_norm_qk];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:1];[e setBytes:&kd length:4 atIndex:2];[e setBytes:&invs length:4 atIndex:3];[e dispatchThreadgroups:MTLSizeMake(nkh,1,1) threadsPerThreadgroup:MTLSizeMake(kd,1,1)];[e endEncoding];}
+                {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->compute_decay_beta];[e setBuffer:g_metal->batch_out[3] offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[2] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:alo atIndex:2];[e setBuffer:g_metal->wf_buf offset:dto atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(nvh,1,1)];[e endEncoding];}
+                {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->delta_net_step];[e setBuffer:g_metal->buf_delta_state[li] offset:0 atIndex:0];[e setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];[e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*4 atIndex:2];[e setBuffer:g_metal->buf_conv_output offset:2*g_cfg.linear_total_key*4 atIndex:3];[e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];[e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:6];[e setBytes:&khpv length:sizeof(khpv) atIndex:7];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];[e endEncoding];}
+                {id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:g_metal->gated_rms_norm];[e setBuffer:g_metal->buf_delta_output offset:0 atIndex:0];[e setBuffer:g_metal->batch_out[1] offset:0 atIndex:1];[e setBuffer:g_metal->wf_buf offset:gno atIndex:2];[e setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];[e setBytes:&vd2 length:4 atIndex:4];[e setBytes:&eps length:4 atIndex:5];[e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(vd2,1,1)];[e endEncoding];}
+                double _t_dl = now_ms();
+                [cmd commit];[cmd waitUntilCompleted];
+                g_prof_delta += now_ms() - _t_dl;
+                memcpy(gated+(size_t)t*z_dim,[g_metal->batch_out[6] contents],z_dim*4);
+            }
+            gpu_dequant_matmulN(g_metal,olw,ols,olb,gated,ap,H,z_dim,gsz,N);
         }
-        float *ap=malloc((size_t)N*H*4); gpu_dequant_matmulN(g_metal,olw,ols,olb,gated,ap,H,z_dim,gsz,N);
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
         free(qkv);free(z);free(be);free(al);free(gated);free(ap);
     }
@@ -4356,6 +4645,35 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     gpu_dequant_matmulN(g_metal,dw,ds,db,aN,oN,H,inter,gsz,N);
     for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
     free(res);free(nmd);free(hp);free(gN);free(uN);free(aN);free(oN);
+}
+
+// Batched (chunked) prefill for DENSE models: run [start,end) prompt tokens N-at-a-time
+// through dense_layer_forward_N, which is bit-exact to token-by-token production but does
+// ~N fewer weight-read passes (the win for the weight-bound dense path). kv + GPU delta
+// state end up identical, so decode continues correctly. *pos is advanced; if
+// out_last_hidden != NULL it receives the final token's post-forward hidden (for the
+// first decode logits). DENSE ONLY (num_experts==0; the batched MoE forward is not faithful).
+static void serve_prefill_dense_batched(WeightFile *wf, const float *embed_batch,
+                                        PromptTokens *pt, int start, int end,
+                                        KVCache **kv, int *pos, float *out_last_hidden) {
+    int H = g_cfg.hidden_dim;
+    enum { PREFILL_CHUNK = 8 };   // matmulN supports up to MATMULN_MAXN=8 columns
+    float *hs = malloc((size_t)PREFILL_CHUNK * H * sizeof(float));
+    int posv[PREFILL_CHUNK];
+    for (int i = start; i < end; i += PREFILL_CHUNK) {
+        int n = (end - i < PREFILL_CHUNK) ? (end - i) : PREFILL_CHUNK;
+        for (int j = 0; j < n; j++) {
+            if (embed_batch) memcpy(hs + (size_t)j * H, embed_batch + (size_t)(i + j) * H, H * sizeof(float));
+            else embed_lookup(wf, pt->ids[i + j], hs + (size_t)j * H);
+            posv[j] = *pos + j;
+        }
+        for (int layer = 0; layer < g_cfg.num_layers; layer++)
+            dense_layer_forward_N(wf, layer, hs, n, kv[layer], posv);
+        if (out_last_hidden && (i + n >= end))
+            memcpy(out_last_hidden, hs + (size_t)(n - 1) * H, H * sizeof(float));
+        *pos += n;
+    }
+    free(hs);
 }
 
 // Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
@@ -12305,7 +12623,13 @@ static void serve_loop(
         // Split prefill: system prompt first, then conversation
         int sys_token_end = req.used_snapshot ? 0 : sys_prompt_token_count;
         if (!snapshot_restored && sys_token_end > 0) {
-            // Prefill system prompt tokens
+            // Prefill system prompt tokens. Dense models use a batched (chunked) forward
+            // that is bit-exact to the token-by-token path but ~8x fewer weight-read passes
+            // (critical for large agent system prompts, e.g. OpenCode's ~12k tokens). MoE
+            // stays token-by-token (batched MoE forward is not faithful).
+            if (g_cfg.num_experts == 0 && batched_prefill_enabled()) {
+                serve_prefill_dense_batched(wf, serve_embed_batch, pt, 0, sys_token_end, kv_caches, &pos, NULL);
+            } else
             for (int i = 0; i < sys_token_end; i++) {
                 cache_telemetry_note_token();
                 if (serve_embed_batch) {
@@ -12372,6 +12696,11 @@ static void serve_loop(
 
         // Prefill remaining tokens (conversation, or all tokens if snapshot restored)
         int prefill_start = sys_token_end;
+        if (g_cfg.num_experts == 0 && batched_prefill_enabled()) {
+            // Dense: batched chunked prefill; last token's hidden feeds the first decode logits.
+            if (pt->count > prefill_start)
+                serve_prefill_dense_batched(wf, serve_embed_batch, pt, prefill_start, pt->count, kv_caches, &pos, hidden);
+        } else
         for (int i = prefill_start; i < pt->count; i++) {
             cache_telemetry_note_token();
             if (serve_embed_batch) {
