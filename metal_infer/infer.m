@@ -57,6 +57,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <getopt.h>
 #include <pthread.h>
@@ -117,6 +118,12 @@ static int g_show_thinking_enabled = 0;
 static int g_system_prompt_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
 static int g_mtp_predictions = -1;
+static int g_mtp_active_experts = 1;
+static int g_mtp_trace_enabled = 0;
+static int g_mtp_trace_topn = 8;
+static char g_mtp_trace_dir[PATH_MAX] = {0};
+static int g_mtp_trace_dir_ready = 0;
+static uint64_t g_mtp_trace_call = 0;
 static float g_default_temperature = 0.7f;
 static float g_default_top_p = 0.8f;
 static int g_default_top_k = 20;
@@ -392,6 +399,8 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 // Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
+// Per-layer production reference (token a) for MTP_VF2_DBG divergence probe.
+static float *g_vf2_ref[64] = {0}; static int g_vf2_ref_on = 0;
 // matmulN kernel select. 0 = v3 (one row/simdgroup), 1 = tiled-X v4, 2 = v5 (multi-row
 // per simdgroup for load-latency hiding). v4 staged X in threadgroup memory but measured
 // SLOWER (L2 already absorbs the X re-reads); kept as a documented negative. v5 gives each
@@ -431,6 +440,28 @@ typedef struct {
 static LZ4IndexEntry *g_lz4_index[MAX_NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
 static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
+
+static char g_flashchat_weights_dir[PATH_MAX] = {0};
+static char g_flashchat_experts_dir[PATH_MAX] = {0};
+static char g_flashchat_mtp_experts_dir[PATH_MAX] = {0};
+static char g_flashchat_lz4_experts_dir[PATH_MAX] = {0};
+
+static void configure_flashchat_artifact_dirs(const char *model_path) {
+    const char *env_weights_dir = getenv("FLASHCHAT_WEIGHTS_DIR");
+    const char *env_experts_dir = getenv("FLASHCHAT_EXPERTS_DIR");
+    if (env_weights_dir && env_weights_dir[0]) {
+        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s", env_weights_dir);
+    } else {
+        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s/flashchat", model_path);
+    }
+    if (env_experts_dir && env_experts_dir[0]) {
+        snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s", env_experts_dir);
+    } else {
+        snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s/packed_experts", g_flashchat_weights_dir);
+    }
+    snprintf(g_flashchat_mtp_experts_dir, sizeof(g_flashchat_mtp_experts_dir), "%s/packed_mtp_experts", g_flashchat_weights_dir);
+    snprintf(g_flashchat_lz4_experts_dir, sizeof(g_flashchat_lz4_experts_dir), "%s/packed_experts_lz4", g_flashchat_weights_dir);
+}
 
 // ============================================================================
 // Expert frequency tracking (diagnostic: --freq flag)
@@ -852,6 +883,7 @@ static void cpu_vec_madd(float *dst, const float *src, float scale, int dim);
 static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits);
 static int cpu_argmax(const float *x, int dim);
 static void embed_lookup(WeightFile *wf, int token_id, float *out);
+static int mkdir_p_cstr(const char *path);
 
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     // mmap the binary file
@@ -913,9 +945,10 @@ static int manifest_has_tensor(WeightFile *wf, const char *name) {
 }
 
 static int read_mtp_packed_layers(const char *model_path) {
+    (void)model_path;
     @autoreleasepool {
         char layout_path[PATH_MAX];
-        snprintf(layout_path, sizeof(layout_path), "%s/flashchat/packed_mtp_experts/layout.json", model_path);
+        snprintf(layout_path, sizeof(layout_path), "%s/layout.json", g_flashchat_mtp_experts_dir);
         NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:layout_path]];
         if (!data) return 0;
         NSError *error = nil;
@@ -929,7 +962,7 @@ static int read_mtp_packed_layers(const char *model_path) {
 static MTPArtifacts detect_mtp_artifacts(WeightFile *wf, const char *model_path) {
     MTPArtifacts mtp = {0};
     mtp.enabled = g_mtp_predictions > 0;
-    snprintf(mtp.packed_dir, sizeof(mtp.packed_dir), "%s/flashchat/packed_mtp_experts", model_path);
+    snprintf(mtp.packed_dir, sizeof(mtp.packed_dir), "%s", g_flashchat_mtp_experts_dir);
 
     mtp.tensors_present =
         manifest_has_tensor(wf, "mtp.fc.weight") &&
@@ -1023,6 +1056,96 @@ static void build_mtp_cache(WeightFile *wf) {
     g_mtp_kv_len = 0;
 }
 
+static void mtp_trace_prepare_dir(void) {
+    if (!g_mtp_trace_enabled || !g_mtp_trace_dir[0] || g_mtp_trace_dir_ready) return;
+    if (mkdir_p_cstr(g_mtp_trace_dir) == 0) {
+        g_mtp_trace_dir_ready = 1;
+    } else {
+        server_log_errorf("[mtp-trace] could not create trace dir %s: %s\n",
+                          g_mtp_trace_dir, strerror(errno));
+        g_mtp_trace_dir[0] = '\0';
+    }
+}
+
+static void mtp_trace_vector(uint64_t call_id, const char *stage, const float *v, int n) {
+    if (!g_mtp_trace_enabled || !v || n <= 0) return;
+    double sum_sq = 0.0;
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(v[i]);
+        if (a > max_abs) max_abs = a;
+        sum_sq += (double)v[i] * (double)v[i];
+    }
+    char path[PATH_MAX] = {0};
+    if (g_mtp_trace_dir[0]) {
+        mtp_trace_prepare_dir();
+        if (g_mtp_trace_dir[0]) {
+            snprintf(path, sizeof(path), "%s/c%05llu_%s.f32",
+                     g_mtp_trace_dir, (unsigned long long)call_id, stage);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(v, sizeof(float), (size_t)n, f);
+                fclose(f);
+            } else {
+                server_log_errorf("[mtp-trace] write failed path=%s error=%s\n",
+                                  path, strerror(errno));
+                path[0] = '\0';
+            }
+        }
+    }
+    int sample = n < 4 ? n : 4;
+    char first[128] = {0};
+    size_t off = 0;
+    for (int i = 0; i < sample; i++) {
+        int wrote = snprintf(first + off, sizeof(first) - off,
+                             "%s%.6f", i ? "," : "", v[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof(first) - off) break;
+        off += (size_t)wrote;
+    }
+    server_log_errorf("[mtp-trace] call=%llu stage=%s n=%d rms=%.6f max_abs=%.6f first=[%s]%s%s\n",
+                      (unsigned long long)call_id, stage, n,
+                      sqrt(sum_sq / (double)n), max_abs, first,
+                      path[0] ? " path=" : "", path[0] ? path : "");
+}
+
+static void mtp_trace_top_values(uint64_t call_id, const char *stage, const float *v, int n) {
+    if (!g_mtp_trace_enabled || !v || n <= 0) return;
+    int topn = g_mtp_trace_topn;
+    if (topn < 1) topn = 1;
+    if (topn > 32) topn = 32;
+    if (topn > n) topn = n;
+    int idx[32];
+    float val[32];
+    for (int i = 0; i < topn; i++) {
+        idx[i] = -1;
+        val[i] = -FLT_MAX;
+    }
+    for (int i = 0; i < n; i++) {
+        float x = v[i];
+        if (x <= val[topn - 1]) continue;
+        int j = topn - 1;
+        while (j > 0 && x > val[j - 1]) {
+            val[j] = val[j - 1];
+            idx[j] = idx[j - 1];
+            j--;
+        }
+        val[j] = x;
+        idx[j] = i;
+    }
+    char line[1024];
+    size_t off = (size_t)snprintf(line, sizeof(line),
+                                  "[mtp-trace] call=%llu stage=%s top%d",
+                                  (unsigned long long)call_id, stage, topn);
+    for (int i = 0; i < topn; i++) {
+        if (off >= sizeof(line)) break;
+        int wrote = snprintf(line + off, sizeof(line) - off,
+                             " %d:%.6f", idx[i], val[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof(line) - off) break;
+        off += (size_t)wrote;
+    }
+    server_log_errorf("%s\n", line);
+}
+
 static int mtp_preflight_forward(WeightFile *wf) {
     (void)wf;
     if (!g_mtp_cache.ready) {
@@ -1066,12 +1189,14 @@ static int mtp_preflight_forward(WeightFile *wf) {
 static int mtp_forward(WeightFile *wf, const char *model_path,
                        const float *input_hidden, const float *next_embedding,
                        float *out_hidden, int *out_draft_token, int log_details) {
+    (void)model_path;
     if (!g_mtp_cache.ready) {
         fprintf(stderr, "[mtp] forward failed: MTP weight cache is incomplete\n");
         return 1;
     }
 
     int rc = 1;
+    uint64_t trace_call = g_mtp_trace_enabled ? ++g_mtp_trace_call : 0;
     int q_proj_dim = g_cfg.num_attn_heads * g_cfg.head_dim * 2;
     int q_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
     int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
@@ -1108,20 +1233,27 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
 
     cpu_rms_norm(input_hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     cpu_rms_norm(next_embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    mtp_trace_vector(trace_call, "pre_fc_hidden_norm", hidden_norm, g_cfg.hidden_dim);
+    mtp_trace_vector(trace_call, "pre_fc_embedding_norm", embedding_norm, g_cfg.hidden_dim);
     // Fusion order matches Qwen3-Next MTP reference: cat([norm_embedding, norm_hidden]).
     memcpy(fc_in, embedding_norm, g_cfg.hidden_dim * sizeof(float));
     memcpy(fc_in + g_cfg.hidden_dim, hidden_norm, g_cfg.hidden_dim * sizeof(float));
     fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
                         fc_in, x, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
     memcpy(residual, x, g_cfg.hidden_dim * sizeof(float));
+    mtp_trace_vector(trace_call, "fc_out", x, g_cfg.hidden_dim);
 
     cpu_rms_norm(x, g_mtp_cache.layer_input_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    mtp_trace_vector(trace_call, "attn_input_norm", normed, g_cfg.hidden_dim);
     fast_dequant_matvec(g_mtp_cache.q_w, g_mtp_cache.q_s, g_mtp_cache.q_b,
                         normed, q_proj, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size);
     fast_dequant_matvec(g_mtp_cache.k_w, g_mtp_cache.k_s, g_mtp_cache.k_b,
                         normed, k, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
     fast_dequant_matvec(g_mtp_cache.v_w, g_mtp_cache.v_s, g_mtp_cache.v_b,
                         normed, v, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    mtp_trace_vector(trace_call, "q_proj", q_proj, q_proj_dim);
+    mtp_trace_vector(trace_call, "k_proj", k, kv_dim);
+    mtp_trace_vector(trace_call, "v_proj", v, kv_dim);
 
     for (int h = 0; h < g_cfg.num_attn_heads; h++) {
         float *src = q_proj + h * (2 * g_cfg.head_dim);
@@ -1144,6 +1276,9 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     }
     int mtp_pos = g_mtp_kv_len;
     apply_rotary_emb(q, k, mtp_pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    mtp_trace_vector(trace_call, "q_rope", q, q_dim);
+    mtp_trace_vector(trace_call, "q_gate", q_gate, q_dim);
+    mtp_trace_vector(trace_call, "k_rope", k, kv_dim);
 
     // Append this (accepted) token's K/V to the persistent MTP KV cache, then run
     // real causal scaled-dot-product attention over the cached context. This
@@ -1177,14 +1312,19 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         }
         free(scores);
     }
+    mtp_trace_vector(trace_call, "attn_out", attn_out, q_dim);
     for (int i = 0; i < q_dim; i++) {
         attn_out[i] *= cpu_sigmoid(q_gate[i]);
     }
+    mtp_trace_vector(trace_call, "attn_gated", attn_out, q_dim);
     fast_dequant_matvec(g_mtp_cache.o_w, g_mtp_cache.o_s, g_mtp_cache.o_b,
                         attn_out, attn_projected, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
+    mtp_trace_vector(trace_call, "attn_projected", attn_projected, g_cfg.hidden_dim);
     for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = residual[i] + attn_projected[i];
+    mtp_trace_vector(trace_call, "post_attn_residual", x, g_cfg.hidden_dim);
 
     cpu_rms_norm(x, g_mtp_cache.post_attn_norm_w, h_post, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    mtp_trace_vector(trace_call, "post_attn_norm", h_post, g_cfg.hidden_dim);
     fast_dequant_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
                         h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size);
     fast_dequant_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
@@ -1194,15 +1334,52 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     fast_dequant_matvec(g_mtp_cache.seg_w, g_mtp_cache.seg_s, g_mtp_cache.seg_b,
                         h_post, &shared_act[0], 1, g_cfg.hidden_dim, g_cfg.group_size);
     float shared_gate_score = shared_act[0];
+    mtp_trace_vector(trace_call, "gate_logits", gate_scores, g_cfg.num_experts);
+    mtp_trace_top_values(trace_call, "gate_logits", gate_scores, g_cfg.num_experts);
+    mtp_trace_vector(trace_call, "shared_gate", shared_gate, g_cfg.shared_intermediate);
+    mtp_trace_vector(trace_call, "shared_up", shared_up, g_cfg.shared_intermediate);
 
     cpu_softmax(gate_scores, g_cfg.num_experts);
-    int expert_index = 0;
-    float expert_weight = 1.0f;
-    cpu_topk(gate_scores, g_cfg.num_experts, 1, &expert_index, &expert_weight);
-    cpu_normalize_weights(&expert_weight, 1);
+    mtp_trace_vector(trace_call, "gate_probs", gate_scores, g_cfg.num_experts);
+    mtp_trace_top_values(trace_call, "gate_probs", gate_scores, g_cfg.num_experts);
+    int mtp_k = g_mtp_active_experts;
+    if (mtp_k < 1) mtp_k = 1;
+    if (mtp_k > g_cfg.num_experts) mtp_k = g_cfg.num_experts;
+    if (mtp_k > 16) mtp_k = 16;
+    int expert_indices[16] = {0};
+    float expert_weights[16] = {0};
+    cpu_topk(gate_scores, g_cfg.num_experts, mtp_k, expert_indices, expert_weights);
+    cpu_normalize_weights(expert_weights, mtp_k);
+    for (int i = 0; i < mtp_k - 1; i++) {
+        for (int j = i + 1; j < mtp_k; j++) {
+            if (expert_weights[j] > expert_weights[i]) {
+                float w = expert_weights[i];
+                expert_weights[i] = expert_weights[j];
+                expert_weights[j] = w;
+                int e = expert_indices[i];
+                expert_indices[i] = expert_indices[j];
+                expert_indices[j] = e;
+            }
+        }
+    }
+    int expert_index = expert_indices[0];
+    if (g_mtp_trace_enabled) {
+        char selected[512];
+        size_t off = (size_t)snprintf(selected, sizeof(selected),
+                                      "[mtp-trace] call=%llu mtp_active_experts=%d selected",
+                                      (unsigned long long)trace_call, mtp_k);
+        for (int k = 0; k < mtp_k; k++) {
+            if (off >= sizeof(selected)) break;
+            int wrote = snprintf(selected + off, sizeof(selected) - off,
+                                 " %d:%.6f", expert_indices[k], expert_weights[k]);
+            if (wrote < 0 || (size_t)wrote >= sizeof(selected) - off) break;
+            off += (size_t)wrote;
+        }
+        server_log_errorf("%s\n", selected);
+    }
 
     char packed_path[PATH_MAX];
-    snprintf(packed_path, sizeof(packed_path), "%s/flashchat/packed_mtp_experts/layer_00.bin", model_path);
+    snprintf(packed_path, sizeof(packed_path), "%s/layer_00.bin", g_flashchat_mtp_experts_dir);
     int fd = open(packed_path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "[mtp] forward failed: cannot open %s: %s\n", packed_path, strerror(errno));
@@ -1210,21 +1387,24 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     }
     size_t esz = active_expert_size();
     void *expert_data = malloc(esz);
-    if (!expert_data) {
+    float *eg = calloc(g_cfg.moe_intermediate, sizeof(float));
+    float *eu = calloc(g_cfg.moe_intermediate, sizeof(float));
+    float *ea = calloc(g_cfg.moe_intermediate, sizeof(float));
+    float *eo = calloc(g_cfg.hidden_dim, sizeof(float));
+    if (!expert_data || !eg || !eu || !ea || !eo) {
         close(fd);
+        free(expert_data); free(eg); free(eu); free(ea); free(eo);
         fprintf(stderr, "[mtp] forward failed: expert allocation failure\n");
         goto cleanup;
     }
-    ssize_t nread = pread(fd, expert_data, esz, (off_t)expert_index * esz);
-    close(fd);
-    if (nread != (ssize_t)esz) {
-        memset(expert_data, 0, esz);
-        expert_index = 0;
-        fd = open(packed_path, O_RDONLY);
-        nread = fd >= 0 ? pread(fd, expert_data, esz, 0) : -1;
-        if (fd >= 0) close(fd);
-    }
-    if (nread == (ssize_t)esz) {
+    for (int k = 0; k < mtp_k; k++) {
+        int eidx = expert_indices[k];
+        ssize_t nread = pread(fd, expert_data, esz, (off_t)eidx * (off_t)esz);
+        if (nread != (ssize_t)esz) {
+            fprintf(stderr, "[mtp] forward warning: expert %d read failed (%zd/%zu)\n",
+                    eidx, nread, esz);
+            continue;
+        }
         uint32_t *gw = (uint32_t *)expert_data;
         uint16_t *gs_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size);
         uint16_t *gb_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size);
@@ -1234,29 +1414,35 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         uint32_t *dw = (uint32_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size);
         uint16_t *ds_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size);
         uint16_t *db_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size);
-        float *eg = calloc(g_cfg.moe_intermediate, sizeof(float));
-        float *eu = calloc(g_cfg.moe_intermediate, sizeof(float));
-        float *ea = calloc(g_cfg.moe_intermediate, sizeof(float));
-        float *eo = calloc(g_cfg.hidden_dim, sizeof(float));
-        if (eg && eu && ea && eo) {
-            cpu_dequant_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-            cpu_dequant_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-            cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
-            cpu_dequant_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
-            cpu_vec_madd(moe_out, eo, expert_weight, g_cfg.hidden_dim);
+        cpu_dequant_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+        cpu_dequant_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+        cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
+        cpu_dequant_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
+        if (g_mtp_trace_enabled && k == 0) {
+            mtp_trace_vector(trace_call, "expert0_gate", eg, g_cfg.moe_intermediate);
+            mtp_trace_vector(trace_call, "expert0_up", eu, g_cfg.moe_intermediate);
+            mtp_trace_vector(trace_call, "expert0_act", ea, g_cfg.moe_intermediate);
+            mtp_trace_vector(trace_call, "expert0_down", eo, g_cfg.hidden_dim);
         }
-        free(eg); free(eu); free(ea); free(eo);
+        cpu_vec_madd(moe_out, eo, expert_weights[k], g_cfg.hidden_dim);
     }
+    close(fd);
     free(expert_data);
+    free(eg); free(eu); free(ea); free(eo);
+    mtp_trace_vector(trace_call, "moe_out", moe_out, g_cfg.hidden_dim);
 
     cpu_swiglu(shared_gate, shared_up, shared_act, g_cfg.shared_intermediate);
+    mtp_trace_vector(trace_call, "shared_act", shared_act, g_cfg.shared_intermediate);
     fast_dequant_matvec(g_mtp_cache.sd_w, g_mtp_cache.sd_s, g_mtp_cache.sd_b,
                         shared_act, shared_out, g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
     float shared_weight = cpu_sigmoid(shared_gate_score);
+    mtp_trace_vector(trace_call, "shared_out", shared_out, g_cfg.hidden_dim);
     for (int i = 0; i < g_cfg.hidden_dim; i++) {
         x[i] = x[i] + moe_out[i] + shared_out[i] * shared_weight;
     }
     cpu_rms_norm(x, g_mtp_cache.norm_w, final_normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+    mtp_trace_vector(trace_call, "final_residual", x, g_cfg.hidden_dim);
+    mtp_trace_vector(trace_call, "final_norm", final_normed, g_cfg.hidden_dim);
 
     float fc_rms = vec_rms(residual, g_cfg.hidden_dim);
     float layer_rms = vec_rms(x, g_cfg.hidden_dim);
@@ -1277,6 +1463,8 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         float *logits = calloc(g_cfg.vocab_size, sizeof(float));
         if (logits) {
             lm_head_forward(wf, final_normed, logits);
+            mtp_trace_vector(trace_call, "logits", logits, g_cfg.vocab_size);
+            mtp_trace_top_values(trace_call, "logits", logits, g_cfg.vocab_size);
             int draft_token = cpu_argmax(logits, g_cfg.vocab_size);
             if (out_draft_token) {
                 *out_draft_token = draft_token;
@@ -1355,6 +1543,11 @@ static int mtp_shadow_draft_token(WeightFile *wf, const char *model_path,
     }
 
     embed_lookup(wf, accepted_token, embedding);
+    if (g_mtp_trace_enabled) {
+        server_log_errorf("[mtp-trace] call=%llu shadow accepted_token=%d mtp_kv_len=%d\n",
+                          (unsigned long long)(g_mtp_trace_call + 1),
+                          accepted_token, g_mtp_kv_len);
+    }
     int draft_token = -1;
     int rc = mtp_forward(wf, model_path, backbone_hidden, embedding, mtp_hidden, &draft_token, 0);
     free(embedding);
@@ -1566,15 +1759,21 @@ static int g_tokenizer_loaded = 0;
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
     
+    const char *env_weights_dir = getenv("FLASHCHAT_WEIGHTS_DIR");
     const char *env_model_path = getenv("FLASHCHAT_MODEL_PATH");
+    char runtime_vocab_fc[1024];
     char model_vocab_fc[1024];
     char model_vocab[1024];
+    if (env_weights_dir) {
+        snprintf(runtime_vocab_fc, sizeof(runtime_vocab_fc), "%s/vocab.bin", env_weights_dir);
+    }
     if (env_model_path) {
         snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/vocab.bin", env_model_path);
         snprintf(model_vocab, sizeof(model_vocab), "%s/vocab.bin", env_model_path);
     }
     
     const char *paths[] = {
+        env_weights_dir ? runtime_vocab_fc : NULL,
         env_model_path ? model_vocab_fc : NULL,
         env_model_path ? model_vocab : NULL,
         "tokenizer.bin",
@@ -4401,10 +4600,11 @@ static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int pac
 
 // Stage 3 unit test: moe_block_2 must match two independent moe_block_1 calls.
 static int mtp_bench_moe(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-moe] requires GPU\n"); return 1; }
     int layer = 0, H = g_cfg.hidden_dim;
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
     int fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "[mtp-moe] cannot open %s\n", path); return 1; }
 
@@ -4452,6 +4652,7 @@ static void linear_attention_forward(WeightFile *wf, int layer_idx, float *hidde
 // for one layer on identical input. If they diverge, a batched forward built from
 // the reference blocks would produce different tokens than normal decode.
 static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vlayer] requires GPU\n"); return 1; }
     int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
     int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
@@ -4464,7 +4665,7 @@ static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
     for (int t = 0; t < 2; t++) {
         int layer = layers[t]; int is_full = (t == 0);
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+        snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
         int fd = open(path, O_RDONLY);
         if (fd < 0) { fprintf(stderr, "[mtp-vlayer] cannot open %s\n", path); rc = 1; continue; }
         struct stat st; void *mm = MAP_FAILED;
@@ -4513,11 +4714,12 @@ static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
 // isolates GPU-attention vs CPU-attention numerics. If MATCH, 4d-ii's full-attn layers
 // can reuse attn_block_2 + moe_block_2.
 static int mtp_verify_deep(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-deep] requires GPU\n"); return 1; }
     int Hd = g_cfg.hidden_dim, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, K = g_cfg.num_experts_per_tok;
     int layer = g_cfg.full_attn_interval - 1;   // first full-attention layer (uses GPU attn at len>=32)
     int P = 40, cap = 128;
-    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
     int fd = open(path, O_RDONLY);
     void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 
@@ -4557,11 +4759,12 @@ static int mtp_verify_deep(WeightFile *wf, const char *model_path) {
 // (buf_delta_state[li]/buf_conv_state[li]); snapshot after prefix, run oracle
 // (2 sequential production forwards), restore, run linear_block_2 (a->b) + MoE.
 static int mtp_verify_linear(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vlin] requires GPU delta-net\n"); return 1; }
     int Hd = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
     int layer = 0, li = layer - (layer + 1) / g_cfg.full_attn_interval;  // layer 0 is linear, li=0
     size_t dsz = 64*128*128*sizeof(float), csz = 3*12288*sizeof(float);
-    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, layer);
+    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
     int fd = open(path, O_RDONLY);
     void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
     LinearAttnState *dummy = linear_attn_state_new();
@@ -4702,6 +4905,7 @@ static void backbone_forward_2(WeightFile *wf, float *ha, float *hb,
 // 4b validation: backbone_forward_2 must equal two reference single forwards
 // (same CPU blocks, just batched), on fresh caches at positions 0 and 1.
 static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vfwd] requires GPU\n"); return 1; }
     int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     int L = g_cfg.num_layers;
@@ -4710,7 +4914,7 @@ static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
     KVCache **kvr = calloc(L, sizeof(KVCache*)), **kvb = calloc(L, sizeof(KVCache*));
     LinearAttnState **lsr = calloc(L, sizeof(LinearAttnState*)), **lsb = calloc(L, sizeof(LinearAttnState*));
     for (int i = 0; i < L; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
         fds[i] = open(p, O_RDONLY);
         int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
         if (is_full) {
@@ -4757,6 +4961,7 @@ static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
 // [t_next@P, draft@P+1], rolling back must leave the state identical to having
 // processed only t_next@P (a single forward). Otherwise rejects corrupt output.
 static int mtp_verify_rollback(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vroll] requires GPU\n"); return 1; }
     int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     int Ld = g_cfg.num_layers;
@@ -4765,7 +4970,7 @@ static int mtp_verify_rollback(WeightFile *wf, const char *model_path) {
     LinearAttnState **lsv = calloc(Ld, sizeof(LinearAttnState*)), **lsg = calloc(Ld, sizeof(LinearAttnState*));
     int cap = 64;
     for (int i = 0; i < Ld; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
         fds[i] = open(p, O_RDONLY);
         if (((i + 1) % g_cfg.full_attn_interval) == 0) {
             kvv[i] = calloc(1, sizeof(KVCache)); kvv[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float)); kvv[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
@@ -4835,7 +5040,7 @@ static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
     LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
     int cap = 8192;
     for (int i = 0; i < Ld; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
         fds[i] = open(p, O_RDONLY);
         if (((i + 1) % g_cfg.full_attn_interval) == 0) {
             kv[i] = calloc(1, sizeof(KVCache));
@@ -5011,17 +5216,18 @@ static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
 // forwards (prod_forward_1) over ALL layers at decode positions — the end-to-end
 // faithfulness check that catches fp compounding across 40 layers.
 static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vf2] requires GPU\n"); return 1; }
     int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads*g_cfg.head_dim, Ld = g_cfg.num_layers, K = g_cfg.num_experts_per_tok;
     int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld,sizeof(void*));
     KVCache **kv = calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld,sizeof(LinearAttnState*));
     int cap = 256;
-    for (int i=0;i<Ld;i++){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/flashchat/packed_experts/layer_%02d.bin",model_path,i); fds[i]=open(p,O_RDONLY);
+    for (int i=0;i<Ld;i++){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/layer_%02d.bin",g_flashchat_experts_dir,i); fds[i]=open(p,O_RDONLY);
         if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} }
         if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)cap*kv_dim,sizeof(float)); }
         else ls[i]=linear_attn_state_new(); }
     float *h=malloc(Hd*sizeof(float)), *scratch=malloc(V*sizeof(float));
-    int P=35;
+    int P = getenv("MTP_VF2_P") ? atoi(getenv("MTP_VF2_P")) : 35;  // <32 => production uses CPU attn too
     reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
     for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++) h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
     GpuStateSnap snap; gpu_snap_alloc(&snap); gpu_snap_save(&snap, kv);
@@ -5084,7 +5290,7 @@ static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new)
     int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld, sizeof(void*));
     KVCache **kv = calloc(Ld, sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
     for (int i = 0; i < Ld; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
         fds[i] = open(p, O_RDONLY); mmaps[i] = NULL;
         if (fds[i] >= 0) { struct stat st; if (fstat(fds[i], &st)==0 && st.st_size>0){ void *m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m; } }
         if (((i + 1) % g_cfg.full_attn_interval) == 0) { kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); }
@@ -5330,6 +5536,7 @@ static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv
 // Depth-N faithfulness: fused_dense_forward_N (N positions) must argmax-match N
 // sequential production forwards. Validates the N-generalized dense layer.
 static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
+    (void)model_path;
     if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts!=0) { fprintf(stderr,"[mtp-vfN] requires dense GPU\n"); return 1; }
     int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4, N=4;
     int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
@@ -12608,6 +12815,10 @@ int main(int argc, char **argv) {
         const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
         const char *env_system_prompt_cache_max_entries = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES");
         const char *env_mtp = getenv("FLASHCHAT_MTP");
+        const char *env_mtp_active_experts = getenv("FLASHCHAT_MTP_ACTIVE_EXPERTS");
+        const char *env_mtp_trace = getenv("FLASHCHAT_MTP_TRACE");
+        const char *env_mtp_trace_top = getenv("FLASHCHAT_MTP_TRACE_TOP");
+        const char *env_mtp_trace_dir = getenv("FLASHCHAT_MTP_TRACE_DIR");
         if (env_temperature && env_temperature[0]) g_default_temperature = strtof(env_temperature, NULL);
         if (env_top_p && env_top_p[0]) g_default_top_p = strtof(env_top_p, NULL);
         if (env_top_k && env_top_k[0]) g_default_top_k = atoi(env_top_k);
@@ -12647,6 +12858,18 @@ int main(int argc, char **argv) {
         }
         if (env_mtp && env_mtp[0]) {
             g_mtp_predictions = parse_mtp_predictions(env_mtp);
+        }
+        if (env_mtp_active_experts && env_mtp_active_experts[0]) {
+            g_mtp_active_experts = atoi(env_mtp_active_experts);
+        }
+        if (env_mtp_trace && env_mtp_trace[0]) {
+            g_mtp_trace_enabled = server_flag_enabled(env_mtp_trace);
+        }
+        if (env_mtp_trace_top && env_mtp_trace_top[0]) {
+            g_mtp_trace_topn = atoi(env_mtp_trace_top);
+        }
+        if (env_mtp_trace_dir && env_mtp_trace_dir[0]) {
+            snprintf(g_mtp_trace_dir, sizeof(g_mtp_trace_dir), "%s", env_mtp_trace_dir);
         }
 
         // Also try to read config from ~/.config/flashchat/config if env vars not set
@@ -12887,6 +13110,29 @@ int main(int argc, char **argv) {
                     g_mtp_predictions, g_cfg.mtp_max_predictions);
             g_mtp_predictions = g_cfg.mtp_max_predictions;
         }
+        if (g_mtp_active_experts < 1) {
+            g_mtp_active_experts = 1;
+        }
+        if (g_cfg.num_experts > 0 && g_mtp_active_experts > g_cfg.num_experts) {
+            g_mtp_active_experts = g_cfg.num_experts;
+        }
+        if (g_mtp_active_experts > 16) {
+            fprintf(stderr, "[mtp] requested MTP active experts exceeds diagnostic cap 16; clamping\n");
+            g_mtp_active_experts = 16;
+        }
+        if (g_mtp_trace_topn < 1) g_mtp_trace_topn = 1;
+        if (g_mtp_trace_topn > 32) g_mtp_trace_topn = 32;
+        if (env_mtp_active_experts && env_mtp_active_experts[0]) {
+            fprintf(stderr, "[mtp] MTP layer active_experts=%d (production active_experts=%d)\n",
+                    g_mtp_active_experts, g_cfg.num_experts_per_tok);
+        }
+        if (g_mtp_trace_enabled) {
+            fprintf(stderr, "[mtp-trace] enabled top=%d%s%s\n",
+                    g_mtp_trace_topn,
+                    g_mtp_trace_dir[0] ? " dir=" : "",
+                    g_mtp_trace_dir[0] ? g_mtp_trace_dir : "");
+        }
+        configure_flashchat_artifact_dirs(model_path);
 
         // K (active experts per token) defaults to the model's num_experts_per_tok
         // from config — i.e. exactly what the model was trained with. Previously
@@ -12927,17 +13173,17 @@ int main(int argc, char **argv) {
 
         if (!weights_path) {
             snprintf(default_weights, sizeof(default_weights),
-                     "%s/flashchat/model_weights.bin", model_path);
+                     "%s/model_weights.bin", g_flashchat_weights_dir);
             weights_path = default_weights;
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
-                     "%s/flashchat/model_weights.json", model_path);
+                     "%s/model_weights.json", g_flashchat_weights_dir);
             manifest_path = default_manifest;
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
-                     "%s/flashchat/vocab.bin", model_path);
+                     "%s/vocab.bin", g_flashchat_weights_dir);
             vocab_path = default_vocab;
         }
 
@@ -13125,7 +13371,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < g_cfg.num_layers; i++) {
             char path[1024];
-            snprintf(path, sizeof(path), "%s/flashchat/packed_experts/layer_%02d.bin", model_path, i);
+            snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
             layer_fds[i] = open(path, O_RDONLY);
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
@@ -13154,12 +13400,12 @@ int main(int argc, char **argv) {
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
             char lz4_probe[1024];
-            snprintf(lz4_probe, sizeof(lz4_probe), "%s/flashchat/packed_experts_lz4/layer_00.bin", model_path);
+            snprintf(lz4_probe, sizeof(lz4_probe), "%s/layer_00.bin", g_flashchat_lz4_experts_dir);
             if (access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < g_cfg.num_layers; i++) {
                     char lz4_path[1024];
-                    snprintf(lz4_path, sizeof(lz4_path), "%s/flashchat/packed_experts_lz4/layer_%02d.bin", model_path, i);
+                    snprintf(lz4_path, sizeof(lz4_path), "%s/layer_%02d.bin", g_flashchat_lz4_experts_dir, i);
                     int lz4_fd = open(lz4_path, O_RDONLY);
                     if (lz4_fd >= 0) {
                         // Load index header (512 entries × 16 bytes = 8KB)
