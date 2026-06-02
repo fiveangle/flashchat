@@ -94,7 +94,7 @@ def main():
     parser.add_argument("--model", type=str, default=None,
                         help="Path to model directory (default: auto-detect from HF cache)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output directory for model_weights.bin and .json (default: MODEL_PATH/flashchat)")
+                        help="Output directory for model_weights.bin and .json (default: MODEL_PATH/flashchat/q<bits>)")
     parser.add_argument("--include-experts", action="store_true",
                         help="Also extract expert weights (huge, not recommended)")
     args = parser.parse_args()
@@ -105,7 +105,8 @@ def main():
     if args.output:
         output_dir = Path(args.output)
     else:
-        output_dir = model_path / "flashchat"
+        bits = int(entry.get("quantization", {}).get("bits", 4) or 4)
+        output_dir = model_path / "flashchat" / f"q{bits}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = model_path / "model.safetensors.index.json"

@@ -61,7 +61,7 @@ Computes three critical paths from the loaded config:
 | Variable | Computation | Example Value |
 |---|---|---|
 | `MODEL_PATH` | `_flashchat_detect_model_path(MODEL_REPO)` → scans `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`, picks latest | `/Users/.../snapshots/abc123` |
-| `WEIGHTS_DIR` | `flashchat_model_runtime_dir(MODEL, MODEL_PATH)` (or `FLASHCHAT_WEIGHTS_DIR` env override). Native non-4-bit variants use `$MODEL_PATH/flashchat/q<bits>`; other models use `$MODEL_PATH/flashchat` | `/Users/.../snapshots/abc123/flashchat/q8` |
+| `WEIGHTS_DIR` | `flashchat_model_runtime_dir(MODEL, MODEL_PATH)` (or `FLASHCHAT_WEIGHTS_DIR` env override). Runtime artifacts use `$MODEL_PATH/flashchat/q<bits>` for every supported quant variant. | `/Users/.../snapshots/abc123/flashchat/q8` |
 | `EXPERTS_DIR` | `$WEIGHTS_DIR/packed_experts` | `/Users/.../snapshots/abc123/flashchat/q8/packed_experts` |
 
 `_flashchat_detect_model_path()` — lib/config.sh:252:
@@ -107,7 +107,7 @@ ensure_setup(force=0)
   │       if expert_index.json is missing or points at a stale model path:
   │         run_python scripts/generate_expert_index.py --model <PATH> --output <WEIGHTS_DIR>
   │         → scans model.safetensors.index.json, writes expert → (shard, offset, size) mapping
-  │       run_python scripts/repack_experts.py --model-id <MODEL> --index <expert_index.json>
+  │       run_python scripts/repack_experts.py --model-id <MODEL> --index <expert_index.json> --output <EXPERTS_DIR>
   │       → produces: packed_experts/layer_XX.bin (and packed_mtp_experts/ for native MTP MoE models)
   │
   ├─ [F] Save Config              flashchat:1879-1905
@@ -263,14 +263,15 @@ After a successful `ensure_setup()`, the following directories and files exist:
         model.safetensors.index.json   # tensor → shard mapping
         tokenizer.json                 # BPE tokenizer
         flashchat/
-          model_weights.bin            # non-expert weights (~5.5GB)
-          model_weights.json           # tensor manifest
-          vocab.bin                    # tokenizer vocab (~8MB)
-          expert_index.json            # expert → safetensors mapping
-          packed_experts/
-            layer_00.bin .. layer_59.bin  # expert weights (~218GB for 397B)
-          packed_mtp_experts/          # native MoE MTP expert weights when supported
-          q8/                           # native 8-bit runtime variant for the same snapshot
+          q4/                          # 4-bit runtime variant
+            model_weights.bin          # non-expert weights (~5.5GB)
+            model_weights.json         # tensor manifest
+            vocab.bin                  # tokenizer vocab (~8MB)
+            expert_index.json          # expert → safetensors mapping
+            packed_experts/
+              layer_00.bin .. layer_59.bin  # expert weights (~218GB for 397B)
+            packed_mtp_experts/        # native MoE MTP expert weights when supported
+          q8/                          # 8-bit runtime variant when supported
 
 <project>/metal_infer/
   .venv/                          # Python venv with numpy

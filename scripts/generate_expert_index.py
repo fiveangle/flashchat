@@ -40,14 +40,14 @@ def main():
                         help='Path to model directory (or set FLASHCHAT_MODEL_PATH)')
     parser.add_argument('--output', type=str,
                         default=None,
-                        help='Output directory (default: MODEL_PATH/flashchat)')
+                        help='Output directory (default: MODEL_PATH/flashchat/q4)')
     args = parser.parse_args()
     
     model_path = Path(args.model)
     if args.output:
         output_dir = Path(args.output)
     else:
-        output_dir = model_path / 'flashchat'
+        output_dir = model_path / 'flashchat' / 'q4'
     output_dir.mkdir(parents=True, exist_ok=True)
     
     index_path = model_path / 'model.safetensors.index.json'

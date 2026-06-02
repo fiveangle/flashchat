@@ -299,16 +299,11 @@ flashchat_model_path_for_id() {
 flashchat_model_runtime_dir() {
     local model_id="$1"
     local model_path="$2"
-    local source_format bits
+    local bits
     [ -n "$model_path" ] || return 1
-    source_format=$(flashchat_model_field "$model_id" "source_format")
     bits=$(flashchat_model_quant_bits "$model_id")
     bits="${bits:-4}"
-    if [ "$source_format" = "native_bf16" ] && [ "$bits" != "4" ]; then
-        echo "${model_path}/flashchat/q${bits}"
-    else
-        echo "${model_path}/flashchat"
-    fi
+    echo "${model_path}/flashchat/q${bits}"
 }
 
 flashchat_list_models() {

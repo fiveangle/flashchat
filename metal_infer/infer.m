@@ -507,7 +507,8 @@ static void configure_flashchat_artifact_dirs(const char *model_path) {
     if (env_weights_dir && env_weights_dir[0]) {
         snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s", env_weights_dir);
     } else {
-        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s/flashchat", model_path);
+        int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s/flashchat/q%d", model_path, bits);
     }
     if (env_experts_dir && env_experts_dir[0]) {
         snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s", env_experts_dir);
@@ -1824,16 +1825,20 @@ static void init_tokenizer(void) {
     char runtime_vocab_fc[1024];
     char model_vocab_fc[1024];
     char model_vocab[1024];
-    if (env_weights_dir) {
-        snprintf(runtime_vocab_fc, sizeof(runtime_vocab_fc), "%s/vocab.bin", env_weights_dir);
+    const char *weights_dir = (env_weights_dir && env_weights_dir[0])
+        ? env_weights_dir
+        : (g_flashchat_weights_dir[0] ? g_flashchat_weights_dir : NULL);
+    if (weights_dir) {
+        snprintf(runtime_vocab_fc, sizeof(runtime_vocab_fc), "%s/vocab.bin", weights_dir);
     }
     if (env_model_path) {
-        snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/vocab.bin", env_model_path);
+        int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+        snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/q%d/vocab.bin", env_model_path, bits);
         snprintf(model_vocab, sizeof(model_vocab), "%s/vocab.bin", env_model_path);
     }
     
     const char *paths[] = {
-        env_weights_dir ? runtime_vocab_fc : NULL,
+        weights_dir ? runtime_vocab_fc : NULL,
         env_model_path ? model_vocab_fc : NULL,
         env_model_path ? model_vocab : NULL,
         "tokenizer.bin",
@@ -11581,7 +11586,8 @@ static int system_prompt_cache_dir(const char *model_path, char *out, size_t out
         snprintf(out, out_sz, "%s/system_prompt_cache", g_flashchat_weights_dir);
         return 0;
     }
-    snprintf(out, out_sz, "%s/flashchat/system_prompt_cache", model_path);
+    int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+    snprintf(out, out_sz, "%s/flashchat/q%d/system_prompt_cache", model_path, bits);
     return 0;
 }
 
@@ -12514,6 +12520,10 @@ cleanup:
     if (system_prompt_cache_path(tmp_dir, hash, path, sizeof(path)) == 0) unlink(path);
     char dir[PATH_MAX];
     if (system_prompt_cache_dir(tmp_dir, dir, sizeof(dir)) == 0) rmdir(dir);
+    char runtime_dir[PATH_MAX];
+    int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+    snprintf(runtime_dir, sizeof(runtime_dir), "%s/flashchat/q%d", tmp_dir, bits);
+    rmdir(runtime_dir);
     char fc_dir[PATH_MAX];
     snprintf(fc_dir, sizeof(fc_dir), "%s/flashchat", tmp_dir);
     rmdir(fc_dir);

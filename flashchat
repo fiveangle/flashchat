@@ -2932,7 +2932,7 @@ prompt_extract_experts() {
             cmd+=(--mtp-experts)
         fi
     else
-        cmd+=(--index "$expert_index_path")
+        cmd+=(--index "$expert_index_path" --output "$(flashchat_get EXPERTS_DIR)")
     fi
     if ! run_python "${cmd[@]}"; then
         echo "ERROR: $quant_label expert extraction failed."
@@ -3599,10 +3599,7 @@ cmd_serve() {
     
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
-    # Pass the resolved runtime dirs so the server loads the right bit-width build.
-    # Without these the engine defaults to MODEL_PATH/flashchat, which is wrong for
-    # non-4-bit models whose artifacts live in flashchat/q{bits} (e.g. q8) -> it would
-    # load the wrong/absent vocab+weights and fail ("tokenization failed").
+    # Pass the resolved runtime dirs so the server loads the selected quant variant.
     export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     export FLASHCHAT_SERVER_PORT="$server_port"

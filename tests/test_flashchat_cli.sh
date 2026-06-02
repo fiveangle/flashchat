@@ -341,7 +341,7 @@ run_test_contains "serve stop force (not running)" "No server running." "$FLASHC
 run_test_contains "serve stop external (not running)" "No server running." "$FLASHCHAT" serve --stop --external
 
 RESTART_MODEL_ROOT="${TMPDIR}/restart-model"
-RESTART_RUNTIME="${RESTART_MODEL_ROOT}/flashchat"
+RESTART_RUNTIME="${RESTART_MODEL_ROOT}/flashchat/q4"
 RESTART_CONFIG="${TMPDIR}/restart_config"
 mkdir -p "$RESTART_RUNTIME"
 : > "${RESTART_RUNTIME}/model_weights.bin"

@@ -394,7 +394,7 @@ def main():
     parser = argparse.ArgumentParser(description="Compile native Qwen BF16 checkpoints for Flashchat")
     parser.add_argument("--model-id", required=True, help="Registry model id to use for dimensions")
     parser.add_argument("--model", required=True, help="Path to native BF16 model snapshot")
-    parser.add_argument("--output", default=None, help="Output directory (default: MODEL/flashchat)")
+    parser.add_argument("--output", default=None, help="Output directory (default: MODEL/flashchat/q<bits>)")
     parser.add_argument("--layers", default=None, help='Expert layers to compile, e.g. "0", "0-3", "all"')
     parser.add_argument("--non-experts", action="store_true", help="Compile non-expert model_weights artifacts")
     parser.add_argument("--experts", action="store_true", help="Compile routed expert packed layer artifacts")
@@ -413,13 +413,8 @@ def main():
     entry = get_model_entry(args.model_id)
     model_path = Path(args.model)
     native_config = native_text_config(model_path)
-    # Bits-aware default runtime dir, matching flashchat_model_runtime_dir() in lib/config.sh:
-    # 4-bit stays at "flashchat" (back-compat); other bit-widths nest under "flashchat/q{bits}"
-    # so a 4-bit and 8-bit build of the SAME HF snapshot don't clobber each other or get
-    # cross-loaded (the engine reads cfg->bits from the registry; mismatched on-disk experts
-    # => garbage).
     _bits = int(entry.get("quantization", {}).get("bits", 4) or 4)
-    _default_out = model_path / "flashchat" if _bits == 4 else model_path / "flashchat" / f"q{_bits}"
+    _default_out = model_path / "flashchat" / f"q{_bits}"
     output_dir = Path(args.output) if args.output else _default_out
     index_path = model_path / "model.safetensors.index.json"
     if not index_path.exists():

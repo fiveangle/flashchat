@@ -69,7 +69,7 @@ test -f "$OUT/mtp-experts/packed_mtp_experts/layer_00.bin"
 python3 scripts/compile_native_qwen.py \
     --model-id "$MODEL_ID" \
     --model "$MODEL" \
-    --output "$OUT/mtp-preflight/flashchat" \
+    --output "$OUT/mtp-preflight/flashchat/q4" \
     --non-experts \
     --include-mtp \
     --name-regex '^mtp\.'
@@ -77,7 +77,7 @@ python3 scripts/compile_native_qwen.py \
 python3 scripts/compile_native_qwen.py \
     --model-id "$MODEL_ID" \
     --model "$MODEL" \
-    --output "$OUT/mtp-preflight/flashchat" \
+    --output "$OUT/mtp-preflight/flashchat/q4" \
     --mtp-experts \
     --layers 0 \
     --max-experts 1
@@ -85,8 +85,8 @@ python3 scripts/compile_native_qwen.py \
 ./metal_infer/infer \
     --model-id "$MODEL_ID" \
     --model "$OUT/mtp-preflight" \
-    --weights "$OUT/mtp-preflight/flashchat/model_weights.bin" \
-    --manifest "$OUT/mtp-preflight/flashchat/model_weights.json" \
+    --weights "$OUT/mtp-preflight/flashchat/q4/model_weights.bin" \
+    --manifest "$OUT/mtp-preflight/flashchat/q4/model_weights.json" \
     --mtp-preflight \
     >/tmp/flashchat-mtp-preflight.out \
     2>/tmp/flashchat-mtp-preflight.err

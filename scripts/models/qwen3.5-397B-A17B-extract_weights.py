@@ -61,7 +61,7 @@ def main():
                         help='Path to model directory (or set FLASHCHAT_MODEL_PATH)')
     parser.add_argument('--output', type=str,
                         default=os.environ.get('FLASHCHAT_WEIGHTS_DIR') or None,
-                        help='Output directory for model_weights.bin and .json (default: MODEL_PATH/flashchat)')
+                        help='Output directory for model_weights.bin and .json (default: MODEL_PATH/flashchat/q4)')
     parser.add_argument('--include-experts', action='store_true',
                         help='Also extract expert weights (huge, not recommended)')
     args = parser.parse_args()
@@ -70,7 +70,7 @@ def main():
     if args.output:
         output_dir = Path(args.output)
     else:
-        output_dir = model_path / 'flashchat'
+        output_dir = model_path / 'flashchat' / 'q4'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load the weight index

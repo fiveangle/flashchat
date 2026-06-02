@@ -292,6 +292,8 @@ def main():
     parser.add_argument("--index",
                         default=get_default_index_path(),
                         help="Path to expert_index.json (default: auto-detect from model path)")
+    parser.add_argument("--output", default=os.environ.get("FLASHCHAT_EXPERTS_DIR"),
+                        help="Output directory for packed expert layer files (default: MODEL_PATH/flashchat/q<bits>/packed_experts)")
     parser.add_argument("--layers", default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
     parser.add_argument("--dry-run", action="store_true",
@@ -307,6 +309,7 @@ def main():
     num_experts = entry["num_experts"]
     quant = entry.get("quantization", {})
     gs = quant.get("group_size", 64)
+    bits = int(quant.get("bits", 4) or 4)
 
     components = build_components(entry)
     expert_size = sum(c["size"] for c in components)
@@ -324,11 +327,11 @@ def main():
     else:
         hf_repo = entry["hf_repo"]
         model_path_detected = detect_model_path(hf_repo)
-        index_path = os.path.join(model_path_detected, "flashchat", "expert_index.json")
+        index_path = os.path.join(model_path_detected, "flashchat", f"q{bits}", "expert_index.json")
 
     if not args.index and not os.path.exists(index_path):
         print(f"ERROR: expert_index.json not found at {index_path}")
-        print("Generate it first: python scripts/generate_expert_index.py --model <path> --output <path>/flashchat")
+        print("Generate it first: python scripts/generate_expert_index.py --model <path> --output <path>/flashchat/q<bits>")
         sys.exit(1)
 
     print("Loading expert index...")
@@ -340,7 +343,7 @@ def main():
         print("ABORTING: component size mismatch")
         sys.exit(1)
 
-    output_dir = os.path.join(model_path, "flashchat", "packed_experts")
+    output_dir = args.output or os.path.join(model_path, "flashchat", f"q{bits}", "packed_experts")
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
 

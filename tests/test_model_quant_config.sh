@@ -42,6 +42,7 @@ helper_output=$(
         echo "native_bytes=$(flashchat_model_expert_pack_bytes Qwen-Qwen36-35B-A3B-8bit)"
         echo "native_q4_runtime=$(flashchat_model_runtime_dir Qwen-Qwen36-35B-A3B /tmp/native)"
         echo "native_q8_runtime=$(flashchat_model_runtime_dir Qwen-Qwen36-35B-A3B-8bit /tmp/native)"
+        echo "mlx_q4_runtime=$(flashchat_model_runtime_dir mlx-community-Qwen36-35B-A3B-4bit /tmp/mlx)"
         echo "mlx_q8_runtime=$(flashchat_model_runtime_dir mlx-community-Qwen36-35B-A3B-8bit /tmp/mlx)"
     '
 )
@@ -64,8 +65,8 @@ if ! echo "$helper_output" | grep -q '^native_bytes=34225520640$'; then
     echo "$helper_output" >&2
     exit 1
 fi
-if ! echo "$helper_output" | grep -q '^native_q4_runtime=/tmp/native/flashchat$'; then
-    echo "FAIL: native 4-bit runtime path should preserve the legacy flashchat directory" >&2
+if ! echo "$helper_output" | grep -q '^native_q4_runtime=/tmp/native/flashchat/q4$'; then
+    echo "FAIL: native 4-bit runtime path should use flashchat/q4" >&2
     echo "$helper_output" >&2
     exit 1
 fi
@@ -74,8 +75,13 @@ if ! echo "$helper_output" | grep -q '^native_q8_runtime=/tmp/native/flashchat/q
     echo "$helper_output" >&2
     exit 1
 fi
-if ! echo "$helper_output" | grep -q '^mlx_q8_runtime=/tmp/mlx/flashchat$'; then
-    echo "FAIL: prequantized MLX runtime path should remain snapshot-local flashchat" >&2
+if ! echo "$helper_output" | grep -q '^mlx_q4_runtime=/tmp/mlx/flashchat/q4$'; then
+    echo "FAIL: MLX 4-bit runtime path should use flashchat/q4" >&2
+    echo "$helper_output" >&2
+    exit 1
+fi
+if ! echo "$helper_output" | grep -q '^mlx_q8_runtime=/tmp/mlx/flashchat/q8$'; then
+    echo "FAIL: MLX 8-bit runtime path should use flashchat/q8" >&2
     echo "$helper_output" >&2
     exit 1
 fi

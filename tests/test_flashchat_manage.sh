@@ -279,10 +279,10 @@ output=$(run_manage "${MODEL_ID}\n1\n${MODEL_ID}\nq\n")
 assert_contains "runtime-ready blob removal succeeds" "Original blobs removed" "$output"
 assert_not_exists "blob link removed" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 assert_not_exists "blob target removed" "${LOCAL_REPO}/blobs/blob1"
-assert_exists "runtime remains after blob removal" "${LOCAL_SNAPSHOT}/flashchat/model_weights.bin"
+assert_exists "runtime remains after blob removal" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/model_weights.bin"
 
 reset_storage
-rm -f "${LOCAL_SNAPSHOT}/flashchat/packed_experts/layer_39.bin"
+rm -f "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/packed_experts/layer_39.bin"
 output=$(run_manage "${MODEL_ID}\n1\nq\n")
 assert_contains "incomplete runtime blocks blob removal" "runtime artifacts are complete" "$output"
 assert_exists "incomplete runtime keeps blob" "${LOCAL_REPO}/blobs/blob1"
@@ -295,15 +295,15 @@ assert_exists "offload creates offloaded repo" "$OFFLOADED_REPO"
 
 output=$(run_manage "${MODEL_ID}\n5\nq\n")
 assert_contains "runtime-only restore succeeds" "Runtime artifacts restored" "$output"
-assert_exists "runtime-only restore copies runtime" "${LOCAL_SNAPSHOT}/flashchat/model_weights.bin"
+assert_exists "runtime-only restore copies runtime" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/model_weights.bin"
 assert_not_exists "runtime-only restore does not copy safetensors" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 assert_exists "runtime-only restore leaves offload intact" "$OFFLOADED_REPO"
 
-printf "local" > "${LOCAL_SNAPSHOT}/flashchat/local-marker"
-printf "offload" > "${OFFLOADED_SNAPSHOT}/flashchat/offload-marker"
+printf "local" > "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/local-marker"
+printf "offload" > "$(runtime_dir_for "$MODEL_ID" "$OFFLOADED_SNAPSHOT")/offload-marker"
 output=$(run_manage "${MODEL_ID}\n5\nwrong-id\nq\n")
 assert_contains "runtime overwrite requires exact model ID" "Confirmation did not match" "$output"
-assert_exists "wrong runtime overwrite keeps local runtime" "${LOCAL_SNAPSHOT}/flashchat/local-marker"
+assert_exists "wrong runtime overwrite keeps local runtime" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/local-marker"
 
 output=$(run_manage "${MODEL_ID}\n4\nq\n")
 assert_contains "full reload refuses local collision" "Refusing to overwrite existing local model" "$output"

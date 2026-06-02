@@ -235,6 +235,9 @@ def main():
                         default=get_default_index_path(),
                         required=get_default_index_path() is None,
                         help='Path to expert_index.json (or set FLASHCHAT_EXPERT_INDEX)')
+    parser.add_argument('--output',
+                        default=os.environ.get('FLASHCHAT_EXPERTS_DIR') or None,
+                        help='Output directory for packed expert layer files (default: MODEL_PATH/flashchat/q4/packed_experts)')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
     parser.add_argument('--dry-run', action='store_true',
@@ -253,7 +256,7 @@ def main():
         print("ABORTING: component size mismatch")
         sys.exit(1)
 
-    output_dir = os.path.join(model_path, "flashchat", "packed_experts")
+    output_dir = args.output or os.path.join(model_path, "flashchat", "q4", "packed_experts")
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
