@@ -170,6 +170,51 @@ flashchat_model_mtp_max() {
     flashchat_model_field "$1" "mtp_max_predictions"
 }
 
+flashchat_model_quant_bits() {
+    local model_id="$1"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model = data.get('models', {}).get(sys.argv[2], {})
+quant = model.get('quantization', {})
+print(quant.get('bits', 4))
+" "$config_file" "$model_id" 2>/dev/null
+}
+
+flashchat_model_expert_pack_bytes() {
+    local model_id="$1"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+model = data.get('models', {}).get(sys.argv[2], {})
+num_experts = int(model.get('num_experts') or 0)
+layers = int(model.get('num_hidden_layers') or 0)
+if num_experts <= 0 or layers <= 0:
+    print(0)
+    sys.exit(0)
+hidden = int(model.get('hidden_size') or 0)
+moe = int(model.get('moe_intermediate_size') or 0)
+quant = model.get('quantization', {})
+bits = int(quant.get('bits', 4) or 4)
+group_size = int(quant.get('group_size', 64) or 64)
+values_per_word = 32 // bits
+gate_w = moe * (hidden // values_per_word) * 4
+gate_s = moe * (hidden // group_size) * 2
+down_w = hidden * (moe // values_per_word) * 4
+down_s = hidden * (moe // group_size) * 2
+expert_size = gate_w + gate_s + gate_s + gate_w + gate_s + gate_s + down_w + down_s + down_s
+print(expert_size * num_experts * layers)
+" "$config_file" "$model_id" 2>/dev/null
+}
+
 # Resolve the model's trained active-experts (K) from the registry. Returns
 # empty string if the field is missing — caller decides what default to use.
 flashchat_model_active_experts() {
@@ -251,6 +296,21 @@ flashchat_model_path_for_id() {
     _flashchat_detect_model_path "$repo"
 }
 
+flashchat_model_runtime_dir() {
+    local model_id="$1"
+    local model_path="$2"
+    local source_format bits
+    [ -n "$model_path" ] || return 1
+    source_format=$(flashchat_model_field "$model_id" "source_format")
+    bits=$(flashchat_model_quant_bits "$model_id")
+    bits="${bits:-4}"
+    if [ "$source_format" = "native_bf16" ] && [ "$bits" != "4" ]; then
+        echo "${model_path}/flashchat/q${bits}"
+    else
+        echo "${model_path}/flashchat"
+    fi
+}
+
 flashchat_list_models() {
     local config_file="$FLASHCHAT_MODEL_CONFIG"
     [ -f "$config_file" ] || return 1
@@ -295,15 +355,18 @@ _flashchat_detect_model_path() {
 # Compute derived paths based on config
 # -----------------------------------------------------------------------------
 _flashchat_compute_paths() {
+    local runtime_dir
     if [ -n "$MODEL_PATH" ]; then
-        WEIGHTS_DIR="${WEIGHTS_DIR:-${MODEL_PATH}/flashchat}"
-        EXPERTS_DIR="${MODEL_PATH}/flashchat/packed_experts"
+        runtime_dir=$(flashchat_model_runtime_dir "$MODEL" "$MODEL_PATH")
+        WEIGHTS_DIR="${WEIGHTS_DIR:-$runtime_dir}"
+        EXPERTS_DIR="${EXPERTS_DIR:-${WEIGHTS_DIR}/packed_experts}"
     else
         local detected_path
         detected_path=$(_flashchat_detect_model_path "$MODEL_REPO")
         MODEL_PATH="$detected_path"
-        WEIGHTS_DIR="${WEIGHTS_DIR:-${detected_path}/flashchat}"
-        EXPERTS_DIR="${detected_path}/flashchat/packed_experts"
+        runtime_dir=$(flashchat_model_runtime_dir "$MODEL" "$detected_path")
+        WEIGHTS_DIR="${WEIGHTS_DIR:-$runtime_dir}"
+        EXPERTS_DIR="${EXPERTS_DIR:-${WEIGHTS_DIR}/packed_experts}"
     fi
 }
 
@@ -620,6 +683,8 @@ export -f flashchat_model_layers
 export -f flashchat_model_default_sampling_profile
 export -f flashchat_model_mtp_default
 export -f flashchat_model_mtp_max
+export -f flashchat_model_quant_bits
+export -f flashchat_model_expert_pack_bytes
 export -f flashchat_model_sampling_profile_field
 export -f flashchat_model_sampling_profiles
 export -f flashchat_model_path_for_id

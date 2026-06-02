@@ -556,6 +556,73 @@ model_status_value() {
     fi
 }
 
+runtime_weights_match_model() {
+    local model_id="$1"
+    local runtime_dir="$2"
+    local model_config
+    model_config=$(flashchat_get MODEL_CONFIG)
+    [ -f "${runtime_dir}/model_weights.bin" ] || return 1
+    [ -f "${runtime_dir}/model_weights.json" ] || return 1
+    [ -f "$model_config" ] || return 1
+    python3 - "$model_config" "$model_id" "${runtime_dir}/model_weights.json" <<'PY'
+import json
+import sys
+
+registry_path, model_id, manifest_path = sys.argv[1:]
+with open(registry_path) as f:
+    registry = json.load(f)
+with open(manifest_path) as f:
+    manifest = json.load(f)
+expected = registry.get("models", {}).get(model_id, {}).get("quantization", {})
+actual = manifest.get("config", {}).get("quantization", {})
+expected_bits = int(expected.get("bits", 4) or 4)
+actual_bits = int(actual.get("bits", 4) or 4)
+expected_group = int(expected.get("group_size", 64) or 64)
+actual_group = int(actual.get("group_size", 64) or 64)
+sys.exit(0 if (expected_bits, expected_group) == (actual_bits, actual_group) else 1)
+PY
+}
+
+runtime_experts_match_model() {
+    local model_id="$1"
+    local runtime_dir="$2"
+    local model_config
+    model_config=$(flashchat_get MODEL_CONFIG)
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    [ "${num_experts:-0}" -gt 0 ] 2>/dev/null || return 0
+    [ -f "${runtime_dir}/packed_experts/layout.json" ] || return 1
+    [ -f "$model_config" ] || return 1
+    python3 - "$model_config" "$model_id" "${runtime_dir}/packed_experts/layout.json" <<'PY'
+import json
+import sys
+
+registry_path, model_id, layout_path = sys.argv[1:]
+with open(registry_path) as f:
+    registry = json.load(f)
+with open(layout_path) as f:
+    layout = json.load(f)
+model = registry.get("models", {}).get(model_id, {})
+hidden = int(model.get("hidden_size") or 0)
+moe = int(model.get("moe_intermediate_size") or 0)
+num_experts = int(model.get("num_experts") or 0)
+quant = model.get("quantization", {})
+bits = int(quant.get("bits", 4) or 4)
+group_size = int(quant.get("group_size", 64) or 64)
+if not hidden or not moe or not num_experts or bits not in (4, 8):
+    sys.exit(1)
+values_per_word = 32 // bits
+gate_w = moe * (hidden // values_per_word) * 4
+gate_s = moe * (hidden // group_size) * 2
+down_w = hidden * (moe // values_per_word) * 4
+down_s = hidden * (moe // group_size) * 2
+expected_expert_size = gate_w + gate_s + gate_s + gate_w + gate_s + gate_s + down_w + down_s + down_s
+actual_expert_size = int(layout.get("expert_size") or 0)
+actual_num_experts = int(layout.get("num_experts") or 0)
+sys.exit(0 if (actual_expert_size, actual_num_experts) == (expected_expert_size, num_experts) else 1)
+PY
+}
+
 model_artifact_status() {
     local model_id="$1"
     local model_path
@@ -563,15 +630,27 @@ model_artifact_status() {
     local layers
     layers=$(flashchat_model_layers "$model_id")
     local last_layer=$((layers - 1))
-    local runtime_dir="${model_path}/flashchat"
+    local runtime_dir
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$model_path")
     local experts_dir="${runtime_dir}/packed_experts"
+    local repack_script
+    repack_script=$(model_registry_script "$model_id" "repack_experts" "scripts/repack_experts.py")
 
-    local downloaded weights vocab index experts
+    local downloaded weights vocab index experts last_expert
     downloaded=$(model_status_value model_has_hf_files "$model_path")
-    weights=$(model_status_value test -f "${runtime_dir}/model_weights.bin" -a -f "${runtime_dir}/model_weights.json")
+    weights=$(model_status_value runtime_weights_match_model "$model_id" "$runtime_dir")
     vocab=$(model_status_value test -f "${runtime_dir}/vocab.bin")
-    index=$(model_status_value test -f "${runtime_dir}/expert_index.json")
-    experts=$(model_status_value test -f "${experts_dir}/layer_$(printf "%02d" "$last_layer").bin")
+    if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
+        index="n/a"
+    else
+        index=$(model_status_value test -f "${runtime_dir}/expert_index.json")
+    fi
+    last_expert="${experts_dir}/layer_$(printf "%02d" "$last_layer").bin"
+    if [ -f "$last_expert" ] && runtime_experts_match_model "$model_id" "$runtime_dir"; then
+        experts="yes"
+    else
+        experts="no"
+    fi
 
     echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts"
 }
@@ -603,7 +682,7 @@ print_model_status_list() {
     local current_model
     current_model="$(flashchat_get MODEL)"
     local i=0
-    local model_id name repo marker status
+    local model_id name repo marker status quant_bits expert_pack_bytes expert_pack_size
 
     printf "  [0] Add a model...\n"
     printf "      (only model_type qwen3_5_moe is supported)\n"
@@ -616,9 +695,18 @@ print_model_status_list() {
         marker=" "
         [ "$model_id" = "$current_model" ] && marker="*"
         status=$(model_artifact_status "$model_id")
+        quant_bits=$(flashchat_model_quant_bits "$model_id")
+        quant_bits="${quant_bits:-4}"
+        expert_pack_bytes=$(flashchat_model_expert_pack_bytes "$model_id")
+        if [ -n "$expert_pack_bytes" ] && [ "$expert_pack_bytes" -gt 0 ] 2>/dev/null; then
+            expert_pack_size=$(bytes_to_human "$expert_pack_bytes")
+        else
+            expert_pack_size="n/a"
+        fi
         printf "  [%d]%s %s\n" "$i" "$marker" "$name"
         printf "      ID: %s\n" "$model_id"
         printf "      Repo: %s\n" "$repo"
+        printf "      Quantization: %s-bit | expert pack: %s\n" "$quant_bits" "$expert_pack_size"
         printf "      %s\n" "$status"
     done < <(flashchat_list_models)
 }
@@ -1284,22 +1372,22 @@ dir_size_human() {
 model_runtime_ready_for_snapshot() {
     local model_id="$1"
     local snapshot="$2"
-    local runtime_dir="${snapshot}/flashchat"
+    local runtime_dir
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$snapshot")
     local experts_dir="${runtime_dir}/packed_experts"
     local num_experts
     local layers
     local i
 
     [ -d "$runtime_dir" ] || return 1
-    [ -f "${runtime_dir}/model_weights.bin" ] || return 1
-    [ -f "${runtime_dir}/model_weights.json" ] || return 1
+    runtime_weights_match_model "$model_id" "$runtime_dir" || return 1
     [ -f "${runtime_dir}/vocab.bin" ] || return 1
 
     # Dense models (num_experts=0) quantize the MLP into model_weights.bin and have
     # no expert_index.json / packed_experts/ — only MoE models stream per-layer experts.
     num_experts=$(flashchat_model_num_experts "$model_id")
     if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
-        [ -f "${runtime_dir}/expert_index.json" ] || return 1
+        runtime_experts_match_model "$model_id" "$runtime_dir" || return 1
         layers=$(flashchat_model_layers "$model_id")
         i=0
         while [ "$i" -lt "$layers" ]; do
@@ -1389,8 +1477,10 @@ use_model_from_offload_repo() {
         return 1
     fi
     export FLASHCHAT_MODEL_PATH="$snapshot"
-    export FLASHCHAT_WEIGHTS_DIR="${snapshot}/flashchat"
-    export FLASHCHAT_EXPERTS_DIR="${snapshot}/flashchat/packed_experts"
+    local runtime_dir
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$snapshot")
+    export FLASHCHAT_WEIGHTS_DIR="$runtime_dir"
+    export FLASHCHAT_EXPERTS_DIR="${runtime_dir}/packed_experts"
     flashchat_load_config
     echo "Using offloaded model for this run."
     echo "$snapshot"
@@ -2032,6 +2122,8 @@ get_last_layer_index() {
 check_model_downloaded() {
     local model_path
     model_path=$(flashchat_get MODEL_PATH)
+    local model_id
+    model_id=$(flashchat_get MODEL)
     local weights_dir
     weights_dir=$(flashchat_get WEIGHTS_DIR)
     if [[ "$weights_dir" != /* ]]; then
@@ -2039,15 +2131,14 @@ check_model_downloaded() {
         weights_dir="${SCRIPT_DIR}/$weights_dir"
     fi
     
-    if ! [ -f "$weights_dir/model_weights.bin" ] || \
-       ! [ -f "$weights_dir/model_weights.json" ] || \
+    if ! runtime_weights_match_model "$model_id" "$weights_dir" || \
        ! [ -f "$weights_dir/vocab.bin" ]; then
         return 1
     fi
 
     # Dense models (num_experts=0) have no packed_experts/ — weights+vocab is complete.
     local num_experts
-    num_experts=$(flashchat_model_num_experts "$(flashchat_get MODEL)")
+    num_experts=$(flashchat_model_num_experts "$model_id")
     if ! [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
         return 0
     fi
@@ -2056,7 +2147,7 @@ check_model_downloaded() {
     last_layer=$(get_last_layer_index)
     local experts_dir
     experts_dir=$(flashchat_get EXPERTS_DIR)
-    [ -f "$experts_dir/layer_${last_layer}.bin" ] && return 0
+    [ -f "$experts_dir/layer_${last_layer}.bin" ] && runtime_experts_match_model "$model_id" "$weights_dir" && return 0
 
     return 1
 }
@@ -2069,13 +2160,16 @@ check_model_extracted() {
 }
 
 prompt_extract_setup() {
+    local quant_bits
+    quant_bits=$(flashchat_model_quant_bits "$(flashchat_get MODEL)")
+    quant_bits="${quant_bits:-4}"
     echo ""
     echo "=== Model Files Required ==="
     echo ""
     echo "The model has been downloaded but the following need to be extracted:"
     echo "  - Non-expert weights (~5.5GB): model_weights.bin + model_weights.json"
     echo "  - Vocabulary: vocab.bin"
-    echo "  - Expert weights (4-bit): packed_experts/"
+    echo "  - Expert weights (${quant_bits}-bit): packed_experts/"
     echo ""
     echo "This is a ONE-TIME setup operation."
     read -p "Run extraction now? [Y/n] " -n 1 -r
@@ -2165,7 +2259,7 @@ check_weights_extracted() {
         weights_dir="${weights_dir#./}"
         weights_dir="${SCRIPT_DIR}/$weights_dir"
     fi
-    [ -f "$weights_dir/model_weights.bin" ] && [ -f "$weights_dir/model_weights.json" ]
+    runtime_weights_match_model "$(flashchat_get MODEL)" "$weights_dir"
     return $?
 }
 
@@ -2194,7 +2288,7 @@ check_experts_extracted() {
     fi
     local last_layer
     last_layer=$(get_last_layer_index)
-    [ -f "$experts_dir/layer_${last_layer}.bin" ]
+    [ -f "$experts_dir/layer_${last_layer}.bin" ] && runtime_experts_match_model "$(flashchat_get MODEL)" "$(flashchat_get WEIGHTS_DIR)"
     return $?
 }
 
@@ -2585,14 +2679,16 @@ prompt_extract_experts() {
         fi
     fi
     
-    local expert_index_path="$model_path/flashchat/expert_index.json"
+    local weights_dir
+    weights_dir=$(flashchat_get WEIGHTS_DIR)
+    local expert_index_path="$weights_dir/expert_index.json"
     if [ "${repack_script##*/}" != "compile_native_qwen.py" ]; then
         if [ -f "$expert_index_path" ]; then
             echo "Using model-specific expert index: $expert_index_path"
         else
             echo "Expert index not found: $expert_index_path"
             echo "Generating expert index from model safetensors..."
-            if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$model_path/flashchat"; then
+            if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$weights_dir"; then
                 echo "ERROR: Expert index generation failed."
                 return 1
             fi
@@ -2604,26 +2700,39 @@ prompt_extract_experts() {
     echo "=== Extract Expert Weights ==="
     echo ""
     
-    local size_4bit="218GB (203GiB)"
+    local quant_bits
+    quant_bits=$(flashchat_model_quant_bits "$model_id")
+    quant_bits="${quant_bits:-4}"
+    local quant_label="${quant_bits}-bit"
+    local expert_pack_bytes expert_pack_size
+    expert_pack_bytes=$(flashchat_model_expert_pack_bytes "$model_id")
+    if [ -n "$expert_pack_bytes" ] && [ "$expert_pack_bytes" -gt 0 ] 2>/dev/null; then
+        expert_pack_size=$(bytes_to_human "$expert_pack_bytes")
+    else
+        expert_pack_size="unknown size"
+    fi
+
     echo "Available disk space:"
     df -h . | tail -1
     echo ""
     
     echo "Model: $model_path"
+    echo "Quantization: $quant_label"
     echo "Expert index: $expert_index_path"
+    echo "Output: $weights_dir/packed_experts"
     echo ""
     
     echo "Choose expert extraction:"
     echo ""
-    echo "  [4] 4-bit mode (~$size_4bit) - Full quality, tool calling supported"
+    echo "  [Y] Extract $quant_label experts (~$expert_pack_size) - Tool calling supported"
     echo "  [Q] Quit"
     echo ""
     
-    echo -n "Select option [4/Q]: "
+    echo -n "Select option [Y/Q]: "
     read -r REPLY
     echo ""
     
-    if [[ "$REPLY" =~ ^[4]$ ]]; then
+    if [[ "$REPLY" =~ ^[Yy]$ ]] || [ -z "$REPLY" ] || [ "$REPLY" = "$quant_bits" ]; then
         :
     elif [[ $REPLY =~ ^[Qq]$ ]]; then
         echo "Run './flashchat' again when ready to extract expert weights."
@@ -2634,12 +2743,12 @@ prompt_extract_experts() {
     fi
     
     echo ""
-    echo "Extracting 4-bit experts..."
+    echo "Extracting $quant_label experts..."
     echo "Estimated time: 30-60 minutes."
     echo ""
     local cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id")
     if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
-        cmd+=(--model "$model_path" --output "$model_path/flashchat" --experts)
+        cmd+=(--model "$model_path" --output "$weights_dir" --experts)
         local mtp_max
         mtp_max=$(flashchat_model_mtp_max "$model_id")
         if [ -n "$mtp_max" ] && [ "$mtp_max" -gt 0 ] 2>/dev/null; then
@@ -2649,10 +2758,10 @@ prompt_extract_experts() {
         cmd+=(--index "$expert_index_path")
     fi
     if ! run_python "${cmd[@]}"; then
-        echo "ERROR: 4-bit expert extraction failed."
+        echo "ERROR: $quant_label expert extraction failed."
         return 1
     fi
-    echo "4-bit experts extracted successfully."
+    echo "$quant_label experts extracted successfully."
 }
 
 prompt_save_config() {
@@ -3288,6 +3397,12 @@ cmd_serve() {
     
     # Set environment for infer
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
+    # Pass the resolved runtime dirs so the server loads the right bit-width build.
+    # Without these the engine defaults to MODEL_PATH/flashchat, which is wrong for
+    # non-4-bit models whose artifacts live in flashchat/q{bits} (e.g. q8) -> it would
+    # load the wrong/absent vocab+weights and fail ("tokenization failed").
+    export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
+    export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     export FLASHCHAT_SERVER_PORT="$server_port"
     export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
     export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
@@ -3690,11 +3805,9 @@ cmd_clean() {
         local blobs_size=""
         blobs_size=$(get_model_blobs_size "$model_path")
         
-        # Packed experts (4-bit)
-        local experts_dir="$model_path/flashchat/packed_experts"
-        if [ ! -d "$experts_dir" ]; then
-            experts_dir="$model_path/packed_experts"
-        fi
+        # Packed experts for the currently selected runtime variant.
+        local experts_dir
+        experts_dir=$(flashchat_get EXPERTS_DIR)
         local experts_size=""
         if [ -d "$experts_dir" ]; then
             experts_size=$(du -sh "$experts_dir" 2>/dev/null | cut -f1)
