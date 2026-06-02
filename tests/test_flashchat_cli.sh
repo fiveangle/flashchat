@@ -149,7 +149,15 @@ run_with_timeout() {
 }
 
 TMPDIR="$(mktemp -d /tmp/flashchat-cli-test.XXXXXX)"
-trap 'rm -rf "$TMPDIR"' EXIT
+STUBBORN_PID=""
+cleanup_test_env() {
+    if [[ -n "${STUBBORN_PID:-}" ]] && kill -0 "$STUBBORN_PID" 2>/dev/null; then
+        kill -9 "$STUBBORN_PID" 2>/dev/null || true
+        wait "$STUBBORN_PID" 2>/dev/null || true
+    fi
+    rm -rf "$TMPDIR"
+}
+trap cleanup_test_env EXIT
 
 export HOME="$TMPDIR"
 mkdir -p "${TMPDIR}/.config/flashchat"
@@ -331,6 +339,67 @@ run_test_contains "serve stop force (not running)" "No server running." "$FLASHC
 
 # serve --stop --external when nothing is running
 run_test_contains "serve stop external (not running)" "No server running." "$FLASHCHAT" serve --stop --external
+
+RESTART_MODEL_ROOT="${TMPDIR}/restart-model"
+RESTART_RUNTIME="${RESTART_MODEL_ROOT}/flashchat"
+RESTART_CONFIG="${TMPDIR}/restart_config"
+mkdir -p "$RESTART_RUNTIME"
+: > "${RESTART_RUNTIME}/model_weights.bin"
+: > "${RESTART_RUNTIME}/vocab.bin"
+cat > "${RESTART_RUNTIME}/model_weights.json" <<'EOF'
+{"config":{"quantization":{"bits":4,"group_size":64}}}
+EOF
+cat > "$RESTART_CONFIG" <<EOF
+MODEL="Qwen-Qwen36-27B"
+MODEL_PATH="${RESTART_MODEL_ROOT}"
+MAX_TOKENS="1"
+SAMPLING_PROFILE="custom"
+REASONING="0"
+TEMPERATURE="0.1"
+TOP_P="0.8"
+TOP_K="20"
+MIN_P="0.0"
+PRESENCE_PENALTY="1.5"
+REPETITION_PENALTY="1.0"
+SERVER_PORT="19998"
+SERVER_HOST="${TEST_HOST}"
+SERVER_LOG_PATH="${TMPDIR}/logs"
+HUGGINGFACE_CACHE_DIR="${TMPDIR}/custom-hf-cache"
+OFFLOAD_DIR="${TMPDIR}/offload"
+SERVER_DEBUG="0"
+SERVER_HTTP_LOG="0"
+SYSTEM_PROMPT_CACHE="1"
+SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
+SHOW_THINKING="0"
+COLOR_OUTPUT="0"
+EOF
+python3 - <<'PY' &
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(3600)
+PY
+STUBBORN_PID=$!
+echo "$STUBBORN_PID" > "${TMPDIR}/.config/flashchat/server.pid"
+echo "stale-signature" > "${TMPDIR}/.config/flashchat/server.signature"
+
+menu_output=""
+if menu_output=$(printf 'nnq' | "$FLASHCHAT" --config "$RESTART_CONFIG" 2>&1); then
+    if echo "$menu_output" | grep -q "New dialog was not started." && \
+       echo "$menu_output" | grep -q "Goodbye!"; then
+        assert_pass "interactive stale restart decline returns to menu"
+    else
+        assert_fail "interactive stale restart decline returns to menu" "expected recovery output not found"
+    fi
+else
+    assert_fail "interactive stale restart decline returns to menu" "flashchat exited non-zero"
+fi
+kill -9 "$STUBBORN_PID" 2>/dev/null || true
+wait "$STUBBORN_PID" 2>/dev/null || true
+STUBBORN_PID=""
+rm -f "${TMPDIR}/.config/flashchat/server.pid" "${TMPDIR}/.config/flashchat/server.signature"
 
 # ---------------------------------------------------------------------------
 # Inference Server Tests

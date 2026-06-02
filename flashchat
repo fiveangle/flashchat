@@ -3004,11 +3004,36 @@ clear_server_signature() {
 
 restart_stale_owned_server() {
     local port="$1"
+    local ask_force=0
+    if [ "${2:-}" = "--ask-force" ]; then
+        ask_force=1
+    fi
+
     if is_server_running && ! server_signature_matches_config "$port"; then
         echo "Configured runtime changed; restarting Flashchat server..."
-        cmd_serve --stop --port "$port"
-        cmd_serve --port "$port"
-        return $?
+        if ! cmd_serve --stop --port "$port"; then
+            if [ "$ask_force" -eq 0 ]; then
+                return 1
+            fi
+
+            local reply=""
+            if ! read -p "Server did not stop cleanly. Force stop and restart it? [Y/n] " -n 1 -r reply; then
+                echo ""
+                return 1
+            fi
+            echo ""
+            if [[ $reply =~ ^[Nn]$ ]]; then
+                return 1
+            fi
+
+            if ! cmd_serve --stop --force --port "$port"; then
+                return 1
+            fi
+        fi
+
+        if ! cmd_serve --port "$port"; then
+            return 1
+        fi
     fi
     return 0
 }
@@ -3494,7 +3519,10 @@ cmd_chat() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
     
-    restart_stale_owned_server "$server_port"
+    if ! restart_stale_owned_server "$server_port" --ask-force; then
+        echo "Server restart was not completed."
+        return 1
+    fi
 
     # Start server if not running
     if ! is_port_listening "$server_port"; then
@@ -3553,7 +3581,9 @@ cmd_prompt() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
     
-    restart_stale_owned_server "$server_port"
+    if ! restart_stale_owned_server "$server_port"; then
+        error "Server restart was not completed"
+    fi
 
     # Start server if not running
     if ! is_port_listening "$server_port"; then
@@ -3600,7 +3630,10 @@ cmd_opencode() {
     local server_host
     server_host="$(flashchat_server_connect_host)"
 
-    restart_stale_owned_server "$server_port"
+    if ! restart_stale_owned_server "$server_port" --ask-force; then
+        echo "Server restart was not completed."
+        return 1
+    fi
 
     if ! is_port_listening "$server_port"; then
         echo "Starting server..."
@@ -3688,7 +3721,9 @@ interactive_menu() {
         case "$REPLY" in
             n|N)
                 echo ""
-                cmd_chat
+                if ! cmd_chat; then
+                    echo "New dialog was not started."
+                fi
                 ;;
             d|D)
                 echo ""
@@ -3730,7 +3765,9 @@ interactive_menu() {
                         fi
                         
                         if [ -n "$session_id" ]; then
-                            cmd_chat --resume "$session_id"
+                            if ! cmd_chat --resume "$session_id"; then
+                                echo "Dialog was not resumed."
+                            fi
                         fi
                     fi
                 fi
