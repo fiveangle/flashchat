@@ -457,6 +457,32 @@ static void md_print(const char *text) {
     }
 }
 
+// Display-layer ASCII normalization for the terminal TUI: fold the common multi-byte
+// Unicode punctuation the model emits down to plain ASCII, in place (replacements are
+// never longer than the source, so dst never overtakes src). The server/API output
+// stays faithful UTF-8 — this only changes what the chat TUI renders, for clean
+// terminals and easy copy-paste.
+static void normalize_punct_ascii(char *s) {
+    const unsigned char *src = (const unsigned char *)s;
+    char *dst = s;
+    while (*src) {
+        unsigned char a = src[0], b = src[1], c = src[2];
+        if (a == 0xE2 && b == 0x80) {
+            switch (c) {
+                case 0x98: case 0x99: *dst++ = '\''; src += 3; continue;             // ' '  -> '
+                case 0x9C: case 0x9D: *dst++ = '"';  src += 3; continue;             // " "  -> "
+                case 0x93:            *dst++ = '-';  src += 3; continue;             // en dash -> -
+                case 0x94:            *dst++ = '-'; *dst++ = '-'; src += 3; continue; // em dash -> --
+                case 0xA6:            *dst++ = '.'; *dst++ = '.'; *dst++ = '.'; src += 3; continue; // ellipsis -> ...
+                default: break;
+            }
+        }
+        if (a == 0xC2 && b == 0xA0) { *dst++ = ' '; src += 2; continue; }            // nbsp -> space
+        *dst++ = (char)*src++;
+    }
+    *dst = '\0';
+}
+
 // Stream SSE response, accumulate text, return malloc'd response string
 static char *stream_response(int sock, int show_thinking) {
     FILE *stream = fdopen(sock, "r");
@@ -496,6 +522,8 @@ static char *stream_response(int sock, int show_thinking) {
             } else decoded[di++] = ck[i];
         }
         decoded[di] = 0;
+        normalize_punct_ascii(decoded);        // ASCII-fold smart quotes/dashes for the terminal
+        di = (int)strlen(decoded);
         if (!di) continue;
 
         if (strstr(decoded, "<think>")) in_think = 1;
