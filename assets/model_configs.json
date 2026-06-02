@@ -301,7 +301,7 @@
       }
     },
     "Qwen-Qwen36-35B-A3B": {
-      "name": "Qwen3.6-35B-A3B",
+      "name": "Qwen3.6-35B-A3B-4bit",
       "hf_repo": "Qwen/Qwen3.6-35B-A3B",
       "hidden_size": 2048,
       "num_hidden_layers": 40,
@@ -373,7 +373,7 @@
         }
       },
       "source_format": "native_bf16",
-      "mtp_default_predictions": 1,
+      "mtp_default_predictions": 2,
       "mtp_max_predictions": 3,
       "mtp_num_hidden_layers": 1
     },
