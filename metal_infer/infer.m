@@ -1692,37 +1692,42 @@ static const char *decode_token(Vocabulary *v, int token_id) {
     if (strcmp(src, "<|im_start|>assistant") == 0) return "";
     if (strcmp(src, "<|im_start|>system") == 0) return "";
     
-    // Replace UTF-8 encoded bytes with actual characters
-    static char buf[256];
+    // Reverse the GPT-2/Qwen byte-level-BPE "byte-to-unicode" map: token text stores
+    // raw bytes remapped to printable code points; UTF-8-decode those code points and
+    // map each one back to its original byte to recover the true UTF-8 text. The old
+    // hand-coded special-cases only covered a few chars (and lossily, e.g. em-dash->"--"),
+    // so smart quotes, em-dashes, accents, CJK, emoji leaked out as mojibake ("\xc3\xa2\xc4\xa2\xc4\xbb").
+    static int byte_decoder[0x180];
+    static int byte_decoder_ready = 0;
+    if (!byte_decoder_ready) {
+        for (int i = 0; i < 0x180; i++) byte_decoder[i] = -1;
+        int nn = 0;
+        for (int b = 0; b < 256; b++) {
+            int printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+            int cp = printable ? b : (256 + nn++);
+            if (cp < 0x180) byte_decoder[cp] = b;
+        }
+        byte_decoder_ready = 1;
+    }
+
+    static char buf[512];
     char *dst = buf;
     const unsigned char *s = (const unsigned char *)src;
-    
-    while (*s && dst < buf + 250) {
-        // 0xC4 0x8A = U+010A (newline in GPT-2 byte encoding)
-        if (s[0] == 0xC4 && s[1] == 0x8A) { *dst++ = '\n'; s += 2; continue; }
-        // 0xC4 0x8B = U+010B (tab)
-        if (s[0] == 0xC4 && s[1] == 0x8B) { *dst++ = '\t'; s += 2; continue; }
-        // 0xC4 0xA0 = U+0120 (space marker Ġ)
-        if (s[0] == 0xC4 && s[1] == 0xA0) { *dst++ = ' '; s += 2; continue; }
-        // 0xC4 0xA1 = U+0121 (ãŁ - often before punctuation)
-        if (s[0] == 0xC4 && s[1] == 0xA1) { *dst++ = ' '; s += 2; continue; }
-        // 0xC3 0xA2 0xC4 0xA2 0xC4 0xB6 = corrupted "âĢĶ" (double-encoded ellipsis/space)
-        // Found in Qwen3 tokenizer vocab - convert to space
-        if (s[0] == 0xC3 && s[1] == 0xA2 && s[2] == 0xC4 && s[3] == 0xA2 && s[4] == 0xC4 && s[5] == 0xB6) {
-            *dst++ = ' '; s += 6; continue;
+    while (*s && dst < buf + 500) {
+        unsigned char c0 = s[0];
+        uint32_t cp; int adv;
+        if (c0 < 0x80) { cp = c0; adv = 1; }
+        else if ((c0 & 0xE0) == 0xC0 && s[1]) { cp = ((uint32_t)(c0 & 0x1F) << 6) | (s[1] & 0x3F); adv = 2; }
+        else if ((c0 & 0xF0) == 0xE0 && s[1] && s[2]) { cp = ((uint32_t)(c0 & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F); adv = 3; }
+        else { *dst++ = (char)c0; s += 1; continue; }
+        if (cp < 0x180 && byte_decoder[cp] >= 0) {
+            *dst++ = (char)byte_decoder[cp];
+        } else {
+            for (int k = 0; k < adv && dst < buf + 500; k++) *dst++ = (char)s[k];
         }
-        // 0xE2 0x80 0xA6 = U+2026 (ellipsis â€¦)
-        if (s[0] == 0xE2 && s[1] == 0x80 && s[2] == 0xA6) { *dst++ = '.'; *dst++ = '.'; *dst++ = '.'; s += 3; continue; }
-        // 0xE2 0x80 0xA0 = U+2020 (en space)
-        if (s[0] == 0xE2 && s[1] == 0x80 && s[2] == 0xA0) { *dst++ = ' '; s += 3; continue; }
-        // 0xE2 0x80 0x94 = U+2014 (em dash —)
-        if (s[0] == 0xE2 && s[1] == 0x80 && s[2] == 0x94) { *dst++ = '-'; *dst++ = '-'; s += 3; continue; }
-        // 0xE2 0x80 0x99 = U+2019 (right single quote ')
-        if (s[0] == 0xE2 && s[1] == 0x80 && s[2] == 0x99) { *dst++ = '\''; s += 3; continue; }
-        *dst++ = *s++;
+        s += adv;
     }
     *dst = '\0';
-    
     return buf;
 }
 
