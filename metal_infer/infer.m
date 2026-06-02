@@ -2312,6 +2312,10 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;  // [g_cfg.num_attn_heads * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [g_cfg.num_attn_heads * g_cfg.head_dim floats] full attention output
     id<MTLBuffer> buf_attn_gate;    // [g_cfg.num_attn_heads * g_cfg.head_dim floats] sigmoid gate
+    // Batched full-attention (dense chunked prefill): N queries/gates/outputs per chunk.
+    id<MTLBuffer> buf_attn_q_batch;     // [MAX_DELTA_BATCH_SLOTS * q_dim]
+    id<MTLBuffer> buf_attn_gate_batch;  // [MAX_DELTA_BATCH_SLOTS * q_dim]
+    id<MTLBuffer> buf_attn_out_batch;   // [MAX_DELTA_BATCH_SLOTS * q_dim]
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [g_cfg.hidden_dim floats] GPU combine output (hidden state)
@@ -2595,6 +2599,10 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_delta_beta_batch  = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_num_v_heads   * sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_delta_alpha_batch = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_num_v_heads   * sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_delta_gated_batch = [ctx->device newBufferWithLength:(size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.linear_total_value   * sizeof(float) options:MTLResourceStorageModeShared];
+        { size_t qb = (size_t)MAX_DELTA_BATCH_SLOTS * g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float);
+          ctx->buf_attn_q_batch    = [ctx->device newBufferWithLength:qb options:MTLResourceStorageModeShared];
+          ctx->buf_attn_gate_batch = [ctx->device newBufferWithLength:qb options:MTLResourceStorageModeShared];
+          ctx->buf_attn_out_batch  = [ctx->device newBufferWithLength:qb options:MTLResourceStorageModeShared]; }
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                g_cfg.num_linear_layers,
                g_cfg.num_linear_layers * (64*128*128*4 + 3*12288*4) / 1e6,
@@ -4286,6 +4294,7 @@ static void full_attention_forward(
 // (at pos_b = pos_a+1) attends to token a's freshly-appended K/V. o_proj uses
 // two single matvecs (its in_dim=q_dim>4096 exceeds the matmul2 kernel limit).
 // ============================================================================
+static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const float *q_gate, float *out);
 static void attn_block_2(
     WeightFile *wf, int layer_idx,
     float *ha, float *hb,     // [hidden_dim] in/out for the two tokens
@@ -4297,6 +4306,11 @@ static void attn_block_2(
     int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
     float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    // Dense GPU attention (unified with fused_layer_forward / dense_layer_forward_N): when on,
+    // this verify block uses the SAME GPU kernels as the baseline so argmax matches losslessly.
+    int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
+    int gpu_attn = (g_dense_gpu_attn && g_metal && g_metal->attn_scores_pipe &&
+                    fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers);
 
     float *res_a = malloc(g_cfg.hidden_dim * sizeof(float));
     float *res_b = malloc(g_cfg.hidden_dim * sizeof(float));
@@ -4383,10 +4397,20 @@ static void attn_block_2(
         int cache_pos = kv->len;
         memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, kk[t], kv_dim * sizeof(float));
         memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, vv[t], kv_dim * sizeof(float));
+        // Mirror this position into the GPU KV cache UNCONDITIONALLY (independent of whether
+        // this token attends on GPU): a later position's GPU attention reads back through it.
+        if (gpu_attn && cache_pos < GPU_KV_SEQ) {
+            memcpy((float*)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos*kv_dim, kk[t], (size_t)kv_dim*4);
+            memcpy((float*)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos*kv_dim, vv[t], (size_t)kv_dim*4);
+        }
         kv->len++;
 
         float *attn_out = calloc(q_dim, sizeof(float));
         double _t_at = now_ms();
+        if (gpu_attn && kv->len <= GPU_KV_SEQ) {
+            // Same standalone GPU full-attention helper used by the dense baseline (fused_layer_forward).
+            gpu_full_attention(fa_idx, kv->len, q, q_gate, attn_out);
+        } else {
         for (int h = 0; h < g_cfg.num_attn_heads; h++) {
             int kv_h = h / heads_per_kv;
             float *qh = q + h * g_cfg.head_dim;
@@ -4405,8 +4429,9 @@ static void attn_block_2(
             }
             free(scores);
         }
-        g_prof_attncpu += now_ms() - _t_at;
         for (int i = 0; i < q_dim; i++) attn_out[i] *= 1.0f / (1.0f + expf(-q_gate[i]));
+        }
+        g_prof_attncpu += now_ms() - _t_at;
 
         float *attn_proj = calloc(g_cfg.hidden_dim, sizeof(float));
         if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_proj, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
@@ -4622,6 +4647,45 @@ static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const fl
     memcpy(out, [ctx->buf_attn_out contents], qdim * sizeof(float));
 }
 
+// Batched GPU full-attention for a chunk of n query positions (n<=MAX_DELTA_BATCH_SLOTS),
+// all in ONE command buffer (one commit+wait) instead of n. Mirrors gpu_linear_delta_dispatch_batch
+// for the full-attn layers: q_all/gate_all are [n][q_dim] (post-norm/RoPE), out_all receives the
+// n gated attention outputs. Token t attends causally to base_len+t+1 positions in buf_kv_k/v[fa_idx]
+// (caller must have appended all n K/V to the mirror first). Shared scratch (buf_attn_scores) is reused
+// per token — safe because the GPU runs the encoders in order (token t's scores->softmax->values
+// finish before token t+1 overwrites them).
+static void gpu_full_attention_batch(int fa_idx, int n, int base_len,
+                                     const float *q_all, const float *gate_all, float *out_all) {
+    MetalCtx *ctx = g_metal;
+    uint32_t hd = (uint32_t)g_cfg.head_dim, kvd = (uint32_t)(g_cfg.num_kv_heads * g_cfg.head_dim);
+    uint32_t seq_stride = GPU_KV_SEQ, hpkv = (uint32_t)(g_cfg.num_attn_heads / g_cfg.num_kv_heads);
+    uint32_t qdim = (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim);
+    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    memcpy([ctx->buf_attn_q_batch contents], q_all, (size_t)n * qdim * sizeof(float));
+    memcpy([ctx->buf_attn_gate_batch contents], gate_all, (size_t)n * qdim * sizeof(float));
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    for (int t = 0; t < n; t++) {
+        uint32_t sl = (uint32_t)(base_len + t + 1);          // causal length for this query
+        NSUInteger qoff = (NSUInteger)((size_t)t * qdim * sizeof(float));
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_scores_pipe];
+          [e setBuffer:ctx->buf_attn_q_batch offset:qoff atIndex:0]; [e setBuffer:ctx->buf_kv_k[fa_idx] offset:0 atIndex:1]; [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+          [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&scale length:4 atIndex:7];[e setBytes:&hpkv length:4 atIndex:8];[e setBytes:&sl length:4 atIndex:9];
+          [e dispatchThreadgroups:MTLSizeMake(sl*g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_softmax_pipe];
+          [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBytes:&sl length:4 atIndex:1];[e setBytes:&seq_stride length:4 atIndex:2];
+          [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
+          [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out_batch offset:qoff atIndex:2];
+          [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
+          uint32_t tt=qdim; [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
+          [e setBuffer:ctx->buf_attn_out_batch offset:qoff atIndex:0];[e setBuffer:ctx->buf_attn_gate_batch offset:qoff atIndex:1];[e setBytes:&qdim length:4 atIndex:2];
+          [e dispatchThreadgroups:MTLSizeMake((qdim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    }
+    [cmd commit]; [cmd waitUntilCompleted];
+    memcpy(out_all, [ctx->buf_attn_out_batch contents], (size_t)n * qdim * sizeof(float));
+}
+
 static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos) {
     int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, inter=g_cfg.dense_intermediate, eps_layer=0; (void)eps_layer;
     float eps=g_cfg.rms_norm_eps;
@@ -4649,31 +4713,39 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
             {vw,vs,vb,nmd,vv,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
           gpu_dequant_matmulN_batch(g_metal, qkv_jobs, 3); }
         float ascale=1.f/sqrtf((float)g_cfg.head_dim);
+        int base_len = kv->len;   // sequence length before this chunk (token t lands at base_len+t)
+        float *q_all=malloc((size_t)N*qd*4), *qg_all=malloc((size_t)N*qd*4);
+        // Prep all N tokens: q/k norm, RoPE, append K/V to cache (+GPU mirror); stage q/gate.
         for (int t=0;t<N;t++){
-            float *q=malloc(qd*4),*qg=malloc(qd*4); float *kt=kk+(size_t)t*kvd,*vt=vv+(size_t)t*kvd;
+            float *q=q_all+(size_t)t*qd, *qg=qg_all+(size_t)t*qd; float *kt=kk+(size_t)t*kvd,*vt=vv+(size_t)t*kvd;
             for(int h=0;h<g_cfg.num_attn_heads;h++){ float*s=qp+(size_t)t*qpd+h*2*g_cfg.head_dim; memcpy(q+h*g_cfg.head_dim,s,g_cfg.head_dim*4); memcpy(qg+h*g_cfg.head_dim,s+g_cfg.head_dim,g_cfg.head_dim*4);}
             for(int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*iv*bf16_to_f32(qn[i]);}
             for(int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=kt+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*iv*bf16_to_f32(kn[i]);}
             apply_rotary_emb(q,kt,pos[t],g_cfg.num_attn_heads,g_cfg.num_kv_heads,g_cfg.head_dim,g_cfg.rotary_dim);
             int cp=kv->len; memcpy(kv->k_cache+(size_t)cp*kvd,kt,kvd*4); memcpy(kv->v_cache+(size_t)cp*kvd,vt,kvd*4);
-            if (dgpu && cp < GPU_KV_SEQ) {  // keep the GPU KV mirror in sync for GPU attention
+            if (dgpu && cp < GPU_KV_SEQ) {
                 memcpy((float*)[g_metal->buf_kv_k[fa_idx] contents]+(size_t)cp*kvd, kt, (size_t)kvd*4);
                 memcpy((float*)[g_metal->buf_kv_v[fa_idx] contents]+(size_t)cp*kvd, vt, (size_t)kvd*4);
             }
             kv->len++;
-            float *aot=ao+(size_t)t*qd;
-            if (dgpu && kv->len>=32 && kv->len<GPU_KV_SEQ) {
-                // GPU attention (scores+softmax+values+sigmoid-gate) -> aot (already gated)
-                gpu_full_attention(fa_idx, kv->len, q, qg, aot);
-            } else {
-                for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(kv->len*4);
-                    for(int p=0;p<kv->len;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
-                    cpu_softmax(sc,kv->len); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
-                    for(int p=0;p<kv->len;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
+        }
+        if (dgpu && (base_len+N)<=GPU_KV_SEQ) {
+            // One command buffer for the whole chunk's attention (token t -> base_len+t+1 keys).
+            // No len>=32 threshold: matches the per-position GPU rule in fused_layer_forward
+            // (baseline) and attn_block_2 (depth-2 verify), so all paths agree bit-for-bit.
+            gpu_full_attention_batch(fa_idx, N, base_len, q_all, qg_all, ao);
+        } else {
+            for (int t=0;t<N;t++){
+                float *q=q_all+(size_t)t*qd, *qg=qg_all+(size_t)t*qd, *aot=ao+(size_t)t*qd;
+                int len_t = base_len + t + 1;   // causal length for token t (NOT kv->len, which is base+N now)
+                for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(len_t*4);
+                    for(int p=0;p<len_t;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
+                    cpu_softmax(sc,len_t); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
+                    for(int p=0;p<len_t;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
                 for(int i=0;i<qd;i++)aot[i]*=cpu_sigmoid(qg[i]);
             }
-            free(q);free(qg);
         }
+        free(q_all); free(qg_all);
         float *ap=malloc((size_t)N*H*4); gpu_dequant_matmulN(g_metal,ow,os,ob,ao,ap,H,qd,gsz,N);
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
         free(qp);free(kk);free(vv);free(ao);free(ap);
@@ -4785,6 +4857,12 @@ static int mtp_bench_attn(WeightFile *wf) {
     memcpy(kv_b.k_cache, kv_o.k_cache, (size_t)cap * kv_dim * sizeof(float));
     memcpy(kv_b.v_cache, kv_o.v_cache, (size_t)cap * kv_dim * sizeof(float));
     kv_b.len = kv_o.len;
+    // Seed the GPU KV mirror so attn_block_2's GPU attention path (if enabled) sees this
+    // synthetic history — production keeps the mirror in sync incrementally, this test doesn't.
+    { int fb = (layer + 1) / g_cfg.full_attn_interval - 1;
+      if (g_metal && g_metal->attn_scores_pipe && fb >= 0 && fb < g_cfg.num_full_attn_layers) {
+        memcpy([g_metal->buf_kv_k[fb] contents], kv_b.k_cache, (size_t)kv_b.len * kv_dim * sizeof(float));
+        memcpy([g_metal->buf_kv_v[fb] contents], kv_b.v_cache, (size_t)kv_b.len * kv_dim * sizeof(float)); } }
 
     float *ha = malloc(H * sizeof(float)), *hb = malloc(H * sizeof(float));
     for (int i = 0; i < H; i++) { ha[i] = cosf(i * 0.013f); hb[i] = sinf(i * 0.019f + 1.0f); }
@@ -5883,6 +5961,9 @@ static void dense_mtp_advance(WeightFile *wf, const float *hcur, int t) {
 // post-a rollback is a later optimization).
 static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_new) {
     if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts != 0) { fprintf(stderr, "[mtp-dense] requires dense GPU model\n"); return 1; }
+    // Attention is unified on GPU across baseline (fused_layer_forward), depth-2 verify
+    // (attn_block_2) and depth-N verify (dense_layer_forward_N) — all use gpu_full_attention[_batch]
+    // at every position, so verify bit-matches baseline (lossless) AND the verify enjoys GPU attention.
     (void)model_path;
     int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4;
     int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
@@ -5992,7 +6073,7 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
 // verify all D+1 positions in one batched forward, accept the longest correct
 // prefix. Full-accept keeps state; partial-accept rolls back via a short re-forward.
 static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int max_new, int D) {
-    (void)model_path;
+    (void)model_path;  // attention unified on GPU across baseline + verify (see mtp_generate_dense)
     if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts != 0) { fprintf(stderr,"[mtp-d%d] requires dense GPU\n",D); return 1; }
     int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4;
     int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
@@ -8321,19 +8402,33 @@ static void fused_layer_forward(
 
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
-        // Dense (num_experts==0) never takes the fused CMD2 path that computes GPU
-        // attention, so force CPU attention (else attn_out_for_oproj=NULL is never
-        // consumed and the o_proj input is stale).
+        // MoE takes the fused CMD2 path; dense (num_experts==0) has no CMD2, so it runs
+        // the standalone gpu_full_attention helper over the same buf_kv_k mirror (written
+        // unconditionally above). This makes dense DECODE use GPU attention too — prefill
+        // already does (dense_layer_forward_N) — so the server leans into GPU attention for
+        // ALL production paths, not just prefill. Big win at long context (O(seq) CPU
+        // attention per token per layer was the dense decode tax in e.g. the 12K case).
+        // NO len>=32 threshold for dense: the dense MTP verify (attn_block_2 /
+        // dense_layer_forward_N) uses the SAME GPU kernels at EVERY position, so baseline and
+        // verify make identical GPU/CPU decisions -> bit-match -> lossless. (MoE keeps >=32.)
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ &&
                               g_cfg.num_experts > 0);
+        int dense_gpu_ready = (g_cfg.num_experts == 0 && g_dense_gpu_attn &&
+                               g_metal && g_metal->attn_scores_pipe &&
+                               fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+                               kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
+        } else if (dense_gpu_ready) {
+            // Dense: standalone GPU full-attention over buf_kv_k/v[fa_idx] (seq_len=kv->len),
+            // result lands in attn_out (CPU buffer) consumed by the dense fallback o_proj.
+            gpu_full_attention(fa_idx, kv->len, q, q_gate, attn_out);
         } else {
             // CPU fallback
             for (int h = 0; h < g_cfg.num_attn_heads; h++) {
