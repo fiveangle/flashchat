@@ -150,7 +150,7 @@ The render path parses an OpenAI-compatible request and writes the exact native 
 
 View and edit settings. If no config exists, defaults are used automatically. The reset option allows you to reconfigure while preserving chat sessions.
 
-The configuration wizard selects from the models in `assets/model_configs.json` and shows the local setup state for each model, including downloaded HuggingFace files and generated files under `<model>/flashchat/`. By default Flashchat uses the standard HuggingFace hub cache at `~/.cache/huggingface/hub`; set `HUGGINGFACE_CACHE_DIR` in the config if your model cache lives somewhere else.
+The configuration wizard selects from the models in `assets/model_configs.json` and shows the local setup state for each model, including downloaded HuggingFace files and generated runtime files. Most models store runtime files under `<model>/flashchat/`; native non-4-bit variants use `<model>/flashchat/q<bits>/` so q4 and q8 builds of the same HuggingFace snapshot can coexist. By default Flashchat uses the standard HuggingFace hub cache at `~/.cache/huggingface/hub`; set `HUGGINGFACE_CACHE_DIR` in the config if your model cache lives somewhere else.
 
 ### Models
 
@@ -175,7 +175,7 @@ Available storage actions:
 - Delete a local model cache repo
 - Offload a whole HuggingFace cache repo to `OFFLOAD_DIR`
 - Fully reload an offloaded model back to the local HuggingFace cache
-- Restore only the generated `<model>/flashchat/` runtime files from offload storage
+- Restore only the generated runtime files for a selected model/quantization from offload storage
 
 Destructive actions require typing the exact model ID. Local model storage uses one global HuggingFace hub cache directory configured as `HUGGINGFACE_CACHE_DIR`, defaulting to `~/.cache/huggingface/hub`. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
 
@@ -216,8 +216,8 @@ Configuration is loaded from (priority highest to lowest):
 | `FLASHCHAT_OFFLOAD_DIR` | Unified root for offloaded HuggingFace model cache repos | unset |
 | `FLASHCHAT_SERVER_PORT` | Server port | `8000` |
 | `FLASHCHAT_SERVER_HOST` | Server host | `127.0.0.1` |
-| `FLASHCHAT_WEIGHTS_DIR` | Weights directory | `<model>/flashchat` |
-| `FLASHCHAT_EXPERTS_DIR` | Experts directory | `<model>/flashchat/packed_experts` |
+| `FLASHCHAT_WEIGHTS_DIR` | Runtime weights directory | `<model>/flashchat` or `<model>/flashchat/q<bits>` for native non-4-bit variants |
+| `FLASHCHAT_EXPERTS_DIR` | Experts directory | `$FLASHCHAT_WEIGHTS_DIR/packed_experts` |
 
 ### Example Config File
 
@@ -256,7 +256,7 @@ COLOR_OUTPUT="1"
 
 `SERVER_LOG_PATH` may be a `.log` file or a directory. Extensionless paths entered in the configuration wizard are treated as directories and will receive `server.log` plus debug artifacts when debug logging is enabled.
 
-`SYSTEM_PROMPT_CACHE` stores compressed, model-local snapshots under `<model>/flashchat/system_prompt_cache/` so repeated server runs with the same harness/system prompt can skip the expensive system prompt prefill. The cache is bounded by `SYSTEM_PROMPT_CACHE_MAX_ENTRIES`.
+`SYSTEM_PROMPT_CACHE` stores compressed, model-local snapshots under the selected runtime directory, such as `<model>/flashchat/system_prompt_cache/` or `<model>/flashchat/q8/system_prompt_cache/`, so repeated server runs with the same harness/system prompt can skip the expensive system prompt prefill. The cache is bounded by `SYSTEM_PROMPT_CACHE_MAX_ENTRIES`.
 
 `SAMPLING_PROFILE` selects a model-supported generation profile from `assets/model_configs.json`. Use `custom` to edit `REASONING`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`, `PRESENCE_PENALTY`, and `REPETITION_PENALTY` directly.
 
@@ -401,11 +401,12 @@ If you changed `SERVER_HOST` or `SERVER_PORT`, use those configured values in `b
 
 | File | Size | Description |
 |------|------|-------------|
-| `<model>/flashchat/model_weights.bin` | 5.5GB | Non-expert weights (mmap'd) |
-| `<model>/flashchat/model_weights.json` | 371KB | Manifest for weight loading |
-| `<model>/flashchat/vocab.bin` | 7.8MB | Tokenizer vocabulary |
-| `<model>/flashchat/expert_index.json` | - | Safetensors expert lookup index |
-| `<model>/flashchat/packed_experts/` | 218GB | Expert weights |
+| `<runtime>/model_weights.bin` | 5.5GB | Runtime weights (mmap'd) |
+| `<runtime>/model_weights.json` | 371KB | Manifest for weight loading |
+| `<runtime>/vocab.bin` | 7.8MB | Tokenizer vocabulary |
+| `<runtime>/expert_index.json` | - | Safetensors expert lookup index for MLX MoE models |
+| `<runtime>/packed_experts/` | model-dependent | Expert weights for MoE models |
+| `<runtime>/packed_mtp_experts/` | model-dependent | MTP expert weights for native MoE models |
 | `~/.config/flashchat/config` | - | User configuration |
 | `~/.config/flashchat/sessions/` | - | Chat session history |
 | `~/.config/flashchat/history` | - | Interactive prompt history |

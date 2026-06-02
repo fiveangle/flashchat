@@ -346,9 +346,62 @@ RESTART_CONFIG="${TMPDIR}/restart_config"
 mkdir -p "$RESTART_RUNTIME"
 : > "${RESTART_RUNTIME}/model_weights.bin"
 : > "${RESTART_RUNTIME}/vocab.bin"
-cat > "${RESTART_RUNTIME}/model_weights.json" <<'EOF'
-{"config":{"quantization":{"bits":4,"group_size":64}}}
-EOF
+python3 - "$REPO_ROOT/assets/model_configs.json" "$RESTART_RUNTIME/model_weights.json" <<'PY'
+import json
+import sys
+
+registry_path, manifest_path = sys.argv[1:]
+with open(registry_path) as f:
+    model = json.load(f)["models"]["Qwen-Qwen36-27B"]
+quant = model.get("quantization", {})
+config = {
+    "hidden_size": model["hidden_size"],
+    "num_hidden_layers": model["num_hidden_layers"],
+    "num_attention_heads": model["num_attention_heads"],
+    "num_key_value_heads": model["num_key_value_heads"],
+    "head_dim": model["head_dim"],
+    "vocab_size": model["vocab_size"],
+    "rms_norm_eps": model["rms_norm_eps"],
+    "num_experts": model["num_experts"],
+    "num_experts_per_tok": model["num_experts_per_tok"],
+    "moe_intermediate_size": model["moe_intermediate_size"],
+    "shared_expert_intermediate_size": model["shared_expert_intermediate_size"],
+    "intermediate_size": model.get("intermediate_size", 0),
+    "full_attention_interval": model["full_attention_interval"],
+    "linear_num_value_heads": model["linear_num_value_heads"],
+    "linear_num_key_heads": model["linear_num_key_heads"],
+    "linear_key_head_dim": model["linear_key_head_dim"],
+    "linear_value_head_dim": model["linear_value_dim"] if "linear_value_dim" in model else model["linear_value_head_dim"],
+    "linear_conv_kernel_dim": model["linear_conv_kernel_dim"],
+    "partial_rotary_factor": model["partial_rotary_factor"],
+    "rope_theta": model["rope_theta"],
+    "quantization": {"bits": quant.get("bits", 4), "group_size": quant.get("group_size", 64)},
+    "mtp_num_hidden_layers": model.get("mtp_num_hidden_layers", 0),
+}
+config["layer_types"] = [
+    "full_attention" if (i + 1) % config["full_attention_interval"] == 0 else "linear_attention"
+    for i in range(config["num_hidden_layers"])
+]
+tensors = {}
+for name in [
+    "mtp.fc.weight",
+    "mtp.fc.scales",
+    "mtp.fc.biases",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.q_proj.scales",
+    "mtp.layers.0.self_attn.q_proj.biases",
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.gate.scales",
+    "mtp.layers.0.mlp.gate.biases",
+    "mtp.norm.weight",
+]:
+    tensors[name] = {"offset": 0, "size": 1, "shape": [1], "dtype": "BF16"}
+with open(manifest_path, "w") as f:
+    json.dump({"config": config, "tensors": tensors}, f)
+PY
 cat > "$RESTART_CONFIG" <<EOF
 MODEL="Qwen-Qwen36-27B"
 MODEL_PATH="${RESTART_MODEL_ROOT}"

@@ -498,10 +498,12 @@ static char g_flashchat_weights_dir[PATH_MAX] = {0};
 static char g_flashchat_experts_dir[PATH_MAX] = {0};
 static char g_flashchat_mtp_experts_dir[PATH_MAX] = {0};
 static char g_flashchat_lz4_experts_dir[PATH_MAX] = {0};
+static char g_flashchat_model_path[PATH_MAX] = {0};
 
 static void configure_flashchat_artifact_dirs(const char *model_path) {
     const char *env_weights_dir = getenv("FLASHCHAT_WEIGHTS_DIR");
     const char *env_experts_dir = getenv("FLASHCHAT_EXPERTS_DIR");
+    snprintf(g_flashchat_model_path, sizeof(g_flashchat_model_path), "%s", model_path ? model_path : "");
     if (env_weights_dir && env_weights_dir[0]) {
         snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s", env_weights_dir);
     } else {
@@ -11574,6 +11576,11 @@ static int mkdir_p_cstr(const char *path) {
 
 static int system_prompt_cache_dir(const char *model_path, char *out, size_t out_sz) {
     if (!model_path || !model_path[0] || !out || out_sz == 0) return -1;
+    if (g_flashchat_model_path[0] && g_flashchat_weights_dir[0] &&
+        strcmp(model_path, g_flashchat_model_path) == 0) {
+        snprintf(out, out_sz, "%s/system_prompt_cache", g_flashchat_weights_dir);
+        return 0;
+    }
     snprintf(out, out_sz, "%s/flashchat/system_prompt_cache", model_path);
     return 0;
 }

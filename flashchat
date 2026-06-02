@@ -573,31 +573,57 @@ with open(registry_path) as f:
     registry = json.load(f)
 with open(manifest_path) as f:
     manifest = json.load(f)
-expected = registry.get("models", {}).get(model_id, {}).get("quantization", {})
-actual = manifest.get("config", {}).get("quantization", {})
-expected_bits = int(expected.get("bits", 4) or 4)
-actual_bits = int(actual.get("bits", 4) or 4)
-expected_group = int(expected.get("group_size", 64) or 64)
-actual_group = int(actual.get("group_size", 64) or 64)
+model = registry.get("models", {}).get(model_id, {})
+config = manifest.get("config", {})
+if not model or not config:
+    sys.exit(1)
+int_fields = [
+    "hidden_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "head_dim", "vocab_size", "num_experts",
+    "num_experts_per_tok", "moe_intermediate_size",
+    "shared_expert_intermediate_size", "full_attention_interval",
+    "linear_num_value_heads", "linear_num_key_heads",
+    "linear_key_head_dim", "linear_value_head_dim",
+    "linear_conv_kernel_dim",
+]
+for field in int_fields:
+    expected = int(model.get(field, 0) or 0)
+    actual = int(config.get(field, -1) if config.get(field) is not None else -1)
+    if expected != actual:
+        sys.exit(1)
+float_fields = ["rms_norm_eps", "partial_rotary_factor", "rope_theta"]
+for field in float_fields:
+    expected = float(model.get(field, 0.0) or 0.0)
+    actual = float(config.get(field, -1.0) if config.get(field) is not None else -1.0)
+    if abs(expected - actual) > max(1e-9, abs(expected) * 1e-9):
+        sys.exit(1)
+expected_quant = model.get("quantization", {})
+actual_quant = config.get("quantization", {})
+expected_bits = int(expected_quant.get("bits", 4) or 4)
+actual_bits = int(actual_quant.get("bits", 4) or 4)
+expected_group = int(expected_quant.get("group_size", 64) or 64)
+actual_group = int(actual_quant.get("group_size", 64) or 64)
 sys.exit(0 if (expected_bits, expected_group) == (actual_bits, actual_group) else 1)
 PY
 }
 
-runtime_experts_match_model() {
+runtime_packed_experts_match_model() {
     local model_id="$1"
     local runtime_dir="$2"
+    local packed_name="${3:-packed_experts}"
+    local expected_layers="${4:-$(flashchat_model_layers "$model_id")}"
     local model_config
     model_config=$(flashchat_get MODEL_CONFIG)
     local num_experts
     num_experts=$(flashchat_model_num_experts "$model_id")
     [ "${num_experts:-0}" -gt 0 ] 2>/dev/null || return 0
-    [ -f "${runtime_dir}/packed_experts/layout.json" ] || return 1
+    [ -f "${runtime_dir}/${packed_name}/layout.json" ] || return 1
     [ -f "$model_config" ] || return 1
-    python3 - "$model_config" "$model_id" "${runtime_dir}/packed_experts/layout.json" <<'PY'
+    python3 - "$model_config" "$model_id" "${runtime_dir}/${packed_name}/layout.json" "$expected_layers" "$packed_name" <<'PY'
 import json
 import sys
 
-registry_path, model_id, layout_path = sys.argv[1:]
+registry_path, model_id, layout_path, expected_layers, packed_name = sys.argv[1:]
 with open(registry_path) as f:
     registry = json.load(f)
 with open(layout_path) as f:
@@ -619,8 +645,78 @@ down_s = hidden * (moe // group_size) * 2
 expected_expert_size = gate_w + gate_s + gate_s + gate_w + gate_s + gate_s + down_w + down_s + down_s
 actual_expert_size = int(layout.get("expert_size") or 0)
 actual_num_experts = int(layout.get("num_experts") or 0)
-sys.exit(0 if (actual_expert_size, actual_num_experts) == (expected_expert_size, num_experts) else 1)
+actual_layers = int(layout.get("num_layers") or 0)
+expected_layers = int(expected_layers or 0)
+artifact = layout.get("artifact")
+if artifact and artifact != packed_name:
+    sys.exit(1)
+sys.exit(0 if (
+    actual_expert_size == expected_expert_size and
+    actual_num_experts == num_experts and
+    (expected_layers <= 0 or actual_layers == expected_layers)
+) else 1)
 PY
+}
+
+runtime_experts_match_model() {
+    runtime_packed_experts_match_model "$1" "$2" "packed_experts" "$(flashchat_model_layers "$1")"
+}
+
+model_mtp_artifacts_required() {
+    local model_id="$1"
+    local source_format mtp_max
+    source_format=$(flashchat_model_field "$model_id" "source_format")
+    mtp_max=$(flashchat_model_mtp_max "$model_id")
+    [ "$source_format" = "native_bf16" ] && [ "${mtp_max:-0}" -gt 0 ] 2>/dev/null
+}
+
+model_mtp_layers() {
+    local layers
+    layers=$(flashchat_model_field "$1" "mtp_num_hidden_layers")
+    echo "${layers:-0}"
+}
+
+runtime_mtp_match_model() {
+    local model_id="$1"
+    local runtime_dir="$2"
+    model_mtp_artifacts_required "$model_id" || return 0
+    [ -f "${runtime_dir}/model_weights.json" ] || return 1
+    python3 - "${runtime_dir}/model_weights.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    manifest = json.load(f)
+tensors = manifest.get("tensors", {})
+required = {
+    "mtp.fc.weight",
+    "mtp.fc.scales",
+    "mtp.fc.biases",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.q_proj.scales",
+    "mtp.layers.0.self_attn.q_proj.biases",
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.gate.scales",
+    "mtp.layers.0.mlp.gate.biases",
+    "mtp.norm.weight",
+}
+sys.exit(0 if required.issubset(tensors) else 1)
+PY
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    [ "${num_experts:-0}" -gt 0 ] 2>/dev/null || return 0
+    local mtp_layers i
+    mtp_layers=$(model_mtp_layers "$model_id")
+    [ "${mtp_layers:-0}" -gt 0 ] 2>/dev/null || return 1
+    runtime_packed_experts_match_model "$model_id" "$runtime_dir" "packed_mtp_experts" "$mtp_layers" || return 1
+    i=0
+    while [ "$i" -lt "$mtp_layers" ]; do
+        [ -f "${runtime_dir}/packed_mtp_experts/layer_$(printf "%02d" "$i").bin" ] || return 1
+        i=$((i + 1))
+    done
 }
 
 model_artifact_status() {
@@ -636,7 +732,7 @@ model_artifact_status() {
     local repack_script
     repack_script=$(model_registry_script "$model_id" "repack_experts" "scripts/repack_experts.py")
 
-    local downloaded weights vocab index experts last_expert
+    local downloaded weights vocab index experts last_expert mtp
     downloaded=$(model_status_value model_has_hf_files "$model_path")
     weights=$(model_status_value runtime_weights_match_model "$model_id" "$runtime_dir")
     vocab=$(model_status_value test -f "${runtime_dir}/vocab.bin")
@@ -645,14 +741,25 @@ model_artifact_status() {
     else
         index=$(model_status_value test -f "${runtime_dir}/expert_index.json")
     fi
-    last_expert="${experts_dir}/layer_$(printf "%02d" "$last_layer").bin"
-    if [ -f "$last_expert" ] && runtime_experts_match_model "$model_id" "$runtime_dir"; then
-        experts="yes"
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        last_expert="${experts_dir}/layer_$(printf "%02d" "$last_layer").bin"
+        if [ -f "$last_expert" ] && runtime_experts_match_model "$model_id" "$runtime_dir"; then
+            experts="yes"
+        else
+            experts="no"
+        fi
     else
-        experts="no"
+        experts="n/a"
+    fi
+    if model_mtp_artifacts_required "$model_id"; then
+        mtp=$(model_status_value runtime_mtp_match_model "$model_id" "$runtime_dir")
+    else
+        mtp="n/a"
     fi
 
-    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts"
+    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts | MTP: $mtp"
 }
 
 model_registry_script() {
@@ -1382,6 +1489,7 @@ model_runtime_ready_for_snapshot() {
     [ -d "$runtime_dir" ] || return 1
     runtime_weights_match_model "$model_id" "$runtime_dir" || return 1
     [ -f "${runtime_dir}/vocab.bin" ] || return 1
+    runtime_mtp_match_model "$model_id" "$runtime_dir" || return 1
 
     # Dense models (num_experts=0) quantize the MLP into model_weights.bin and have
     # no expert_index.json / packed_experts/ — only MoE models stream per-layer experts.
@@ -1484,6 +1592,51 @@ use_model_from_offload_repo() {
     flashchat_load_config
     echo "Using offloaded model for this run."
     echo "$snapshot"
+}
+
+runtime_artifact_entries() {
+    local model_id="$1"
+    printf "%s\n" model_weights.bin model_weights.json vocab.bin system_prompt_cache
+    local num_experts
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        printf "%s\n" expert_index.json packed_experts packed_experts_lz4
+        if model_mtp_artifacts_required "$model_id"; then
+            printf "%s\n" packed_mtp_experts
+        fi
+    fi
+}
+
+runtime_artifacts_exist() {
+    local model_id="$1"
+    local runtime_dir="$2"
+    local entry
+    while IFS= read -r entry; do
+        [ -e "${runtime_dir}/${entry}" ] && return 0
+    done < <(runtime_artifact_entries "$model_id")
+    return 1
+}
+
+remove_runtime_artifacts() {
+    local model_id="$1"
+    local runtime_dir="$2"
+    local entry
+    while IFS= read -r entry; do
+        [ -e "${runtime_dir}/${entry}" ] || continue
+        rm -rf "${runtime_dir:?}/${entry}" || return 1
+    done < <(runtime_artifact_entries "$model_id")
+}
+
+copy_runtime_artifacts() {
+    local model_id="$1"
+    local source_runtime="$2"
+    local local_runtime="$3"
+    local entry
+    mkdir -p "$local_runtime" || return 1
+    while IFS= read -r entry; do
+        [ -e "${source_runtime}/${entry}" ] || continue
+        cp -R "${source_runtime}/${entry}" "$local_runtime/" || return 1
+    done < <(runtime_artifact_entries "$model_id")
 }
 
 confirm_exact_model_id() {
@@ -1634,7 +1787,7 @@ manage_remove_original_blobs() {
     fi
     if ! model_runtime_ready_for_snapshot "$model_id" "$snapshot"; then
         echo "Original blobs can only be removed after the runtime artifacts are complete."
-        echo "Expected model_weights.bin, model_weights.json, vocab.bin, expert_index.json, and all packed expert layers."
+        echo "Expected complete runtime artifacts for this model and quantization."
         return 1
     fi
     blobs_size=$(get_model_blobs_size "$snapshot")
@@ -1746,15 +1899,15 @@ manage_restore_runtime_only() {
         echo "Offloaded model does not have complete runtime artifacts."
         return 1
     fi
-    source_runtime="${source_snapshot}/flashchat"
+    source_runtime=$(flashchat_model_runtime_dir "$model_id" "$source_snapshot")
     local_snapshot="${local_repo}/snapshots/$(basename "$source_snapshot")"
-    local_runtime="${local_snapshot}/flashchat"
+    local_runtime=$(flashchat_model_runtime_dir "$model_id" "$local_snapshot")
 
-    if [ -e "$local_runtime" ]; then
+    if runtime_artifacts_exist "$model_id" "$local_runtime"; then
         echo "Local runtime artifacts already exist:"
         echo "$local_runtime"
         confirm_exact_model_id "$model_id" "Type the exact model ID to overwrite the local runtime artifacts:" || return 1
-        if ! rm -rf "$local_runtime"; then
+        if ! remove_runtime_artifacts "$model_id" "$local_runtime"; then
             echo "Unable to remove existing local runtime artifacts."
             return 1
         fi
@@ -1764,8 +1917,12 @@ manage_restore_runtime_only() {
         echo "Unable to create local snapshot directory."
         return 1
     fi
-    if ! cp -R "$source_runtime" "$local_snapshot/"; then
+    if ! copy_runtime_artifacts "$model_id" "$source_runtime" "$local_runtime"; then
         echo "Unable to restore runtime artifacts."
+        return 1
+    fi
+    if ! model_runtime_ready_for_snapshot "$model_id" "$local_snapshot"; then
+        echo "Restored runtime artifacts did not pass validation."
         return 1
     fi
     echo "Runtime artifacts restored without copying original safetensors blobs."
@@ -2124,32 +2281,7 @@ check_model_downloaded() {
     model_path=$(flashchat_get MODEL_PATH)
     local model_id
     model_id=$(flashchat_get MODEL)
-    local weights_dir
-    weights_dir=$(flashchat_get WEIGHTS_DIR)
-    if [[ "$weights_dir" != /* ]]; then
-        weights_dir="${weights_dir#./}"
-        weights_dir="${SCRIPT_DIR}/$weights_dir"
-    fi
-    
-    if ! runtime_weights_match_model "$model_id" "$weights_dir" || \
-       ! [ -f "$weights_dir/vocab.bin" ]; then
-        return 1
-    fi
-
-    # Dense models (num_experts=0) have no packed_experts/ — weights+vocab is complete.
-    local num_experts
-    num_experts=$(flashchat_model_num_experts "$model_id")
-    if ! [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
-        return 0
-    fi
-
-    local last_layer
-    last_layer=$(get_last_layer_index)
-    local experts_dir
-    experts_dir=$(flashchat_get EXPERTS_DIR)
-    [ -f "$experts_dir/layer_${last_layer}.bin" ] && runtime_experts_match_model "$model_id" "$weights_dir" && return 0
-
-    return 1
+    model_runtime_ready_for_snapshot "$model_id" "$model_path"
 }
 
 check_model_extracted() {
@@ -2163,13 +2295,21 @@ prompt_extract_setup() {
     local quant_bits
     quant_bits=$(flashchat_model_quant_bits "$(flashchat_get MODEL)")
     quant_bits="${quant_bits:-4}"
+    local model_id num_experts
+    model_id=$(flashchat_get MODEL)
+    num_experts=$(flashchat_model_num_experts "$model_id")
     echo ""
     echo "=== Model Files Required ==="
     echo ""
     echo "The model has been downloaded but the following need to be extracted:"
-    echo "  - Non-expert weights (~5.5GB): model_weights.bin + model_weights.json"
+    echo "  - Runtime weights: model_weights.bin + model_weights.json"
     echo "  - Vocabulary: vocab.bin"
-    echo "  - Expert weights (${quant_bits}-bit): packed_experts/"
+    if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        echo "  - Expert weights (${quant_bits}-bit): packed_experts/"
+    fi
+    if model_mtp_artifacts_required "$model_id"; then
+        echo "  - Multi-token prediction assets for this model"
+    fi
     echo ""
     echo "This is a ONE-TIME setup operation."
     read -p "Run extraction now? [Y/n] " -n 1 -r
@@ -2274,11 +2414,42 @@ check_vocab_exported() {
     return $?
 }
 
+expert_index_matches_model_path() {
+    local index_path="$1"
+    local model_path="$2"
+    [ -f "$index_path" ] || return 1
+    python3 - "$index_path" "$model_path" <<'PY'
+import json
+import os
+import sys
+
+index_path, model_path = sys.argv[1:]
+try:
+    with open(index_path) as f:
+        data = json.load(f)
+    indexed = os.path.realpath(os.path.expanduser(data.get("model_path", "")))
+    current = os.path.realpath(os.path.expanduser(model_path))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if indexed == current else 1)
+PY
+}
+
 check_experts_extracted() {
+    local weights_dir
+    weights_dir=$(flashchat_get WEIGHTS_DIR)
+    if [[ "$weights_dir" != /* ]]; then
+        weights_dir="${weights_dir#./}"
+        weights_dir="${SCRIPT_DIR}/$weights_dir"
+    fi
+
     # Dense models (num_experts=0) have no experts to extract — nothing to do.
     local num_experts
     num_experts=$(flashchat_model_num_experts "$(flashchat_get MODEL)")
-    [ "${num_experts:-0}" -gt 0 ] 2>/dev/null || return 0
+    if ! [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        runtime_mtp_match_model "$(flashchat_get MODEL)" "$weights_dir"
+        return $?
+    fi
 
     local experts_dir
     experts_dir=$(flashchat_get EXPERTS_DIR)
@@ -2288,7 +2459,9 @@ check_experts_extracted() {
     fi
     local last_layer
     last_layer=$(get_last_layer_index)
-    [ -f "$experts_dir/layer_${last_layer}.bin" ] && runtime_experts_match_model "$(flashchat_get MODEL)" "$(flashchat_get WEIGHTS_DIR)"
+    [ -f "$experts_dir/layer_${last_layer}.bin" ] && \
+        runtime_experts_match_model "$(flashchat_get MODEL)" "$weights_dir" && \
+        runtime_mtp_match_model "$(flashchat_get MODEL)" "$weights_dir"
     return $?
 }
 
@@ -2683,10 +2856,14 @@ prompt_extract_experts() {
     weights_dir=$(flashchat_get WEIGHTS_DIR)
     local expert_index_path="$weights_dir/expert_index.json"
     if [ "${repack_script##*/}" != "compile_native_qwen.py" ]; then
-        if [ -f "$expert_index_path" ]; then
+        if expert_index_matches_model_path "$expert_index_path" "$model_path"; then
             echo "Using model-specific expert index: $expert_index_path"
         else
-            echo "Expert index not found: $expert_index_path"
+            if [ -f "$expert_index_path" ]; then
+                echo "Expert index points at a different model location. Regenerating it for the current model path."
+            else
+                echo "Expert index not found: $expert_index_path"
+            fi
             echo "Generating expert index from model safetensors..."
             if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$weights_dir"; then
                 echo "ERROR: Expert index generation failed."

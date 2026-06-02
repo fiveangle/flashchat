@@ -61,8 +61,8 @@ Computes three critical paths from the loaded config:
 | Variable | Computation | Example Value |
 |---|---|---|
 | `MODEL_PATH` | `_flashchat_detect_model_path(MODEL_REPO)` → scans `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`, picks latest | `/Users/.../snapshots/abc123` |
-| `WEIGHTS_DIR` | `$MODEL_PATH/flashchat` (or `FLASHCHAT_WEIGHTS_DIR` env override) | `/Users/.../snapshots/abc123/flashchat` |
-| `EXPERTS_DIR` | `$WEIGHTS_DIR/packed_experts` | `/Users/.../snapshots/abc123/flashchat/packed_experts` |
+| `WEIGHTS_DIR` | `flashchat_model_runtime_dir(MODEL, MODEL_PATH)` (or `FLASHCHAT_WEIGHTS_DIR` env override). Native non-4-bit variants use `$MODEL_PATH/flashchat/q<bits>`; other models use `$MODEL_PATH/flashchat` | `/Users/.../snapshots/abc123/flashchat/q8` |
+| `EXPERTS_DIR` | `$WEIGHTS_DIR/packed_experts` | `/Users/.../snapshots/abc123/flashchat/q8/packed_experts` |
 
 `_flashchat_detect_model_path()` — lib/config.sh:252:
 - Escapes `/` to `--` in the repo string
@@ -104,12 +104,11 @@ ensure_setup(force=0)
   │
   ├─ [E] Expert Weights           flashchat:1799-1876
   │   └─ if check_experts_extracted() fails → prompt_extract_experts()
-  │       if expert_index.json missing:
-  │         run_python scripts/generate_expert_index.py --model <PATH> --output <PATH>/flashchat
+  │       if expert_index.json is missing or points at a stale model path:
+  │         run_python scripts/generate_expert_index.py --model <PATH> --output <WEIGHTS_DIR>
   │         → scans model.safetensors.index.json, writes expert → (shard, offset, size) mapping
-  │       prompt [4] for bit-width
   │       run_python scripts/repack_experts.py --model-id <MODEL> --index <expert_index.json>
-  │       → produces: packed_experts/layer_XX.bin (one file per layer, ~218GB total for 397B model)
+  │       → produces: packed_experts/layer_XX.bin (and packed_mtp_experts/ for native MTP MoE models)
   │
   ├─ [F] Save Config              flashchat:1879-1905
   │   └─ if no config exists → prompt_save_config()
@@ -128,11 +127,11 @@ All return 0 (true/ready) or 1 (false/need setup).
 | Function | File:Line | Checks |
 |---|---|---|
 | `check_xcode_cli()` | flashchat:1908 | `xcode-select -p` succeeds |
-| `check_model_downloaded()` | flashchat:1432 | `model_weights.bin`, `model_weights.json`, `vocab.bin`, and `layer_<last>.bin` all exist under WEIGHTS_DIR/EXPERTS_DIR |
+| `check_model_downloaded()` | flashchat:1432 | Selected model/quant runtime passes manifest, vocab, expert, dense, and MTP validation |
 | `check_model_extracted()` | flashchat:1457 | `model-*.safetensors` or `model.safetensors` or `config.json` exist under MODEL_PATH |
 | `check_weights_extracted()` | flashchat:1560 | `model_weights.bin` and `model_weights.json` exist under WEIGHTS_DIR |
 | `check_vocab_exported()` | flashchat:1571 | `vocab.bin` exists under WEIGHTS_DIR |
-| `check_experts_extracted()` | flashchat:1582 | `layer_<last_layer>.bin` exists under EXPERTS_DIR |
+| `check_experts_extracted()` | flashchat:1582 | MoE expert layers match the selected model; dense models validate any required MTP tensors instead |
 | `check_binaries()` | flashchat:1521 | `metal_infer/infer` and `metal_infer/chat` exist |
 | `check_binaries_current()` | flashchat:1534 | builds exist AND all source files are older than their binaries |
 
@@ -172,7 +171,7 @@ Output: ~8MB `vocab.bin`. Read by `metal_infer/tokenizer.h` at inference time.
 
 ## Expert Index Generation: `scripts/generate_expert_index.py`
 
-Only runs if `expert_index.json` doesn't already exist in the model's `flashchat/` directory.
+Runs when `expert_index.json` is missing or when its recorded `model_path` no longer matches the current snapshot location. This matters after a HuggingFace cache repo has been moved to or run from offload storage.
 
 1. Reads `model.safetensors.index.json` — a manifest mapping tensor names to shard files
 2. Uses regex to locate expert MLP tensors: `model.layers.<N>.mlp.switch_mlp.(gate|up|down)_proj.(weight|scales|biases)`
@@ -270,6 +269,8 @@ After a successful `ensure_setup()`, the following directories and files exist:
           expert_index.json            # expert → safetensors mapping
           packed_experts/
             layer_00.bin .. layer_59.bin  # expert weights (~218GB for 397B)
+          packed_mtp_experts/          # native MoE MTP expert weights when supported
+          q8/                           # native 8-bit runtime variant for the same snapshot
 
 <project>/metal_infer/
   .venv/                          # Python venv with numpy
