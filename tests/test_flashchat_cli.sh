@@ -234,6 +234,8 @@ echo ""
 run_test_contains "status basic" "Flashchat Show Status" "$FLASHCHAT"  status
 run_test_contains "status server info" "Server:" "$FLASHCHAT"  status
 run_test_contains "status model info" "Model:" "$FLASHCHAT"  status
+run_test_contains "status quantization info" "Quantization: 4-bit" "$FLASHCHAT"  status
+run_test_contains "main menu quantization info" "Quantization: 4-bit" bash -c "printf q | $FLASHCHAT"
 
 # ---------------------------------------------------------------------------
 # Models command
@@ -300,6 +302,7 @@ echo ""
 
 run_test_contains "config show" "Flashchat Configuration" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config model" "Model:" bash -c "echo 'n' | $FLASHCHAT  config"
+run_test_contains "config quantization" "Quantization: 4-bit" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config server" "Server:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config HuggingFace cache dir" "HuggingFace cache dir:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASHCHAT  config"

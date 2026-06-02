@@ -59,6 +59,14 @@ error() {
     exit 1
 }
 
+current_quantization_label() {
+    local model_id bits
+    model_id=$(flashchat_get MODEL)
+    bits=$(flashchat_model_quant_bits "$model_id")
+    bits="${bits:-4}"
+    echo "${bits}-bit"
+}
+
 normalize_server_log_path() {
     local path="$1"
     [ -z "$path" ] && return
@@ -296,6 +304,7 @@ cmd_status() {
     echo "    GET  /health               (health check)"
     echo ""
     echo "Model: $(flashchat_get MODEL) ($(flashchat_get MODEL_REPO))"
+    echo "Quantization: $(current_quantization_label)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
     echo "Reasoning: $(flashchat_get REASONING)"
@@ -471,6 +480,7 @@ cmd_config() {
     echo "=== Flashchat Configuration ==="
     echo ""
     echo "Model: $(flashchat_get MODEL)"
+    echo "Quantization: $(current_quantization_label)"
     echo "Repository: $(flashchat_get MODEL_REPO)"
     echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Sampling profile: $(flashchat_get SAMPLING_PROFILE) | Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
@@ -506,6 +516,7 @@ cmd_config_interactive() {
     echo ""
     echo "=== Configuration Settings ==="
     echo "  -Model: $(flashchat_get MODEL)"
+    echo "  -Quantization: $(current_quantization_label)"
     echo "  -Repository: $(flashchat_get MODEL_REPO)"
     echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "  -Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
@@ -3888,6 +3899,7 @@ interactive_menu() {
         echo "=================================================="
         echo "Status: $setup_status at $server_url"
         echo "Model: $(flashchat_get MODEL)"
+        echo "Quantization: $(current_quantization_label)"
         echo "$server_line"
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]anage, [Q]uit"
         read -p "> " -n 1 -r
