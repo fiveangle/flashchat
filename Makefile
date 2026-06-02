@@ -37,7 +37,7 @@ BUILD_DIR = metal_infer
 ifeq ($(origin CC),default)
 CC = clang
 endif
-OPT ?= conservative
+OPT ?= aggressive
 
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 BASE_CFLAGS = -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
@@ -326,4 +326,7 @@ model-add-config-smoke:
 model-edit-config-smoke:
 	bash tests/test_model_edit_config.sh
 
-test: cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke api-smoke
+model-quant-config-smoke:
+	bash tests/test_model_quant_config.sh
+
+test: cli-smoke manage-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke model-quant-config-smoke api-smoke

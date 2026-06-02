@@ -297,14 +297,34 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     cfg->num_full_attn_layers = cfg->num_layers / cfg->full_attn_interval;
     cfg->num_linear_layers    = cfg->num_layers - cfg->num_full_attn_layers;
 
+    if (cfg->bits == 0) cfg->bits = 4;
+    if (cfg->group_size == 0) cfg->group_size = 64;
+    if (cfg->bits != 4 && cfg->bits != 8) {
+        fprintf(stderr, "ERROR: quantization bits %d is not supported\n", cfg->bits);
+        return -1;
+    }
+    if (32 % cfg->bits != 0) {
+        fprintf(stderr, "ERROR: quantization bits %d does not pack into U32 words\n", cfg->bits);
+        return -1;
+    }
+
     int gs = cfg->group_size;
-    int gate_w = (cfg->moe_intermediate * cfg->hidden_dim) / 2;
+    int values_per_word = 32 / cfg->bits;
+    if ((cfg->hidden_dim % values_per_word) != 0 || (cfg->moe_intermediate % values_per_word) != 0) {
+        fprintf(stderr, "ERROR: model dimensions do not align with %d-bit U32 packing\n", cfg->bits);
+        return -1;
+    }
+    if ((cfg->hidden_dim % gs) != 0 || (cfg->moe_intermediate % gs) != 0 || (gs % values_per_word) != 0) {
+        fprintf(stderr, "ERROR: model dimensions do not align with group_size %d\n", gs);
+        return -1;
+    }
+    int gate_w = cfg->moe_intermediate * (cfg->hidden_dim / values_per_word) * 4;
     int gate_s = cfg->moe_intermediate * (cfg->hidden_dim / gs) * 2;
     int gate_b = gate_s;
     int up_w   = gate_w;
     int up_s   = gate_s;
     int up_b   = gate_s;
-    int down_w = (cfg->hidden_dim * cfg->moe_intermediate) / 2;
+    int down_w = cfg->hidden_dim * (cfg->moe_intermediate / values_per_word) * 4;
     int down_s = cfg->hidden_dim * (cfg->moe_intermediate / gs) * 2;
     int down_b = down_s;
     cfg->expert_size = gate_w + gate_s + gate_b + up_w + up_s + up_b + down_w + down_s + down_b;

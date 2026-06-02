@@ -52,7 +52,7 @@ def get_model_entry(model_id):
 #   gate_proj / up_proj:  out_dim = moe_intermediate_size, in_dim = hidden_size
 #   down_proj:            out_dim = hidden_size, in_dim = moe_intermediate_size
 #
-#   weight_size = out_dim * (in_dim // 8) * 4      (U32 packed 4-bit)
+#   weight_size = out_dim * (in_dim // values_per_word) * 4
 #   scale_size  = out_dim * (in_dim // G) * 2       (BF16)
 #   bias_size   = out_dim * (in_dim // G) * 2       (BF16)
 #
@@ -65,20 +65,22 @@ def build_components(entry):
     quant = entry.get("quantization", {})
     gs = quant.get("group_size", 64)
     bits = quant.get("bits", 4)
+    if bits not in (4, 8):
+        raise ValueError(f"unsupported quantization bits={bits}")
+    values_per_word = 32 // bits
 
     gate_up_out = moe_int
     gate_up_in = hidden
     down_out = hidden
     down_in = moe_int
 
-    packed_in = 8   # 8 4-bit elements per U32 word
     u32_size = 4    # each U32 word is 4 bytes
 
-    gate_up_wsize = gate_up_out * (gate_up_in // packed_in) * u32_size
+    gate_up_wsize = gate_up_out * (gate_up_in // values_per_word) * u32_size
     gate_up_ssize = gate_up_out * (gate_up_in // gs) * 2
     gate_up_bsize = gate_up_out * (gate_up_in // gs) * 2
 
-    down_wsize = down_out * (down_in // packed_in) * u32_size
+    down_wsize = down_out * (down_in // values_per_word) * u32_size
     down_ssize = down_out * (down_in // gs) * 2
     down_bsize = down_out * (down_in // gs) * 2
 
@@ -86,13 +88,13 @@ def build_components(entry):
     components = []
 
     for name, size, out_d, in_d, s_groups in [
-        ("gate_proj.weight", gate_up_wsize, gate_up_out, gate_up_in // 8, None),
+        ("gate_proj.weight", gate_up_wsize, gate_up_out, gate_up_in // values_per_word, None),
         ("gate_proj.scales", gate_up_ssize, gate_up_out, gate_up_in // gs, gate_up_in // gs),
         ("gate_proj.biases", gate_up_bsize, gate_up_out, gate_up_in // gs, gate_up_in // gs),
-        ("up_proj.weight",   gate_up_wsize, gate_up_out, gate_up_in // 8, None),
+        ("up_proj.weight",   gate_up_wsize, gate_up_out, gate_up_in // values_per_word, None),
         ("up_proj.scales",   gate_up_ssize, gate_up_out, gate_up_in // gs, gate_up_in // gs),
         ("up_proj.biases",   gate_up_bsize, gate_up_out, gate_up_in // gs, gate_up_in // gs),
-        ("down_proj.weight",  down_wsize,   down_out,   down_in // 8, None),
+        ("down_proj.weight",  down_wsize,   down_out,   down_in // values_per_word, None),
         ("down_proj.scales",  down_ssize,   down_out,   down_in // gs, down_in // gs),
         ("down_proj.biases",  down_bsize,   down_out,   down_in // gs, down_in // gs),
     ]:

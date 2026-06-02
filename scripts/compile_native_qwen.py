@@ -17,6 +17,7 @@ from flashchat_quant import (
     bf16_to_f32,
     f32_to_bf16,
     quantize_f32_to_4bit_affine_rows,
+    quantize_f32_to_8bit_affine_rows,
     split_qwen_gate_up_proj,
 )
 from repack_experts import build_components, get_model_entry, parse_layers
@@ -95,11 +96,17 @@ def write_aligned(out_f, offset, data):
     return start, offset
 
 
-def quantize_matrix_to_entries(name, matrix, group_size):
-    weight, scales, biases = quantize_f32_to_4bit_affine_rows(matrix, group_size)
+def quantize_matrix_to_entries(name, matrix, bits, group_size):
+    if bits == 4:
+        weight, scales, biases = quantize_f32_to_4bit_affine_rows(matrix, group_size)
+    elif bits == 8:
+        weight, scales, biases = quantize_f32_to_8bit_affine_rows(matrix, group_size)
+    else:
+        raise ValueError(f"unsupported quantization bits={bits}")
+    values_per_word = 32 // bits
     in_dim = matrix.shape[1]
     return [
-        (name, weight.tobytes(), [matrix.shape[0], in_dim // 8], "U32"),
+        (name, weight.tobytes(), [matrix.shape[0], in_dim // values_per_word], "U32"),
         (name[:-len(".weight")] + ".scales", scales.tobytes(), [matrix.shape[0], in_dim // group_size], "BF16"),
         (name[:-len(".weight")] + ".biases", biases.tobytes(), [matrix.shape[0], in_dim // group_size], "BF16"),
     ]
@@ -215,7 +222,9 @@ def planned_non_expert_tensors(weight_map, headers, group_size, include_mtp):
 
 def compile_non_experts(model_path, output_dir, weight_map, headers, entry, native_config,
                         include_mtp, dry_run, limit, name_regex):
-    group_size = entry.get("quantization", {}).get("group_size", 64)
+    quant = entry.get("quantization", {})
+    bits = quant.get("bits", 4)
+    group_size = quant.get("group_size", 64)
     tensors, skipped_experts, skipped_mtp = planned_non_expert_tensors(weight_map, headers, group_size, include_mtp)
     if name_regex:
         pattern = re.compile(name_regex)
@@ -253,7 +262,7 @@ def compile_non_experts(model_path, output_dir, weight_map, headers, entry, nati
             entries = []
             if will_quantize:
                 matrix = read_tensor_bf16(model_path, filename, header, data_start, orig)
-                entries = quantize_matrix_to_entries(san, matrix, group_size)
+                entries = quantize_matrix_to_entries(san, matrix, bits, group_size)
             else:
                 raw = read_tensor_raw(model_path, filename, header, data_start, orig)
                 if should_shift_native_norm(san, meta):
@@ -299,7 +308,9 @@ def build_expert_sources(weight_map, prefix):
 
 def compile_routed_experts(model_path, output_dir, weight_map, headers, entry, layers,
                            dry_run, max_experts, prefix, packed_name, label, layout_layers):
-    group_size = entry.get("quantization", {}).get("group_size", 64)
+    quant = entry.get("quantization", {})
+    bits = quant.get("bits", 4)
+    group_size = quant.get("group_size", 64)
     components = build_components(entry)
     comp_by_name = {c["name"]: c for c in components}
     expert_size = sum(c["size"] for c in components)
@@ -357,7 +368,7 @@ def compile_routed_experts(model_path, output_dir, weight_map, headers, entry, l
             }
 
             for proj, matrix in matrices.items():
-                for name, data, _, _ in quantize_matrix_to_entries(f"{proj}.weight", matrix, group_size):
+                for name, data, _, _ in quantize_matrix_to_entries(f"{proj}.weight", matrix, bits, group_size):
                     comp_name = name
                     comp = comp_by_name[comp_name]
                     dst = expert * expert_size + comp["offset"]
@@ -402,7 +413,14 @@ def main():
     entry = get_model_entry(args.model_id)
     model_path = Path(args.model)
     native_config = native_text_config(model_path)
-    output_dir = Path(args.output) if args.output else model_path / "flashchat"
+    # Bits-aware default runtime dir, matching flashchat_model_runtime_dir() in lib/config.sh:
+    # 4-bit stays at "flashchat" (back-compat); other bit-widths nest under "flashchat/q{bits}"
+    # so a 4-bit and 8-bit build of the SAME HF snapshot don't clobber each other or get
+    # cross-loaded (the engine reads cfg->bits from the registry; mismatched on-disk experts
+    # => garbage).
+    _bits = int(entry.get("quantization", {}).get("bits", 4) or 4)
+    _default_out = model_path / "flashchat" if _bits == 4 else model_path / "flashchat" / f"q{_bits}"
+    output_dir = Path(args.output) if args.output else _default_out
     index_path = model_path / "model.safetensors.index.json"
     if not index_path.exists():
         print(f"ERROR: {index_path} not found", file=sys.stderr)

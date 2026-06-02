@@ -53,6 +53,34 @@ def unpack_4bit_rows(packed, in_dim):
     return u4
 
 
+def pack_8bit_rows(values):
+    u8 = np.asarray(values, dtype=np.uint8)
+    if u8.ndim != 2:
+        raise ValueError("8-bit packing expects a 2D array")
+    if u8.shape[1] % 4 != 0:
+        raise ValueError("input dimension must be divisible by 4")
+
+    packed = np.zeros((u8.shape[0], u8.shape[1] // 4), dtype=np.uint32)
+    for i in range(4):
+        packed |= u8[:, i::4].astype(np.uint32) << (8 * i)
+    return packed
+
+
+def unpack_8bit_rows(packed, in_dim):
+    words = np.asarray(packed, dtype=np.uint32)
+    if words.ndim != 2:
+        raise ValueError("8-bit unpacking expects a 2D packed array")
+    if in_dim % 4 != 0:
+        raise ValueError("input dimension must be divisible by 4")
+    if words.shape[1] != in_dim // 4:
+        raise ValueError("packed shape does not match input dimension")
+
+    u8 = np.zeros((words.shape[0], in_dim), dtype=np.uint8)
+    for i in range(4):
+        u8[:, i::4] = ((words >> (8 * i)) & 0xFF).astype(np.uint8)
+    return u8
+
+
 def quantize_f32_to_4bit_affine_rows(values, group_size=64):
     f32 = np.asarray(values, dtype=np.float32)
     if f32.ndim != 2:
@@ -84,6 +112,37 @@ def quantize_f32_to_4bit_affine_rows(values, group_size=64):
     return pack_4bit_rows(u4), f32_to_bf16(scales), f32_to_bf16(biases)
 
 
+def quantize_f32_to_8bit_affine_rows(values, group_size=64):
+    f32 = np.asarray(values, dtype=np.float32)
+    if f32.ndim != 2:
+        raise ValueError("quantization expects a 2D array")
+    if f32.shape[1] % group_size != 0:
+        raise ValueError("input dimension must be divisible by group_size")
+    if group_size % 4 != 0:
+        raise ValueError("group_size must be divisible by 4")
+
+    out_dim, in_dim = f32.shape
+    num_groups = in_dim // group_size
+    scales = np.zeros((out_dim, num_groups), dtype=np.float32)
+    biases = np.zeros((out_dim, num_groups), dtype=np.float32)
+    u8 = np.zeros((out_dim, in_dim), dtype=np.uint8)
+
+    for g in range(num_groups):
+        start = g * group_size
+        end = start + group_size
+        group = f32[:, start:end]
+        min_vals = group.min(axis=1, keepdims=True)
+        max_vals = group.max(axis=1, keepdims=True)
+        scale = (max_vals - min_vals) / 255.0
+        scale = np.where(scale < 1e-8, 1e-8, scale)
+        quantized = np.rint((group - min_vals) / scale)
+        u8[:, start:end] = np.clip(quantized, 0, 255).astype(np.uint8)
+        scales[:, g:g + 1] = scale
+        biases[:, g:g + 1] = min_vals
+
+    return pack_8bit_rows(u8), f32_to_bf16(scales), f32_to_bf16(biases)
+
+
 def dequantize_4bit_affine_rows(weight, scales_bf16, biases_bf16, in_dim, group_size=64):
     packed = np.asarray(weight, dtype=np.uint32)
     out_dim = packed.shape[0]
@@ -97,6 +156,22 @@ def dequantize_4bit_affine_rows(weight, scales_bf16, biases_bf16, in_dim, group_
         start = g * group_size
         end = start + group_size
         out[:, start:end] = u4[:, start:end] * scales[:, g:g + 1] + biases[:, g:g + 1]
+    return out
+
+
+def dequantize_8bit_affine_rows(weight, scales_bf16, biases_bf16, in_dim, group_size=64):
+    packed = np.asarray(weight, dtype=np.uint32)
+    out_dim = packed.shape[0]
+    num_groups = in_dim // group_size
+    scales = bf16_to_f32(scales_bf16).reshape(out_dim, num_groups)
+    biases = bf16_to_f32(biases_bf16).reshape(out_dim, num_groups)
+    u8 = unpack_8bit_rows(packed, in_dim).astype(np.float32)
+    out = np.empty((out_dim, in_dim), dtype=np.float32)
+
+    for g in range(num_groups):
+        start = g * group_size
+        end = start + group_size
+        out[:, start:end] = u8[:, start:end] * scales[:, g:g + 1] + biases[:, g:g + 1]
     return out
 
 

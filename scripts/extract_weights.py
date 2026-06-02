@@ -140,10 +140,6 @@ def main():
     print(f"Skipped expert: {skipped_expert}")
     print(f"Extracting: {len(tensors_to_extract)} tensors")
 
-    eight_bit_overrides = load_8bit_tensor_overrides(model_path / "config.json")
-    if eight_bit_overrides:
-        print(f"Found {len(eight_bit_overrides)} 8-bit quantization overrides (will convert to 4-bit)")
-
     by_file = defaultdict(list)
     for name, filename in tensors_to_extract.items():
         by_file[filename].append(name)
@@ -166,9 +162,19 @@ def main():
 
     config = entry
     quant = config.get("quantization", {})
+    target_bits = quant.get("bits", 4)
+    group_size = quant.get("group_size", 64)
+    if target_bits not in (4, 8):
+        print(f"ERROR: unsupported quantization bits={target_bits}", file=sys.stderr)
+        sys.exit(1)
     hidden_size = config["hidden_size"]
     num_layers = config["num_hidden_layers"]
     interval = config["full_attention_interval"]
+
+    eight_bit_overrides = load_8bit_tensor_overrides(model_path / "config.json")
+    if eight_bit_overrides:
+        mode = "preserve native 8-bit" if target_bits == 8 else "convert to 4-bit"
+        print(f"Found {len(eight_bit_overrides)} 8-bit quantization overrides ({mode})")
 
     bin_path = output_dir / "model_weights.bin"
     manifest = {
@@ -196,8 +202,8 @@ def main():
             "partial_rotary_factor": config["partial_rotary_factor"],
             "rope_theta": config["rope_theta"],
             "quantization": {
-                "bits": quant.get("bits", 4),
-                "group_size": quant.get("group_size", 64),
+                "bits": target_bits,
+                "group_size": group_size,
             },
         }
     }
@@ -258,17 +264,19 @@ def main():
                     sf.seek(data_start + biases_meta["data_offsets"][0])
                     biases_data = sf.read(biases_meta["data_offsets"][1] - biases_meta["data_offsets"][0])
 
-                weight_u32 = np.frombuffer(weight_data, dtype=np.uint32).reshape(shape)
                 out_dim = shape[0]
                 in_dim = shape[1] * 4
+                packed_cols = shape[1]
 
-                new_w_u32, new_s_bf16, new_b_bf16 = convert_8bit_to_4bit(
-                    weight_u32, scales_data, biases_data, out_dim, in_dim, group_size=64
-                )
-
-                weight_data = new_w_u32.tobytes()
-                scales_data = new_s_bf16.tobytes()
-                biases_data = new_b_bf16.tobytes()
+                if target_bits == 4:
+                    weight_u32 = np.frombuffer(weight_data, dtype=np.uint32).reshape(shape)
+                    new_w_u32, new_s_bf16, new_b_bf16 = convert_8bit_to_4bit(
+                        weight_u32, scales_data, biases_data, out_dim, in_dim, group_size=group_size
+                    )
+                    weight_data = new_w_u32.tobytes()
+                    scales_data = new_s_bf16.tobytes()
+                    biases_data = new_b_bf16.tobytes()
+                    packed_cols = in_dim // 8
 
                 if offset % ALIGN != 0:
                     pad = ALIGN - (offset % ALIGN)
@@ -279,7 +287,7 @@ def main():
                 manifest["tensors"][san_name] = {
                     "offset": offset,
                     "size": len(weight_data),
-                    "shape": [out_dim, in_dim // 8],
+                    "shape": [out_dim, packed_cols],
                     "dtype": dtype,
                 }
                 offset += len(weight_data)

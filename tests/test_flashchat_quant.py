@@ -13,11 +13,16 @@ from flashchat_quant import (  # noqa: E402
     bf16_to_f32,
     convert_8bit_to_4bit,
     dequantize_4bit_affine_rows,
+    dequantize_8bit_affine_rows,
     f32_to_bf16,
+    pack_8bit_rows,
     quantize_f32_to_4bit_affine_rows,
+    quantize_f32_to_8bit_affine_rows,
     split_qwen_gate_up_proj,
+    unpack_8bit_rows,
 )
-from compile_native_qwen import should_shift_native_norm, shift_native_norm_data  # noqa: E402
+from compile_native_qwen import quantize_matrix_to_entries, should_shift_native_norm, shift_native_norm_data  # noqa: E402
+from repack_experts import build_components  # noqa: E402
 
 
 def require(condition, message):
@@ -65,6 +70,65 @@ def test_8bit_to_4bit_legacy_contract():
     require(weight.dtype == np.uint32, "8-bit conversion weight dtype mismatch")
     require(new_scales.shape == (out_dim, in_dim // group_size), "8-bit conversion scales shape mismatch")
     require(new_biases.shape == (out_dim, in_dim // group_size), "8-bit conversion biases shape mismatch")
+
+
+def test_8bit_affine_dequantization():
+    out_dim = 2
+    in_dim = 64
+    u8 = np.arange(out_dim * in_dim, dtype=np.uint8).reshape(out_dim, in_dim)
+    packed = pack_8bit_rows(u8)
+    unpacked = unpack_8bit_rows(packed, in_dim)
+    require(np.array_equal(unpacked, u8), "8-bit pack/unpack mismatch")
+
+    scales_f32 = np.array([[0.5], [0.25]], dtype=np.float32)
+    biases_f32 = np.array([[-1.0], [2.0]], dtype=np.float32)
+    restored = dequantize_8bit_affine_rows(
+        packed, f32_to_bf16(scales_f32), f32_to_bf16(biases_f32), in_dim, group_size=64
+    )
+    expected = u8.astype(np.float32) * scales_f32 + biases_f32
+    require(np.allclose(restored, expected, rtol=0.01, atol=0.01), "8-bit dequantization mismatch")
+
+
+def test_8bit_affine_quantization():
+    values = np.linspace(-2.0, 3.0, 128, dtype=np.float32).reshape(2, 64)
+    weight, scales, biases = quantize_f32_to_8bit_affine_rows(values, group_size=64)
+    restored = dequantize_8bit_affine_rows(weight, scales, biases, values.shape[1], group_size=64)
+
+    require(weight.dtype == np.uint32, "8-bit packed weight dtype should be U32")
+    require(weight.shape == (2, 16), "8-bit packed weight shape mismatch")
+    require(scales.dtype == np.uint16, "8-bit scales should be BF16 words")
+    require(biases.dtype == np.uint16, "8-bit biases should be BF16 words")
+    require(np.max(np.abs(restored - values)) < 0.04, "8-bit reconstruction error too large")
+
+
+def test_repack_components_respect_bits():
+    base = {
+        "hidden_size": 128,
+        "moe_intermediate_size": 64,
+        "quantization": {"group_size": 64},
+    }
+    entry_4 = dict(base)
+    entry_4["quantization"] = {"bits": 4, "group_size": 64}
+    entry_8 = dict(base)
+    entry_8["quantization"] = {"bits": 8, "group_size": 64}
+
+    by_name_4 = {c["name"]: c for c in build_components(entry_4)}
+    by_name_8 = {c["name"]: c for c in build_components(entry_8)}
+
+    require(by_name_4["gate_proj.weight"]["shape"] == [64, 16], "4-bit gate shape mismatch")
+    require(by_name_8["gate_proj.weight"]["shape"] == [64, 32], "8-bit gate shape mismatch")
+    require(by_name_8["gate_proj.weight"]["size"] == by_name_4["gate_proj.weight"]["size"] * 2,
+            "8-bit gate weight size should double 4-bit")
+
+
+def test_native_compile_respects_bits():
+    matrix = np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(2, 64)
+    entries4 = quantize_matrix_to_entries("proj.weight", matrix, 4, 64)
+    entries8 = quantize_matrix_to_entries("proj.weight", matrix, 8, 64)
+
+    require(entries4[0][2] == [2, 8], "native compiler 4-bit packed shape mismatch")
+    require(entries8[0][2] == [2, 16], "native compiler 8-bit packed shape mismatch")
+    require(len(entries8[0][1]) == len(entries4[0][1]) * 2, "native compiler 8-bit weight bytes should double")
 
 
 def test_qwen_gate_up_split():
@@ -135,6 +199,10 @@ def main():
     test_bf16_roundtrip()
     test_4bit_affine_quantization()
     test_8bit_to_4bit_legacy_contract()
+    test_8bit_affine_dequantization()
+    test_8bit_affine_quantization()
+    test_repack_components_respect_bits()
+    test_native_compile_respects_bits()
     test_qwen_gate_up_split()
     test_native_qwen_norm_shift_policy()
     test_known_bf16_mtp_snapshot_metadata()
