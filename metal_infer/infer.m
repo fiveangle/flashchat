@@ -2346,7 +2346,15 @@ static MetalCtx *metal_setup(void) {
     }
 
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.mathMode = MTLMathModeFast;
+    // Metal defaults to fast-math (approx exp/rsqrt/divide, float reassociation, NO NaN/Inf
+    // handling). That can produce intermittent gibberish when softmax/attention hit a value
+    // that should saturate but instead overflows unguarded, and it widens CPU-vs-GPU drift.
+    // FLASHCHAT_MATH=safe (IEEE, precise, NaN-safe) or =relaxed lets us A/B against =fast.
+    const char *mm = getenv("FLASHCHAT_MATH");
+    if (mm && strcmp(mm, "safe") == 0)         opts.mathMode = MTLMathModeSafe;
+    else if (mm && strcmp(mm, "relaxed") == 0) opts.mathMode = MTLMathModeRelaxed;
+    else                                        opts.mathMode = MTLMathModeFast;
+    if (mm) fprintf(stderr, "[metal] math mode: %s\n", mm);
     opts.languageVersion = MTLLanguageVersion3_1;
     double t0 = now_ms();
     ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
@@ -3199,6 +3207,34 @@ static void fast_dequant_matvec(
     } else {
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
+}
+
+// SwiGLU via the production swiglu_fused GPU kernel (Metal exp), so the MoE batched
+// verify block is bit-faithful to production. Production computes expert/shared SwiGLU
+// on GPU; cpu_swiglu (libm expf) differs by a few ulp, which is harmless for dense but
+// — through the top-K routing threshold — flips expert selection on MoE and cascades to
+// garbage over 40 layers. Dense stays on cpu_swiglu (its production path is CPU too).
+static void gpu_swiglu(MetalCtx *ctx, const float *gate, const float *up, float *out, int dim) {
+    static id<MTLBuffer> gbuf = nil, ubuf = nil, obuf = nil;
+    size_t sz = (size_t)dim * sizeof(float);
+    if (!gbuf || (size_t)[gbuf length] < sz) gbuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    if (!ubuf || (size_t)[ubuf length] < sz) ubuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    if (!obuf || (size_t)[obuf length] < sz) obuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    memcpy([gbuf contents], gate, sz);
+    memcpy([ubuf contents], up, sz);
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:ctx->swiglu];
+    [e setBuffer:gbuf offset:0 atIndex:0];
+    [e setBuffer:ubuf offset:0 atIndex:1];
+    [e setBuffer:obuf offset:0 atIndex:2];
+    uint32_t d = (uint32_t)dim;
+    [e setBytes:&d length:4 atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake((d + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    memcpy(out, [obuf contents], sz);
 }
 
 // ============================================================================
@@ -4795,7 +4831,7 @@ static void routed_ffn_1(void *buf, const float *x, float *out) {
     float *eg = malloc(MI * sizeof(float)), *eu = malloc(MI * sizeof(float)), *ea = malloc(MI * sizeof(float));
     fast_dequant_matvec(gw, gs, gb, x, eg, MI, H, gsz);
     fast_dequant_matvec(uw, us, ub, x, eu, MI, H, gsz);
-    cpu_swiglu(eg, eu, ea, MI);
+    gpu_swiglu(g_metal, eg, eu, ea, MI);  // GPU swiglu => bit-faithful to production MoE
     fast_dequant_matvec(dw, ds, db, ea, out, H, MI, gsz);
     free(eg); free(eu); free(ea);
 }
@@ -4810,8 +4846,8 @@ static void routed_ffn_2(void *buf, const float *xa, const float *xb, float *oa,
     float *eaa = malloc(MI*sizeof(float)), *eab = malloc(MI*sizeof(float));
     gpu_dequant_matmul2(g_metal, gw, gs, gb, xa, xb, ega, egb, MI, H, gsz);
     gpu_dequant_matmul2(g_metal, uw, us, ub, xa, xb, eua, eub, MI, H, gsz);
-    cpu_swiglu(ega, eua, eaa, MI);
-    cpu_swiglu(egb, eub, eab, MI);
+    gpu_swiglu(g_metal, ega, eua, eaa, MI);  // GPU swiglu => bit-faithful to production MoE
+    gpu_swiglu(g_metal, egb, eub, eab, MI);
     gpu_dequant_matmul2(g_metal, dw, ds, db, eaa, eab, oa, ob, H, MI, gsz);
     free(ega); free(egb); free(eua); free(eub); free(eaa); free(eab);
 }
@@ -4830,6 +4866,7 @@ static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_p
     fast_dequant_matvec(gw, gs, gb, h_post, scores, g_cfg.num_experts, H, gsz);
     cpu_softmax(scores, g_cfg.num_experts);
     cpu_topk(scores, g_cfg.num_experts, K, idx, wt);
+    if (getenv("MOE_DBG") && layer <= 1) { fprintf(stderr,"[moe-dbg-block] L%d hpost0=%.6f experts=[",layer,h_post[0]); for(int k=0;k<K;k++)fprintf(stderr,"%d ",idx[k]); fprintf(stderr,"]\n"); }
     cpu_normalize_weights(wt, K);
     free(scores);
 }
@@ -4847,7 +4884,7 @@ static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, floa
     float *sg = malloc(SI*sizeof(float)), *su = malloc(SI*sizeof(float)), *sa = malloc(SI*sizeof(float)), score = 0;
     fast_dequant_matvec(sgw, sgs, sgb, h_post, sg, SI, H, gsz);
     fast_dequant_matvec(suw, sus, sub, h_post, su, SI, H, gsz);
-    cpu_swiglu(sg, su, sa, SI);
+    gpu_swiglu(g_metal, sg, su, sa, SI);  // GPU swiglu => bit-faithful to production MoE
     fast_dequant_matvec(sdw, sds, sdb, sa, shared_out, H, SI, gsz);
     fast_dequant_matvec(segw, segs, segb, h_post, &score, 1, H, gsz);
     float w = cpu_sigmoid(score);
@@ -4873,8 +4910,8 @@ static void shared_expert_2(WeightFile *wf, int layer, const float *hpa, const f
     float scorea = 0, scoreb = 0;
     gpu_dequant_matmul2(g_metal, sgw, sgs, sgb, hpa, hpb, sga, sgb_, SI, H, gsz);
     gpu_dequant_matmul2(g_metal, suw, sus, sub, hpa, hpb, sua, sub_, SI, H, gsz);
-    cpu_swiglu(sga, sua, saa, SI);
-    cpu_swiglu(sgb_, sub_, sab, SI);
+    gpu_swiglu(g_metal, sga, sua, saa, SI);  // GPU swiglu => bit-faithful to production MoE
+    gpu_swiglu(g_metal, sgb_, sub_, sab, SI);
     gpu_dequant_matmul2(g_metal, sdw, sds, sdb, saa, sab, out_a, out_b, H, SI, gsz);
     gpu_dequant_matmul2(g_metal, segw, segs, segb, hpa, hpb, &scorea, &scoreb, 1, H, gsz);
     float wa = cpu_sigmoid(scorea), wb = cpu_sigmoid(scoreb);
@@ -5544,6 +5581,12 @@ static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
             dense_mlp_block_2(wf, layer, ha, hb);
         else
             moe_block_2(wf, layer, ha, hb, fds[layer]);
+        if (getenv("MTP_VF2_DBG")) {
+            double na2=0; for(int i=0;i<Hd;i++) na2+=ha[i]*ha[i];
+            int is_full=((layer+1)%g_cfg.full_attn_interval)==0;
+            double rel=-1; if(g_vf2_ref_on && g_vf2_ref[layer]){ double e=0,r=0; for(int i=0;i<Hd;i++){e=fmax(e,fabs(ha[i]-g_vf2_ref[layer][i])); r=fmax(r,fabs(g_vf2_ref[layer][i]));} rel=r>0?e/r:e; }
+            fprintf(stderr,"[vf2-dbg] layer %2d %s |ha|=%.4f rel_vs_prod=%.3e\n",layer,is_full?"FULL":"lin ",sqrt(na2),rel);
+        }
     }
     uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
     float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
@@ -5583,7 +5626,17 @@ static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
     gpu_snap_restore(&snap, kv);
     float *Hat=malloc(Hd*sizeof(float)),*Hbt=malloc(Hd*sizeof(float)),*la_t=malloc(V*sizeof(float)),*lb_t=malloc(V*sizeof(float));
     embed_lookup(wf,ta,Hat); embed_lookup(wf,tb,Hbt);
+    // DBG: capture production per-layer hidden for token a, then restore state for the batched run.
+    if (getenv("MTP_VF2_DBG")) {
+        gpu_snap_restore(&snap, kv);
+        float *hr=malloc(Hd*sizeof(float)); embed_lookup(wf,ta,hr);
+        for (int L=0; L<Ld; L++) { int isf=((L+1)%g_cfg.full_attn_interval)==0;
+            fused_layer_forward(wf,L,hr,isf?kv[L]:NULL,isf?NULL:ls[L],P,mmaps[L],K,fds[L]); complete_deferred_experts();
+            if(!g_vf2_ref[L]) g_vf2_ref[L]=malloc(Hd*sizeof(float)); memcpy(g_vf2_ref[L],hr,Hd*sizeof(float)); }
+        free(hr); g_vf2_ref_on=1; gpu_snap_restore(&snap, kv);
+    }
     fused_layer_forward_2(wf,Hat,Hbt,kv,fds,P,P+1,la_t,lb_t,NULL);
+    g_vf2_ref_on=0;
 
     double ea=0,eb=0,ref=0; for(int i=0;i<V;i++){ ea=fmax(ea,fabs(la_o[i]-la_t[i])); eb=fmax(eb,fabs(lb_o[i]-lb_t[i])); ref=fmax(ref,fabs(la_o[i])); }
     int aa_o=cpu_argmax(la_o,V),aa_t=cpu_argmax(la_t,V),bb_o=cpu_argmax(lb_o,V),bb_t=cpu_argmax(lb_t,V);
@@ -6550,6 +6603,26 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 // LM head (logits projection)
 // ============================================================================
 
+// First-defense NaN/Inf guard. CRITICAL: under -ffast-math (-ffinite-math-only) the
+// compiler assumes all floats are finite, so isnan()/isfinite() fold to constants and
+// silently miss the very gibberish we're hunting. We inspect the raw IEEE-754 bits
+// (exponent all-ones => Inf or NaN) which integer ops can't optimize away. Enabled with
+// FLASHCHAT_NAN_CHECK=1 (zero cost otherwise); logs the first non-finite it finds so we
+// can localize intermittent corruption (lm_head logits, layer hidden, expert outputs).
+static int g_nan_check = -1;
+static inline int fc_is_nonfinite(float v) {
+    uint32_t u; memcpy(&u, &v, sizeof(u));
+    return ((u >> 23) & 0xFFu) == 0xFFu;   // Inf (mantissa 0) or NaN (mantissa != 0)
+}
+static int fc_check_finite(const float *x, int n, const char *where) {
+    if (g_nan_check < 0) g_nan_check = getenv("FLASHCHAT_NAN_CHECK") ? 1 : 0;
+    if (!g_nan_check) return 0;
+    int bad = 0, first = -1;
+    for (int i = 0; i < n; i++) if (fc_is_nonfinite(x[i])) { if (first < 0) first = i; bad++; }
+    if (bad) fprintf(stderr, "[nan-check] %s: %d/%d non-finite (first idx %d)\n", where, bad, n, first);
+    return bad;
+}
+
 static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) {
     // lm_head: [hidden_dim=4096] -> [vocab_size=248320]
     // This is a HUGE matmul. For 248320 output dims, it will be slow on CPU.
@@ -6568,8 +6641,15 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
+    // First-defense: catch a non-finite hidden state feeding the lm_head (upstream
+    // corruption) before it turns into garbage logits.
+    fc_check_finite(hidden, g_cfg.hidden_dim, "lm_head input hidden");
+
     // Full matmul — use GPU if available (248320 output rows!)
     fast_dequant_matvec(W, S, B, hidden, logits, g_cfg.vocab_size, g_cfg.hidden_dim, g_cfg.group_size);
+
+    // ...and catch non-finite logits before they reach argmax/sampling (the gibberish point).
+    fc_check_finite(logits, g_cfg.vocab_size, "lm_head logits");
 }
 
 // ============================================================================
@@ -8730,6 +8810,7 @@ static void fused_layer_forward(
     float expert_weights[64];
     cpu_topk(gate_scores, g_cfg.num_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    if (getenv("MOE_DBG") && layer_idx <= 1) { fprintf(stderr,"[moe-dbg-prod ] L%d hpost0=%.6f experts=[",layer_idx,h_post[0]); for(int k=0;k<K;k++)fprintf(stderr,"%d ",expert_indices[k]); fprintf(stderr,"]\n"); }
     if (g_freq_tracking) {
         for (int k = 0; k < K; k++) {
             g_expert_freq[layer_idx][expert_indices[k]]++;
