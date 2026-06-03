@@ -93,4 +93,45 @@ if [ "$auto_value" != "3" ]; then
     exit 1
 fi
 
+cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
+MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+SAMPLING_PROFILE="custom"
+MTP="2"
+MAX_TOKENS="1"
+SERVER_PORT="19996"
+SERVER_HOST="127.0.0.1"
+SERVER_LOG_PATH="/tmp/flashchat-mtp-config-smoke-logs"
+HUGGINGFACE_CACHE_DIR="/tmp/flashchat-mtp-config-smoke-hf"
+OFFLOAD_DIR=""
+SERVER_DEBUG="0"
+SERVER_HTTP_LOG="0"
+SYSTEM_PROMPT_CACHE="1"
+SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
+SHOW_THINKING="0"
+COLOR_OUTPUT="0"
+EOF
+
+{
+    printf 'y'
+    printf '\n'
+    printf '\n'
+    printf '2\n'
+    for _ in $(seq 1 12); do
+        printf '\n'
+    done
+} | HOME="$HOME_DIR" FLASHCHAT_MODEL_CONFIG="$CONFIG_JSON" ./flashchat config >/dev/null 2>&1
+
+if ! grep -q '^SAMPLING_PROFILE="thinking-coding"$' "$HOME_DIR/.config/flashchat/config"; then
+    echo "FAIL: config wizard did not save selected canned profile" >&2
+    exit 1
+fi
+if ! grep -q '^MTP=""$' "$HOME_DIR/.config/flashchat/config"; then
+    echo "FAIL: config wizard did not preserve auto MTP for canned profile" >&2
+    exit 1
+fi
+if ! grep -q '^TEMPERATURE="0.6"$' "$HOME_DIR/.config/flashchat/config"; then
+    echo "FAIL: config wizard did not write canned profile temperature" >&2
+    exit 1
+fi
+
 echo "MTP config precedence smoke passed"
