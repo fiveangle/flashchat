@@ -2865,12 +2865,27 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
 // We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
 // byte offsets to point each shader argument at the right tensor.
 // This avoids per-tensor buffer creation and the page-alignment constraint.
+static void gpu_dequant_matmulN(MetalCtx *ctx, const void *W_packed, const void *scales,
+    const void *biases, const float *X, float *OUT, uint32_t out_dim, uint32_t in_dim,
+    uint32_t group_size, uint32_t N);
+
 static void gpu_dequant_matvec(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
     const float *x_f32, float *out_f32,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
+    // #1: the in_dim>4096 single-token matvec used matvec_fast (1 row/TG, X re-read from device),
+    // which is load-latency bound. matmulN with N=1 is the v5 multi-row-per-simdgroup kernel
+    // (independent per-row weight loads overlap -> ILP latency hiding). Routing the big matvecs
+    // (down_proj/o_proj/lm_head) through it measured +14% on dense decode -> DEFAULT ON.
+    static int s_matvec_mm = -1;
+    if (s_matvec_mm < 0) s_matvec_mm = getenv("FLASHCHAT_NO_MATVEC_MM") ? 0 : 1;
+    if (s_matvec_mm && ctx->wf_buf && in_dim > 4096) {
+        gpu_dequant_matmulN(ctx, W_packed, scales, biases, x_f32, out_f32, out_dim, in_dim, group_size, 1);
+        return;
+    }
+
     // Copy input to Metal buffer
     memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
 
@@ -3322,8 +3337,14 @@ static void gpu_batch_matvec(
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        // in_dim<=4096: matvec_v3 (x_shared). in_dim>4096: the v5 multi-row matmulN kernel
+        // (N=1) instead of matvec_fast — ILP latency hiding, same +14% win, still in ONE cmd
+        // buffer so gate+up stay batched. (FLASHCHAT_NO_MATVEC_MM forces matvec_fast.)
+        static int s_bm_mm = -1;
+        if (s_bm_mm < 0) s_bm_mm = getenv("FLASHCHAT_NO_MATVEC_MM") ? 0 : 1;
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
+        int use_mm = (!use_v3 && s_bm_mm);
+        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : (use_mm ? matmuln_pipe(ctx) : matvec_fast_pipe(ctx))];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -3336,6 +3357,11 @@ static void gpu_batch_matvec(
         if (use_v3) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else if (use_mm) {
+            uint32_t one = 1; [enc setBytes:&one length:4 atIndex:8];  // N=1
+            uint32_t rpt = matmuln_rows_per_tg();
+            [enc dispatchThreadgroups:MTLSizeMake((s->out_dim + rpt - 1) / rpt, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
@@ -3376,8 +3402,13 @@ static void gpu_encode_batch_matvec(
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        // in_dim>4096 (e.g. dense QKV at hidden=5120): v5 multi-row matmulN (N=1) instead of
+        // matvec_fast for ILP latency hiding. (FLASHCHAT_NO_MATVEC_MM forces matvec_fast.)
+        static int s_em_mm = -1;
+        if (s_em_mm < 0) s_em_mm = getenv("FLASHCHAT_NO_MATVEC_MM") ? 0 : 1;
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : matvec_fast_pipe(ctx)];
+        int use_mm = (!use_v3 && s_em_mm);
+        [enc setComputePipelineState: use_v3 ? matvec_v3_pipe(ctx) : (use_mm ? matmuln_pipe(ctx) : matvec_fast_pipe(ctx))];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -3390,6 +3421,11 @@ static void gpu_encode_batch_matvec(
         if (use_v3) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else if (use_mm) {
+            uint32_t one = 1; [enc setBytes:&one length:4 atIndex:8];  // N=1
+            uint32_t rpt = matmuln_rows_per_tg();
+            [enc dispatchThreadgroups:MTLSizeMake((s->out_dim + rpt - 1) / rpt, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
