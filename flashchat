@@ -796,20 +796,29 @@ print(model.get("scripts", {}).get(sys.argv[3]) or sys.argv[4])
 PY
 }
 
+numbered_model_registry_entries() {
+    local i=0
+    local model_id name repo
+
+    while IFS=$'\t' read -r model_id name repo; do
+        [ -n "$model_id" ] || continue
+        i=$((i + 1))
+        printf "%d\t%s\t%s\t%s\n" "$i" "$model_id" "$name" "$repo"
+    done < <(flashchat_list_models)
+}
+
 print_model_status_list() {
     local current_model
     current_model="$(flashchat_get MODEL)"
-    local i=0
-    local model_id name repo marker status quant_bits expert_pack_bytes expert_pack_size
+    local number model_id name repo marker status quant_bits expert_pack_bytes expert_pack_size
 
     printf "  [0] Add a model...\n"
     printf "      (only model_type qwen3_5_moe is supported)\n"
     printf "  [E] Edit a model registry entry...\n"
     printf "\n"
 
-    while IFS=$'\t' read -r model_id name repo; do
+    while IFS=$'\t' read -r number model_id name repo; do
         [ -n "$model_id" ] || continue
-        i=$((i + 1))
         marker=" "
         [ "$model_id" = "$current_model" ] && marker="*"
         status=$(model_artifact_status "$model_id")
@@ -821,12 +830,12 @@ print_model_status_list() {
         else
             expert_pack_size="n/a"
         fi
-        printf "  [%d]%s %s\n" "$i" "$marker" "$name"
+        printf "  [%d]%s %s\n" "$number" "$marker" "$name"
         printf "      ID: %s\n" "$model_id"
         printf "      Repo: %s\n" "$repo"
         printf "      Quantization: %s-bit | expert pack: %s\n" "$quant_bits" "$expert_pack_size"
         printf "      %s\n" "$status"
-    done < <(flashchat_list_models)
+    done < <(numbered_model_registry_entries)
 }
 
 add_model_to_registry() {
@@ -1266,18 +1275,20 @@ PY
 
 select_model_from_registry() {
     local default_model="$1"
+    local model_numbers=()
     local model_ids=()
-    local model_id name repo
-    local i=0
+    local number model_id name repo
+    local i
 
     echo "Available models:" >&2
     echo "" >&2
     print_model_status_list >&2
     echo "" >&2
-    while IFS=$'\t' read -r model_id name repo; do
+    while IFS=$'\t' read -r number model_id name repo; do
         [ -n "$model_id" ] || continue
+        model_numbers+=("$number")
         model_ids+=("$model_id")
-    done < <(flashchat_list_models)
+    done < <(numbered_model_registry_entries)
 
     if [ ${#model_ids[@]} -eq 0 ]; then
         echo "No model registry entries found. Using $default_model." >&2
@@ -1311,11 +1322,12 @@ select_model_from_registry() {
             continue
         fi
         if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
-            i=$((REPLY - 1))
-            if [ "$i" -ge 0 ] && [ "$i" -lt ${#model_ids[@]} ]; then
-                echo "${model_ids[$i]}"
-                return
-            fi
+            for i in "${!model_numbers[@]}"; do
+                if [ "${model_numbers[$i]}" = "$REPLY" ]; then
+                    echo "${model_ids[$i]}"
+                    return
+                fi
+            done
         elif flashchat_model_exists "$REPLY"; then
             echo "$REPLY"
             return
@@ -2058,6 +2070,10 @@ prompt_config_interactive() {
     local selected_model
     selected_model=$(select_model_from_registry "$default_model")
     echo "MODEL=\"$selected_model\"" >> /tmp/flashchat_new_config
+    local selected_quant_bits
+    selected_quant_bits=$(flashchat_model_quant_bits "$selected_model")
+    selected_quant_bits="${selected_quant_bits:-4}"
+    echo "Selected model: $selected_model (${selected_quant_bits}-bit)"
     echo ""
     
     # Max Tokens
@@ -2069,8 +2085,9 @@ prompt_config_interactive() {
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashchat_new_config
 
     # Sampling Profile
-    local default_profile
-    default_profile=$(flashchat_get SAMPLING_PROFILE)
+    local original_profile default_profile
+    original_profile=$(flashchat_get SAMPLING_PROFILE)
+    default_profile="$original_profile"
     if [ "$selected_model" != "$default_model" ] && [ "$default_profile" != "custom" ]; then
         default_profile=$(flashchat_model_default_sampling_profile "$selected_model")
     fi
@@ -2261,7 +2278,12 @@ prompt_config_interactive() {
     new_config=$(cat /tmp/flashchat_new_config)
     rm -f /tmp/flashchat_new_config
     
-    if [ "$old_config" = "$new_config" ]; then
+    local selection_changed=0
+    if [ "$selected_model" != "$default_model" ] || [ "$selected_profile" != "$original_profile" ]; then
+        selection_changed=1
+    fi
+
+    if [ "$old_config" = "$new_config" ] && [ "$selection_changed" -eq 0 ]; then
         echo "No changes made."
     else
         echo "$new_config" > "$(flashchat_get CONFIG_FILE)"
