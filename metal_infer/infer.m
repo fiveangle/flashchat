@@ -2482,6 +2482,9 @@ static MetalCtx *metal_setup(void) {
         size_t slot_size = (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim * 2) * sizeof(float);  // 16384 floats
         if (slot_size < (size_t)g_cfg.linear_conv_dim * sizeof(float))
             slot_size = (size_t)g_cfg.linear_conv_dim * sizeof(float);  // 12288 floats
+        // Dense MLP batches gate+up (out_dim = dense_intermediate) through batch_out slots.
+        if (slot_size < (size_t)g_cfg.dense_intermediate * sizeof(float))
+            slot_size = (size_t)g_cfg.dense_intermediate * sizeof(float);
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
             ctx->batch_out[i] = [ctx->device newBufferWithLength:slot_size
                                                          options:MTLResourceStorageModeShared];
@@ -7856,8 +7859,19 @@ static void dense_mlp_forward(WeightFile *wf, int layer, const float *h_post,
     uint32_t *dw=DW("down_proj.weight"); uint16_t *ds=DW("down_proj.scales"),*db=DW("down_proj.biases");
     #undef DW
     float *g=malloc(inter*sizeof(float)),*u=malloc(inter*sizeof(float)),*a=malloc(inter*sizeof(float)),*o=malloc(H*sizeof(float));
-    fast_dequant_matvec(gw,gs,gb,h_post,g,inter,H,gsz);
-    fast_dequant_matvec(uw,us,ub,h_post,u,inter,H,gsz);
+    // gate and up are independent and share the same input (h_post) -> batch into ONE
+    // command buffer (one commit+wait, one input upload) instead of two. down depends on
+    // swiglu(gate,up) so it stays a separate dispatch.
+    if (g_metal && g_metal->wf_buf) {
+        BatchMatvecSpec sp[2] = {
+            { gw,gs,gb, g, (uint32_t)inter, (uint32_t)H, (uint32_t)gsz, 0 },
+            { uw,us,ub, u, (uint32_t)inter, (uint32_t)H, (uint32_t)gsz, 1 },
+        };
+        gpu_batch_matvec(g_metal, h_post, (uint32_t)H, sp, 2);
+    } else {
+        fast_dequant_matvec(gw,gs,gb,h_post,g,inter,H,gsz);
+        fast_dequant_matvec(uw,us,ub,h_post,u,inter,H,gsz);
+    }
     cpu_swiglu(g,u,a,inter);
     fast_dequant_matvec(dw,ds,db,a,o,H,inter,gsz);
     for (int i=0;i<H;i++) hidden_out[i] = h_mid[i] + o[i];
