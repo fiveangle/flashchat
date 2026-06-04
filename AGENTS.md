@@ -111,7 +111,39 @@ make manage-smoke
 make tool-template-smoke
 make api-smoke
 make test
+
+# Performance regression benchmark (server-level, per model) + trend report
+make bench-api
+make bench-report
 ```
+
+## Performance Regression Testing (read before touching the hot path)
+
+`make bench-api` is the canonical perf-regression command. It **derives its matrix from
+the model registry** (`assets/model_configs.json`) — every installed model not opted out
+with `"benchmark": false` is benchmarked in its as-shipped default config, against the
+real HTTP server, with one uniform spec (fixed prompts, temp 0, warmup + repeats),
+recording **prefill (TTFT)** and **decode (tok/s)** separately to `assets/api_perf_log.tsv`.
+`make bench-report` compares the latest rows to prior commits (keyed on `hw_model`) and
+flags regressions.
+
+This design exists because the perf log silently went stale for the entire MTP + dense
+arc: the suite followed a single configured model, so new models/quants were never
+measured. Coverage is now structural, not manual — **but two things still require a human:**
+
+1. **Adding a model/quant variant:** put it in the registry (you must anyway, for the TUI)
+   and it is benchmarked automatically. Only set `"benchmark": false` for variants that
+   physically cannot run here (e.g. the 397B). Do **not** add a parallel benchmark list —
+   a second source of truth is exactly what rotted last time.
+2. **Adding a perf-affecting *axis* that is not a model** (a new kernel mode, an MTP
+   depth, a sampling/runtime toggle that ships on by default): it is exercised
+   automatically *only* if it's part of the model's default config. If it's a new opt-in
+   path, add it to the spec in `tests/bench_api.sh` so every model covers it.
+
+**Run `make bench-api` (or at least `--model-id <id>`) for any change to the decode/prefill
+hot path, kernels, attention, or speculative decoding, and confirm `make bench-report`
+shows no regression before committing.** Ad-hoc `--mtp-generate-*` numbers are for
+inner-loop iteration, not regression sign-off.
 
 ## Code Style
 
