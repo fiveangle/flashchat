@@ -130,14 +130,17 @@ resolve_model() {
         done
     fi
     [[ -f "${WD}/model_weights.bin" ]] || return 1
-    # Experts-dir fallback probe (MoE only).
+    # Experts dir (MoE only). The engine uses FLASHCHAT_EXPERTS_DIR *directly* as the dir
+    # holding layer_XX.bin (it does NOT append packed_experts) — so it must point AT
+    # packed_experts, not its parent. Earlier this set ED to the parent, so layer files were
+    # never found, experts didn't load, and generation was garbage (which is what made MoE
+    # "fail" tool calls and produced bogus benchmark numbers). Resolve against WD/q{bits}.
     if [[ "${NE:-0}" -gt 0 ]]; then
-        if [[ -z "$ED" || ! -d "${ED}/packed_experts" ]]; then
-            for cand in "${ED}" "${MP}/flashchat/q${BITS}" "${MP}/flashchat"; do
-                [[ -n "$cand" && -d "${cand}/packed_experts" ]] && { ED="$cand"; break; }
-            done
-        fi
-        [[ -d "${ED}/packed_experts" ]] || return 1
+        ED=""
+        for cand in "${WD}/packed_experts" "${MP}/flashchat/q${BITS}/packed_experts" "${MP}/flashchat/packed_experts"; do
+            [[ -d "$cand" && ( -f "$cand/layer_00.bin" || -n "$(ls "$cand" 2>/dev/null | head -1)" ) ]] && { ED="$cand"; break; }
+        done
+        [[ -n "$ED" ]] || return 1
     fi
     return 0
 }
@@ -260,7 +263,7 @@ bench_tool() {
 {"model":"bench","messages":[{"role":"user","content":"Record the result 'ok'."}],
  "tools":[{"type":"function","function":{"name":"record_result","description":"Record a result",
    "parameters":{"type":"object","properties":{"result":{"type":"string"}},"required":["result"]}}}],
- "tool_choice":{"type":"function","function":{"name":"record_result"}},"max_tokens":64,"temperature":0}
+ "tool_choice":{"type":"function","function":{"name":"record_result"}},"max_tokens":256,"temperature":0}
 JSON
     end="$(now_ms)"; dur=$((end-start))
     status="pass"; grep -q '"name":"record_result"' "$body" || status="warn"
