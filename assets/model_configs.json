@@ -2,6 +2,7 @@
   "models": {
     "mlx-community-Qwen35-397B-A17B-4bit": {
       "name": "Qwen3.5-397B-A17B",
+      "benchmark": false,
       "hf_repo": "mlx-community/Qwen3.5-397B-A17B-4bit",
       "hidden_size": 4096,
       "num_hidden_layers": 60,
@@ -534,6 +535,7 @@
     },
     "Qwen-Qwen36-27B-8bit": {
       "name": "Qwen3.6-27B-8bit",
+      "benchmark": false,
       "hf_repo": "Qwen/Qwen3.6-27B",
       "hidden_size": 5120,
       "num_hidden_layers": 64,

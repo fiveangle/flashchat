@@ -109,7 +109,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke test
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke test bench-api bench-report
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -186,6 +186,8 @@ help:
 	@printf "  make model-edit-config-smoke  Run edit-model registry smoke test\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
+	@printf "  make bench-api     Run API performance regression benchmark (per registry model)\n"
+	@printf "  make bench-report  Compare latest benchmark vs prior commits, flag regressions\n"
 	@printf "\n"
 	@printf "Maintenance:\n"
 	@printf "  make clean         Remove build artifacts and archive repo-local ./debug contents\n"
@@ -296,6 +298,17 @@ chat-run: $(CHAT_TARGET)
 
 api-smoke: $(INFER_TARGET)
 	bash tests/test_api_smoke.sh
+
+# Performance regression benchmark — iterates the model registry (installed models not
+# opted out via "benchmark": false), runs the uniform spec per model in its default config,
+# appends prefill/decode metrics to assets/api_perf_log.tsv. Separate from `make test`
+# because it starts a real server per model and is minutes-long.
+bench-api: $(INFER_TARGET)
+	bash tests/bench_api.sh
+
+# Compare the latest benchmark rows against prior commits and flag regressions.
+bench-report:
+	python3 tests/bench_report.py
 
 cli-smoke:
 	bash tests/test_flashchat_cli.sh
