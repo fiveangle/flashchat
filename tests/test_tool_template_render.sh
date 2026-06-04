@@ -376,6 +376,32 @@ else
     assert_fail "native XML parser preserves multiline and typed params"
 fi
 
+# qwen3_coder dialect: a single <parameters>{json}</parameters> block, closed with
+# </function> and no </tool_call> (as some Qwen3.6 quants emit under greedy). The parser
+# must extract it just like the xml form.
+CODER_TOOL_CALL_TXT="${TMPDIR}/coder_tool_call.txt"
+cat > "$CODER_TOOL_CALL_TXT" <<'EOF'
+<tool_call>
+<function=record_result>
+<parameters>{"result": "done", "count": 3, "ok": true}</parameters>
+</function>
+EOF
+coder_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$CODER_TOOL_CALL_TXT" | tail -1)
+python3 - "$coder_parsed" <<'PY'
+import json, sys
+outer = json.loads(sys.argv[1])
+args = json.loads(outer["arguments"])
+assert outer["name"] == "record_result", outer
+assert args["result"] == "done", args
+assert args["count"] == 3, args
+assert args["ok"] is True, args
+PY
+if [ $? -eq 0 ]; then
+    assert_pass "native coder parser extracts <parameters>{json}</parameters> (no </tool_call>)"
+else
+    assert_fail "native coder parser extracts <parameters>{json}</parameters> (no </tool_call>)"
+fi
+
 echo ""
 echo "========================================"
 echo "Flashchat Tool Template Render Summary"

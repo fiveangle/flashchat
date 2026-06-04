@@ -10941,32 +10941,58 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
     memset(parsed, 0, sizeof(*parsed));
     const char *tc_start = strstr(tool_call_buf, "<tool_call>");
     if (!tc_start) return 0;
+    // qwen3_xml closes with </tool_call>; qwen3_coder may omit it and close on </function>.
     const char *tc_end = strstr(tc_start, "</tool_call>");
-    if (!tc_end) return 0;
 
     const char *body = tc_start + strlen("<tool_call>");
     const char *fn_open = strstr(body, "<function=");
-    if (!fn_open || fn_open >= tc_end) return 0;
+    if (!fn_open || (tc_end && fn_open >= tc_end)) return 0;
     fn_open += strlen("<function=");
     const char *fn_name_end = strchr(fn_open, '>');
-    if (!fn_name_end || fn_name_end >= tc_end) return 0;
+    if (!fn_name_end || (tc_end && fn_name_end >= tc_end)) return 0;
     size_t name_len = (size_t)(fn_name_end - fn_open);
     if (name_len == 0 || name_len >= sizeof(parsed->name)) return 0;
     char name_buf[sizeof(parsed->name)];
     memcpy(name_buf, fn_open, name_len);
     name_buf[name_len] = '\0';
 
-    NSMutableDictionary *args = [NSMutableDictionary dictionary];
     const char *cursor = fn_name_end + 1;
     const char *fn_close = strstr(cursor, "</function>");
-    if (!fn_close || fn_close > tc_end) fn_close = tc_end;
+    // The call is complete once terminated by </function> (coder) or </tool_call> (xml).
+    if (!fn_close && !tc_end) return 0;
+    const char *region_end = (fn_close && (!tc_end || fn_close < tc_end)) ? fn_close : tc_end;
 
-    while (cursor < fn_close) {
+    // --- qwen3_coder dialect: a single <parameters>{json}</parameters> arguments object ---
+    // (distinct from xml's per-key <parameter=KEY>; "<parameters>" never matches "<parameter=").
+    const char *params_open = strstr(cursor, "<parameters>");
+    if (params_open && params_open < region_end) {
+        const char *j_start = params_open + strlen("<parameters>");
+        const char *params_close = strstr(j_start, "</parameters>");
+        const char *j_end = (params_close && params_close <= region_end) ? params_close : region_end;
+        while (j_start < j_end && (unsigned char)*j_start <= ' ') j_start++;
+        while (j_end > j_start && (unsigned char)j_end[-1] <= ' ') j_end--;
+        size_t jlen = (size_t)(j_end - j_start);
+        if (jlen >= 2 && j_start[0] == '{') {
+            NSData *jd = [NSData dataWithBytes:j_start length:jlen];
+            id obj = [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil];
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                strncpy(parsed->name, name_buf, sizeof(parsed->name) - 1);
+                parsed->arguments = dup_nsstring(json_stringify_obj(obj));
+                parsed->is_tool_call = 1;
+                return 1;
+            }
+        }
+        return 0;  // <parameters> present but JSON not yet complete/valid — keep streaming
+    }
+
+    // --- qwen3_xml dialect: per-key <parameter=KEY>value</parameter> ---
+    NSMutableDictionary *args = [NSMutableDictionary dictionary];
+    while (cursor < region_end) {
         const char *p_open = strstr(cursor, "<parameter=");
-        if (!p_open || p_open >= fn_close) break;
+        if (!p_open || p_open >= region_end) break;
         p_open += strlen("<parameter=");
         const char *p_key_end = strchr(p_open, '>');
-        if (!p_key_end || p_key_end >= fn_close) break;
+        if (!p_key_end || p_key_end >= region_end) break;
         size_t key_len = (size_t)(p_key_end - p_open);
         if (key_len == 0 || key_len > 128) { cursor = p_key_end + 1; continue; }
 
@@ -10978,7 +11004,7 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
         // The closing tag is `\n</parameter>` (template puts \n before it),
         // but be lenient and accept either form.
         const char *p_close = strstr(val_start, "</parameter>");
-        if (!p_close || p_close > fn_close) break;
+        if (!p_close || p_close > region_end) break;
         const char *val_end = p_close;
         if (val_end > val_start && val_end[-1] == '\n') val_end--;
 
