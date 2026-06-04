@@ -11715,6 +11715,39 @@ static int system_prompt_cache_path(const char *model_path, uint64_t hash, char 
     return 0;
 }
 
+static struct timespec stat_mtime_spec(const struct stat *st) {
+#if defined(__APPLE__)
+    return st->st_mtimespec;
+#else
+    struct timespec ts = { st->st_mtime, 0 };
+    return ts;
+#endif
+}
+
+static int timespec_before(struct timespec a, struct timespec b) {
+    if (a.tv_sec != b.tv_sec) return a.tv_sec < b.tv_sec;
+    return a.tv_nsec < b.tv_nsec;
+}
+
+static int touch_file_now(const char *path) {
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0) return -1;
+    struct timeval times[2] = { now, now };
+    return utimes(path, times);
+}
+
+static int discard_system_prompt_disk_cache(const char *model_path, uint64_t hash) {
+    char path[PATH_MAX];
+    if (system_prompt_cache_path(model_path, hash, path, sizeof(path)) != 0) return -1;
+    if (unlink(path) == 0) {
+        server_log_errorf("[serve] sys_prompt_disk_cache discarded invalid %s\n", path);
+        return 0;
+    }
+    if (errno == ENOENT) return 0;
+    server_log_errorf("[serve] sys_prompt_disk_cache discard failed %s: %s\n", path, strerror(errno));
+    return -1;
+}
+
 static size_t serve_gpu_delta_snapshot_size(void) {
     return 64 * 128 * 128 * sizeof(float);
 }
@@ -11910,7 +11943,7 @@ static int load_system_prompt_disk_cache(const char *model_path, uint64_t prompt
                                          KVSnapshot *kv_snapshots,
                                          float **la_conv_snapshots, float **la_ssm_snapshots,
                                          void **gpu_delta_snapshots, void **gpu_conv_snapshots,
-                                         int *loaded_tokens);
+                                         int *loaded_tokens, int *invalid_cache);
 
 // Fingerprint every persistent runtime buffer that affects inference. Used
 // to localize "snapshot does not faithfully represent runtime state" bugs:
@@ -12201,7 +12234,7 @@ static int save_system_prompt_disk_cache(const char *model_path,
         if (load_system_prompt_disk_cache(model_path, prompt_hash, token_count,
                                           kv_load, conv_load, ssm_load,
                                           gpu_delta_load, gpu_conv_load,
-                                          &loaded_tokens) != 0) {
+                                          &loaded_tokens, NULL) != 0) {
             server_log_errorf("[cache-validate] FAIL load returned error for %s\n", path);
             diffs++;
         } else {
@@ -12261,12 +12294,14 @@ static int save_system_prompt_disk_cache(const char *model_path,
     return 0;
 }
 
-static void *read_cache_chunk_payload(FILE *f, const SysPromptCacheChunk *chunk) {
+static void *read_cache_chunk_payload(FILE *f, const SysPromptCacheChunk *chunk, int *invalid_chunk) {
+    if (invalid_chunk) *invalid_chunk = 0;
     if (!f || !chunk || chunk->raw_size == 0 || chunk->stored_size == 0) return NULL;
     void *stored = malloc((size_t)chunk->stored_size);
     if (!stored) return NULL;
     if (fread(stored, 1, (size_t)chunk->stored_size, f) != (size_t)chunk->stored_size) {
         free(stored);
+        if (invalid_chunk) *invalid_chunk = 1;
         return NULL;
     }
     void *raw = stored;
@@ -12282,14 +12317,17 @@ static void *read_cache_chunk_payload(FILE *f, const SysPromptCacheChunk *chunk)
         free(stored);
         if (n != (size_t)chunk->raw_size) {
             free(raw);
+            if (invalid_chunk) *invalid_chunk = 1;
             return NULL;
         }
     } else if (chunk->algorithm != SYSPROMPT_CACHE_ALG_RAW) {
         free(stored);
+        if (invalid_chunk) *invalid_chunk = 1;
         return NULL;
     }
     if (fnv1a_bytes(raw, (size_t)chunk->raw_size) != chunk->checksum) {
         free(raw);
+        if (invalid_chunk) *invalid_chunk = 1;
         return NULL;
     }
     return raw;
@@ -12303,7 +12341,9 @@ static int load_system_prompt_disk_cache(const char *model_path,
                                          float **la_ssm_snapshots,
                                          void **gpu_delta_snapshots,
                                          void **gpu_conv_snapshots,
-                                         int *loaded_tokens) {
+                                         int *loaded_tokens,
+                                         int *invalid_cache) {
+    if (invalid_cache) *invalid_cache = 0;
     if (!g_system_prompt_cache_enabled || !model_path || expected_tokens <= 0) return -1;
 
     char path[PATH_MAX];
@@ -12326,6 +12366,7 @@ static int load_system_prompt_disk_cache(const char *model_path,
         hdr.conv_state_size != (uint64_t)((g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float)) ||
         hdr.ssm_state_size != (uint64_t)(g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float))) {
         fclose(f);
+        if (invalid_cache) *invalid_cache = 1;
         return -1;
     }
 
@@ -12343,53 +12384,57 @@ static int load_system_prompt_disk_cache(const char *model_path,
     int kv_k_count = 0, kv_v_count = 0, conv_count = 0, ssm_count = 0, gpu_delta_count = 0, gpu_conv_count = 0;
     size_t kv_sz = (size_t)hdr.token_count * hdr.kv_dim * sizeof(float);
     int ok = 1;
+    int invalid = 0;
     for (uint32_t c = 0; c < hdr.chunk_count; c++) {
         SysPromptCacheChunk chunk;
         if (fread(&chunk, 1, sizeof(chunk), f) != sizeof(chunk)) {
             ok = 0;
+            invalid = 1;
             break;
         }
-        void *payload = read_cache_chunk_payload(f, &chunk);
+        int invalid_chunk = 0;
+        void *payload = read_cache_chunk_payload(f, &chunk, &invalid_chunk);
         if (!payload) {
             ok = 0;
+            if (invalid_chunk) invalid = 1;
             break;
         }
         int layer = chunk.layer;
         switch (chunk.kind) {
             case SYSPROMPT_CACHE_KIND_KV_K:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_kv[layer].k_snapshot);
                 tmp_kv[layer].k_snapshot = payload;
                 tmp_kv[layer].len = hdr.token_count;
                 kv_k_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_KV_V:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_kv[layer].v_snapshot);
                 tmp_kv[layer].v_snapshot = payload;
                 tmp_kv[layer].len = hdr.token_count;
                 kv_v_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_LA_CONV:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != hdr.conv_state_size) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != hdr.conv_state_size) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_conv[layer]);
                 tmp_conv[layer] = payload;
                 conv_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_LA_SSM:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != hdr.ssm_state_size) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != hdr.ssm_state_size) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_ssm[layer]);
                 tmp_ssm[layer] = payload;
                 ssm_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_GPU_DELTA:
-                if (layer < 0 || layer >= g_cfg.num_linear_layers || chunk.raw_size != hdr.gpu_delta_size) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_linear_layers || chunk.raw_size != hdr.gpu_delta_size) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_gpu_delta[layer]);
                 tmp_gpu_delta[layer] = payload;
                 gpu_delta_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_GPU_CONV:
-                if (layer < 0 || layer >= g_cfg.num_linear_layers || chunk.raw_size != hdr.gpu_conv_size) { ok = 0; free(payload); break; }
+                if (layer < 0 || layer >= g_cfg.num_linear_layers || chunk.raw_size != hdr.gpu_conv_size) { ok = 0; invalid = 1; free(payload); break; }
                 free(tmp_gpu_conv[layer]);
                 tmp_gpu_conv[layer] = payload;
                 gpu_conv_count++;
@@ -12397,6 +12442,7 @@ static int load_system_prompt_disk_cache(const char *model_path,
             default:
                 free(payload);
                 ok = 0;
+                invalid = 1;
                 break;
         }
         if (!ok) break;
@@ -12408,25 +12454,32 @@ static int load_system_prompt_disk_cache(const char *model_path,
         for (int i = 0; i < g_cfg.num_layers; i++) {
             int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
             if (is_full) {
-                if (!tmp_kv[i].k_snapshot || !tmp_kv[i].v_snapshot) ok = 0;
+                if (!tmp_kv[i].k_snapshot || !tmp_kv[i].v_snapshot) { ok = 0; invalid = 1; }
             } else {
-                if (!tmp_conv[i] || !tmp_ssm[i]) ok = 0;
+                if (!tmp_conv[i] || !tmp_ssm[i]) { ok = 0; invalid = 1; }
             }
         }
         if (expect_gpu > 0) {
             for (int i = 0; i < g_cfg.num_linear_layers; i++) {
-                if (!tmp_gpu_delta[i] || !tmp_gpu_conv[i]) ok = 0;
+                if (!tmp_gpu_delta[i] || !tmp_gpu_conv[i]) { ok = 0; invalid = 1; }
             }
         }
     }
-    if (!ok ||
-        kv_k_count != g_cfg.num_full_attn_layers ||
+    if (!ok) {
+        free_system_prompt_snapshots(tmp_kv, tmp_conv, tmp_ssm, tmp_gpu_delta, tmp_gpu_conv);
+        free(tmp_kv); free(tmp_conv); free(tmp_ssm); free(tmp_gpu_delta); free(tmp_gpu_conv);
+        if (invalid_cache) *invalid_cache = invalid;
+        return -1;
+    }
+    if (kv_k_count != g_cfg.num_full_attn_layers ||
         kv_v_count != g_cfg.num_full_attn_layers ||
         conv_count != g_cfg.num_linear_layers ||
         ssm_count != g_cfg.num_linear_layers ||
         (expect_gpu > 0 && (gpu_delta_count != expect_gpu || gpu_conv_count != expect_gpu))) {
+        invalid = 1;
         free_system_prompt_snapshots(tmp_kv, tmp_conv, tmp_ssm, tmp_gpu_delta, tmp_gpu_conv);
         free(tmp_kv); free(tmp_conv); free(tmp_ssm); free(tmp_gpu_delta); free(tmp_gpu_conv);
+        if (invalid_cache) *invalid_cache = invalid;
         return -1;
     }
 
@@ -12444,6 +12497,9 @@ static int load_system_prompt_disk_cache(const char *model_path,
     if (loaded_tokens) *loaded_tokens = (int)hdr.token_count;
     server_log_errorf("[serve] sys_prompt_disk_cache loaded %s raw=%.2fGiB stored=%.2fGiB chunks=%u\n",
                       path, hdr.raw_bytes / 1073741824.0, hdr.stored_bytes / 1073741824.0, hdr.chunk_count);
+    if (touch_file_now(path) != 0) {
+        server_log_errorf("[serve] sys_prompt_disk_cache touch failed %s: %s\n", path, strerror(errno));
+    }
     return 0;
 }
 
@@ -12456,7 +12512,7 @@ static void prune_system_prompt_disk_cache(const char *model_path) {
 
     typedef struct {
         char path[PATH_MAX];
-        time_t mtime;
+        struct timespec mtime;
     } CacheEntry;
     CacheEntry entries[128];
     int count = 0;
@@ -12467,7 +12523,7 @@ static void prune_system_prompt_disk_cache(const char *model_path) {
         snprintf(entries[count].path, sizeof(entries[count].path), "%s/%s", dir, ent->d_name);
         struct stat st;
         if (stat(entries[count].path, &st) == 0) {
-            entries[count].mtime = st.st_mtime;
+            entries[count].mtime = stat_mtime_spec(&st);
             count++;
         }
     }
@@ -12475,7 +12531,7 @@ static void prune_system_prompt_disk_cache(const char *model_path) {
     while (count > g_system_prompt_cache_max_entries) {
         int oldest = 0;
         for (int i = 1; i < count; i++) {
-            if (entries[i].mtime < entries[oldest].mtime) oldest = i;
+            if (timespec_before(entries[i].mtime, entries[oldest].mtime)) oldest = i;
         }
         unlink(entries[oldest].path);
         entries[oldest] = entries[count - 1];
@@ -12506,6 +12562,8 @@ static int cache_roundtrip_test(void) {
 
     int failures = 0;
     uint64_t hash = 0xCAFEBABE12345678ULL;
+    uint64_t hash_b = 0xCAFEBABE12345679ULL;
+    uint64_t hash_c = 0xCAFEBABE1234567AULL;
     fprintf(stderr, "[cache-roundtrip] model=%s layers=%d full=%d linear=%d\n",
             g_cfg.model_id, g_cfg.num_layers, g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
 
@@ -12572,6 +12630,15 @@ static int cache_roundtrip_test(void) {
         goto cleanup;
     }
 
+    char path_a[PATH_MAX], path_b[PATH_MAX], path_c[PATH_MAX];
+    if (system_prompt_cache_path(tmp_dir, hash, path_a, sizeof(path_a)) != 0 ||
+        system_prompt_cache_path(tmp_dir, hash_b, path_b, sizeof(path_b)) != 0 ||
+        system_prompt_cache_path(tmp_dir, hash_c, path_c, sizeof(path_c)) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL cache path generation\n");
+        failures++;
+        goto cleanup;
+    }
+
     KVSnapshot *kv_load = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
     float **conv_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
     float **ssm_load = calloc((size_t)g_cfg.num_layers, sizeof(float *));
@@ -12581,7 +12648,7 @@ static int cache_roundtrip_test(void) {
     int load_rc = load_system_prompt_disk_cache(tmp_dir, hash, token_count,
                                                 kv_load, conv_load, ssm_load,
                                                 gpu_delta_load, gpu_conv_load,
-                                                &loaded_tokens);
+                                                &loaded_tokens, NULL);
     if (load_rc != 0) {
         fprintf(stderr, "[cache-roundtrip] FAIL load rc=%d\n", load_rc);
         failures++;
@@ -12629,12 +12696,125 @@ static int cache_roundtrip_test(void) {
     free_system_prompt_snapshots(kv_load, conv_load, ssm_load, gpu_delta_load, gpu_conv_load);
     free(kv_load); free(conv_load); free(ssm_load);
 
+    FILE *bad_cache = fopen(path_a, "wb");
+    if (!bad_cache) {
+        fprintf(stderr, "[cache-roundtrip] FAIL open corrupt target: %s\n", strerror(errno));
+        failures++;
+        goto cleanup;
+    }
+    fwrite("bad-cache", 1, 9, bad_cache);
+    fclose(bad_cache);
+    KVSnapshot *kv_bad = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+    float **conv_bad = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    float **ssm_bad = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    void *gpu_delta_bad[MAX_LINEAR_LAYERS] = {0};
+    void *gpu_conv_bad[MAX_LINEAR_LAYERS] = {0};
+    int invalid_cache = 0;
+    if (!kv_bad || !conv_bad || !ssm_bad ||
+        load_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                      kv_bad, conv_bad, ssm_bad,
+                                      gpu_delta_bad, gpu_conv_bad,
+                                      &loaded_tokens, &invalid_cache) == 0 ||
+        !invalid_cache) {
+        fprintf(stderr, "[cache-roundtrip] FAIL corrupt cache was not rejected as invalid\n");
+        failures++;
+        if (kv_bad) free_system_prompt_snapshots(kv_bad, conv_bad, ssm_bad, gpu_delta_bad, gpu_conv_bad);
+        free(kv_bad); free(conv_bad); free(ssm_bad);
+        goto cleanup;
+    }
+    free_system_prompt_snapshots(kv_bad, conv_bad, ssm_bad, gpu_delta_bad, gpu_conv_bad);
+    free(kv_bad); free(conv_bad); free(ssm_bad);
+    if (discard_system_prompt_disk_cache(tmp_dir, hash) != 0 ||
+        save_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                      kv_orig, conv_orig, ssm_orig,
+                                      gpu_delta_dummy, gpu_conv_dummy) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL replace corrupt cache\n");
+        failures++;
+        goto cleanup;
+    }
+    KVSnapshot *kv_repaired = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+    float **conv_repaired = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    float **ssm_repaired = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    void *gpu_delta_repaired[MAX_LINEAR_LAYERS] = {0};
+    void *gpu_conv_repaired[MAX_LINEAR_LAYERS] = {0};
+    if (!kv_repaired || !conv_repaired || !ssm_repaired ||
+        load_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                      kv_repaired, conv_repaired, ssm_repaired,
+                                      gpu_delta_repaired, gpu_conv_repaired,
+                                      &loaded_tokens, NULL) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL load repaired cache\n");
+        failures++;
+        if (kv_repaired) free_system_prompt_snapshots(kv_repaired, conv_repaired, ssm_repaired, gpu_delta_repaired, gpu_conv_repaired);
+        free(kv_repaired); free(conv_repaired); free(ssm_repaired);
+        goto cleanup;
+    }
+    free_system_prompt_snapshots(kv_repaired, conv_repaired, ssm_repaired, gpu_delta_repaired, gpu_conv_repaired);
+    free(kv_repaired); free(conv_repaired); free(ssm_repaired);
+
+    g_system_prompt_cache_max_entries = 2;
+    if (save_system_prompt_disk_cache(tmp_dir, hash_b, token_count,
+                                      kv_orig, conv_orig, ssm_orig,
+                                      gpu_delta_dummy, gpu_conv_dummy) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL save hash_b for prune test\n");
+        failures++;
+        goto cleanup;
+    }
+    struct timeval old_times[2];
+    old_times[0].tv_sec = old_times[1].tv_sec = 1000;
+    old_times[0].tv_usec = old_times[1].tv_usec = 0;
+    if (utimes(path_a, old_times) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL set old mtime for hash_a: %s\n", strerror(errno));
+        failures++;
+        goto cleanup;
+    }
+    old_times[0].tv_sec = old_times[1].tv_sec = 1001;
+    if (utimes(path_b, old_times) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL set old mtime for hash_b: %s\n", strerror(errno));
+        failures++;
+        goto cleanup;
+    }
+    KVSnapshot *kv_touch = calloc((size_t)g_cfg.num_layers, sizeof(KVSnapshot));
+    float **conv_touch = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    float **ssm_touch = calloc((size_t)g_cfg.num_layers, sizeof(float *));
+    void *gpu_delta_touch[MAX_LINEAR_LAYERS] = {0};
+    void *gpu_conv_touch[MAX_LINEAR_LAYERS] = {0};
+    int touched_tokens = 0;
+    if (!kv_touch || !conv_touch || !ssm_touch ||
+        load_system_prompt_disk_cache(tmp_dir, hash, token_count,
+                                      kv_touch, conv_touch, ssm_touch,
+                                      gpu_delta_touch, gpu_conv_touch,
+                                      &touched_tokens, NULL) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL touch-load hash_a for prune test\n");
+        failures++;
+        if (kv_touch) free_system_prompt_snapshots(kv_touch, conv_touch, ssm_touch, gpu_delta_touch, gpu_conv_touch);
+        free(kv_touch); free(conv_touch); free(ssm_touch);
+        goto cleanup;
+    }
+    free_system_prompt_snapshots(kv_touch, conv_touch, ssm_touch, gpu_delta_touch, gpu_conv_touch);
+    free(kv_touch); free(conv_touch); free(ssm_touch);
+    if (save_system_prompt_disk_cache(tmp_dir, hash_c, token_count,
+                                      kv_orig, conv_orig, ssm_orig,
+                                      gpu_delta_dummy, gpu_conv_dummy) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL save hash_c for prune test\n");
+        failures++;
+        goto cleanup;
+    }
+    prune_system_prompt_disk_cache(tmp_dir);
+    if (access(path_a, R_OK) != 0 || access(path_b, R_OK) == 0 || access(path_c, R_OK) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL prune kept wrong entries (a=%d b=%d c=%d)\n",
+                access(path_a, R_OK) == 0, access(path_b, R_OK) == 0, access(path_c, R_OK) == 0);
+        failures++;
+        goto cleanup;
+    }
+
 cleanup:
     if (kv_orig) free_system_prompt_snapshots(kv_orig, conv_orig, ssm_orig, gpu_delta_dummy, gpu_conv_dummy);
     free(kv_orig); free(conv_orig); free(ssm_orig);
 
     char path[PATH_MAX];
     if (system_prompt_cache_path(tmp_dir, hash, path, sizeof(path)) == 0) unlink(path);
+    if (system_prompt_cache_path(tmp_dir, hash_b, path, sizeof(path)) == 0) unlink(path);
+    if (system_prompt_cache_path(tmp_dir, hash_c, path, sizeof(path)) == 0) unlink(path);
     char dir[PATH_MAX];
     if (system_prompt_cache_dir(tmp_dir, dir, sizeof(dir)) == 0) rmdir(dir);
     char runtime_dir[PATH_MAX];
@@ -12707,6 +12887,7 @@ static void serve_loop(
     // On subsequent requests with the same hash, restore the snapshot.
     uint64_t cached_sys_hash = 0;
     int cached_sys_token_count = 0;
+    int cached_sys_disk_backed = 0;
 
     KVSnapshot kv_snapshots[g_cfg.num_layers];
     memset(kv_snapshots, 0, sizeof(kv_snapshots));
@@ -12885,6 +13066,7 @@ static void serve_loop(
         uint64_t req_sys_hash = hash_string_djb2(req_sys_prompt);
         int sys_prompt_token_count = count_sys_prompt_tokens(req_sys_prompt);
         int snapshot_restored = 0;
+        int disk_cache_invalid = 0;
         int pos = 0;
 
         if (cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
@@ -12902,6 +13084,16 @@ static void serve_loop(
             pos = cached_sys_token_count;
             snapshot_restored = 1;
             req.used_snapshot = 1;
+            if (cached_sys_disk_backed && g_system_prompt_cache_enabled) {
+                char touch_path[PATH_MAX];
+                if (system_prompt_cache_path(model_path, req_sys_hash, touch_path, sizeof(touch_path)) != 0 ||
+                    access(touch_path, R_OK) != 0) {
+                    cached_sys_disk_backed = 0;
+                } else if (touch_file_now(touch_path) != 0) {
+                    cached_sys_disk_backed = 0;
+                    server_log_errorf("[serve] sys_prompt_disk_cache touch failed %s: %s\n", touch_path, strerror(errno));
+                }
+            }
             if (cache_fingerprint_enabled() && g_fp_post_cold.valid) {
                 RuntimeFingerprint fp_post_restore;
                 fingerprint_runtime_state(cached_sys_token_count, kv_caches, layer_states, &fp_post_restore);
@@ -12915,8 +13107,10 @@ static void serve_loop(
                                                  la_ssm_snapshots,
                                                  gpu_delta_snapshots,
                                                  gpu_conv_snapshots,
-                                                 &cached_sys_token_count) == 0) {
+                                                 &cached_sys_token_count,
+                                                 &disk_cache_invalid) == 0) {
             cached_sys_hash = req_sys_hash;
+            cached_sys_disk_backed = 1;
             restore_system_prompt_snapshots(cached_sys_token_count,
                                             kv_snapshots,
                                             la_conv_snapshots,
@@ -12938,6 +13132,9 @@ static void serve_loop(
             }
         } else {
             // Cache miss: clear state and run full prefill
+            if (disk_cache_invalid) {
+                discard_system_prompt_disk_cache(model_path, req_sys_hash);
+            }
             if (cached_sys_hash != 0) {
                 server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%llu new_hash=%llu\n",
                                   request_id, cached_sys_hash, req_sys_hash);
@@ -12947,6 +13144,7 @@ static void serve_loop(
             }
             clear_runtime_state_serve(layer_states, kv_caches);
             req.used_snapshot = 0;
+            cached_sys_disk_backed = 0;
         }
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
@@ -13030,6 +13228,12 @@ static void serve_loop(
             } else {
                 snapshot_saved = 1;
                 if (g_system_prompt_cache_enabled) {
+                    char save_path[PATH_MAX];
+                    int save_path_existed = 0;
+                    if (system_prompt_cache_path(model_path, req_sys_hash, save_path, sizeof(save_path)) == 0 &&
+                        access(save_path, R_OK) == 0) {
+                        save_path_existed = 1;
+                    }
                     if (save_system_prompt_disk_cache(model_path,
                                                       req_sys_hash,
                                                       sys_token_end,
@@ -13038,6 +13242,7 @@ static void serve_loop(
                                                       la_ssm_snapshots,
                                                       gpu_delta_snapshots,
                                                       gpu_conv_snapshots) == 0) {
+                        cached_sys_disk_backed = save_path_existed ? 0 : 1;
                         prune_system_prompt_disk_cache(model_path);
                     } else {
                         server_log_errorf("[serve] %s sys_prompt_disk_cache save skipped/failed\n", request_id);
@@ -13057,6 +13262,7 @@ static void serve_loop(
             } else {
                 cached_sys_hash = 0;
                 cached_sys_token_count = 0;
+                cached_sys_disk_backed = 0;
             }
         }
 

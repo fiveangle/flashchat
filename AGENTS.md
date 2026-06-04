@@ -145,6 +145,27 @@ hot path, kernels, attention, or speculative decoding, and confirm `make bench-r
 shows no regression before committing.** Ad-hoc `--mtp-generate-*` numbers are for
 inner-loop iteration, not regression sign-off.
 
+### Dense Prefill TensorOps Direction
+
+For dense prefill performance work, investigate Metal 4 MPP/TensorOps `matmul2d`
+for the `gpu_dequant_matmulN` / `gpu_dequant_matmulN_batch` path first. Treat
+`MPSNDArrayQuantizedMatrixMultiplication` as a useful affine-quantized comparator
+or fallback probe only if the local SDK exposes it, but keep the likely production
+direction focused on a low-overhead MPP kernel path, gated by runtime capability
+checks and preserving the existing Metal 3 kernels as the fallback on older
+toolchains or devices.
+Preserve MLX affine quantization semantics: TensorOps experiments must process
+64-wide quant groups and apply each group's scale/bias with a per-token group
+sum; a single full-K raw uint4 matmul is not equivalent. BF16 activations are the
+current production-oriented input candidate, and zero-copy integration still
+needs an aligned/repacked 4-bit tensor layout or another validated binding path.
+Current SDK probes also show two practical MPP limits: Metal buffer argument
+indices top out at 30, so group-wise TensorOps kernels must chunk groups, and
+the simple one-MTLTensor-per-group shape is only validated for small output
+tiles before TensorOps returns zero results. Do not wire this into production
+until a compact resource layout or tensor-pool strategy is validated at full
+80-group dense dimensions.
+
 ## Code Style
 
 ### General Principles
