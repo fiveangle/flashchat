@@ -10962,8 +10962,12 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
     if (!fn_close && !tc_end) return 0;
     const char *region_end = (fn_close && (!tc_end || fn_close < tc_end)) ? fn_close : tc_end;
 
-    // --- qwen3_coder dialect: a single <parameters>{json}</parameters> arguments object ---
-    // (distinct from xml's per-key <parameter=KEY>; "<parameters>" never matches "<parameter=").
+    // --- <parameters>...</parameters> block (distinct from xml's per-key <parameter=KEY>;
+    // "<parameters>" never matches "<parameter="). Two coder-family variants seen from Qwen3.6:
+    //   (a) JSON object:   <parameters>{"k": v, ...}</parameters>
+    //   (b) nested XML:    <parameters><k>v</k> ...</parameters>
+    // (b) shows up especially when a cached system-prompt snapshot nudges the model's near-tie
+    // format choice. Handle both so tool-calling is robust to whichever dialect a model emits.
     const char *params_open = strstr(cursor, "<parameters>");
     if (params_open && params_open < region_end) {
         const char *j_start = params_open + strlen("<parameters>");
@@ -10973,6 +10977,7 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
         while (j_end > j_start && (unsigned char)j_end[-1] <= ' ') j_end--;
         size_t jlen = (size_t)(j_end - j_start);
         if (jlen >= 2 && j_start[0] == '{') {
+            // (a) JSON arguments object
             NSData *jd = [NSData dataWithBytes:j_start length:jlen];
             id obj = [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil];
             if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -10981,8 +10986,44 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
                 parsed->is_tool_call = 1;
                 return 1;
             }
+            return 0;  // JSON not yet complete/valid — keep streaming
         }
-        return 0;  // <parameters> present but JSON not yet complete/valid — keep streaming
+        if (jlen >= 3 && j_start[0] == '<') {
+            // (b) nested-XML param tags: <KEY>value</KEY>...
+            NSMutableDictionary *args = [NSMutableDictionary dictionary];
+            const char *c = j_start;
+            while (c < j_end) {
+                const char *t = memchr(c, '<', (size_t)(j_end - c));
+                if (!t) break;
+                if (t + 1 < j_end && t[1] == '/') {                 // a closing tag — skip past it
+                    const char *gt = memchr(t, '>', (size_t)(j_end - t));
+                    if (!gt) break; c = gt + 1; continue;
+                }
+                const char *key_close = memchr(t, '>', (size_t)(j_end - t));
+                if (!key_close) break;
+                size_t klen = (size_t)(key_close - (t + 1));
+                if (klen == 0 || klen > 128) { c = key_close + 1; continue; }
+                char key_s[136]; memcpy(key_s, t + 1, klen); key_s[klen] = '\0';
+                char close_tag[160]; int ctn = snprintf(close_tag, sizeof(close_tag), "</%s>", key_s);
+                const char *vstart = key_close + 1;
+                if (vstart < j_end && *vstart == '\n') vstart++;
+                const char *vclose = strstr(vstart, close_tag);
+                if (!vclose || vclose > j_end) break;
+                const char *vend = vclose;
+                if (vend > vstart && vend[-1] == '\n') vend--;
+                NSString *key = [[NSString alloc] initWithBytes:t + 1 length:klen encoding:NSUTF8StringEncoding];
+                NSString *raw = [[NSString alloc] initWithBytes:vstart length:(NSUInteger)(vend - vstart) encoding:NSUTF8StringEncoding];
+                if (key) args[key] = native_param_value_to_json_type(raw ?: @"");
+                c = vclose + ctn;
+            }
+            if ([args count] > 0) {
+                strncpy(parsed->name, name_buf, sizeof(parsed->name) - 1);
+                parsed->arguments = dup_nsstring(json_stringify_obj(args));
+                parsed->is_tool_call = 1;
+                return 1;
+            }
+        }
+        return 0;  // <parameters> present but not yet complete/parseable — keep streaming
     }
 
     // --- qwen3_xml dialect: per-key <parameter=KEY>value</parameter> ---

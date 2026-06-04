@@ -402,6 +402,36 @@ else
     assert_fail "native coder parser extracts <parameters>{json}</parameters> (no </tool_call>)"
 fi
 
+# coder nested-XML variant: <parameters><KEY>value</KEY>...</parameters> (seen from Qwen3.6
+# when a cached system-prompt snapshot nudges the format choice). Typed values like the xml path.
+NESTED_TOOL_CALL_TXT="${TMPDIR}/nested_tool_call.txt"
+cat > "$NESTED_TOOL_CALL_TXT" <<'EOF'
+<tool_call>
+<function=record_result>
+<parameters>
+<result>ok</result>
+<count>3</count>
+<ok>true</ok>
+</parameters>
+</function>
+</tool_call>
+EOF
+nested_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$NESTED_TOOL_CALL_TXT" | tail -1)
+python3 - "$nested_parsed" <<'PY'
+import json, sys
+outer = json.loads(sys.argv[1])
+args = json.loads(outer["arguments"])
+assert outer["name"] == "record_result", outer
+assert args["result"] == "ok", args
+assert args["count"] == 3, args
+assert args["ok"] is True, args
+PY
+if [ $? -eq 0 ]; then
+    assert_pass "native coder parser extracts <parameters><KEY>v</KEY></parameters> (nested-XML)"
+else
+    assert_fail "native coder parser extracts <parameters><KEY>v</KEY></parameters> (nested-XML)"
+fi
+
 echo ""
 echo "========================================"
 echo "Flashchat Tool Template Render Summary"
