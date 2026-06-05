@@ -13866,26 +13866,33 @@ static void serve_loop(
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
         }
-        // Real MTP draft/verify speculative-decode state. On accept the batched
-        // verify already forwarded the draft at pos+1, so the draft is streamed on
-        // the next iteration WITHOUT re-forwarding (mtp_succ_pending); the token
-        // after it (sampled from the verify's position-b logits) is carried in
-        // mtp_succ_token / mtp_succ_hidden. mtp_backbone_hidden always holds the
-        // backbone hidden that produced the current next_token (the MTP drafter input).
+        // Real MTP depth-N draft/verify speculative-decode state.
+        //   B = predictor batch size (g_mtp_predictions, >=2): verify B positions =
+        //   1 committed seed + (B-1) chained drafts. Accept the longest correct
+        //   prefix. Accepted drafts are already forwarded by the verify, so they
+        //   drain-emit from mtp_q[] WITHOUT re-forwarding; the corrected/bonus token
+        //   becomes the next seed (mtp_seed), emitted then produced normally.
+        //   mtp_backbone_hidden = backbone that produced the current seed (drafter input).
         const int mtp_H = g_cfg.hidden_dim, mtp_V = g_cfg.vocab_size;
         const int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
+        const int mtp_B = g_mtp_predictions > 1 ? g_mtp_predictions : 2;  // batch size (positions)
         GpuStateSnap mtp_snap; int mtp_snap_ready = 0;
-        float *mtp_ha = NULL, *mtp_hb = NULL, *mtp_la = NULL, *mtp_lb = NULL, *mtp_succ_hidden = NULL;
-        int mtp_succ_pending = 0, mtp_succ_token = -1;
+        float *mtp_hs = NULL, *mtp_ln = NULL, *mtp_seed_hidden = NULL, *mtp_mh = NULL;
+        int *mtp_drafts = NULL, *mtp_posv = NULL;
+        int mtp_q[8]; int mtp_q_len = 0, mtp_q_idx = 0;   // accepted drafts pending drain-emit
+        int mtp_seed_pending = 0, mtp_seed = -1;          // next seed to emit-then-produce
         if (mtp_shadow_available) {
             gpu_snap_alloc(&mtp_snap); mtp_snap_ready = 1;
-            mtp_ha = malloc((size_t)mtp_H*sizeof(float)); mtp_hb = malloc((size_t)mtp_H*sizeof(float));
-            mtp_la = malloc((size_t)mtp_V*sizeof(float)); mtp_lb = malloc((size_t)mtp_V*sizeof(float));
-            mtp_succ_hidden = malloc((size_t)mtp_H*sizeof(float));
+            mtp_hs   = malloc((size_t)mtp_B*mtp_H*sizeof(float));
+            mtp_ln   = malloc((size_t)mtp_B*mtp_V*sizeof(float));
+            mtp_mh   = malloc((size_t)mtp_B*mtp_H*sizeof(float));   // MTP rollout hiddens
+            mtp_drafts = malloc((size_t)mtp_B*sizeof(int));
+            mtp_posv = malloc((size_t)mtp_B*sizeof(int));
+            mtp_seed_hidden = malloc((size_t)mtp_H*sizeof(float));
             if (!g_mtp_k_cache) g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
             if (!g_mtp_v_cache) g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
             server_log_errorf("[mtp] %s draft/verify speculative decode ACTIVE (predictor batch size=%d)\n",
-                              request_id, g_mtp_predictions);
+                              request_id, mtp_B);
         }
 
         if (final_norm_w) {
@@ -14041,14 +14048,14 @@ tool_call_checked:
                 token_counts[next_token]++;
             }
 
-            // ---- Produce the successor of next_token ----
-            // Prequeue: next_token was already forwarded as position-b of an
-            // accepted batched verify, so its successor is already known. Stream-
-            // advance without a forward (state and pos were advanced at accept time).
-            if (mtp_succ_pending) {
-                memcpy(mtp_backbone_hidden, mtp_succ_hidden, (size_t)mtp_H*sizeof(float));
-                next_token = mtp_succ_token;
-                mtp_succ_pending = 0;
+            // ---- Produce the successor(s) of next_token ----
+            // Drain accepted drafts (already forwarded by the verify): emit only.
+            if (mtp_q_idx < mtp_q_len) { next_token = mtp_q[mtp_q_idx++]; continue; }
+            // Then the corrected/bonus seed: emit it (next iter), then produce from it.
+            if (mtp_seed_pending) {
+                next_token = mtp_seed;
+                memcpy(mtp_backbone_hidden, mtp_seed_hidden, (size_t)mtp_H*sizeof(float));
+                mtp_seed_pending = 0;
                 continue;
             }
 
@@ -14056,48 +14063,70 @@ tool_call_checked:
             // from being sampled into something malformed.
             float iter_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
                                      ? 0.0f : req.temperature;
+            #define MTP_PICK(L) pick_next_token((L), g_cfg.vocab_size, iter_temperature, req.top_p, \
+                                                req.top_k, req.min_p, effective_presence_penalty,    \
+                                                effective_repetition_penalty, token_counts, req.reasoning_enabled)
 
             int mtp_did_spec = 0;
             if (mtp_shadow_available) {
-                int d = -1;
-                mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &d);
-                if (d >= 0) {
+                // Roll out up to B-1 chained drafts from (backbone, seed=next_token).
+                int mtp_kv_L = g_mtp_kv_len, nd = 0;
+                {
+                    float *mhp = mtp_backbone_hidden; int tok = next_token;
+                    float emb[mtp_H];
+                    for (int j = 0; j < mtp_B - 1; j++) {
+                        int dj = -1;
+                        embed_lookup(wf, tok, emb);
+                        if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, 0) != 0 || dj < 0) break;
+                        mtp_drafts[j] = dj; mhp = mtp_mh + (size_t)j*mtp_H; tok = dj; nd++;
+                    }
+                }
+                if (nd > 0) {
                     mtp_did_spec = 1;
-                    mtp_shadow_checks++;
-                    // Batched verify of [next_token, draft] at [pos, pos+1]. mtp_ha/mtp_hb
-                    // end as the post-layer backbone hidden for each position; mtp_la/mtp_lb
-                    // are their logits; mtp_snap captures post-token-a state for rollback.
-                    embed_lookup(wf, next_token, mtp_ha);
-                    embed_lookup(wf, d, mtp_hb);
-                    fused_layer_forward_2(wf, mtp_ha, mtp_hb, kv_caches, layer_fds,
-                                          pos, pos + 1, mtp_la, mtp_lb, &mtp_snap);
-                    int t_v1 = pick_next_token(mtp_la, g_cfg.vocab_size, iter_temperature, req.top_p,
-                                               req.top_k, req.min_p, effective_presence_penalty,
-                                               effective_repetition_penalty, token_counts,
-                                               req.reasoning_enabled);
-                    if (t_v1 == d) {
-                        // Accept: the real successor of next_token IS the draft d (already
-                        // forwarded at pos+1). Stream it next iteration without re-forwarding;
-                        // the token after it is sampled from the verify's position-b logits.
-                        mtp_shadow_hits++;
-                        memcpy(mtp_succ_hidden, mtp_hb, (size_t)mtp_H*sizeof(float));
-                        mtp_succ_token = pick_next_token(mtp_lb, g_cfg.vocab_size, iter_temperature, req.top_p,
-                                                         req.top_k, req.min_p, effective_presence_penalty,
-                                                         effective_repetition_penalty, token_counts,
-                                                         req.reasoning_enabled);
-                        memcpy(mtp_backbone_hidden, mtp_ha, (size_t)mtp_H*sizeof(float)); // backbone that produced d
-                        next_token = d;
-                        mtp_succ_pending = 1;
-                        pos += 2;
+                    int Nv = nd + 1;
+                    gpu_snap_save(&mtp_snap, kv_caches);
+                    embed_lookup(wf, next_token, mtp_hs);
+                    for (int j = 0; j < nd; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
+                    for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
+                    fused_dense_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                    // Accept the longest correct prefix.
+                    int acc = 0;
+                    for (int j = 0; j < nd; j++) {
+                        mtp_shadow_checks++;
+                        int tv = MTP_PICK(mtp_ln + (size_t)j*mtp_V);
+                        if (mtp_drafts[j] == tv) { acc++; mtp_shadow_hits++; } else break;
+                    }
+                    int seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);  // corrected (acc<nd) or bonus
+                    if (acc < nd) {
+                        // Partial: undo the speculative tail, re-forward the acc+1 committed positions.
+                        gpu_snap_restore(&mtp_snap, kv_caches);
+                        embed_lookup(wf, next_token, mtp_hs);
+                        for (int j = 0; j < acc; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
+                        for (int t = 0; t < acc+1; t++) mtp_posv[t] = pos + t;
+                        fused_dense_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                        seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
+                    }
+                    // MTP attention KV: keep only the committed prefix's entries (the
+                    // rollout appended the input tokens; drop the rejected tail).
+                    g_mtp_kv_len = mtp_kv_L + (acc < nd ? acc + 1 : nd);
+                    if (g_mtp_kv_len > GPU_KV_SEQ) g_mtp_kv_len = GPU_KV_SEQ;
+                    pos += acc + 1;
+                    // Committed successors of the (already-emitted) seed: drafts[0..acc-1]
+                    // (forwarded) then seed_tok (produced next round). seed_tok's backbone
+                    // is the verify's position-acc hidden.
+                    if (acc > 0) {
+                        next_token = mtp_drafts[0];
+                        mtp_q_len = acc - 1; mtp_q_idx = 0;
+                        for (int j = 1; j < acc; j++) mtp_q[j-1] = mtp_drafts[j];
+                        mtp_seed = seed_tok; mtp_seed_pending = 1;
+                        memcpy(mtp_seed_hidden, mtp_hs + (size_t)acc*mtp_H, (size_t)mtp_H*sizeof(float));
                     } else {
-                        // Reject: drop the draft, restore post-token-a state, continue from t_v1.
-                        batched_rollback_apply(&mtp_snap, kv_caches);
-                        memcpy(mtp_backbone_hidden, mtp_ha, (size_t)mtp_H*sizeof(float)); // backbone that produced t_v1
-                        next_token = t_v1;
-                        pos += 1;
+                        next_token = seed_tok;
+                        memcpy(mtp_backbone_hidden, mtp_hs + (size_t)acc*mtp_H, (size_t)mtp_H*sizeof(float));
                     }
                 }
             }
+            #undef MTP_PICK
 
             if (!mtp_did_spec) {
                 // Baseline single-token forward (MTP off, or drafter unavailable this step).
@@ -14138,7 +14167,7 @@ tool_call_checked:
         mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
         g_overlap_in_decode = 0;
         if (mtp_snap_ready) gpu_snap_free(&mtp_snap);
-        free(mtp_ha); free(mtp_hb); free(mtp_la); free(mtp_lb); free(mtp_succ_hidden);
+        free(mtp_hs); free(mtp_ln); free(mtp_mh); free(mtp_drafts); free(mtp_posv); free(mtp_seed_hidden);
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
             server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
@@ -14623,14 +14652,13 @@ int main(int argc, char **argv) {
                         batch, g_cfg.mtp_max_predictions);
                 batch = g_cfg.mtp_max_predictions;
             }
-            // Only single-draft speculation (batch size 2) is wired today; larger
-            // batches (multi-draft) fall back to 2 until depth-N is implemented.
-            if (batch > 2) {
-                fprintf(stderr, "[mtp] predictor batch size %d requested; multi-draft (>2) "
-                                "not yet wired, running batch size 2\n", batch);
-                batch = 2;
+            // The N-position verify (fused_dense_forward_N -> matmulN) supports up to
+            // 8 columns; cap the predictor batch there.
+            if (batch > 8) {
+                fprintf(stderr, "[mtp] predictor batch size %d exceeds the N-position verify limit; clamping to 8\n", batch);
+                batch = 8;
             }
-            g_mtp_predictions = batch;            // 0 = off, 2 = enabled (positions/verify)
+            g_mtp_predictions = batch;            // 0 = off, >=2 = predictor batch size (positions/verify)
         }
         if (g_mtp_active_experts < 1) {
             g_mtp_active_experts = 1;
