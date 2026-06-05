@@ -11250,18 +11250,29 @@ static int sse_send_reasoning_delta(int fd, const char *request_id, const char *
     return (wr <= 0) ? -1 : 0;
 }
 
-static void sse_send_done(int fd, const char *request_id, int mtp_drafts, int mtp_accepted) {
+static void sse_send_done(int fd, const char *request_id, int mtp_drafts, int mtp_accepted,
+                          const int *mtp_pos_checks, const int *mtp_pos_hits) {
     char chunk[1024];
     long created = sse_created_timestamp();
     // Attach MTP (multi-token prediction) shadow-draft stats as a usage extension
     // on the terminal chunk so streaming clients can surface acceptance rate.
     // Omitted when no drafts were made (mtp_drafts == 0).
-    char usage[160] = "";
+    char usage[256] = "";
     if (mtp_drafts > 0) {
         double acc = (double)mtp_accepted / (double)mtp_drafts;
+        // Build per-position acceptance JSON array, e.g. [0.81,0.63,0.41]
+        char pos_arr[128] = "[";
+        int pos_len = 1;
+        int npos = 0;
+        for (int j = 0; mtp_pos_checks && mtp_pos_hits && j < 8 && mtp_pos_checks[j] > 0; j++, npos++) {
+            double pr = (double)mtp_pos_hits[j] / (double)mtp_pos_checks[j];
+            pos_len += snprintf(pos_arr + pos_len, sizeof(pos_arr) - (size_t)pos_len,
+                                "%s%.4f", j ? "," : "", pr);
+        }
+        strncat(pos_arr, "]", sizeof(pos_arr) - (size_t)pos_len - 1);
         snprintf(usage, sizeof(usage),
-                 ",\"usage\":{\"mtp_drafts\":%d,\"mtp_accepted\":%d,\"mtp_acceptance\":%.4f}",
-                 mtp_drafts, mtp_accepted, acc);
+                 ",\"usage\":{\"mtp_drafts\":%d,\"mtp_accepted\":%d,\"mtp_acceptance\":%.4f,\"mtp_per_pos\":%s}",
+                 mtp_drafts, mtp_accepted, acc, npos > 0 ? pos_arr : "[]");
     }
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
@@ -13586,7 +13597,7 @@ static void serve_loop(
                               request_id, fixed_title);
             if (req.stream) {
                 sse_send_delta(client_fd, request_id, fixed_title);
-                sse_send_done(client_fd, request_id, 0, 0);
+                sse_send_done(client_fd, request_id, 0, 0, NULL, NULL);
             } else {
                 char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL, NULL);
                 if (final_json) {
@@ -14205,7 +14216,7 @@ tool_call_checked:
                 else sse_send_response_tool_call(client_fd, request_id, &parsed_tool_call);
             }
             if (is_chat && !parsed_tool_call.is_tool_call) {
-                sse_send_done(client_fd, request_id, mtp_shadow_checks, mtp_shadow_hits);
+                sse_send_done(client_fd, request_id, mtp_shadow_checks, mtp_shadow_hits, mtp_pos_checks, mtp_pos_hits);
             } else if (!is_chat) {
                 sse_send_response_done(client_fd, request_id, final_json);
             }
