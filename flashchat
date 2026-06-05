@@ -67,6 +67,16 @@ current_quantization_label() {
     echo "${bits}-bit"
 }
 
+mtp_label() {
+    local v="$1"
+    case "$v" in
+        ""|1) echo "automatic" ;;
+        0) echo "disabled" ;;
+        *[!0-9]*) echo "automatic ($v)" ;;
+        *) echo "batch size $v" ;;
+    esac
+}
+
 normalize_server_log_path() {
     local path="$1"
     [ -z "$path" ] && return
@@ -186,7 +196,7 @@ Environment variables:
                               content (e.g. for diversifying parameter values
                               across runs).
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
-  FLASHCHAT_MTP                  Multi-token prediction draft budget (0 disables, empty=auto)
+  FLASHCHAT_MTP                  Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size; empty=automatic)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
 
@@ -322,7 +332,7 @@ cmd_status() {
     fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
-    echo "Multi-token prediction: ${MTP:-auto} draft budget"
+    echo "Multi-token prediction: $(mtp_label "$MTP")"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
     echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
@@ -496,7 +506,7 @@ cmd_config() {
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
     echo "Show thinking: $(flashchat_get SHOW_THINKING) | Server debug: $(flashchat_get SERVER_DEBUG) | HTTP log: $(flashchat_get SERVER_HTTP_LOG) | Color: $(flashchat_get COLOR_OUTPUT)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
-    echo "Multi-token prediction: ${MTP:-auto} draft budget"
+    echo "Multi-token prediction: $(mtp_label "$MTP")"
     echo "Server log path: $(flashchat_get SERVER_LOG_PATH)"
     echo "HuggingFace cache dir: $(flashchat_get HUGGINGFACE_CACHE_DIR)"
     echo "Offload dir: $(flashchat_get OFFLOAD_DIR)"
@@ -537,7 +547,7 @@ cmd_config_interactive() {
     echo "  -Server HTTP traffic log (0/1): $(flashchat_get SERVER_HTTP_LOG)"
     echo "  -Persistent system prompt cache (0/1): $(flashchat_get SYSTEM_PROMPT_CACHE)"
     echo "  -Persistent system prompt cache entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
-    echo "  -Multi-token prediction draft budget (empty=auto, 0=disabled): ${MTP:-auto}"
+    echo "  -Multi-token prediction (0=disabled, 1=automatic, 2+=batch size): $(mtp_label "$MTP")"
     echo "  -Show thinking tokens (0/1): $(flashchat_get SHOW_THINKING)"
     echo "  -Color output (0/1): $(flashchat_get COLOR_OUTPUT)"
     unset REPLY
@@ -2244,15 +2254,15 @@ prompt_config_interactive() {
     else
         default_mtp=$(flashchat_get MTP)
     fi
-    printf "Multi-token prediction draft budget (auto=registry/profile, 0=disabled) [%s]: " "${default_mtp:-auto}"
+    printf "Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size) [%s]: " "$(mtp_label "$default_mtp")"
     read -r REPLY
     echo ""
     if [[ "$REPLY" =~ ^[Aa][Uu][Tt][Oo]$ ]]; then
-        echo "MTP=\"\"" >> /tmp/flashchat_new_config
-    elif [ -z "$REPLY" ] && [ -z "$default_mtp" ]; then
-        echo "MTP=\"\"" >> /tmp/flashchat_new_config
+        echo "MTP=\"1\"" >> /tmp/flashchat_new_config
+    elif [ -z "$REPLY" ]; then
+        echo "MTP=\"${default_mtp}\"" >> /tmp/flashchat_new_config
     else
-        echo "MTP=\"${REPLY:-$default_mtp}\"" >> /tmp/flashchat_new_config
+        echo "MTP=\"${REPLY}\"" >> /tmp/flashchat_new_config
     fi
 
     # Show Thinking

@@ -31,7 +31,7 @@
  *   This allows the next layer's CMD1 to submit immediately without waiting
  *   for CMD3 completion — the GPU queue serializes CMD3(N-1) then CMD1(N).
  *   Saves ~0.83ms/layer deferred_wait + CPU combine + input_norm overhead.
- *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
+ *   Multi-expert buffers (MAX_K=16 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
  *   Batched encoding: 2 encoders per expert (gate+up fused, SwiGLU+down fused)
  *   + 2 for shared expert = K*2 + 2 total encoders in CMD3.
@@ -201,25 +201,31 @@ static int server_flag_enabled(const char *value) {
            strcasecmp(value, "no") != 0;
 }
 
+// MTP setting value space (uniform across env / config / CLI):
+//   0           = disabled
+//   1           = automatic (engine chooses; also the meaning when missing/blank)
+//   2 or higher = explicit predictor batch size (positions verified per step:
+//                 1 committed token + (N-1) draft tokens)
+// Returns that raw value; -1 is reserved as the "nothing set this yet" sentinel
+// and is never produced here (missing → 1 = automatic).
 static int parse_mtp_predictions(const char *value) {
-    if (!value || !value[0]) return -1;
-    if (strcasecmp(value, "auto") == 0) return -1;
+    if (!value || !value[0]) return 1;                        // missing → automatic
+    if (strcasecmp(value, "auto") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "yes") == 0) {
+        return 1;                                             // automatic
+    }
     if (strcasecmp(value, "false") == 0 ||
         strcasecmp(value, "off") == 0 ||
         strcasecmp(value, "no") == 0) {
-        return 0;
-    }
-    if (strcasecmp(value, "true") == 0 ||
-        strcasecmp(value, "on") == 0 ||
-        strcasecmp(value, "yes") == 0) {
-        return 1;
+        return 0;                                             // disabled
     }
     char *end = NULL;
     long v = strtol(value, &end, 10);
-    if (end == value) return 0;
-    if (v < 0) return -1;
+    if (end == value || v < 0) return 1;                      // garbage → automatic
     if (v > 16) return 16;
-    return (int)v;
+    return (int)v;                                            // 0, 1, or batch size
 }
 
 static void server_log_open(void) {
@@ -526,7 +532,7 @@ typedef struct {
 } LZ4IndexEntry;
 
 static LZ4IndexEntry *g_lz4_index[MAX_NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
-static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
+static void *g_lz4_comp_bufs[MAX_K];             // pre-allocated compressed read buffers (one per active expert)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
 static char g_flashchat_weights_dir[PATH_MAX] = {0};
@@ -2661,7 +2667,7 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
+    #define MAX_K 16   // must match model_config.h MAX_K (K=10 models: 80B-A3B, 397B)
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [g_cfg.expert_size bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [g_cfg.expert_size bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [g_cfg.moe_intermediate floats]
@@ -2693,7 +2699,7 @@ typedef struct {
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [g_cfg.hidden_dim floats] GPU combine output (hidden state)
-    id<MTLBuffer> buf_combine_params; // [10 floats] expert weights[8] + shared_gate_score + padding
+    id<MTLBuffer> buf_combine_params; // [MAX_K+2 floats] expert weights[0..MAX_K-1] + shared_gate_score
     id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
     // Shared event for CPU-GPU synchronization (async pipeline)
     id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
@@ -2924,7 +2930,7 @@ static MetalCtx *metal_setup(void) {
     // CMD3 GPU-side combine buffers
     ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-    ctx->buf_combine_params = [ctx->device newBufferWithLength:10 * sizeof(float)
+    ctx->buf_combine_params = [ctx->device newBufferWithLength:(MAX_K + 2) * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -9826,12 +9832,12 @@ static void fused_layer_forward(
             // Prepare combine params: expert_weights[0..K-1] + shared_gate_score
             {
                 float *params = (float *)[g_metal->buf_combine_params contents];
-                // Zero all 10 slots first (unused experts get weight=0)
-                memset(params, 0, 10 * sizeof(float));
+                // Zero all weight slots first (unused experts get weight=0)
+                memset(params, 0, (MAX_K + 2) * sizeof(float));
                 for (int k = 0; k < actual_K; k++) {
                     params[k] = valid[k] ? expert_weights[k] : 0.0f;
                 }
-                params[8] = shared_gate_score;
+                params[MAX_K] = shared_gate_score;  // shared_gate at params[MAX_K] (matches kernel)
             }
 
             // Enc C1: moe_combine_residual
@@ -9845,11 +9851,11 @@ static void fused_layer_forward(
                 for (int k = 0; k < MAX_K; k++) {
                     [enc setBuffer:g_metal->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
                 }
-                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:11]; // params
+                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:(3 + MAX_K)]; // params after the MAX_K expert buffers
                 uint32_t dim = g_cfg.hidden_dim;
                 uint32_t k_val = (uint32_t)actual_K;
-                [enc setBytes:&dim   length:4 atIndex:12];
-                [enc setBytes:&k_val length:4 atIndex:13];
+                [enc setBytes:&dim   length:4 atIndex:(3 + MAX_K + 1)];
+                [enc setBytes:&k_val length:4 atIndex:(3 + MAX_K + 2)];
                 uint32_t tgs = (dim + 255) / 256;
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -10335,7 +10341,7 @@ static void api_request_init(ApiRequest *req, ApiKind kind) {
     req->min_p = g_default_min_p;
     req->presence_penalty = g_default_presence_penalty;
     req->repetition_penalty = g_default_repetition_penalty;
-    req->reasoning_enabled = g_default_reasoning_enabled;
+    req->reasoning_enabled = g_cfg.thinking_capable ? g_default_reasoning_enabled : 0;
     req->tool_choice_mode = TOOL_CHOICE_AUTO;
     strncpy(req->model, kApiModelId, sizeof(req->model) - 1);
 }
@@ -10652,7 +10658,7 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     NSNumber *repetition_penalty = root[@"repetition_penalty"];
     if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
-    if (reasoning && reasoning != [NSNull null]) {
+    if (reasoning && reasoning != [NSNull null] && g_cfg.thinking_capable) {
         req->reasoning_explicit = 1;
         req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
     }
@@ -10825,7 +10831,14 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     // empty-think-here is at GENERATION time only — it's required because the
     // model was trained to always start with a think marker. v19's "abolish
     // empty think" applies to past-turn rendering, not the generation prefix.
-    if (req->reasoning_enabled) {
+    if (!g_cfg.thinking_capable) {
+        // Non-thinking Instruct model (e.g. Qwen3-Next-80B-A3B-Instruct): the
+        // model has no <think> mode and was NOT trained to start the assistant
+        // turn with a think marker. Injecting one (even an empty <think></think>)
+        // drives it out of distribution and it immediately emits <|endoftext|>.
+        // Open the assistant turn bare, exactly like the model's own chat template.
+        [conversation appendString:@"<|im_start|>assistant\n"];
+    } else if (req->reasoning_enabled) {
         [conversation appendString:@"<|im_start|>assistant\n<think>\n"];
         // Tier-1 escalation: exactly one consecutive tool error and reasoning
         // is enabled. Seed the <think> block with a concrete correction
@@ -10884,7 +10897,7 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     NSNumber *repetition_penalty = root[@"repetition_penalty"];
     if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
-    if (reasoning && reasoning != [NSNull null]) {
+    if (reasoning && reasoning != [NSNull null] && g_cfg.thinking_capable) {
         req->reasoning_explicit = 1;
         req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
     }
@@ -11195,14 +11208,24 @@ static int sse_send_reasoning_delta(int fd, const char *request_id, const char *
     return (wr <= 0) ? -1 : 0;
 }
 
-static void sse_send_done(int fd, const char *request_id) {
+static void sse_send_done(int fd, const char *request_id, int mtp_drafts, int mtp_accepted) {
     char chunk[1024];
     long created = sse_created_timestamp();
+    // Attach MTP (multi-token prediction) shadow-draft stats as a usage extension
+    // on the terminal chunk so streaming clients can surface acceptance rate.
+    // Omitted when no drafts were made (mtp_drafts == 0).
+    char usage[160] = "";
+    if (mtp_drafts > 0) {
+        double acc = (double)mtp_accepted / (double)mtp_drafts;
+        snprintf(usage, sizeof(usage),
+                 ",\"usage\":{\"mtp_drafts\":%d,\"mtp_accepted\":%d,\"mtp_acceptance\":%.4f}",
+                 mtp_drafts, mtp_accepted, acc);
+    }
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
-        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]%s}\n\n"
         "data: [DONE]\n\n",
-        request_id, created, kApiModelId);
+        request_id, created, kApiModelId, usage);
     server_http_log_block(request_id, "response", "sse chat.completion.done", chunk);
     http_write(fd, chunk, n);
 }
@@ -13521,7 +13544,7 @@ static void serve_loop(
                               request_id, fixed_title);
             if (req.stream) {
                 sse_send_delta(client_fd, request_id, fixed_title);
-                sse_send_done(client_fd, request_id);
+                sse_send_done(client_fd, request_id, 0, 0);
             } else {
                 char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL, NULL);
                 if (final_json) {
@@ -13799,13 +13822,33 @@ static void serve_loop(
         }
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
-        int mtp_shadow_available = mtp_can_shadow_draft(wf);
-        int mtp_pending_draft = -1;
-        int mtp_shadow_hits = 0;
-        int mtp_shadow_checks = 0;
+        int mtp_shadow_available = mtp_can_shadow_draft(wf);  // MTP enabled AND artifacts present
+        int mtp_shadow_hits = 0;     // drafts accepted (real speculative decode)
+        int mtp_shadow_checks = 0;   // drafts verified
         g_mtp_kv_len = 0;  // fresh MTP attention context per generation
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+        }
+        // Real MTP draft/verify speculative-decode state. On accept the batched
+        // verify already forwarded the draft at pos+1, so the draft is streamed on
+        // the next iteration WITHOUT re-forwarding (mtp_succ_pending); the token
+        // after it (sampled from the verify's position-b logits) is carried in
+        // mtp_succ_token / mtp_succ_hidden. mtp_backbone_hidden always holds the
+        // backbone hidden that produced the current next_token (the MTP drafter input).
+        const int mtp_H = g_cfg.hidden_dim, mtp_V = g_cfg.vocab_size;
+        const int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
+        GpuStateSnap mtp_snap; int mtp_snap_ready = 0;
+        float *mtp_ha = NULL, *mtp_hb = NULL, *mtp_la = NULL, *mtp_lb = NULL, *mtp_succ_hidden = NULL;
+        int mtp_succ_pending = 0, mtp_succ_token = -1;
+        if (mtp_shadow_available) {
+            gpu_snap_alloc(&mtp_snap); mtp_snap_ready = 1;
+            mtp_ha = malloc((size_t)mtp_H*sizeof(float)); mtp_hb = malloc((size_t)mtp_H*sizeof(float));
+            mtp_la = malloc((size_t)mtp_V*sizeof(float)); mtp_lb = malloc((size_t)mtp_V*sizeof(float));
+            mtp_succ_hidden = malloc((size_t)mtp_H*sizeof(float));
+            if (!g_mtp_k_cache) g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
+            if (!g_mtp_v_cache) g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
+            server_log_errorf("[mtp] %s draft/verify speculative decode ACTIVE (predictor batch size=%d)\n",
+                              request_id, g_mtp_predictions);
         }
 
         if (final_norm_w) {
@@ -13827,14 +13870,6 @@ static void serve_loop(
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
-        if (mtp_shadow_available) {
-            int draft_token = -1;
-            if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
-                server_log_errorf("[mtp] %s shadow draft after token=%d -> %d\n",
-                                  request_id, next_token, draft_token);
-                mtp_pending_draft = draft_token;
-            }
-        }
         server_log_errorf("[serve] %s first_token=%d%s\n", request_id, next_token,
                           (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
 
@@ -13870,17 +13905,6 @@ static void serve_loop(
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
-            if (gen > 0 && mtp_pending_draft >= 0) {
-                mtp_shadow_checks++;
-                if (mtp_pending_draft == next_token) {
-                    mtp_shadow_hits++;
-                    server_log_errorf("[mtp] %s shadow hit token=%d\n", request_id, next_token);
-                } else {
-                    server_log_errorf("[mtp] %s shadow miss draft=%d actual=%d\n",
-                                      request_id, mtp_pending_draft, next_token);
-                }
-                mtp_pending_draft = -1;
-            }
             if (next_token == g_cfg.think_start_token) in_think = 1;
             if (next_token == g_cfg.think_end_token) in_think = 0;
             if (in_think) think_tokens++;
@@ -13979,58 +14003,105 @@ tool_call_checked:
             if (token_counts && next_token >= 0 && next_token < g_cfg.vocab_size) {
                 token_counts[next_token]++;
             }
-            embed_lookup(wf, next_token, hidden);
-            for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
-            }
-            complete_deferred_experts();
-            pos++;
 
-            if (mtp_shadow_available) {
-                memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+            // ---- Produce the successor of next_token ----
+            // Prequeue: next_token was already forwarded as position-b of an
+            // accepted batched verify, so its successor is already known. Stream-
+            // advance without a forward (state and pos were advanced at accept time).
+            if (mtp_succ_pending) {
+                memcpy(mtp_backbone_hidden, mtp_succ_hidden, (size_t)mtp_H*sizeof(float));
+                next_token = mtp_succ_token;
+                mtp_succ_pending = 0;
+                continue;
             }
 
-            if (final_norm_w) {
-                float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
-                memcpy(hidden, normed, g_cfg.hidden_dim * sizeof(float));
-                free(normed);
-            }
-            lm_head_forward(wf, hidden, logits);
-            // Mirror the first-token override: inside a <tool_call> block we
-            // sample greedily so the rigid XML format doesn't get sampled
-            // into something malformed (e.g. <function=\n instead of
-            // <function=name).
+            // Greedy override inside a <tool_call> block keeps the rigid XML format
+            // from being sampled into something malformed.
             float iter_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
-                                     ? 0.0f
-                                     : req.temperature;
-            next_token = pick_next_token(logits, g_cfg.vocab_size, iter_temperature, req.top_p,
-                                         req.top_k, req.min_p, effective_presence_penalty,
-                                         effective_repetition_penalty, token_counts,
-                                         req.reasoning_enabled);
+                                     ? 0.0f : req.temperature;
+
+            int mtp_did_spec = 0;
             if (mtp_shadow_available) {
-                int draft_token = -1;
-                if (mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &draft_token) == 0) {
-                    server_log_errorf("[mtp] %s shadow draft after token=%d -> %d\n",
-                                      request_id, next_token, draft_token);
-                    mtp_pending_draft = draft_token;
+                int d = -1;
+                mtp_shadow_draft_token(wf, model_path, mtp_backbone_hidden, next_token, &d);
+                if (d >= 0) {
+                    mtp_did_spec = 1;
+                    mtp_shadow_checks++;
+                    // Batched verify of [next_token, draft] at [pos, pos+1]. mtp_ha/mtp_hb
+                    // end as the post-layer backbone hidden for each position; mtp_la/mtp_lb
+                    // are their logits; mtp_snap captures post-token-a state for rollback.
+                    embed_lookup(wf, next_token, mtp_ha);
+                    embed_lookup(wf, d, mtp_hb);
+                    fused_layer_forward_2(wf, mtp_ha, mtp_hb, kv_caches, layer_fds,
+                                          pos, pos + 1, mtp_la, mtp_lb, &mtp_snap);
+                    int t_v1 = pick_next_token(mtp_la, g_cfg.vocab_size, iter_temperature, req.top_p,
+                                               req.top_k, req.min_p, effective_presence_penalty,
+                                               effective_repetition_penalty, token_counts,
+                                               req.reasoning_enabled);
+                    if (t_v1 == d) {
+                        // Accept: the real successor of next_token IS the draft d (already
+                        // forwarded at pos+1). Stream it next iteration without re-forwarding;
+                        // the token after it is sampled from the verify's position-b logits.
+                        mtp_shadow_hits++;
+                        memcpy(mtp_succ_hidden, mtp_hb, (size_t)mtp_H*sizeof(float));
+                        mtp_succ_token = pick_next_token(mtp_lb, g_cfg.vocab_size, iter_temperature, req.top_p,
+                                                         req.top_k, req.min_p, effective_presence_penalty,
+                                                         effective_repetition_penalty, token_counts,
+                                                         req.reasoning_enabled);
+                        memcpy(mtp_backbone_hidden, mtp_ha, (size_t)mtp_H*sizeof(float)); // backbone that produced d
+                        next_token = d;
+                        mtp_succ_pending = 1;
+                        pos += 2;
+                    } else {
+                        // Reject: drop the draft, restore post-token-a state, continue from t_v1.
+                        batched_rollback_apply(&mtp_snap, kv_caches);
+                        memcpy(mtp_backbone_hidden, mtp_ha, (size_t)mtp_H*sizeof(float)); // backbone that produced t_v1
+                        next_token = t_v1;
+                        pos += 1;
+                    }
                 }
+            }
+
+            if (!mtp_did_spec) {
+                // Baseline single-token forward (MTP off, or drafter unavailable this step).
+                embed_lookup(wf, next_token, hidden);
+                for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                    int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+                if (mtp_shadow_available) {
+                    memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
+                }
+                if (final_norm_w) {
+                    float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
+                    cpu_rms_norm(hidden, final_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
+                    memcpy(hidden, normed, g_cfg.hidden_dim * sizeof(float));
+                    free(normed);
+                }
+                lm_head_forward(wf, hidden, logits);
+                next_token = pick_next_token(logits, g_cfg.vocab_size, iter_temperature, req.top_p,
+                                             req.top_k, req.min_p, effective_presence_penalty,
+                                             effective_repetition_penalty, token_counts,
+                                             req.reasoning_enabled);
             }
         }
 
         if (mtp_shadow_checks > 0) {
-            double hit_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
-            server_log_errorf("[mtp] %s shadow summary hits=%d checks=%d rate=%.1f%%\n",
-                              request_id, mtp_shadow_hits, mtp_shadow_checks, hit_rate);
+            double acc_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
+            server_log_errorf("[mtp] %s speculative summary accepted=%d drafts=%d acceptance=%.1f%%\n",
+                              request_id, mtp_shadow_hits, mtp_shadow_checks, acc_rate);
         }
         mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
         g_overlap_in_decode = 0;
+        if (mtp_snap_ready) gpu_snap_free(&mtp_snap);
+        free(mtp_ha); free(mtp_hb); free(mtp_la); free(mtp_lb); free(mtp_succ_hidden);
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
             server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
@@ -14051,7 +14122,7 @@ tool_call_checked:
                 else sse_send_response_tool_call(client_fd, request_id, &parsed_tool_call);
             }
             if (is_chat && !parsed_tool_call.is_tool_call) {
-                sse_send_done(client_fd, request_id);
+                sse_send_done(client_fd, request_id, mtp_shadow_checks, mtp_shadow_hits);
             } else if (!is_chat) {
                 sse_send_response_done(client_fd, request_id, final_json);
             }
@@ -14489,13 +14560,43 @@ int main(int argc, char **argv) {
         }
         kApiModelId = g_cfg.model_id;
         configure_arch_perf();   // auto-derive fastest correct perf toggles from architecture
-        if (g_mtp_predictions < 0) {
-            g_mtp_predictions = g_cfg.mtp_default_predictions > 0 ? g_cfg.mtp_default_predictions : 0;
-        }
-        if (g_cfg.mtp_max_predictions > 0 && g_mtp_predictions > g_cfg.mtp_max_predictions) {
-            fprintf(stderr, "[mtp] requested draft budget %d exceeds model max %d; clamping\n",
-                    g_mtp_predictions, g_cfg.mtp_max_predictions);
-            g_mtp_predictions = g_cfg.mtp_max_predictions;
+        // Resolve the MTP setting (0=disabled, 1=automatic, >=2=explicit batch size)
+        // into an effective predictor batch size. g_mtp_predictions ends up holding
+        // that batch size: 0 disables MTP, >=2 enables it (value = positions per
+        // verify). Downstream code treats g_mtp_predictions > 0 as "MTP enabled".
+        {
+            int raw = g_mtp_predictions;
+            if (raw < 0) raw = 1;                 // nothing set it → automatic
+            int batch;
+            if (raw == 0) {
+                batch = 0;                        // disabled
+            } else if (raw == 1) {
+                // Automatic: enable only where the batched verify is bit-faithful.
+                // Dense models are faithful (lossless). MoE is not yet faithful, so
+                // automatic leaves it OFF (output would diverge) — force with
+                // FLASHCHAT_MTP=2 to run it anyway. This is the only place the
+                // dense/MoE distinction is applied; an explicit batch size below
+                // always enables regardless.
+                batch = (g_cfg.num_experts == 0) ? 2 : 0;
+                if (batch == 0)
+                    fprintf(stderr, "[mtp] automatic: MTP off for this MoE model "
+                                    "(batched verify not yet bit-faithful); set FLASHCHAT_MTP=2 to force\n");
+            } else {
+                batch = raw;                      // explicit predictor batch size
+            }
+            if (g_cfg.mtp_max_predictions > 0 && batch > g_cfg.mtp_max_predictions) {
+                fprintf(stderr, "[mtp] requested batch size %d exceeds model max %d; clamping\n",
+                        batch, g_cfg.mtp_max_predictions);
+                batch = g_cfg.mtp_max_predictions;
+            }
+            // Only single-draft speculation (batch size 2) is wired today; larger
+            // batches (multi-draft) fall back to 2 until depth-N is implemented.
+            if (batch > 2) {
+                fprintf(stderr, "[mtp] predictor batch size %d requested; multi-draft (>2) "
+                                "not yet wired, running batch size 2\n", batch);
+                batch = 2;
+            }
+            g_mtp_predictions = batch;            // 0 = off, 2 = enabled (positions/verify)
         }
         if (g_mtp_active_experts < 1) {
             g_mtp_active_experts = 1;
@@ -14528,7 +14629,7 @@ int main(int argc, char **argv) {
         // --k still overrides for the streaming-bound 397B model where the SSD
         // I/O cost of more experts may justify the quality tradeoff.
         //
-        // Hard cap at MAX_K=8 (Metal multi-expert buffer slots). For models trained
+        // Hard cap at MAX_K (Metal multi-expert buffer slots). For models trained
         // with K>8 (e.g. 397B-A17B's K=10) this is a known under-experting that
         // requires expanding MAX_K to fix; report it loudly so it is not silent.
         if (K <= 0) {
@@ -14623,11 +14724,11 @@ int main(int argc, char **argv) {
         MTPArtifacts mtp = detect_mtp_artifacts(wf, model_path);
         if (g_mtp_predictions > 0) {
             if (mtp.tensors_present && mtp.packed_experts_present) {
-                fprintf(stderr, "[mtp] enabled; draft budget=%d; artifacts detected (%s)\n",
+                fprintf(stderr, "[mtp] enabled; predictor batch size=%d; artifacts detected (%s)\n",
                         g_mtp_predictions, mtp.packed_dir);
-                fprintf(stderr, "[mtp] draft/verify decode is not active yet; using shadow path\n");
-                if (g_mtp_predictions > 1) {
-                    fprintf(stderr, "[mtp] shadow path currently evaluates one draft token; extra budget is reserved for verify decode\n");
+                fprintf(stderr, "[mtp] draft/verify speculative decode ACTIVE in server decode path\n");
+                if (g_cfg.num_experts > 0) {
+                    fprintf(stderr, "[mtp] note: MoE batched verify is not yet bit-faithful; accepted drafts may diverge from baseline output\n");
                 }
             } else {
                 fprintf(stderr, "[mtp] requested but artifacts are incomplete; using existing decode path\n");

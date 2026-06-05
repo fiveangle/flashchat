@@ -1832,39 +1832,47 @@ kernel void gated_rms_norm(
 //
 // Dispatch: (dim + 255) / 256 threadgroups, 256 threads each.
 
+// Combine up to MAX_K=16 expert outputs (must match model_config.h MAX_K). Buffers 3..18 are
+// the 16 expert outputs; params (buffer 19) holds weights[0..15] then shared_gate_score at [16].
+// Unused experts have weight 0 (host zeroes them), so K<16 is handled by the K>n guards.
 kernel void moe_combine_residual(
     device const float* h_mid       [[buffer(0)]],   // [dim]
     device const float* shared_out  [[buffer(1)]],   // [dim]
     device float*       hidden_out  [[buffer(2)]],   // [dim] output
-    device const float* expert_out0 [[buffer(3)]],   // [dim] expert 0
-    device const float* expert_out1 [[buffer(4)]],   // [dim] expert 1
-    device const float* expert_out2 [[buffer(5)]],   // [dim] expert 2
-    device const float* expert_out3 [[buffer(6)]],   // [dim] expert 3
-    device const float* expert_out4 [[buffer(7)]],   // [dim] expert 4
-    device const float* expert_out5 [[buffer(8)]],   // [dim] expert 5
-    device const float* expert_out6 [[buffer(9)]],   // [dim] expert 6
-    device const float* expert_out7 [[buffer(10)]],  // [dim] expert 7
-    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], shared_gate_score, (unused)
-    constant uint&      dim         [[buffer(12)]],
-    constant uint&      K           [[buffer(13)]],
+    device const float* e0  [[buffer(3)]],  device const float* e1  [[buffer(4)]],
+    device const float* e2  [[buffer(5)]],  device const float* e3  [[buffer(6)]],
+    device const float* e4  [[buffer(7)]],  device const float* e5  [[buffer(8)]],
+    device const float* e6  [[buffer(9)]],  device const float* e7  [[buffer(10)]],
+    device const float* e8  [[buffer(11)]], device const float* e9  [[buffer(12)]],
+    device const float* e10 [[buffer(13)]], device const float* e11 [[buffer(14)]],
+    device const float* e12 [[buffer(15)]], device const float* e13 [[buffer(16)]],
+    device const float* e14 [[buffer(17)]], device const float* e15 [[buffer(18)]],
+    device const float* params      [[buffer(19)]],  // [18]: weights[0..15], shared_gate_score at [16]
+    constant uint&      dim         [[buffer(20)]],
+    constant uint&      K           [[buffer(21)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= dim) return;
 
-    // Read expert weights and shared gate from params buffer
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));  // sigmoid(shared_gate_score)
+    float shared_gate = 1.0f / (1.0f + exp(-params[16]));  // sigmoid(shared_gate_score)
 
-    // Weighted sum of expert outputs
     float moe = 0.0f;
-    // Unrolled for MAX_K=8 with branch on K to avoid reading invalid buffers
-    if (K > 0) moe += params[0] * expert_out0[tid];
-    if (K > 1) moe += params[1] * expert_out1[tid];
-    if (K > 2) moe += params[2] * expert_out2[tid];
-    if (K > 3) moe += params[3] * expert_out3[tid];
-    if (K > 4) moe += params[4] * expert_out4[tid];
-    if (K > 5) moe += params[5] * expert_out5[tid];
-    if (K > 6) moe += params[6] * expert_out6[tid];
-    if (K > 7) moe += params[7] * expert_out7[tid];
+    if (K > 0)  moe += params[0]  * e0[tid];
+    if (K > 1)  moe += params[1]  * e1[tid];
+    if (K > 2)  moe += params[2]  * e2[tid];
+    if (K > 3)  moe += params[3]  * e3[tid];
+    if (K > 4)  moe += params[4]  * e4[tid];
+    if (K > 5)  moe += params[5]  * e5[tid];
+    if (K > 6)  moe += params[6]  * e6[tid];
+    if (K > 7)  moe += params[7]  * e7[tid];
+    if (K > 8)  moe += params[8]  * e8[tid];
+    if (K > 9)  moe += params[9]  * e9[tid];
+    if (K > 10) moe += params[10] * e10[tid];
+    if (K > 11) moe += params[11] * e11[tid];
+    if (K > 12) moe += params[12] * e12[tid];
+    if (K > 13) moe += params[13] * e13[tid];
+    if (K > 14) moe += params[14] * e14[tid];
+    if (K > 15) moe += params[15] * e15[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }

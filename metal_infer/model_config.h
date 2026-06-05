@@ -26,7 +26,7 @@
 #define MAX_FULL_ATTN_LAYERS        16
 #define MAX_LINEAR_LAYERS           48
 #define MAX_SEQ_LEN                 1048576
-#define MAX_K                       8
+#define MAX_K                       16   // Qwen3-Next-80B-A3B / 397B use num_experts_per_tok=10; was 8
 
 // ============================================================================
 // Model configuration struct
@@ -96,6 +96,9 @@ typedef struct {
     int eos_token_2;
     int think_start_token;
     int think_end_token;
+    int thinking_capable;   // 1 = model has a <think> reasoning mode (default); 0 = non-thinking
+                            // Instruct variants (e.g. Qwen3-Next-80B-A3B-Instruct). Non-thinking
+                            // models must NOT get a <think> block injected into the assistant turn.
 
     int mtp_default_predictions;
     int mtp_max_predictions;
@@ -275,6 +278,15 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
         tp = json_find_key(p, "eos_2"); if (tp) json_parse_int(tp, &cfg->eos_token_2);
         tp = json_find_key(p, "think_start"); if (tp) json_parse_int(tp, &cfg->think_start_token);
         tp = json_find_key(p, "think_end"); if (tp) json_parse_int(tp, &cfg->think_end_token);
+    }
+
+    // Thinking capability defaults to ON (Qwen3 hybrid models). Instruct variants
+    // set "thinking_capable": false so the server never injects a <think> block.
+    cfg->thinking_capable = 1;
+    p = json_find_key(model_start, "thinking_capable");
+    if (p) {
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == 'f' || *p == 'F' || *p == '0') cfg->thinking_capable = 0;
     }
 
     p = json_find_key(model_start, "scripts");

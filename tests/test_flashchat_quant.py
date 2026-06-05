@@ -21,7 +21,15 @@ from flashchat_quant import (  # noqa: E402
     split_qwen_gate_up_proj,
     unpack_8bit_rows,
 )
-from compile_native_qwen import quantize_matrix_to_entries, should_shift_native_norm, shift_native_norm_data  # noqa: E402
+from compile_native_qwen import (  # noqa: E402
+    build_expert_sources,
+    expand_native_projection_matrix,
+    expert_source_layout,
+    is_routed_expert,
+    quantize_matrix_to_entries,
+    should_shift_native_norm,
+    shift_native_norm_data,
+)
 from repack_experts import build_components  # noqa: E402
 
 
@@ -170,6 +178,67 @@ def test_native_qwen_norm_shift_policy():
             "native norm shift should add one before writing BF16")
 
 
+def test_native_qwen_next_projection_split():
+    entry = {
+        "linear_num_key_heads": 1,
+        "linear_key_head_dim": 2,
+        "linear_num_value_heads": 2,
+        "linear_value_head_dim": 2,
+    }
+    qkvz = np.arange(48, dtype=np.float32).reshape(12, 4)
+    got = expand_native_projection_matrix("model.layers.0.linear_attn.in_proj_qkvz.weight", qkvz, entry)
+
+    require([name for name, _ in got] == [
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.0.linear_attn.in_proj_z.weight",
+    ], "qkvz split should produce runtime qkv and z names")
+    require(got[0][1].shape == (8, 4), "qkv split row count mismatch")
+    require(got[1][1].shape == (4, 4), "z split row count mismatch")
+    require(np.array_equal(got[0][1], qkvz[:8]), "qkv split contents mismatch")
+    require(np.array_equal(got[1][1], qkvz[8:]), "z split contents mismatch")
+
+    ba = np.arange(16, dtype=np.float32).reshape(4, 4)
+    got = expand_native_projection_matrix("model.layers.0.linear_attn.in_proj_ba.weight", ba, entry)
+    require([name for name, _ in got] == [
+        "model.layers.0.linear_attn.in_proj_b.weight",
+        "model.layers.0.linear_attn.in_proj_a.weight",
+    ], "ba split should produce runtime b and a names")
+    require(got[0][1].shape == (2, 4), "b split row count mismatch")
+    require(got[1][1].shape == (2, 4), "a split row count mismatch")
+    require(np.array_equal(got[0][1], ba[:2]), "b split contents mismatch")
+    require(np.array_equal(got[1][1], ba[2:]), "a split contents mismatch")
+
+
+def test_native_qwen_next_expert_source_layouts():
+    stacked = {
+        "model.layers.0.mlp.experts.gate_up_proj": "a.safetensors",
+        "model.layers.0.mlp.experts.down_proj": "a.safetensors",
+    }
+    individual = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": "a.safetensors",
+        "model.layers.0.mlp.experts.0.up_proj.weight": "a.safetensors",
+        "model.layers.0.mlp.experts.0.down_proj.weight": "a.safetensors",
+        "model.layers.0.mlp.experts.1.gate_proj.weight": "b.safetensors",
+        "model.layers.0.mlp.experts.1.up_proj.weight": "b.safetensors",
+        "model.layers.0.mlp.experts.1.down_proj.weight": "b.safetensors",
+    }
+
+    for name in stacked:
+        require(is_routed_expert(name), f"{name} should be recognized as a routed expert")
+    for name in individual:
+        require(is_routed_expert(name), f"{name} should be recognized as a routed expert")
+
+    sources = build_expert_sources(stacked, "model.layers.")
+    require(expert_source_layout(sources[0], 2) == "stacked", "stacked experts should be preferred")
+    sources = build_expert_sources(individual, "model.layers.")
+    require(expert_source_layout(sources[0], 2) == "individual", "individual expert tensors should be complete")
+
+    broken = dict(individual)
+    del broken["model.layers.0.mlp.experts.1.up_proj.weight"]
+    sources = build_expert_sources(broken, "model.layers.")
+    require(expert_source_layout(sources[0], 2) is None, "missing individual expert tensor should fail validation")
+
+
 def test_known_bf16_mtp_snapshot_metadata():
     snapshot = Path(
         "/Volumes/usr/Users/speedster/dev/models/hf/models--Qwen--Qwen3.6-35B-A3B/"
@@ -205,6 +274,8 @@ def main():
     test_native_compile_respects_bits()
     test_qwen_gate_up_split()
     test_native_qwen_norm_shift_policy()
+    test_native_qwen_next_projection_split()
+    test_native_qwen_next_expert_source_layouts()
     test_known_bf16_mtp_snapshot_metadata()
     print("flashchat quant helper tests passed")
 

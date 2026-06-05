@@ -477,6 +477,7 @@ static char *stream_response(int sock, int show_thinking) {
     if (!stream) { close(sock); return NULL; }
 
     int header_done = 0, in_think = 0, tokens = 0;
+    int mtp_drafts = -1, mtp_accepted = -1;  // MTP shadow-draft stats from final chunk usage
     double t_start = now_ms(), t_first = 0;
     md_reset();  // fresh markdown state for each response
 
@@ -491,6 +492,14 @@ static char *stream_response(int sock, int show_thinking) {
         }
         if (strncmp(line, "data: ", 6) != 0) continue;
         if (strncmp(line + 6, "[DONE]", 6) == 0) break;
+
+        // Final chunk carries MTP shadow-draft usage stats (no content delta).
+        char *mk = strstr(line + 6, "\"mtp_drafts\":");
+        if (mk) {
+            mtp_drafts = atoi(mk + 13);
+            char *ak = strstr(line + 6, "\"mtp_accepted\":");
+            if (ak) mtp_accepted = atoi(ak + 15);
+        }
 
         char *ck = strstr(line + 6, "\"content\":\"");
         if (!ck) continue;
@@ -537,10 +546,15 @@ static char *stream_response(int sock, int show_thinking) {
     double gen_time = t_first > 0 ? t_end - t_first : 0;
     int gen_tokens = tokens > 1 ? tokens - 1 : 0;
     printf("\n\n");
-    if (gen_tokens > 0 && gen_time > 0)
-        printf("[%d tokens, %.1f tok/s, TTFT %.1fs]\n\n",
+    if (gen_tokens > 0 && gen_time > 0) {
+        char mtp[64] = "";
+        if (mtp_drafts > 0)
+            snprintf(mtp, sizeof(mtp), ", MTP %.0f%% (%d/%d)",
+                     100.0 * mtp_accepted / mtp_drafts, mtp_accepted, mtp_drafts);
+        printf("[%d tokens, %.1f tok/s, TTFT %.1fs%s]\n\n",
                tokens, gen_tokens * 1000.0 / gen_time,
-               ttft_ms / 1000.0);
+               ttft_ms / 1000.0, mtp);
+    }
 
     return response;
 }

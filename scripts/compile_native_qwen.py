@@ -24,6 +24,12 @@ from repack_experts import build_components, get_model_entry, parse_layers
 
 
 ALIGN = 64
+STACKED_EXPERT_RE = re.compile(
+    r"^(?:model|mtp)\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$"
+)
+INDIVIDUAL_EXPERT_RE = re.compile(
+    r"^(?:model|mtp)\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def parse_safetensors_header(path):
@@ -43,7 +49,7 @@ def sanitize_name(name):
 
 def is_routed_expert(name):
     san = sanitize_name(name)
-    return re.search(r"(?:^|\.)(?:model|mtp)\.layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)$", san) is not None
+    return STACKED_EXPERT_RE.match(san) is not None or INDIVIDUAL_EXPERT_RE.match(san) is not None
 
 
 def read_tensor_raw(model_path, filename, header, data_start, name):
@@ -110,6 +116,70 @@ def quantize_matrix_to_entries(name, matrix, bits, group_size):
         (name[:-len(".weight")] + ".scales", scales.tobytes(), [matrix.shape[0], in_dim // group_size], "BF16"),
         (name[:-len(".weight")] + ".biases", biases.tobytes(), [matrix.shape[0], in_dim // group_size], "BF16"),
     ]
+
+
+def linear_attention_dims(entry):
+    key_dim = int(entry["linear_num_key_heads"]) * int(entry["linear_key_head_dim"])
+    value_dim = int(entry["linear_num_value_heads"]) * int(entry["linear_value_head_dim"])
+    conv_dim = key_dim * 2 + value_dim
+    gate_dim = int(entry["linear_num_value_heads"])
+    return conv_dim, value_dim, gate_dim
+
+
+def expand_native_projection_matrix(san_name, matrix, entry):
+    # Qwen3-Next ships the GatedDeltaNet input projections stacked AND interleaved
+    # per key-head (see Qwen3NextGatedDeltaNet.fix_query_key_value_ordering in HF).
+    # in_proj_qkvz rows are grouped as num_k_heads blocks of
+    #   [q: head_k_dim, k: head_k_dim, v: (num_v_heads/num_k_heads)*head_v_dim,
+    #    z: (num_v_heads/num_k_heads)*head_v_dim]
+    # which HF reshapes to head-contiguous query/key/value/z, then forms
+    #   mixed_qkv = cat(query, key, value)  -> [q_all, k_all, v_all]
+    # The engine copies conv1d.weight verbatim and consumes in_proj_qkv in exactly
+    # that head-contiguous [q_all, k_all, v_all] order, so we must de-interleave
+    # here. A flat slice (matrix[:conv_dim]) mixes heads together and silently
+    # corrupts linear attention in every GatedDeltaNet layer.
+    nkh = int(entry["linear_num_key_heads"])
+    nvh = int(entry["linear_num_value_heads"])
+    hkd = int(entry["linear_key_head_dim"])
+    hvd = int(entry["linear_value_head_dim"])
+    vh_per_kh = nvh // nkh  # value heads grouped under each key head
+
+    if san_name.endswith(".linear_attn.in_proj_qkvz.weight"):
+        conv_dim, value_dim, _ = linear_attention_dims(entry)
+        expected = conv_dim + value_dim
+        if matrix.shape[0] != expected:
+            raise ValueError(f"{san_name} row count {matrix.shape[0]} != expected {expected}")
+        in_features = matrix.shape[1]
+        v_blk = vh_per_kh * hvd  # v (and z) rows per key-head block
+        blk = 2 * hkd + 2 * v_blk
+        per_head = matrix.reshape(nkh, blk, in_features)
+        q = per_head[:, 0:hkd, :].reshape(nkh * hkd, in_features)
+        k = per_head[:, hkd:2 * hkd, :].reshape(nkh * hkd, in_features)
+        v = per_head[:, 2 * hkd:2 * hkd + v_blk, :].reshape(nkh * v_blk, in_features)
+        z = per_head[:, 2 * hkd + v_blk:, :].reshape(nkh * v_blk, in_features)
+        qkv = np.concatenate([q, k, v], axis=0)
+        prefix = san_name[:-len("in_proj_qkvz.weight")]
+        return [
+            (prefix + "in_proj_qkv.weight", np.ascontiguousarray(qkv)),
+            (prefix + "in_proj_z.weight", np.ascontiguousarray(z)),
+        ]
+    if san_name.endswith(".linear_attn.in_proj_ba.weight"):
+        _, _, gate_dim = linear_attention_dims(entry)
+        expected = gate_dim * 2
+        if matrix.shape[0] != expected:
+            raise ValueError(f"{san_name} row count {matrix.shape[0]} != expected {expected}")
+        in_features = matrix.shape[1]
+        # ba rows are grouped as num_k_heads blocks of [b: vh_per_kh, a: vh_per_kh],
+        # reshaped by HF to head-contiguous b/a of length num_v_heads.
+        per_head = matrix.reshape(nkh, 2 * vh_per_kh, in_features)
+        b = per_head[:, 0:vh_per_kh, :].reshape(nkh * vh_per_kh, in_features)
+        a = per_head[:, vh_per_kh:, :].reshape(nkh * vh_per_kh, in_features)
+        prefix = san_name[:-len("in_proj_ba.weight")]
+        return [
+            (prefix + "in_proj_b.weight", np.ascontiguousarray(b)),
+            (prefix + "in_proj_a.weight", np.ascontiguousarray(a)),
+        ]
+    return [(san_name, matrix)]
 
 
 def should_quantize_tensor(san_name, meta, group_size):
@@ -262,7 +332,8 @@ def compile_non_experts(model_path, output_dir, weight_map, headers, entry, nati
             entries = []
             if will_quantize:
                 matrix = read_tensor_bf16(model_path, filename, header, data_start, orig)
-                entries = quantize_matrix_to_entries(san, matrix, bits, group_size)
+                for out_name, out_matrix in expand_native_projection_matrix(san, matrix, entry):
+                    entries.extend(quantize_matrix_to_entries(out_name, out_matrix, bits, group_size))
             else:
                 raw = read_tensor_raw(model_path, filename, header, data_start, orig)
                 if should_shift_native_norm(san, meta):
@@ -292,18 +363,34 @@ def compile_non_experts(model_path, output_dir, weight_map, headers, entry, nati
 
 
 def build_expert_sources(weight_map, prefix):
-    sources = {}
+    sources = defaultdict(lambda: {"stacked": {}, "individual": defaultdict(dict)})
     for name, filename in weight_map.items():
         san = sanitize_name(name)
         if not san.startswith(prefix):
             continue
-        if san.endswith(".experts.gate_up_proj"):
-            layer = int(re.search(r"\.layers\.(\d+)\.", san).group(1))
-            sources.setdefault(layer, {})["gate_up"] = (name, filename)
-        elif san.endswith(".experts.down_proj"):
-            layer = int(re.search(r"\.layers\.(\d+)\.", san).group(1))
-            sources.setdefault(layer, {})["down"] = (name, filename)
+        match = STACKED_EXPERT_RE.match(san)
+        if match:
+            layer = int(match.group(1))
+            key = "gate_up" if match.group(2) == "gate_up_proj" else "down"
+            sources[layer]["stacked"][key] = (name, filename)
+            continue
+        match = INDIVIDUAL_EXPERT_RE.match(san)
+        if match:
+            layer = int(match.group(1))
+            expert = int(match.group(2))
+            sources[layer]["individual"][expert][match.group(3)] = (name, filename)
     return sources
+
+
+def expert_source_layout(layer_sources, experts_to_write):
+    if {"gate_up", "down"} <= set(layer_sources.get("stacked", {})):
+        return "stacked"
+    individual = layer_sources.get("individual", {})
+    required = {"gate_proj", "up_proj", "down_proj"}
+    for expert in range(experts_to_write):
+        if required - set(individual.get(expert, {})):
+            return None
+    return "individual"
 
 
 def compile_routed_experts(model_path, output_dir, weight_map, headers, entry, layers,
@@ -325,7 +412,7 @@ def compile_routed_experts(model_path, output_dir, weight_map, headers, entry, l
     if experts_to_write != num_experts:
         print(f"Smoke mode: writing first {experts_to_write} of {num_experts} experts")
     if dry_run:
-        missing = [layer for layer in layers if {"gate_up", "down"} - set(sources.get(layer, {}))]
+        missing = [layer for layer in layers if not expert_source_layout(sources.get(layer, {}), experts_to_write)]
         if missing:
             raise RuntimeError(f"missing routed expert tensors for layers: {missing[:8]}")
         planned = len(layers) * experts_to_write * expert_size
@@ -345,27 +432,38 @@ def compile_routed_experts(model_path, output_dir, weight_map, headers, entry, l
 
     for layer in layers:
         layer_sources = sources.get(layer, {})
-        if {"gate_up", "down"} - set(layer_sources):
+        layout = expert_source_layout(layer_sources, experts_to_write)
+        if not layout:
             raise RuntimeError(f"missing routed expert tensors for layer {layer}")
         out_path = packed_dir / f"layer_{layer:02d}.bin"
         fd = os.open(out_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
         os.ftruncate(fd, layer_size)
         started = time.time()
 
-        gate_up_name, gate_up_file = layer_sources["gate_up"]
-        down_name, down_file = layer_sources["down"]
-        gate_up_header, gate_up_start = headers[gate_up_file]
-        down_header, down_start = headers[down_file]
+        if layout == "stacked":
+            gate_up_name, gate_up_file = layer_sources["stacked"]["gate_up"]
+            down_name, down_file = layer_sources["stacked"]["down"]
+            gate_up_header, gate_up_start = headers[gate_up_file]
+            down_header, down_start = headers[down_file]
 
         for expert in range(experts_to_write):
-            gate_up = read_expert_bf16(model_path, gate_up_file, gate_up_header, gate_up_start, gate_up_name, expert)
-            gate, up = split_qwen_gate_up_proj(gate_up)
-            down = read_expert_bf16(model_path, down_file, down_header, down_start, down_name, expert)
-            matrices = {
-                "gate_proj": gate,
-                "up_proj": up,
-                "down_proj": down,
-            }
+            if layout == "stacked":
+                gate_up = read_expert_bf16(model_path, gate_up_file, gate_up_header, gate_up_start, gate_up_name, expert)
+                gate, up = split_qwen_gate_up_proj(gate_up)
+                down = read_expert_bf16(model_path, down_file, down_header, down_start, down_name, expert)
+                matrices = {
+                    "gate_proj": gate,
+                    "up_proj": up,
+                    "down_proj": down,
+                }
+            else:
+                matrices = {}
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensor_name, tensor_file = layer_sources["individual"][expert][proj]
+                    tensor_header, tensor_start = headers[tensor_file]
+                    matrices[proj] = read_tensor_bf16(
+                        model_path, tensor_file, tensor_header, tensor_start, tensor_name
+                    )
 
             for proj, matrix in matrices.items():
                 for name, data, _, _ in quantize_matrix_to_entries(f"{proj}.weight", matrix, bits, group_size):
