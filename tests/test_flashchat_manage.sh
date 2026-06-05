@@ -271,7 +271,7 @@ echo ""
 
 reset_storage
 output=$(run_manage "${MODEL_ID}\n1\nwrong-id\nq\n")
-assert_contains "wrong model ID refuses blob removal" "Confirmation did not match" "$output"
+assert_contains "wrong model ID refuses blob removal" "Cancelled." "$output"
 assert_exists "wrong model ID keeps blob link" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 assert_exists "wrong model ID keeps blob target" "${LOCAL_REPO}/blobs/blob1"
 
@@ -293,38 +293,32 @@ assert_contains "offload moves repo" "Model offloaded" "$output"
 assert_not_exists "offload removes local repo" "$LOCAL_REPO"
 assert_exists "offload creates offloaded repo" "$OFFLOADED_REPO"
 
-output=$(run_manage "${MODEL_ID}\n5\nq\n")
-assert_contains "runtime-only restore succeeds" "Runtime artifacts restored" "$output"
-assert_exists "runtime-only restore copies runtime" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/model_weights.bin"
-assert_not_exists "runtime-only restore does not copy safetensors" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
-assert_exists "runtime-only restore leaves offload intact" "$OFFLOADED_REPO"
+output=$(run_manage "${MODEL_ID}\n4\nq\n")
+assert_contains "install local runtime succeeds" "Runtime installed locally" "$output"
+assert_contains "install local runtime shows selected runtime" "Flashchat 4-bit runtime" "$output"
+assert_exists "install local runtime copies runtime" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/model_weights.bin"
+assert_not_exists "install local runtime does not copy safetensors" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
+assert_exists "install local runtime leaves offload intact" "$OFFLOADED_REPO"
 
 printf "local" > "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/local-marker"
 printf "offload" > "$(runtime_dir_for "$MODEL_ID" "$OFFLOADED_SNAPSHOT")/offload-marker"
-output=$(run_manage "${MODEL_ID}\n5\nwrong-id\nq\n")
-assert_contains "runtime overwrite requires exact model ID" "Confirmation did not match" "$output"
+rm -f "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/packed_experts/layer_39.bin"
+output=$(run_manage "${MODEL_ID}\n4\nwrong-id\nq\n")
+assert_contains "runtime overwrite requires exact model ID" "Cancelled." "$output"
 assert_exists "wrong runtime overwrite keeps local runtime" "$(runtime_dir_for "$MODEL_ID" "$LOCAL_SNAPSHOT")/local-marker"
-
-output=$(run_manage "${MODEL_ID}\n4\nq\n")
-assert_contains "full reload refuses local collision" "Refusing to overwrite existing local model" "$output"
-assert_exists "collision leaves offload repo" "$OFFLOADED_REPO"
-
-rm -rf "$LOCAL_REPO"
-output=$(run_manage "${MODEL_ID}\n4\n${MODEL_ID}\nq\n")
-assert_contains "full reload moves repo back" "Model fully reloaded" "$output"
-assert_exists "full reload restores local repo" "$LOCAL_REPO"
-assert_not_exists "full reload removes offload copy" "$OFFLOADED_REPO"
 
 reset_storage
 output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
 assert_contains "startup restore setup offloads model" "Model offloaded" "$output"
 output=$(run_flashchat "\nq\n")
 assert_contains "startup restore offers offload copy" "Offloaded Model Found" "$output"
+assert_contains "startup restore shows selected runtime" "Flashchat 4-bit runtime" "$output"
 assert_contains "startup restore offers offload run" "Run from offload directory" "$output"
-assert_contains "startup restore reloads model" "Model fully reloaded" "$output"
+assert_contains "startup restore installs runtime locally" "Runtime installed locally" "$output"
 assert_not_contains "startup restore skips HF download prompt" "Model Download Required" "$output"
 assert_exists "startup restore creates local repo" "$LOCAL_REPO"
-assert_not_exists "startup restore consumes offload repo" "$OFFLOADED_REPO"
+assert_exists "startup restore keeps offload repo" "$OFFLOADED_REPO"
+assert_not_exists "startup restore does not copy safetensors" "${LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 
 reset_storage
 output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
@@ -339,9 +333,8 @@ assert_exists "startup offload run keeps offload repo" "$OFFLOADED_REPO"
 reset_storage
 output=$(run_manage "${MODEL_ID}\n3\n${MODEL_ID}\nq\n")
 mkdir -p "$LOCAL_REPO"
-output=$(run_flashchat "y\nq\n")
-assert_contains "startup offload collision reports reload unavailable" "Reloading to the HuggingFace cache is unavailable" "$output"
-assert_contains "startup offload collision uses offloaded model" "Using offloaded model for this run" "$output"
+output=$(run_flashchat "\nq\n")
+assert_contains "startup offload collision installs runtime" "Runtime installed locally" "$output"
 assert_exists "startup offload collision keeps local repo" "$LOCAL_REPO"
 assert_exists "startup offload collision keeps offload repo" "$OFFLOADED_REPO"
 
@@ -354,7 +347,7 @@ assert_exists "collision keeps offload repo" "$OFFLOADED_REPO"
 
 rm -rf "$OFFLOADED_REPO"
 output=$(run_manage "${MODEL_ID}\n2\nwrong-id\nq\n")
-assert_contains "wrong model ID refuses local delete" "Confirmation did not match" "$output"
+assert_contains "wrong model ID refuses local delete" "Cancelled." "$output"
 assert_exists "wrong model ID keeps local repo" "$LOCAL_REPO"
 
 output=$(run_manage "${MODEL_ID}\n2\n${MODEL_ID}\nq\n")
@@ -369,18 +362,20 @@ assert_exists "native offload creates shared offload repo" "$NATIVE_OFFLOADED_RE
 
 write_runtime_fixture "$NATIVE_Q4_ID" "$NATIVE_LOCAL_SNAPSHOT"
 printf "q4-local" > "$(runtime_dir_for "$NATIVE_Q4_ID" "$NATIVE_LOCAL_SNAPSHOT")/q4-marker"
-output=$(run_manage "${NATIVE_Q8_ID}\n5\nq\n")
-assert_contains "native q8 runtime-only restore succeeds" "Runtime artifacts restored" "$output"
+output=$(run_manage "${NATIVE_Q8_ID}\n4\nq\n")
+assert_contains "native q8 install local runtime succeeds" "Runtime installed locally" "$output"
+assert_contains "native q8 install shows selected runtime" "Flashchat 8-bit runtime" "$output"
 assert_exists "native q8 restore creates q8 runtime" "$(runtime_dir_for "$NATIVE_Q8_ID" "$NATIVE_LOCAL_SNAPSHOT")/model_weights.bin"
 assert_exists "native q8 restore includes MTP experts" "$(runtime_dir_for "$NATIVE_Q8_ID" "$NATIVE_LOCAL_SNAPSHOT")/packed_mtp_experts/layer_00.bin"
 assert_exists "native q8 restore preserves q4 runtime files" "$(runtime_dir_for "$NATIVE_Q4_ID" "$NATIVE_LOCAL_SNAPSHOT")/q4-marker"
-assert_not_exists "native q8 runtime-only restore does not copy original blobs" "${NATIVE_LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
+assert_not_exists "native q8 install local runtime does not copy original blobs" "${NATIVE_LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 
 rm -rf "$NATIVE_LOCAL_REPO"
 write_runtime_fixture "$NATIVE_Q8_ID" "$NATIVE_LOCAL_SNAPSHOT"
 printf "q8-local" > "$(runtime_dir_for "$NATIVE_Q8_ID" "$NATIVE_LOCAL_SNAPSHOT")/q8-marker"
-output=$(run_manage "${NATIVE_Q4_ID}\n5\nq\n")
-assert_contains "native q4 runtime-only restore succeeds" "Runtime artifacts restored" "$output"
+output=$(run_manage "${NATIVE_Q4_ID}\n4\nq\n")
+assert_contains "native q4 install local runtime succeeds" "Runtime installed locally" "$output"
+assert_contains "native q4 install shows selected runtime" "Flashchat 4-bit runtime" "$output"
 assert_exists "native q4 restore creates q4 runtime" "$(runtime_dir_for "$NATIVE_Q4_ID" "$NATIVE_LOCAL_SNAPSHOT")/model_weights.bin"
 assert_exists "native q4 restore preserves q8 runtime files" "$(runtime_dir_for "$NATIVE_Q8_ID" "$NATIVE_LOCAL_SNAPSHOT")/q8-marker"
 
@@ -394,10 +389,10 @@ assert_exists "dense runtime remains without packed experts" "$(runtime_dir_for 
 reset_dense_storage
 output=$(run_manage "${DENSE_ID}\n3\n${DENSE_ID}\nq\n")
 assert_contains "dense offload moves repo" "Model offloaded" "$output"
-output=$(run_manage "${DENSE_ID}\n5\nq\n")
-assert_contains "dense runtime-only restore succeeds" "Runtime artifacts restored" "$output"
-assert_exists "dense runtime-only restore copies MTP weights" "$(runtime_dir_for "$DENSE_ID" "$DENSE_LOCAL_SNAPSHOT")/model_weights.json"
-assert_not_exists "dense runtime-only restore does not copy safetensors" "${DENSE_LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
+output=$(run_manage "${DENSE_ID}\n4\nq\n")
+assert_contains "dense install local runtime succeeds" "Runtime installed locally" "$output"
+assert_exists "dense install local runtime copies MTP weights" "$(runtime_dir_for "$DENSE_ID" "$DENSE_LOCAL_SNAPSHOT")/model_weights.json"
+assert_not_exists "dense install local runtime does not copy safetensors" "${DENSE_LOCAL_SNAPSHOT}/model-00001-of-00001.safetensors"
 
 echo ""
 echo "========================================"

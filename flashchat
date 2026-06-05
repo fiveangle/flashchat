@@ -1473,10 +1473,12 @@ ensure_huggingface_cache_dir() {
 
 model_local_repo_dir() {
     local model_id="$1"
-    local repo
+    local hf_cache repo
+    hf_cache=$(flashchat_hf_cache_dir)
+    hf_cache="${hf_cache%/}"
     repo=$(flashchat_model_repo "$model_id")
     [ -n "$repo" ] || return 1
-    printf "%s/%s\n" "$(flashchat_hf_cache_dir)" "$(hf_repo_dir_name "$repo")"
+    printf "%s/%s\n" "$hf_cache" "$(hf_repo_dir_name "$repo")"
 }
 
 model_offloaded_repo_dir() {
@@ -1484,10 +1486,19 @@ model_offloaded_repo_dir() {
     local offload_dir
     local repo
     offload_dir="$(flashchat_get OFFLOAD_DIR)"
+    offload_dir="${offload_dir%/}"
     repo=$(flashchat_model_repo "$model_id")
     [ -n "$offload_dir" ] || return 1
     [ -n "$repo" ] || return 1
     printf "%s/%s\n" "$offload_dir" "$(hf_repo_dir_name "$repo")"
+}
+
+model_runtime_label() {
+    local model_id="$1"
+    local bits
+    bits=$(flashchat_model_quant_bits "$model_id")
+    bits="${bits:-4}"
+    printf "Flashchat %s-bit runtime\n" "$bits"
 }
 
 latest_snapshot_in_repo() {
@@ -1604,7 +1615,7 @@ reload_model_from_offload_repo() {
 
 use_model_from_offload_repo() {
     local model_id="$1"
-    local offloaded_repo snapshot
+    local offloaded_repo snapshot runtime_dir runtime_label
     offloaded_repo=$(model_offloaded_repo_dir "$model_id")
     if [ ! -d "$offloaded_repo" ]; then
         echo "Offloaded model is not present."
@@ -1616,12 +1627,13 @@ use_model_from_offload_repo() {
         return 1
     fi
     export FLASHCHAT_MODEL_PATH="$snapshot"
-    local runtime_dir
     runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$snapshot")
+    runtime_label=$(model_runtime_label "$model_id")
     export FLASHCHAT_WEIGHTS_DIR="$runtime_dir"
     export FLASHCHAT_EXPERTS_DIR="${runtime_dir}/packed_experts"
     flashchat_load_config
     echo "Using offloaded model for this run."
+    echo "Runtime: $runtime_label"
     echo "$snapshot"
 }
 
@@ -1670,16 +1682,125 @@ copy_runtime_artifacts() {
     done < <(runtime_artifact_entries "$model_id")
 }
 
+generate_runtime_artifacts_from_snapshot() {
+    local model_id="$1"
+    local source_snapshot="$2"
+    local local_runtime="$3"
+    local extract_script repack_script num_experts
+    extract_script=$(model_registry_script "$model_id" "extract_weights" "scripts/extract_weights.py")
+    repack_script=$(model_registry_script "$model_id" "repack_experts" "scripts/repack_experts.py")
+
+    mkdir -p "$local_runtime" || return 1
+
+    local cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$source_snapshot" --output "$local_runtime")
+    if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
+        cmd+=(--non-experts --include-mtp)
+    fi
+    run_python "${cmd[@]}" || return 1
+
+    run_python "$SCRIPT_DIR/scripts/export_tokenizer.py" "$source_snapshot/tokenizer.json" "$local_runtime/vocab.bin" || return 1
+
+    num_experts=$(flashchat_model_num_experts "$model_id")
+    if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
+        if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
+            cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id" --model "$source_snapshot" --output "$local_runtime" --experts)
+            local mtp_max
+            mtp_max=$(flashchat_model_mtp_max "$model_id")
+            if [ -n "$mtp_max" ] && [ "$mtp_max" -gt 0 ] 2>/dev/null; then
+                cmd+=(--mtp-experts)
+            fi
+            run_python "${cmd[@]}" || return 1
+        else
+            run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$source_snapshot" --output "$local_runtime" || return 1
+            run_python "$SCRIPT_DIR/$repack_script" --model-id "$model_id" \
+                --index "$local_runtime/expert_index.json" --output "$local_runtime/packed_experts" || return 1
+        fi
+    fi
+}
+
+install_model_runtime_locally_from_offload() {
+    local model_id="$1"
+    local local_repo offloaded_repo source_snapshot source_runtime local_snapshot local_runtime
+    local runtime_label
+    ensure_offload_dir || return 1
+    local_repo=$(model_local_repo_dir "$model_id")
+    offloaded_repo=$(model_offloaded_repo_dir "$model_id")
+    runtime_label=$(model_runtime_label "$model_id")
+    if [ ! -d "$offloaded_repo" ]; then
+        echo "Offloaded model is not present."
+        return 1
+    fi
+    source_snapshot=$(latest_snapshot_in_repo "$offloaded_repo" 2>/dev/null || true)
+    if [ -z "$source_snapshot" ]; then
+        echo "Offloaded model has no snapshot directory."
+        return 1
+    fi
+
+    local_snapshot="${local_repo}/snapshots/$(basename "$source_snapshot")"
+    local_runtime=$(flashchat_model_runtime_dir "$model_id" "$local_snapshot")
+    source_runtime=$(flashchat_model_runtime_dir "$model_id" "$source_snapshot")
+
+    if model_runtime_ready_for_snapshot "$model_id" "$local_snapshot"; then
+        echo "$runtime_label is already installed locally."
+        return 0
+    fi
+
+    if runtime_artifacts_exist "$model_id" "$local_runtime"; then
+        echo "Local $runtime_label artifacts already exist:"
+        echo "$local_runtime"
+        confirm_exact_model_id "$model_id" "Type the exact model ID to overwrite the local runtime artifacts:" || return 1
+        if ! remove_runtime_artifacts "$model_id" "$local_runtime"; then
+            echo "Unable to remove existing local runtime artifacts."
+            return 1
+        fi
+    fi
+
+    if ! mkdir -p "$local_snapshot"; then
+        echo "Unable to create local snapshot directory."
+        return 1
+    fi
+
+    echo "Runtime: $runtime_label"
+    echo "Source snapshot: $source_snapshot"
+    echo "Local runtime: $local_runtime"
+    echo ""
+
+    if model_runtime_ready_for_snapshot "$model_id" "$source_snapshot"; then
+        echo "Installing $runtime_label locally from offloaded runtime artifacts..."
+        if ! copy_runtime_artifacts "$model_id" "$source_runtime" "$local_runtime"; then
+            echo "Unable to install local runtime artifacts."
+            return 1
+        fi
+    elif model_original_weights_present_for_snapshot "$source_snapshot"; then
+        echo "Installing $runtime_label locally from offloaded model files..."
+        if ! generate_runtime_artifacts_from_snapshot "$model_id" "$source_snapshot" "$local_runtime"; then
+            echo "Unable to generate local runtime artifacts."
+            return 1
+        fi
+    else
+        echo "Offloaded model has neither complete runtime artifacts nor original model files."
+        return 1
+    fi
+
+    if ! model_runtime_ready_for_snapshot "$model_id" "$local_snapshot"; then
+        echo "Installed runtime artifacts did not pass validation."
+        return 1
+    fi
+    echo "Runtime installed locally: $runtime_label"
+    echo "Original safetensors blobs were not copied."
+}
+
 confirm_exact_model_id() {
     local model_id="$1"
     local prompt="${2:-Type the exact model ID to continue}"
     echo "$prompt"
+    echo "Expected: $model_id"
     printf "Model ID: "
     read -r REPLY
     if [ "$REPLY" = "$model_id" ]; then
         return 0
     fi
-    echo "Cancelled. Confirmation did not match '$model_id'."
+    echo "Cancelled."
     return 1
 }
 
@@ -1961,18 +2082,20 @@ manage_restore_runtime_only() {
 
 manage_model_menu() {
     local model_id="$1"
-    local name
+    local name runtime_label
     name=$(flashchat_model_name "$model_id")
+    runtime_label=$(model_runtime_label "$model_id")
     while true; do
         echo ""
         echo "=== Manage ${name:-$model_id} ==="
         echo "Model ID: $model_id"
+        echo "Runtime: $runtime_label"
         echo ""
         echo "  [1] Remove original blobs"
         echo "  [2] Delete local model"
         echo "  [3] Offload local model"
-        echo "  [4] Full reload from offload"
-        echo "  [5] Restore runtime only from offload"
+        echo "  [4] Install $runtime_label locally from offload"
+        echo "  [5] Run from offload for this launch"
         echo "  [Q] Back"
         printf "> "
         read -r REPLY
@@ -1980,8 +2103,8 @@ manage_model_menu() {
             1) manage_remove_original_blobs "$model_id" || true ;;
             2) manage_delete_local_model "$model_id" || true ;;
             3) manage_offload_model "$model_id" || true ;;
-            4) manage_full_reload_model "$model_id" || true ;;
-            5) manage_restore_runtime_only "$model_id" || true ;;
+            4) install_model_runtime_locally_from_offload "$model_id" || true ;;
+            5) use_model_from_offload_repo "$model_id" || true ;;
             q|Q|"") return ;;
             *) echo "Please choose one of the listed actions." ;;
         esac
@@ -2705,7 +2828,8 @@ prompt_download_model() {
 }
 
 prompt_restore_model_from_offload() {
-    local model_id model_repo offload_dir offloaded_repo local_repo local_collision
+    local model_id model_repo offload_dir offloaded_repo source_snapshot
+    local local_repo local_snapshot local_runtime runtime_label
     model_id=$(flashchat_get MODEL)
     model_repo=$(flashchat_get MODEL_REPO)
     offload_dir=$(flashchat_get OFFLOAD_DIR)
@@ -2722,6 +2846,7 @@ prompt_restore_model_from_offload() {
     offloaded_repo=$(model_offloaded_repo_dir "$model_id" 2>/dev/null || true)
     [ -n "$offloaded_repo" ] || return 1
     [ -d "$offloaded_repo" ] || return 1
+    source_snapshot=$(latest_snapshot_in_repo "$offloaded_repo" 2>/dev/null || true)
 
     if ! model_repo_can_restore "$model_id" "$offloaded_repo"; then
         echo "A matching offload directory exists, but it does not contain a usable model snapshot:"
@@ -2729,12 +2854,12 @@ prompt_restore_model_from_offload() {
         echo ""
         return 1
     fi
+    [ -n "$source_snapshot" ] || return 1
 
     local_repo=$(model_local_repo_dir "$model_id")
-    local_collision=0
-    if [ -e "$local_repo" ]; then
-        local_collision=1
-    fi
+    local_snapshot="${local_repo}/snapshots/$(basename "$source_snapshot")"
+    local_runtime=$(flashchat_model_runtime_dir "$model_id" "$local_snapshot")
+    runtime_label=$(model_runtime_label "$model_id")
 
     echo ""
     echo "=== Offloaded Model Found ==="
@@ -2743,33 +2868,15 @@ prompt_restore_model_from_offload() {
     echo "$offloaded_repo"
     echo ""
     echo "Model: $model_repo"
+    echo "Runtime: $runtime_label"
+    echo "Local install path: $local_runtime"
     echo ""
 
-    if [ "$local_collision" -eq 1 ]; then
-        echo "A matching offloaded model was found, but the local cache path already exists:"
-        echo "$local_repo"
-        echo ""
-        echo "Reloading to the HuggingFace cache is unavailable until that path is repaired or moved."
-        echo "Run from the offloaded copy instead?"
-        read -p "Run from offload? [y/N] " -n 1 -r
-        echo ""
-
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            if ! use_model_from_offload_repo "$model_id"; then
-                exit 1
-            fi
-            return 0
-        fi
-
-        echo "Cancelled. Run 'flashchat' again when ready."
-        exit 0
-    fi
-
     echo "Choose how to use it:"
-    echo "  [R] Reload to HuggingFace cache (default)"
+    echo "  [I] Install $runtime_label locally (default)"
     echo "  [U] Run from offload directory for this launch"
     echo "  [C] Cancel"
-    read -p "Selection [R/u/c] " -n 1 -r
+    read -p "Selection [I/u/c] " -n 1 -r
     echo ""
 
     if [[ $REPLY =~ ^[Uu]$ ]]; then
@@ -2779,8 +2886,8 @@ prompt_restore_model_from_offload() {
         return 0
     fi
 
-    if [[ $REPLY =~ ^[Rr]$ ]] || [ -z "$REPLY" ]; then
-        if ! reload_model_from_offload_repo "$model_id"; then
+    if [[ $REPLY =~ ^[Ii]$ ]] || [ -z "$REPLY" ]; then
+        if ! install_model_runtime_locally_from_offload "$model_id"; then
             exit 1
         fi
         flashchat_load_config
