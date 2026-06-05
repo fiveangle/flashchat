@@ -70,7 +70,8 @@ current_quantization_label() {
 mtp_label() {
     local v="$1"
     case "$v" in
-        ""|1) echo "automatic" ;;
+        "") echo "registry default" ;;
+        1) echo "automatic" ;;
         0) echo "disabled" ;;
         *[!0-9]*) echo "automatic ($v)" ;;
         *) echo "batch size $v" ;;
@@ -196,7 +197,7 @@ Environment variables:
                               content (e.g. for diversifying parameter values
                               across runs).
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
-  FLASHCHAT_MTP                  Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size; empty=automatic)
+  FLASHCHAT_MTP                  Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size; empty=registry default)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
 
@@ -685,10 +686,10 @@ runtime_experts_match_model() {
 
 model_mtp_artifacts_required() {
     local model_id="$1"
-    local source_format mtp_max
+    local source_format mtp_default
     source_format=$(flashchat_model_field "$model_id" "source_format")
-    mtp_max=$(flashchat_model_mtp_max "$model_id")
-    [ "$source_format" = "native_bf16" ] && [ "${mtp_max:-0}" -gt 0 ] 2>/dev/null
+    mtp_default=$(flashchat_model_mtp_default "$model_id")
+    [ "$source_format" = "native_bf16" ] && [ "${mtp_default:-0}" -gt 0 ] 2>/dev/null
 }
 
 model_mtp_layers() {
@@ -775,12 +776,16 @@ model_artifact_status() {
         experts="n/a"
     fi
     if model_mtp_artifacts_required "$model_id"; then
-        mtp=$(model_status_value runtime_mtp_match_model "$model_id" "$runtime_dir")
+        if runtime_mtp_match_model "$model_id" "$runtime_dir"; then
+            mtp="ready"
+        else
+            mtp="missing"
+        fi
     else
         mtp="n/a"
     fi
 
-    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts | MTP: $mtp"
+    echo "downloaded: $downloaded | weights: $weights | vocab: $vocab | expert index: $index | experts: $experts | MTP artifacts: $mtp"
 }
 
 model_registry_script() {
@@ -980,8 +985,7 @@ entry = {
     'rms_norm_eps': rms_norm_eps,
     'num_experts': num_experts,
     'num_experts_per_tok': num_experts_per_tok,
-    'mtp_default_predictions': 1 if mtp_layers else 0,
-    'mtp_max_predictions': 3 if mtp_layers else 0,
+    'mtp_default_predictions': 1,
     'mtp_num_hidden_layers': mtp_layers,
     'moe_intermediate_size': moe_intermediate_size,
     'shared_expert_intermediate_size': shared_expert_intermediate_size,
@@ -1125,7 +1129,6 @@ labels = {
     "num_experts": "Total experts",
     "num_experts_per_tok": "Active experts (K / num_experts_per_tok)",
     "mtp_default_predictions": "MTP default draft predictions",
-    "mtp_max_predictions": "MTP maximum draft predictions",
     "moe_intermediate_size": "MoE intermediate size",
     "shared_expert_intermediate_size": "Shared expert intermediate size",
     "full_attention_interval": "Full attention interval",
@@ -1148,7 +1151,7 @@ for key in [
     "name", "hf_repo", "source_format", "hidden_size", "num_hidden_layers",
     "num_attention_heads", "num_key_value_heads", "head_dim",
     "vocab_size", "rms_norm_eps", "num_experts", "num_experts_per_tok",
-    "mtp_default_predictions", "mtp_max_predictions",
+    "mtp_default_predictions",
     "moe_intermediate_size", "shared_expert_intermediate_size",
     "full_attention_interval", "linear_num_value_heads",
     "linear_num_key_heads", "linear_key_head_dim",
@@ -1221,7 +1224,6 @@ labels = {
     "num_experts": "Total experts",
     "num_experts_per_tok": "Active experts (K / num_experts_per_tok)",
     "mtp_default_predictions": "MTP default draft predictions",
-    "mtp_max_predictions": "MTP maximum draft predictions",
     "moe_intermediate_size": "MoE intermediate size",
     "shared_expert_intermediate_size": "Shared expert intermediate size",
     "full_attention_interval": "Full attention interval",
@@ -1246,7 +1248,7 @@ fields = [
     "name", "hf_repo", "source_format", "hidden_size", "num_hidden_layers",
     "num_attention_heads", "num_key_value_heads", "head_dim",
     "vocab_size", "rms_norm_eps", "num_experts", "num_experts_per_tok",
-    "mtp_default_predictions", "mtp_max_predictions",
+    "mtp_default_predictions",
     "moe_intermediate_size", "shared_expert_intermediate_size",
     "full_attention_interval", "linear_num_value_heads",
     "linear_num_key_heads", "linear_key_head_dim",
@@ -1280,6 +1282,7 @@ PY
     if [ ! -s "$updates_file" ]; then
         rm -f "$updates_file"
         echo "No changes made." >&2
+        echo "$model_id"
         return 0
     fi
 
@@ -1300,7 +1303,7 @@ if model is None:
 int_fields = {
     "hidden_size", "num_hidden_layers", "num_attention_heads",
     "num_key_value_heads", "head_dim", "vocab_size", "num_experts",
-    "num_experts_per_tok", "mtp_default_predictions", "mtp_max_predictions",
+    "num_experts_per_tok", "mtp_default_predictions",
     "moe_intermediate_size", "shared_expert_intermediate_size",
     "full_attention_interval", "linear_num_value_heads",
     "linear_num_key_heads", "linear_key_head_dim",
@@ -1340,6 +1343,7 @@ PY
     fi
 
     rm -f "$updates_file"
+    echo "$model_id"
     return 0
 }
 
@@ -1375,7 +1379,13 @@ select_model_from_registry() {
             return
         fi
         if [[ "$REPLY" =~ ^[Ee]$ ]]; then
-            edit_model_registry_entry || true
+            local edited_model
+            if edited_model=$(edit_model_registry_entry); then
+                if [ -n "$edited_model" ] && flashchat_model_exists "$edited_model"; then
+                    echo "$edited_model"
+                    return
+                fi
+            fi
             print_model_status_list >&2
             echo "" >&2
             continue
@@ -1409,10 +1419,14 @@ select_model_from_registry() {
 print_sampling_profile_list() {
     local model_id="$1"
     local current_profile="$2"
-    local profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp
+    local profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp_default
     local i=0
 
-    while IFS=$'\t' read -r profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp; do
+    printf "  [0] Add a profile...\n"
+    printf "  [E] Edit a sampling profile...\n"
+    printf "\n"
+
+    while IFS=$'\t' read -r profile_id label description temperature top_p top_k min_p presence_penalty repetition_penalty reasoning mtp_default; do
         [ -n "$profile_id" ] || continue
         i=$((i + 1))
         local marker=" "
@@ -1421,7 +1435,7 @@ print_sampling_profile_list() {
         printf "      ID: %s\n" "$profile_id"
         printf "      %s\n" "$description"
         printf "      reasoning: %s | MTP: %s | temp: %s | top-p: %s | top-k: %s | min-p: %s | presence: %s | repetition: %s\n" \
-            "$reasoning" "$(mtp_label "$mtp")" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
+            "$reasoning" "$(mtp_label "$mtp_default")" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
     done < <(flashchat_model_sampling_profiles "$model_id")
     i=$((i + 1))
     local marker=" "
@@ -1431,6 +1445,360 @@ print_sampling_profile_list() {
     printf "      Manually choose every sampling value.\n"
 }
 
+sampling_profile_exists() {
+    local model_id="$1"
+    local profile_id="$2"
+    local registry_file
+    registry_file=$(flashchat_get MODEL_CONFIG)
+    [ -n "$model_id" ] || return 1
+    [ -n "$profile_id" ] || return 1
+    [ "$profile_id" != "custom" ] || return 1
+    [ -f "$registry_file" ] || return 1
+    python3 - "$registry_file" "$model_id" "$profile_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+profiles = data.get("models", {}).get(sys.argv[2], {}).get("sampling_profiles", {})
+sys.exit(0 if sys.argv[3] in profiles else 1)
+PY
+}
+
+sampling_profile_selection_default() {
+    local model_id="$1"
+    local default_profile="$2"
+    local model_default
+
+    if [ -n "$default_profile" ] && [ "$default_profile" != "custom" ] && sampling_profile_exists "$model_id" "$default_profile"; then
+        echo "$default_profile"
+        return
+    fi
+
+    model_default=$(flashchat_model_default_sampling_profile "$model_id")
+    if [ -n "$model_default" ] && [ "$model_default" != "custom" ] && sampling_profile_exists "$model_id" "$model_default"; then
+        echo "$model_default"
+        return
+    fi
+
+    echo "custom"
+}
+
+sampling_profile_prompt_fields() {
+    local registry_file="$1"
+    local model_id="$2"
+    local profile_id="$3"
+    local fallback_id="$4"
+    python3 - "$registry_file" "$model_id" "$profile_id" "$fallback_id" <<'PY'
+import json
+import sys
+
+registry_file, model_id, profile_id, fallback_id = sys.argv[1:5]
+with open(registry_file) as f:
+    data = json.load(f)
+profiles = data.get("models", {}).get(model_id, {}).get("sampling_profiles", {})
+profile = profiles.get(profile_id, {}) if profile_id else {}
+defaults = {
+    "label": fallback_id,
+    "description": "",
+    "reasoning": 0,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0,
+    "mtp_default_predictions": "",
+}
+defaults.update(profile)
+if "mtp_default_predictions" not in profile and "mtp" in profile:
+    defaults["mtp_default_predictions"] = profile["mtp"]
+fields = [
+    ("label", "Profile label"),
+    ("description", "Description"),
+    ("reasoning", "Reasoning enabled (0/1)"),
+    ("temperature", "Temperature (0.0-2.0)"),
+    ("top_p", "Top-p (0.0-1.0)"),
+    ("top_k", "Top-k"),
+    ("min_p", "Min-p (0.0-1.0)"),
+    ("presence_penalty", "Presence penalty"),
+    ("repetition_penalty", "Repetition penalty"),
+    ("mtp_default_predictions", "MTP default predictions (blank=inherit, auto/1=automatic, 0=disabled, 2+=batch size)"),
+]
+for field, label in fields:
+    print(f"{field}\t{label}\t{defaults.get(field, '')}")
+PY
+}
+
+prompt_sampling_profile_fields() {
+    local fields_file="$1"
+    local updates_file="$2"
+    local write_all="$3"
+    local field label value display selected
+
+    exec 3< "$fields_file"
+    while IFS=$'\t' read -r -u 3 field label value; do
+        display="$value"
+        [ "$field" = "mtp_default_predictions" ] && display=$(mtp_label "$value")
+        printf "%s [%s]: " "$label" "$display" >&2
+        read -r REPLY
+        if [ "$write_all" = "1" ]; then
+            selected="${REPLY:-$value}"
+            printf "%s\t%s\n" "$field" "$selected" >> "$updates_file"
+        elif [ -n "$REPLY" ]; then
+            printf "%s\t%s\n" "$field" "$REPLY" >> "$updates_file"
+        fi
+    done
+    exec 3<&-
+}
+
+write_sampling_profile_registry_updates() {
+    local registry_file="$1"
+    local model_id="$2"
+    local profile_id="$3"
+    local updates_file="$4"
+    local mode="$5"
+
+    python3 - "$registry_file" "$model_id" "$profile_id" "$updates_file" "$mode" <<'PY'
+import json
+import os
+import shutil
+import sys
+
+registry_file, model_id, profile_id, updates_file, mode = sys.argv[1:6]
+with open(registry_file) as f:
+    data = json.load(f)
+model = data.get("models", {}).get(model_id)
+if model is None:
+    print(f"ERROR: Model '{model_id}' is not in the registry.")
+    sys.exit(1)
+profiles = model.setdefault("sampling_profiles", {})
+if mode == "add":
+    if profile_id in profiles:
+        print(f"ERROR: Sampling profile '{profile_id}' already exists.")
+        sys.exit(1)
+    profile = {}
+else:
+    profile = profiles.get(profile_id)
+    if profile is None:
+        print(f"ERROR: Sampling profile '{profile_id}' is not in the registry.")
+        sys.exit(1)
+
+int_fields = {"reasoning", "top_k", "mtp_default_predictions"}
+float_fields = {"temperature", "top_p", "min_p", "presence_penalty", "repetition_penalty"}
+
+def coerce(field, value):
+    value = value.strip()
+    if field == "mtp_default_predictions" and value.lower() in {"", "auto", "automatic"}:
+        return None
+    if field in int_fields:
+        return int(value)
+    if field in float_fields:
+        return float(value)
+    return value
+
+with open(updates_file) as f:
+    for line in f:
+        field, value = line.rstrip("\n").split("\t", 1)
+        value = coerce(field, value)
+        if field == "mtp_default_predictions" and value is None:
+            profile.pop("mtp_default_predictions", None)
+            profile.pop("mtp", None)
+        else:
+            profile[field] = value
+
+if not profile.get("label"):
+    profile["label"] = profile_id
+
+if mode == "add":
+    profiles[profile_id] = profile
+
+backup = registry_file + ".backup." + str(os.getpid())
+shutil.copy(registry_file, backup)
+with open(registry_file, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("Sampling profile added." if mode == "add" else "Sampling profile updated.")
+PY
+}
+
+add_sampling_profile_entry() {
+    local model_id="$1"
+    local default_profile="$2"
+    local registry_file profile_id clone_default clone_profile fields_file updates_file
+    registry_file=$(flashchat_get MODEL_CONFIG)
+
+    echo "" >&2
+    echo "=== Add Sampling Profile ===" >&2
+    echo "Model: $model_id" >&2
+    echo "" >&2
+
+    while true; do
+        printf "New profile ID: " >&2
+        read -r REPLY
+        echo "" >&2
+        profile_id="$REPLY"
+        if [ -z "$profile_id" ]; then
+            echo "Cancelled." >&2
+            return 1
+        fi
+        if [ "$profile_id" = "custom" ] || [[ ! "$profile_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Use letters, numbers, dots, underscores, or dashes. 'custom' is reserved." >&2
+            continue
+        fi
+        if sampling_profile_exists "$model_id" "$profile_id"; then
+            echo "Sampling profile '$profile_id' already exists." >&2
+            continue
+        fi
+        break
+    done
+
+    clone_default="$default_profile"
+    if [ "$clone_default" = "custom" ] || ! sampling_profile_exists "$model_id" "$clone_default"; then
+        clone_default=$(flashchat_model_default_sampling_profile "$model_id")
+    fi
+    if [ "$clone_default" = "custom" ] || ! sampling_profile_exists "$model_id" "$clone_default"; then
+        clone_default=""
+    fi
+
+    printf "Clone existing profile ID, or '-' to start from defaults [%s]: " "${clone_default:-none}" >&2
+    read -r REPLY
+    echo "" >&2
+    if [ "$REPLY" = "-" ]; then
+        clone_profile=""
+    elif [ -n "$REPLY" ]; then
+        clone_profile="$REPLY"
+    else
+        clone_profile="$clone_default"
+    fi
+    if [ -n "$clone_profile" ] && ! sampling_profile_exists "$model_id" "$clone_profile"; then
+        echo "Sampling profile '$clone_profile' does not exist." >&2
+        return 1
+    fi
+
+    echo "Press Enter to accept each default." >&2
+    fields_file=$(mktemp)
+    updates_file=$(mktemp)
+    sampling_profile_prompt_fields "$registry_file" "$model_id" "$clone_profile" "$profile_id" > "$fields_file"
+    prompt_sampling_profile_fields "$fields_file" "$updates_file" 1
+    rm -f "$fields_file"
+
+    if ! write_sampling_profile_registry_updates "$registry_file" "$model_id" "$profile_id" "$updates_file" "add" >&2; then
+        rm -f "$updates_file"
+        return 1
+    fi
+
+    rm -f "$updates_file"
+    echo "$profile_id"
+}
+
+edit_sampling_profile_entry() {
+    local model_id="$1"
+    local profile_ids=()
+    local profile_id label description rest i=0
+
+    echo "" >&2
+    echo "=== Edit Sampling Profile ===" >&2
+    echo "Model: $model_id" >&2
+    echo "" >&2
+
+    while IFS=$'\t' read -r profile_id label description rest; do
+        [ -n "$profile_id" ] || continue
+        i=$((i + 1))
+        profile_ids+=("$profile_id")
+        printf "  [%d] %s\n" "$i" "$label" >&2
+        printf "      ID: %s\n" "$profile_id" >&2
+    done < <(flashchat_model_sampling_profiles "$model_id")
+
+    if [ ${#profile_ids[@]} -eq 0 ]; then
+        echo "No sampling profiles found." >&2
+        return 1
+    fi
+
+    while true; do
+        printf "Select profile number or ID to edit: " >&2
+        read -r REPLY
+        echo "" >&2
+        if [ -z "$REPLY" ]; then
+            echo "Cancelled." >&2
+            return 1
+        fi
+        if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+            i=$((REPLY - 1))
+            if [ "$i" -ge 0 ] && [ "$i" -lt ${#profile_ids[@]} ]; then
+                profile_id="${profile_ids[$i]}"
+                break
+            fi
+        elif sampling_profile_exists "$model_id" "$REPLY"; then
+            profile_id="$REPLY"
+            break
+        fi
+        echo "Please choose one of the listed sampling profiles." >&2
+    done
+
+    local registry_file fields_file updates_file
+    registry_file=$(flashchat_get MODEL_CONFIG)
+
+    printf "Delete this profile? Type '%s' to delete, or press Enter to edit: " "$profile_id" >&2
+    read -r REPLY
+    echo "" >&2
+    if [ "$REPLY" = "$profile_id" ]; then
+        if ! python3 - "$registry_file" "$model_id" "$profile_id" >&2 <<'PY'
+import json
+import os
+import shutil
+import sys
+
+registry_file, model_id, profile_id = sys.argv[1:4]
+with open(registry_file) as f:
+    data = json.load(f)
+model = data.get("models", {}).get(model_id)
+if model is None:
+    print(f"ERROR: Model '{model_id}' is not in the registry.")
+    sys.exit(1)
+profiles = model.setdefault("sampling_profiles", {})
+if profile_id not in profiles:
+    print(f"ERROR: Sampling profile '{profile_id}' is not in the registry.")
+    sys.exit(1)
+del profiles[profile_id]
+if model.get("default_sampling_profile") == profile_id:
+    model["default_sampling_profile"] = next(iter(profiles), "custom")
+backup = registry_file + ".backup." + str(os.getpid())
+shutil.copy(registry_file, backup)
+with open(registry_file, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("Sampling profile deleted.")
+PY
+        then
+            echo "ERROR: Failed to delete sampling profile." >&2
+        fi
+        return 1
+    fi
+
+    echo "Press Enter to keep the current value. Type 'auto' for automatic MTP." >&2
+    fields_file=$(mktemp)
+    updates_file=$(mktemp)
+    sampling_profile_prompt_fields "$registry_file" "$model_id" "$profile_id" "$profile_id" > "$fields_file"
+    prompt_sampling_profile_fields "$fields_file" "$updates_file" 0
+    rm -f "$fields_file"
+
+    if [ ! -s "$updates_file" ]; then
+        rm -f "$updates_file"
+        echo "No changes made." >&2
+        echo "$profile_id"
+        return 0
+    fi
+
+    if ! write_sampling_profile_registry_updates "$registry_file" "$model_id" "$profile_id" "$updates_file" "edit" >&2; then
+        rm -f "$updates_file"
+        return 1
+    fi
+
+    rm -f "$updates_file"
+    echo "$profile_id"
+}
+
 select_sampling_profile_from_registry() {
     local model_id="$1"
     local default_profile="$2"
@@ -1438,27 +1806,48 @@ select_sampling_profile_from_registry() {
     local profile_id label description rest
     local i=0
 
-    [ -n "$default_profile" ] || default_profile=$(flashchat_model_default_sampling_profile "$model_id")
-    [ -n "$default_profile" ] || default_profile="custom"
-
-    echo "Sampling profiles:" >&2
-    echo "" >&2
-    print_sampling_profile_list "$model_id" "$default_profile" >&2
-    echo "" >&2
-
-    while IFS=$'\t' read -r profile_id label description rest; do
-        [ -n "$profile_id" ] || continue
-        profile_ids+=("$profile_id")
-    done < <(flashchat_model_sampling_profiles "$model_id")
-    profile_ids+=("custom")
+    default_profile=$(sampling_profile_selection_default "$model_id" "$default_profile")
 
     while true; do
+        profile_ids=()
+        i=0
+        echo "Sampling profiles:" >&2
+        echo "" >&2
+        print_sampling_profile_list "$model_id" "$default_profile" >&2
+        echo "" >&2
+
+        while IFS=$'\t' read -r profile_id label description rest; do
+            [ -n "$profile_id" ] || continue
+            profile_ids+=("$profile_id")
+        done < <(flashchat_model_sampling_profiles "$model_id")
+        profile_ids+=("custom")
+
         printf "Select sampling profile number or ID [%s]: " "$default_profile" >&2
         read -r REPLY
         echo "" >&2
         if [ -z "$REPLY" ]; then
             echo "$default_profile"
             return
+        fi
+        if [[ "$REPLY" = "0" ]] || [[ "$REPLY" =~ ^[Aa]$ ]]; then
+            local added_profile
+            if added_profile=$(add_sampling_profile_entry "$model_id" "$default_profile"); then
+                echo "$added_profile"
+                return
+            fi
+            default_profile=$(sampling_profile_selection_default "$model_id" "$default_profile")
+            continue
+        fi
+        if [[ "$REPLY" =~ ^[Ee]$ ]]; then
+            local edited_profile
+            if edited_profile=$(edit_sampling_profile_entry "$model_id"); then
+                if [ -n "$edited_profile" ] && sampling_profile_exists "$model_id" "$edited_profile"; then
+                    echo "$edited_profile"
+                    return
+                fi
+            fi
+            default_profile=$(sampling_profile_selection_default "$model_id" "$default_profile")
+            continue
         fi
         if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
             i=$((REPLY - 1))
@@ -1754,7 +2143,10 @@ generate_runtime_artifacts_from_snapshot() {
 
     local cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$source_snapshot" --output "$local_runtime")
     if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
-        cmd+=(--non-experts --include-mtp)
+        cmd+=(--non-experts)
+        if model_mtp_artifacts_required "$model_id"; then
+            cmd+=(--include-mtp)
+        fi
     fi
     run_python "${cmd[@]}" || return 1
 
@@ -1764,9 +2156,7 @@ generate_runtime_artifacts_from_snapshot() {
     if [ "${num_experts:-0}" -gt 0 ] 2>/dev/null; then
         if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
             cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id" --model "$source_snapshot" --output "$local_runtime" --experts)
-            local mtp_max
-            mtp_max=$(flashchat_model_mtp_max "$model_id")
-            if [ -n "$mtp_max" ] && [ "$mtp_max" -gt 0 ] 2>/dev/null; then
+            if model_mtp_artifacts_required "$model_id"; then
                 cmd+=(--mtp-experts)
             fi
             run_python "${cmd[@]}" || return 1
@@ -2433,15 +2823,15 @@ prompt_config_interactive() {
     # Multi-token Prediction
     local default_mtp
     if [ "${selected_profile:-custom}" != "custom" ]; then
-        default_mtp=$(flashchat_model_sampling_profile_field "$selected_model" "$selected_profile" "mtp")
+        default_mtp=$(flashchat_model_sampling_profile_field "$selected_model" "$selected_profile" "mtp_default_predictions")
     else
         default_mtp=$(flashchat_get MTP)
     fi
-    printf "Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size) [%s]: " "$(mtp_label "$default_mtp")"
+    printf "Multi-token prediction (blank=registry default, 0=disabled, 1=automatic, 2+=predictor batch size) [%s]: " "$(mtp_label "$default_mtp")"
     read -r REPLY
     echo ""
     if [[ "$REPLY" =~ ^[Aa][Uu][Tt][Oo]$ ]]; then
-        echo "MTP=\"1\"" >> /tmp/flashchat_new_config
+        echo "MTP=\"\"" >> /tmp/flashchat_new_config
     elif [ -z "$REPLY" ]; then
         echo "MTP=\"${default_mtp}\"" >> /tmp/flashchat_new_config
     else
@@ -2997,7 +3387,10 @@ prompt_extract_weights() {
     if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
         local cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$(flashchat_get MODEL_PATH)" --output "$weights_dir")
         if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
-            cmd+=(--non-experts --include-mtp)
+            cmd+=(--non-experts)
+            if model_mtp_artifacts_required "$model_id"; then
+                cmd+=(--include-mtp)
+            fi
         fi
         if run_python "${cmd[@]}"; then
             echo "Weights extracted successfully."
@@ -3138,9 +3531,7 @@ prompt_extract_experts() {
     local cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id")
     if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
         cmd+=(--model "$model_path" --output "$weights_dir" --experts)
-        local mtp_max
-        mtp_max=$(flashchat_model_mtp_max "$model_id")
-        if [ -n "$mtp_max" ] && [ "$mtp_max" -gt 0 ] 2>/dev/null; then
+        if model_mtp_artifacts_required "$model_id"; then
             cmd+=(--mtp-experts)
         fi
     else

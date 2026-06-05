@@ -166,8 +166,22 @@ flashchat_model_mtp_default() {
     flashchat_model_field "$1" "mtp_default_predictions"
 }
 
-flashchat_model_mtp_max() {
-    flashchat_model_field "$1" "mtp_max_predictions"
+flashchat_server_default_field() {
+    local field="$1"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$field" ] || return 1
+    [ -f "$config_file" ] || return 1
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+value = data.get('server_defaults', {}).get(sys.argv[2], '')
+print(value if value is not None else '')
+" "$config_file" "$field" 2>/dev/null
+}
+
+flashchat_server_mtp_default() {
+    flashchat_server_default_field "mtp_default_predictions"
 }
 
 flashchat_model_quant_bits() {
@@ -257,7 +271,10 @@ import json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
 profile = data.get('models', {}).get(sys.argv[2], {}).get('sampling_profiles', {}).get(sys.argv[3], {})
-value = profile.get(sys.argv[4], '')
+field = sys.argv[4]
+value = profile.get(field, '')
+if field == 'mtp_default_predictions' and value == '':
+    value = profile.get('mtp', '')
 print(value if value is not None else '')
 " "$config_file" "$model_id" "$profile_id" "$field" 2>/dev/null
 }
@@ -284,7 +301,7 @@ for profile_id, profile in profiles.items():
         str(profile.get('presence_penalty', '')),
         str(profile.get('repetition_penalty', '')),
         str(profile.get('reasoning', '')),
-        str(profile.get('mtp', '')),
+        str(profile.get('mtp_default_predictions', profile.get('mtp', ''))),
     ]))
 " "$config_file" "$model_id" 2>/dev/null
 }
@@ -484,7 +501,10 @@ flashchat_load_config() {
         profile_presence_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "presence_penalty")
         profile_repetition_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "repetition_penalty")
         profile_reasoning=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "reasoning")
-        profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp")
+        profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp_default_predictions")
+        if [ -z "$profile_mtp" ]; then
+            profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp")
+        fi
         [ -n "$profile_temperature" ] && TEMPERATURE="$profile_temperature"
         [ -n "$profile_top_p" ] && TOP_P="$profile_top_p"
         [ -n "$profile_top_k" ] && TOP_K="$profile_top_k"
@@ -493,6 +513,11 @@ flashchat_load_config() {
         [ -n "$profile_repetition_penalty" ] && REPETITION_PENALTY="$profile_repetition_penalty"
         [ -n "$profile_reasoning" ] && REASONING="$profile_reasoning"
         [ -z "$MTP" ] && [ -n "$profile_mtp" ] && MTP="$profile_mtp"
+    fi
+    if [ -z "$MTP" ]; then
+        local server_mtp_default
+        server_mtp_default=$(flashchat_server_mtp_default)
+        [ -n "$server_mtp_default" ] && MTP="$server_mtp_default"
     fi
     if [ -z "$MTP" ]; then
         local model_mtp_default
@@ -677,7 +702,8 @@ export -f flashchat_model_repo
 export -f flashchat_model_layers
 export -f flashchat_model_default_sampling_profile
 export -f flashchat_model_mtp_default
-export -f flashchat_model_mtp_max
+export -f flashchat_server_default_field
+export -f flashchat_server_mtp_default
 export -f flashchat_model_quant_bits
 export -f flashchat_model_expert_pack_bytes
 export -f flashchat_model_sampling_profile_field

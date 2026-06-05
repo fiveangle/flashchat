@@ -203,13 +203,13 @@ static int server_flag_enabled(const char *value) {
 
 // MTP setting value space (uniform across env / config / CLI):
 //   0           = disabled
-//   1           = automatic (engine chooses; also the meaning when missing/blank)
+//   1           = automatic (engine chooses)
 //   2 or higher = explicit predictor batch size (positions verified per step:
 //                 1 committed token + (N-1) draft tokens)
 // Returns that raw value; -1 is reserved as the "nothing set this yet" sentinel
-// and is never produced here (missing → 1 = automatic).
+// for missing/blank values.
 static int parse_mtp_predictions(const char *value) {
-    if (!value || !value[0]) return 1;                        // missing → automatic
+    if (!value || !value[0]) return -1;
     if (strcasecmp(value, "auto") == 0 ||
         strcasecmp(value, "true") == 0 ||
         strcasecmp(value, "on") == 0 ||
@@ -13867,6 +13867,8 @@ static void serve_loop(
         int mtp_shadow_available = mtp_can_shadow_draft(wf);  // MTP enabled AND artifacts present
         int mtp_shadow_hits = 0;     // drafts accepted (real speculative decode)
         int mtp_shadow_checks = 0;   // drafts verified
+        int mtp_pos_checks[8] = {0}; // per-position: how many times we checked that position
+        int mtp_pos_hits[8]   = {0}; // per-position: how many times that position was accepted
         g_mtp_kv_len = 0;  // fresh MTP attention context per generation
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
@@ -14098,8 +14100,9 @@ tool_call_checked:
                     int acc = 0;
                     for (int j = 0; j < nd; j++) {
                         mtp_shadow_checks++;
+                        if (j < 8) mtp_pos_checks[j]++;
                         int tv = MTP_PICK(mtp_ln + (size_t)j*mtp_V);
-                        if (mtp_drafts[j] == tv) { acc++; mtp_shadow_hits++; } else break;
+                        if (mtp_drafts[j] == tv) { acc++; mtp_shadow_hits++; if (j < 8) mtp_pos_hits[j]++; } else break;
                     }
                     int seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);  // corrected (acc<nd) or bonus
                     if (acc < nd) {
@@ -14166,8 +14169,17 @@ tool_call_checked:
 
         if (mtp_shadow_checks > 0) {
             double acc_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
-            server_log_errorf("[mtp] %s speculative summary accepted=%d drafts=%d acceptance=%.1f%%\n",
-                              request_id, mtp_shadow_hits, mtp_shadow_checks, acc_rate);
+            // Build per-position acceptance string, e.g. "0.81, 0.63, 0.41"
+            char mtp_pos_buf[128] = "";
+            int mtp_pos_buf_len = 0;
+            for (int j = 0; j < 8 && mtp_pos_checks[j] > 0; j++) {
+                double pr = (double)mtp_pos_hits[j] / (double)mtp_pos_checks[j];
+                mtp_pos_buf_len += snprintf(mtp_pos_buf + mtp_pos_buf_len,
+                                            sizeof(mtp_pos_buf) - (size_t)mtp_pos_buf_len,
+                                            "%s%.2f", j ? ", " : "", pr);
+            }
+            server_log_errorf("[mtp] %s speculative summary accepted=%d drafts=%d acceptance=%.1f%% per-pos=[%s]\n",
+                              request_id, mtp_shadow_hits, mtp_shadow_checks, acc_rate, mtp_pos_buf);
         }
         mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
         g_overlap_in_decode = 0;
@@ -14201,10 +14213,22 @@ tool_call_checked:
             send_json_ok(client_fd, final_json);
         }
 
-        server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)%s\n",
-                          request_id, gen_count, now_ms() - t_gen,
-                          gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
-                          parsed_tool_call.is_tool_call ? " [tool_call]" : "");
+        {
+            char mtp_summary[160] = "";
+            if (mtp_shadow_checks > 0) {
+                int mtp_len = snprintf(mtp_summary, sizeof(mtp_summary), " | MTP");
+                for (int j = 0; j < 8 && mtp_pos_checks[j] > 0; j++) {
+                    double pr = (double)mtp_pos_hits[j] / (double)mtp_pos_checks[j];
+                    mtp_len += snprintf(mtp_summary + mtp_len, sizeof(mtp_summary) - (size_t)mtp_len,
+                                        " %.2f", pr);
+                }
+            }
+            server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)%s%s\n",
+                              request_id, gen_count, now_ms() - t_gen,
+                              gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
+                              parsed_tool_call.is_tool_call ? " [tool_call]" : "",
+                              mtp_summary);
+        }
         if (g_expert_cache) cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
         else if (g_malloc_cache) cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
 
@@ -14637,7 +14661,16 @@ int main(int argc, char **argv) {
         // verify). Downstream code treats g_mtp_predictions > 0 as "MTP enabled".
         {
             int raw = g_mtp_predictions;
-            if (raw < 0) raw = 1;                 // nothing set it → automatic
+            if (raw < 0) {
+                int server_default = -1;
+                if (load_server_mtp_default(config_json_path, &server_default) == 0 && server_default >= 0) {
+                    raw = server_default;
+                } else if (g_cfg.mtp_default_predictions >= 0) {
+                    raw = g_cfg.mtp_default_predictions;
+                } else {
+                    raw = 1;
+                }
+            }
             int batch;
             if (raw == 0) {
                 batch = 0;                        // disabled
@@ -14651,11 +14684,6 @@ int main(int argc, char **argv) {
                 batch = 2;
             } else {
                 batch = raw;                      // explicit predictor batch size
-            }
-            if (g_cfg.mtp_max_predictions > 0 && batch > g_cfg.mtp_max_predictions) {
-                fprintf(stderr, "[mtp] requested batch size %d exceeds model max %d; clamping\n",
-                        batch, g_cfg.mtp_max_predictions);
-                batch = g_cfg.mtp_max_predictions;
             }
             // The N-position verify (fused_dense_forward_N -> matmulN) supports up to
             // 8 columns; cap the predictor batch there.

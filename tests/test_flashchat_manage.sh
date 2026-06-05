@@ -170,7 +170,7 @@ config["layer_types"] = [
 config["mtp_num_hidden_layers"] = model.get("mtp_num_hidden_layers", 0)
 
 tensors = {"model.embed_tokens.weight": {"offset": 0, "size": 1, "shape": [1], "dtype": "BF16"}}
-mtp_required = model.get("source_format") == "native_bf16" and int(model.get("mtp_max_predictions") or 0) > 0
+mtp_required = model.get("source_format") == "native_bf16" and int(model.get("mtp_default_predictions") or 0) > 0
 if mtp_required:
     for name in [
         "mtp.fc.weight",

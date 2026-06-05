@@ -20,7 +20,6 @@ base = data["models"]["mlx-community-Qwen36-35B-A3B-4bit"].copy()
 base["name"] = "Temporary Edit Model"
 base["hf_repo"] = "example/Temporary-Edit-Model"
 base["mtp_default_predictions"] = 1
-base["mtp_max_predictions"] = 3
 data["models"]["temporary-edit-model"] = base
 delete = base.copy()
 delete["name"] = "Temporary Delete Model"
@@ -70,7 +69,6 @@ update_output=$(
         for _ in $(seq 1 10); do printf '\n'; done
         printf '6\n'
         printf '2\n'
-        printf '4\n'
         for _ in $(seq 1 80); do printf '\n'; done
     } | run_config_with_input 2>&1
 )
@@ -85,6 +83,16 @@ if ! echo "$update_output" | grep -q "Active experts (K / num_experts_per_tok) \
     exit 1
 fi
 
+if echo "$update_output" | awk 'seen && /Select model number or ID/ { found=1 } index($0, "Registry entry updated.") { seen=1 } END { exit found ? 0 : 1 }'; then
+    echo "FAIL: edit flow returned to model selection after updating registry entry" >&2
+    exit 1
+fi
+
+if ! echo "$update_output" | grep -q "Selected model: temporary-edit-model"; then
+    echo "FAIL: edit flow did not continue with edited model" >&2
+    exit 1
+fi
+
 python3 - "$CONFIG_JSON" <<'PY'
 import json
 import sys
@@ -95,8 +103,12 @@ model = data["models"]["temporary-edit-model"]
 assert model["name"] == "Edited Model Name", model["name"]
 assert model["num_experts_per_tok"] == 6, model["num_experts_per_tok"]
 assert model["mtp_default_predictions"] == 2, model["mtp_default_predictions"]
-assert model["mtp_max_predictions"] == 4, model["mtp_max_predictions"]
 PY
+
+if ! grep -q '^MODEL="temporary-edit-model"$' "$HOME_DIR/.config/flashchat/config"; then
+    echo "FAIL: config wizard did not save edited model selection" >&2
+    exit 1
+fi
 
 delete_output=$(
     {

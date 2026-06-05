@@ -101,7 +101,6 @@ typedef struct {
                             // models must NOT get a <think> block injected into the assistant turn.
 
     int mtp_default_predictions;
-    int mtp_max_predictions;
 
     char extract_weights_script[128];
     char repack_experts_script[128];
@@ -188,6 +187,29 @@ static int load_default_model_id(const char *json_path, char *out, size_t out_le
     return rc;
 }
 
+static int load_server_mtp_default(const char *json_path, int *out) {
+    FILE *f = fopen(json_path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *json = malloc(size + 1);
+    if (!json) { fclose(f); return -1; }
+    fread(json, 1, size, f);
+    json[size] = '\0';
+    fclose(f);
+
+    const char *server_defaults = json_find_key(json, "server_defaults");
+    const char *p = server_defaults ? json_find_key(server_defaults, "mtp_default_predictions") : NULL;
+    int rc = -1;
+    if (p && json_parse_int(p, out) == 0) {
+        rc = 0;
+    }
+    free(json);
+    return rc;
+}
+
 static int load_model_config(const char *json_path, const char *model_id, ModelConfig *cfg) {
     FILE *f = fopen(json_path, "rb");
     if (!f) {
@@ -248,7 +270,6 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_INT(num_experts, "num_experts");
     CFG_INT(num_experts_per_tok, "num_experts_per_tok");
     CFG_INT(mtp_default_predictions, "mtp_default_predictions");
-    CFG_INT(mtp_max_predictions, "mtp_max_predictions");
     CFG_INT(moe_intermediate, "moe_intermediate_size");
     CFG_INT(shared_intermediate, "shared_expert_intermediate_size");
     CFG_INT(dense_intermediate, "intermediate_size");

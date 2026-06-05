@@ -19,8 +19,8 @@ with open(src) as f:
 
 model = data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]
 model["mtp_default_predictions"] = 1
-model["mtp_max_predictions"] = 3
-model["sampling_profiles"]["instruct"]["mtp"] = 3
+model["sampling_profiles"]["instruct"]["mtp_default_predictions"] = 3
+data["server_defaults"] = {"mtp_default_predictions": 2}
 
 with open(dst, "w") as f:
     json.dump(data, f, indent=2)
@@ -92,6 +92,36 @@ if [ "$auto_value" != "3" ]; then
     echo "FAIL: auto MTP expected profile value 3, got '$auto_value'" >&2
     exit 1
 fi
+
+python3 - "$CONFIG_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+del data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]["sampling_profiles"]["instruct"]["mtp_default_predictions"]
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+
+server_default_value=$(run_get_mtp bash -c 'source lib/config.sh; flashchat_load_config; flashchat_get MTP')
+if [ "$server_default_value" != "2" ]; then
+    echo "FAIL: server MTP default expected 2, got '$server_default_value'" >&2
+    exit 1
+fi
+
+python3 - "$CONFIG_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]["sampling_profiles"]["instruct"]["mtp_default_predictions"] = 3
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
 
 cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
 MODEL="mlx-community-Qwen36-35B-A3B-4bit"

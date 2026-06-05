@@ -26,6 +26,7 @@
 #   make mtp-config-smoke — run MTP config/profile precedence smoke test
 #   make model-add-config-smoke — run add-model configuration smoke test
 #   make model-edit-config-smoke — run edit-model registry smoke test
+#   make profile-edit-config-smoke — run edit-profile registry smoke test
 #   make test      — run all functional smoke tests
 #   make help      — list available targets
 #   make clean     — remove build artifacts
@@ -115,7 +116,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mpp-tensorops-smoke mpp-tensorops-runtime-smoke mpp-tensorops-bench private-ane-probe private-ane-dense-probe private-ane-dense-mlp-block-probe mtp-config-smoke model-add-config-smoke model-edit-config-smoke test bench-api bench-report
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mpp-tensorops-smoke mpp-tensorops-runtime-smoke mpp-tensorops-bench private-ane-probe private-ane-dense-probe private-ane-dense-mlp-block-probe mtp-config-smoke model-add-config-smoke model-edit-config-smoke profile-edit-config-smoke test bench-api bench-report
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -196,6 +197,7 @@ help:
 	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
 	@printf "  make model-add-config-smoke  Run add-model configuration smoke test\n"
 	@printf "  make model-edit-config-smoke  Run edit-model registry smoke test\n"
+	@printf "  make profile-edit-config-smoke  Run edit-profile registry smoke test\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "  make bench-api     Run API performance regression benchmark (per registry model)\n"
@@ -373,7 +375,10 @@ model-add-config-smoke:
 model-edit-config-smoke:
 	bash tests/test_model_edit_config.sh
 
+profile-edit-config-smoke:
+	bash tests/test_profile_edit_config.sh
+
 model-quant-config-smoke:
 	bash tests/test_model_quant_config.sh
 
-test: cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke model-quant-config-smoke api-smoke
+test: cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke profile-edit-config-smoke model-quant-config-smoke api-smoke

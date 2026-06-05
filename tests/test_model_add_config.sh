@@ -115,8 +115,7 @@ model = data["models"]["Qwen-Qwen36-35B-A3B"]
 assert model["source_format"] == "native_bf16"
 assert model["scripts"]["extract_weights"] == "scripts/compile_native_qwen.py"
 assert model["scripts"]["repack_experts"] == "scripts/compile_native_qwen.py"
-assert model["mtp_default_predictions"] == 0
-assert model["mtp_max_predictions"] == 0
+assert model["mtp_default_predictions"] == 1
 PY
 
 echo "model add config smoke passed"
