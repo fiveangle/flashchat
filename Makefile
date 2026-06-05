@@ -21,6 +21,8 @@
 #   make mpp-tensorops-runtime-smoke — run Metal 4 MPP TensorOps runtime smoke test
 #   make mpp-tensorops-bench — benchmark TensorOps affine matmul against current v5
 #   make private-ane-probe — opt-in private ANE in-memory MIL probe
+#   make private-ane-dense-probe — opt-in private ANE dense projection probe
+#   make private-ane-dense-mlp-block-probe — opt-in private ANE fused dense MLP block probe
 #   make mtp-config-smoke — run MTP config/profile precedence smoke test
 #   make model-add-config-smoke — run add-model configuration smoke test
 #   make model-edit-config-smoke — run edit-model registry smoke test
@@ -43,9 +45,9 @@ CC = clang
 endif
 OPT ?= aggressive
 
-FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
+FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate -framework IOSurface
 BASE_CFLAGS = -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
-BASE_LDFLAGS = -lpthread -lcompression
+BASE_LDFLAGS = -lpthread -lcompression -ldl
 
 VALID_OPTS = aggressive conservative debug
 ifeq ($(filter $(OPT),$(VALID_OPTS)),)
@@ -113,7 +115,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mpp-tensorops-smoke mpp-tensorops-runtime-smoke mpp-tensorops-bench private-ane-probe mtp-config-smoke model-add-config-smoke model-edit-config-smoke test bench-api bench-report
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mpp-tensorops-smoke mpp-tensorops-runtime-smoke mpp-tensorops-bench private-ane-probe private-ane-dense-probe private-ane-dense-mlp-block-probe mtp-config-smoke model-add-config-smoke model-edit-config-smoke test bench-api bench-report
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -189,6 +191,8 @@ help:
 	@printf "  make mpp-tensorops-runtime-smoke  Run Metal 4 MPP TensorOps runtime smoke test\n"
 	@printf "  make mpp-tensorops-bench  Benchmark TensorOps affine matmul against current v5\n"
 	@printf "  make private-ane-probe  Opt-in private ANE in-memory MIL probe\n"
+	@printf "  make private-ane-dense-probe  Opt-in private ANE dense projection probe\n"
+	@printf "  make private-ane-dense-mlp-block-probe  Opt-in private ANE fused dense MLP block probe\n"
 	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
 	@printf "  make model-add-config-smoke  Run add-model configuration smoke test\n"
 	@printf "  make model-edit-config-smoke  Run edit-model registry smoke test\n"
@@ -353,6 +357,12 @@ mpp-tensorops-bench:
 
 private-ane-probe:
 	bash tests/test_private_ane_probe.sh
+
+private-ane-dense-probe:
+	bash tests/test_private_ane_dense_projection_probe.sh
+
+private-ane-dense-mlp-block-probe:
+	bash tests/test_private_ane_dense_mlp_block_probe.sh
 
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
