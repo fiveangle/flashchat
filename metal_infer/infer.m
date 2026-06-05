@@ -5186,7 +5186,8 @@ static void gpu_full_attention_batch(int fa_idx, int n, int base_len,
     memcpy(out_all, [ctx->buf_attn_out_batch contents], (size_t)n * qdim * sizeof(float));
 }
 
-static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos) {
+static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_fd);  // defined below
+static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos, int packed_fd) {
     double t_dense_layer = g_timing_enabled ? now_ms() : 0.0;
     int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, inter=g_cfg.dense_intermediate, eps_layer=0; (void)eps_layer;
     float eps=g_cfg.rms_norm_eps;
@@ -5298,43 +5299,50 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     if (g_timing_enabled) {
         g_prof_dense_chunk_attn += now_ms() - t_dense_layer;
     }
-    double t_dense_mlp = g_timing_enabled ? now_ms() : 0.0;
-    // dense MLP (N positions)
-    char gate_name[256], up_name[256], down_name[256];
-    uint32_t *gw=LWN(gate_name,"mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
-    uint32_t *uw=LWN(up_name,"mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
-    uint32_t *dw=LWN(down_name,"mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
+    // ---- MLP sublayer: the ONLY architecture-specific branch (dense vs MoE) ----
+    if (g_cfg.num_experts == 0) {
+        double t_dense_mlp = g_timing_enabled ? now_ms() : 0.0;
+        // dense MLP (N positions)
+        char gate_name[256], up_name[256], down_name[256];
+        uint32_t *gw=LWN(gate_name,"mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
+        uint32_t *uw=LWN(up_name,"mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
+        uint32_t *dw=LWN(down_name,"mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
+        float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
+        float *oN=malloc((size_t)N*H*4);
+        char mlp_block_name[256];
+        snprintf(mlp_block_name,sizeof(mlp_block_name),"model.layers.%d.mlp.block",layer);
+        if (!ane_dense_project(mlp_block_name, hp, oN, N, H, H)) {
+            if (!dense_fused_mlp_enabled() ||
+                !gpu_dense_mlp_N(g_metal, gw, gs, gb, uw, us, ub, dw, ds, db,
+                                 hp, oN, (uint32_t)H, (uint32_t)inter, (uint32_t)gsz, (uint32_t)N)) {
+                float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4);
+                { MMJob gu_jobs[2] = {
+                    {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,gate_name},
+                    {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,up_name} };
+                  gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
+                if (dense_gpu_swiglu_enabled() && g_metal && g_metal->swiglu) {
+                    gpu_swiglu(g_metal, gN, uN, aN, (int)((size_t)N * inter));
+                } else {
+                    for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
+                }
+                { MMJob down_job = {dw,ds,db,aN,oN,(uint32_t)H,(uint32_t)inter,(uint32_t)gsz,(uint32_t)N,down_name};
+                  gpu_dequant_matmulN_batch(g_metal, &down_job, 1); }
+                free(gN);free(uN);free(aN);
+            }
+        }
+        for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
+        if (g_timing_enabled) {
+            g_prof_dense_chunk_mlp += now_ms() - t_dense_mlp;
+            g_prof_dense_chunk_layers++;
+        }
+        free(hp);free(oN);
+    } else {
+        // MoE experts (N positions) — reuses the faithful production expert kernel.
+        moe_block_N(wf, layer, hs, N, packed_fd);
+    }
     #undef LWN
     #undef LW
-    float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
-    float *oN=malloc((size_t)N*H*4);
-    char mlp_block_name[256];
-    snprintf(mlp_block_name,sizeof(mlp_block_name),"model.layers.%d.mlp.block",layer);
-    if (!ane_dense_project(mlp_block_name, hp, oN, N, H, H)) {
-        if (!dense_fused_mlp_enabled() ||
-            !gpu_dense_mlp_N(g_metal, gw, gs, gb, uw, us, ub, dw, ds, db,
-                             hp, oN, (uint32_t)H, (uint32_t)inter, (uint32_t)gsz, (uint32_t)N)) {
-            float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4);
-            { MMJob gu_jobs[2] = {
-                {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,gate_name},
-                {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,up_name} };
-              gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
-            if (dense_gpu_swiglu_enabled() && g_metal && g_metal->swiglu) {
-                gpu_swiglu(g_metal, gN, uN, aN, (int)((size_t)N * inter));
-            } else {
-                for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
-            }
-            { MMJob down_job = {dw,ds,db,aN,oN,(uint32_t)H,(uint32_t)inter,(uint32_t)gsz,(uint32_t)N,down_name};
-              gpu_dequant_matmulN_batch(g_metal, &down_job, 1); }
-            free(gN);free(uN);free(aN);
-        }
-    }
-    for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
-    if (g_timing_enabled) {
-        g_prof_dense_chunk_mlp += now_ms() - t_dense_mlp;
-        g_prof_dense_chunk_layers++;
-    }
-    free(res);free(nmd);free(hp);free(oN);
+    free(res);free(nmd);
 }
 
 // Batched (chunked) prefill for DENSE models: run [start,end) prompt tokens N-at-a-time
@@ -5358,7 +5366,7 @@ static void serve_prefill_dense_batched(WeightFile *wf, const float *embed_batch
             posv[j] = *pos + j;
         }
         for (int layer = 0; layer < g_cfg.num_layers; layer++)
-            dense_layer_forward_N(wf, layer, hs, n, kv[layer], posv);
+            dense_layer_forward_N(wf, layer, hs, n, kv[layer], posv, -1);  // dense prefill: no experts
         if (out_last_hidden && (i + n >= end))
             memcpy(out_last_hidden, hs + (size_t)(n - 1) * H, H * sizeof(float));
         *pos += n;
@@ -5594,6 +5602,50 @@ static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int pac
     shared_expert_2(wf, layer, hpa, hpb, sa, sb);
     for (int i = 0; i < H; i++) { ha[i] = ha[i] + moe_a[i] + sa[i]; hb[i] = hb[i] + moe_b[i] + sb[i]; }
     free(hpa); free(hpb); free(moe_a); free(moe_b); free(buf); free(oa); free(ob); free(sa); free(sb);
+}
+
+// N-position MoE block: faithful generalization of moe_block_2 for the depth-N
+// verify. hs is N*H (post-attention residual stream, in/out). Routes all N
+// positions, loads the union of their experts once each, and runs the faithful
+// per-token production expert kernel (routed_ffn_1) for whichever positions use
+// each expert. Branches only at the MLP — same routing/experts/shared/combine as
+// production, so it stays bit-faithful at any N.
+static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_fd) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    float *hp = malloc((size_t)N*H*sizeof(float));
+    int   *idx = malloc((size_t)N*K*sizeof(int));
+    float *wt  = malloc((size_t)N*K*sizeof(float));
+    for (int t = 0; t < N; t++)
+        moe_route(wf, layer, hs+(size_t)t*H, hp+(size_t)t*H, idx+(size_t)t*K, wt+(size_t)t*K);
+    float *moe = calloc((size_t)N*H, sizeof(float));
+    void *buf = malloc(active_expert_size());
+    float *eo = malloc(H*sizeof(float));
+    int *seen = calloc(g_cfg.num_experts, sizeof(int));
+    int *uni  = malloc((size_t)N*K*sizeof(int)); int n_union = 0;
+    for (int t = 0; t < N; t++) for (int k = 0; k < K; k++) {
+        int e = idx[(size_t)t*K+k];
+        if (e >= 0 && e < g_cfg.num_experts && !seen[e]) { seen[e] = 1; uni[n_union++] = e; }
+    }
+    g_moe_last_union = n_union;
+    for (int u = 0; u < n_union; u++) {
+        int e = uni[u];
+        if (pread(packed_fd, buf, active_expert_size(), (off_t)e * active_expert_size()) != (ssize_t)active_expert_size()) continue;
+        for (int t = 0; t < N; t++) {
+            int kk = -1;
+            for (int k = 0; k < K; k++) if (idx[(size_t)t*K+k] == e) { kk = k; break; }
+            if (kk >= 0) {
+                routed_ffn_1(buf, hp+(size_t)t*H, eo);
+                cpu_vec_madd(moe+(size_t)t*H, eo, wt[(size_t)t*K+kk], H);
+            }
+        }
+    }
+    float *shared = malloc(H*sizeof(float));
+    for (int t = 0; t < N; t++) {
+        shared_expert_1(wf, layer, hp+(size_t)t*H, shared);
+        for (int i = 0; i < H; i++)
+            hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[i];
+    }
+    free(hp); free(idx); free(wt); free(moe); free(buf); free(eo); free(seen); free(uni); free(shared);
 }
 
 // Stage 3 unit test: moe_block_2 must match two independent moe_block_1 calls.
@@ -6538,10 +6590,13 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
 
 // Depth-N batched forward: N positions through all layers + norm + batched lm_head.
 // hs[N*H] in/out (ends as per-position pre-norm hidden); logits[N*V] out.
-static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *pos, float *logits) {
+// General N-position forward (dense AND MoE — branches only at the MLP inside
+// dense_layer_forward_N). hs is N*H in/out; logits is N*V out. fds[layer] is the
+// packed-expert fd for MoE layers (ignored for dense / full-attn layers).
+static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *fds, int *pos, float *logits) {
     int H=g_cfg.hidden_dim, V=g_cfg.vocab_size, gsz=g_cfg.group_size;
     for (int layer=0; layer<g_cfg.num_layers; layer++)
-        dense_layer_forward_N(wf, layer, hs, N, kv[layer], pos);
+        dense_layer_forward_N(wf, layer, hs, N, kv[layer], pos, fds ? fds[layer] : -1);
     uint16_t *nw=get_tensor_ptr(wf,"model.norm.weight");
     float *nd=malloc((size_t)N*H*4);
     for (int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H, nw, nd+(size_t)t*H, H, g_cfg.rms_norm_eps);
@@ -6554,12 +6609,16 @@ static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv
 // sequential production forwards. Validates the N-generalized dense layer.
 static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     (void)model_path;
-    if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts!=0) { fprintf(stderr,"[mtp-vfN] requires dense GPU\n"); return 1; }
-    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4, N=4;
+    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr,"[mtp-vfN] requires GPU\n"); return 1; }
+    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, N=4;
+    int K=g_cfg.num_experts_per_tok>0?g_cfg.num_experts_per_tok:4;
     int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
     KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
     int cap=256;
-    for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
+    for(int i=0;i<Ld;i++){ fds[i]=-1;
+        if (g_cfg.num_experts>0){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/layer_%02d.bin",g_flashchat_experts_dir,i); fds[i]=open(p,O_RDONLY);
+            if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} } }
+        if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
     float *h=malloc(Hd*4),*scratch=malloc(V*4); int P=35;
     reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
     for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++)h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
@@ -6570,7 +6629,7 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     gpu_snap_restore(&snap,kv);
     float *hs=malloc((size_t)N*Hd*4),*ln=malloc((size_t)N*V*4); int posv[4]={P,P+1,P+2,P+3};
     for(int t=0;t<N;t++) embed_lookup(wf,toks[t],hs+(size_t)t*Hd);
-    fused_dense_forward_N(wf,hs,N,kv,posv,ln);
+    fused_dense_forward_N(wf,hs,N,kv,fds,posv,ln);
     int allmatch=1; for(int t=0;t<N;t++){ int ao=cpu_argmax(lo+(size_t)t*V,V),an=cpu_argmax(ln+(size_t)t*V,V); double e=0,r=0; for(int i=0;i<V;i++){e=fmax(e,fabs(lo[(size_t)t*V+i]-ln[(size_t)t*V+i]));r=fmax(r,fabs(lo[(size_t)t*V+i]));} fprintf(stderr,"[mtp-vfN] pos%d argmax prod=%d batchedN=%d rel=%.2e\n",t,ao,an,r>0?e/r:e); if(ao!=an)allmatch=0; }
     fprintf(stderr,"[mtp-vfN] %s\n", allmatch?"PASS: depth-N forward matches production":"DIVERGE");
     gpu_snap_free(&snap);
@@ -6626,7 +6685,7 @@ static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int 
         gpu_snap_save(&snap,kv);
         embed_lookup(wf,t_next,hs); for(int j=0;j<nd;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
         for(int t=0;t<Nv;t++) posv[t]=pos+t;
-        fused_dense_forward_N(wf,hs,Nv,kv,posv,ln);
+        fused_dense_forward_N(wf,hs,Nv,kv,fds,posv,ln);
         mtp_tok[mn++]=t_next;
         int acc=0;
         for(int j=0;j<nd;j++){ int tv=cpu_argmax(ln+(size_t)j*V,V); checks++; if(drafts[j]==tv){ accepts++; acc++; if(mn<max_new)mtp_tok[mn++]=drafts[j]; } else break; }
@@ -6636,7 +6695,7 @@ static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int 
             gpu_snap_restore(&snap,kv);
             embed_lookup(wf,t_next,hs); for(int j=0;j<acc;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
             for(int t=0;t<acc+1;t++) posv[t]=pos+t;
-            fused_dense_forward_N(wf,hs,acc+1,kv,posv,ln);
+            fused_dense_forward_N(wf,hs,acc+1,kv,fds,posv,ln);
             next_tok = cpu_argmax(ln+(size_t)acc*V,V);
         }
         // MTP-KV advance for committed tokens (t_next + accepted drafts)
