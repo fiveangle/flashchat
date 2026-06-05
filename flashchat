@@ -1111,6 +1111,34 @@ edit_model_registry_entry() {
 import json
 import sys
 
+labels = {
+    "name": "Display name",
+    "hf_repo": "HuggingFace repository",
+    "source_format": "Source format",
+    "hidden_size": "Hidden size",
+    "num_hidden_layers": "Layer count",
+    "num_attention_heads": "Attention heads",
+    "num_key_value_heads": "Key/value heads",
+    "head_dim": "Attention head dimension",
+    "vocab_size": "Vocabulary size",
+    "rms_norm_eps": "RMS norm epsilon",
+    "num_experts": "Total experts",
+    "num_experts_per_tok": "Active experts (K / num_experts_per_tok)",
+    "mtp_default_predictions": "MTP default draft predictions",
+    "mtp_max_predictions": "MTP maximum draft predictions",
+    "moe_intermediate_size": "MoE intermediate size",
+    "shared_expert_intermediate_size": "Shared expert intermediate size",
+    "full_attention_interval": "Full attention interval",
+    "linear_num_value_heads": "Linear attention value heads",
+    "linear_num_key_heads": "Linear attention key heads",
+    "linear_key_head_dim": "Linear attention key head dimension",
+    "linear_value_head_dim": "Linear attention value head dimension",
+    "linear_conv_kernel_dim": "Linear convolution kernel dimension",
+    "partial_rotary_factor": "Partial rotary factor",
+    "rope_theta": "RoPE theta",
+    "default_sampling_profile": "Default sampling profile",
+}
+
 with open(sys.argv[1]) as f:
     data = json.load(f)
 model_id = sys.argv[2]
@@ -1128,19 +1156,19 @@ for key in [
     "partial_rotary_factor", "rope_theta", "default_sampling_profile",
 ]:
     if key in model:
-        print(f"{key}: {model[key]}")
+        print(f"{labels.get(key, key)}: {model[key]}")
 quant = model.get("quantization", {})
 if quant:
-    print(f"quantization.bits: {quant.get('bits', '')}")
-    print(f"quantization.group_size: {quant.get('group_size', '')}")
+    print(f"Quantization bits: {quant.get('bits', '')}")
+    print(f"Quantization group size: {quant.get('group_size', '')}")
 scripts = model.get("scripts", {})
 if scripts:
-    print(f"scripts.extract_weights: {scripts.get('extract_weights', '')}")
-    print(f"scripts.repack_experts: {scripts.get('repack_experts', '')}")
+    print(f"Weight extraction script: {scripts.get('extract_weights', '')}")
+    print(f"Expert repack script: {scripts.get('repack_experts', '')}")
 PY
 
     printf "Delete registry entry ? [y/N] " >&2
-    read -n 1 -r REPLY
+    read -r REPLY
     echo "" >&2
     if [[ "$REPLY" =~ ^[Yy]$ ]]; then
         if ! python3 - "$registry_file" "$model_id" >&2 <<'PY'
@@ -1179,6 +1207,38 @@ PY
 import json
 import sys
 
+labels = {
+    "name": "Display name",
+    "hf_repo": "HuggingFace repository",
+    "source_format": "Source format",
+    "hidden_size": "Hidden size",
+    "num_hidden_layers": "Layer count",
+    "num_attention_heads": "Attention heads",
+    "num_key_value_heads": "Key/value heads",
+    "head_dim": "Attention head dimension",
+    "vocab_size": "Vocabulary size",
+    "rms_norm_eps": "RMS norm epsilon",
+    "num_experts": "Total experts",
+    "num_experts_per_tok": "Active experts (K / num_experts_per_tok)",
+    "mtp_default_predictions": "MTP default draft predictions",
+    "mtp_max_predictions": "MTP maximum draft predictions",
+    "moe_intermediate_size": "MoE intermediate size",
+    "shared_expert_intermediate_size": "Shared expert intermediate size",
+    "full_attention_interval": "Full attention interval",
+    "linear_num_value_heads": "Linear attention value heads",
+    "linear_num_key_heads": "Linear attention key heads",
+    "linear_key_head_dim": "Linear attention key head dimension",
+    "linear_value_head_dim": "Linear attention value head dimension",
+    "linear_conv_kernel_dim": "Linear convolution kernel dimension",
+    "partial_rotary_factor": "Partial rotary factor",
+    "rope_theta": "RoPE theta",
+    "default_sampling_profile": "Default sampling profile",
+    "quantization.bits": "Quantization bits",
+    "quantization.group_size": "Quantization group size",
+    "scripts.extract_weights": "Weight extraction script",
+    "scripts.repack_experts": "Expert repack script",
+}
+
 with open(sys.argv[1]) as f:
     data = json.load(f)
 model = data.get("models", {}).get(sys.argv[2], {})
@@ -1194,20 +1254,20 @@ fields = [
     "partial_rotary_factor", "rope_theta", "default_sampling_profile",
 ]
 for field in fields:
-    print(f"{field}\t{model.get(field, '')}")
+    print(f"{field}\t{labels.get(field, field)}\t{model.get(field, '')}")
 quant = model.get("quantization", {})
-print(f"quantization.bits\t{quant.get('bits', '')}")
-print(f"quantization.group_size\t{quant.get('group_size', '')}")
+print(f"quantization.bits\t{labels['quantization.bits']}\t{quant.get('bits', '')}")
+print(f"quantization.group_size\t{labels['quantization.group_size']}\t{quant.get('group_size', '')}")
 scripts = model.get("scripts", {})
-print(f"scripts.extract_weights\t{scripts.get('extract_weights', '')}")
-print(f"scripts.repack_experts\t{scripts.get('repack_experts', '')}")
+print(f"scripts.extract_weights\t{labels['scripts.extract_weights']}\t{scripts.get('extract_weights', '')}")
+print(f"scripts.repack_experts\t{labels['scripts.repack_experts']}\t{scripts.get('repack_experts', '')}")
 PY
 
     local updates_file
     updates_file=$(mktemp)
     exec 3< "$edit_file"
-    while IFS=$'\t' read -r -u 3 field value; do
-        printf "%s [%s]: " "$field" "$value" >&2
+    while IFS=$'\t' read -r -u 3 field label value; do
+        printf "%s [%s]: " "$label" "$value" >&2
         read -r REPLY
         if [ -n "$REPLY" ]; then
             printf "%s\t%s\n" "$field" "$REPLY" >> "$updates_file"
@@ -1314,7 +1374,7 @@ select_model_from_registry() {
             echo "$default_model"
             return
         fi
-        if [ "$REPLY" = "E" ]; then
+        if [[ "$REPLY" =~ ^[Ee]$ ]]; then
             edit_model_registry_entry || true
             print_model_status_list >&2
             echo "" >&2

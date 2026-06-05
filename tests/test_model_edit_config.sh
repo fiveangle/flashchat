@@ -63,11 +63,12 @@ run_config_with_input() {
 update_output=$(
     {
         printf 'y'
-        printf 'E\n'
+        printf 'e\n'
         printf 'temporary-edit-model\n'
-        printf 'n'
+        printf 'n\n'
         printf 'Edited Model Name\n'
-        for _ in $(seq 1 11); do printf '\n'; done
+        for _ in $(seq 1 10); do printf '\n'; done
+        printf '6\n'
         printf '2\n'
         printf '4\n'
         for _ in $(seq 1 80); do printf '\n'; done
@@ -79,6 +80,11 @@ if ! echo "$update_output" | grep -q "Delete registry entry ? \\[y/N\\]"; then
     exit 1
 fi
 
+if ! echo "$update_output" | grep -q "Active experts (K / num_experts_per_tok) \\[8\\]"; then
+    echo "FAIL: edit flow did not show active expert registry default" >&2
+    exit 1
+fi
+
 python3 - "$CONFIG_JSON" <<'PY'
 import json
 import sys
@@ -87,6 +93,7 @@ with open(sys.argv[1]) as f:
     data = json.load(f)
 model = data["models"]["temporary-edit-model"]
 assert model["name"] == "Edited Model Name", model["name"]
+assert model["num_experts_per_tok"] == 6, model["num_experts_per_tok"]
 assert model["mtp_default_predictions"] == 2, model["mtp_default_predictions"]
 assert model["mtp_max_predictions"] == 4, model["mtp_max_predictions"]
 PY
@@ -96,7 +103,7 @@ delete_output=$(
         printf 'y'
         printf 'E\n'
         printf 'temporary-delete-model\n'
-        printf 'y'
+        printf 'y\n'
         for _ in $(seq 1 80); do printf '\n'; done
     } | run_config_with_input 2>&1
 )
