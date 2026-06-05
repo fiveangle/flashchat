@@ -5447,49 +5447,27 @@ static int mtp_bench_attn(WeightFile *wf) {
 // ============================================================================
 static int g_moe_last_union = 0;  // |union of the two tokens' routed experts| (diagnostic)
 
-static void expert_slices(void *buf,
-    uint32_t **gw, uint16_t **gs, uint16_t **gb,
-    uint32_t **uw, uint16_t **us, uint16_t **ub,
-    uint32_t **dw, uint16_t **ds, uint16_t **db) {
-    char *p = buf;
-    *gw = (uint32_t *)p; p += g_cfg.gate_w_size;
-    *gs = (uint16_t *)p; p += g_cfg.gate_s_size;
-    *gb = (uint16_t *)p; p += g_cfg.gate_b_size;
-    *uw = (uint32_t *)p; p += g_cfg.up_w_size;
-    *us = (uint16_t *)p; p += g_cfg.up_s_size;
-    *ub = (uint16_t *)p; p += g_cfg.up_b_size;
-    *dw = (uint32_t *)p; p += g_cfg.down_w_size;
-    *ds = (uint16_t *)p; p += g_cfg.down_s_size;
-    *db = (uint16_t *)p;
-}
 
 // Single-token routed expert FFN: out = down(swiglu(gate(x), up(x))).
 static void routed_ffn_1(void *buf, const float *x, float *out) {
-    int H = g_cfg.hidden_dim, MI = g_cfg.moe_intermediate, gsz = g_cfg.group_size;
-    uint32_t *gw, *uw, *dw; uint16_t *gs, *gb, *us, *ub, *ds, *db;
-    expert_slices(buf, &gw, &gs, &gb, &uw, &us, &ub, &dw, &ds, &db);
-    float *eg = malloc(MI * sizeof(float)), *eu = malloc(MI * sizeof(float)), *ea = malloc(MI * sizeof(float));
-    fast_dequant_matvec(gw, gs, gb, x, eg, MI, H, gsz);
-    fast_dequant_matvec(uw, us, ub, x, eu, MI, H, gsz);
-    gpu_swiglu(g_metal, eg, eu, ea, MI);  // GPU swiglu => bit-faithful to production MoE
-    fast_dequant_matvec(dw, ds, db, ea, out, H, MI, gsz);
-    free(eg); free(eu); free(ea);
+    // Faithful single-expert FFN: identical kernels + buffers to the production
+    // CMD3 expert path (gpu_encode_expert_forward_slot — matvec_v3 gate/up/down +
+    // GPU swiglu). Previously used CPU fast_dequant_matvec, which diverged ~9% from
+    // the production GPU expert kernel and broke MTP-verify faithfulness for MoE.
+    memcpy([g_metal->buf_multi_expert_data[0] contents], buf, active_expert_size());
+    memcpy([g_metal->buf_multi_expert_input contents], x, g_cfg.hidden_dim * sizeof(float));
+    id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+    gpu_encode_expert_forward_slot(g_metal, cmd, 0);
+    [cmd commit]; [cmd waitUntilCompleted];
+    memcpy(out, [g_metal->buf_multi_expert_out[0] contents], g_cfg.hidden_dim * sizeof(float));
 }
 
-// Batched routed expert FFN: one weight read serves both tokens.
+// Two tokens through the SAME expert. Run the faithful per-token expert kernel
+// twice (the weight stays resident in buf_multi_expert_data[0] across both, so the
+// second call only re-copies the input). Speed is irrelevant here; faithfulness is.
 static void routed_ffn_2(void *buf, const float *xa, const float *xb, float *oa, float *ob) {
-    int H = g_cfg.hidden_dim, MI = g_cfg.moe_intermediate, gsz = g_cfg.group_size;
-    uint32_t *gw, *uw, *dw; uint16_t *gs, *gb, *us, *ub, *ds, *db;
-    expert_slices(buf, &gw, &gs, &gb, &uw, &us, &ub, &dw, &ds, &db);
-    float *ega = malloc(MI*sizeof(float)), *egb = malloc(MI*sizeof(float));
-    float *eua = malloc(MI*sizeof(float)), *eub = malloc(MI*sizeof(float));
-    float *eaa = malloc(MI*sizeof(float)), *eab = malloc(MI*sizeof(float));
-    gpu_dequant_matmul2(g_metal, gw, gs, gb, xa, xb, ega, egb, MI, H, gsz);
-    gpu_dequant_matmul2(g_metal, uw, us, ub, xa, xb, eua, eub, MI, H, gsz);
-    gpu_swiglu(g_metal, ega, eua, eaa, MI);  // GPU swiglu => bit-faithful to production MoE
-    gpu_swiglu(g_metal, egb, eub, eab, MI);
-    gpu_dequant_matmul2(g_metal, dw, ds, db, eaa, eab, oa, ob, H, MI, gsz);
-    free(ega); free(egb); free(eua); free(eub); free(eaa); free(eab);
+    routed_ffn_1(buf, xa, oa);
+    routed_ffn_1(buf, xb, ob);
 }
 
 // Compute post-attn norm + routing (softmax/topk/normalize) for one token.
@@ -14572,15 +14550,12 @@ int main(int argc, char **argv) {
                 batch = 0;                        // disabled
             } else if (raw == 1) {
                 // Automatic: enable only where the batched verify is bit-faithful.
-                // Dense models are faithful (lossless). MoE is not yet faithful, so
-                // automatic leaves it OFF (output would diverge) — force with
-                // FLASHCHAT_MTP=2 to run it anyway. This is the only place the
-                // dense/MoE distinction is applied; an explicit batch size below
-                // always enables regardless.
-                batch = (g_cfg.num_experts == 0) ? 2 : 0;
-                if (batch == 0)
-                    fprintf(stderr, "[mtp] automatic: MTP off for this MoE model "
-                                    "(batched verify not yet bit-faithful); set FLASHCHAT_MTP=2 to force\n");
+                // The batched verify is now bit-faithful for BOTH dense and MoE
+                // (linear attention + MoE expert FFN reuse the production GPU
+                // kernels — see routed_ffn_1 / mtp-verify-forward2), so automatic
+                // enables MTP at the proven batch size wherever the model carries
+                // MTP artifacts.
+                batch = 2;
             } else {
                 batch = raw;                      // explicit predictor batch size
             }
@@ -14726,10 +14701,7 @@ int main(int argc, char **argv) {
             if (mtp.tensors_present && mtp.packed_experts_present) {
                 fprintf(stderr, "[mtp] enabled; predictor batch size=%d; artifacts detected (%s)\n",
                         g_mtp_predictions, mtp.packed_dir);
-                fprintf(stderr, "[mtp] draft/verify speculative decode ACTIVE in server decode path\n");
-                if (g_cfg.num_experts > 0) {
-                    fprintf(stderr, "[mtp] note: MoE batched verify is not yet bit-faithful; accepted drafts may diverge from baseline output\n");
-                }
+                fprintf(stderr, "[mtp] draft/verify speculative decode ACTIVE in server decode path (lossless: batched verify is bit-faithful)\n");
             } else {
                 fprintf(stderr, "[mtp] requested but artifacts are incomplete; using existing decode path\n");
                 fprintf(stderr, "[mtp] tensors=%s packed_experts=%s\n",
