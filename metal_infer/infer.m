@@ -302,6 +302,11 @@ static void server_log_open(void) {
     fprintf(g_server_log, "[serve] Sampling defaults: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
             g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
             g_default_presence_penalty, g_default_repetition_penalty);
+    server_log_timestamp(g_server_log);
+    if (g_mtp_predictions > 0)
+        fprintf(g_server_log, "[serve] MTP: predictor batch size %d (draft/verify speculative decode)\n", g_mtp_predictions);
+    else
+        fprintf(g_server_log, "[serve] MTP: disabled\n");
     if (g_server_debug_enabled) {
         server_log_timestamp(g_server_log);
         fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
@@ -14765,6 +14770,10 @@ int main(int argc, char **argv) {
         printf("K:        %d experts/layer\n", K);
         printf("Experts:  %zu bytes each\n", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+        if (g_mtp_predictions > 0)
+            printf("MTP:      predictor batch size %d (draft/verify speculative decode)\n", g_mtp_predictions);
+        else
+            printf("MTP:      disabled\n");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
             printf("Cache:    malloc %d entries (%.1f GB)\n",

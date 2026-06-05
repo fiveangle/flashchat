@@ -1361,7 +1361,7 @@ print_sampling_profile_list() {
         printf "      ID: %s\n" "$profile_id"
         printf "      %s\n" "$description"
         printf "      reasoning: %s | MTP: %s | temp: %s | top-p: %s | top-k: %s | min-p: %s | presence: %s | repetition: %s\n" \
-            "$reasoning" "${mtp:-auto}" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
+            "$reasoning" "$(mtp_label "$mtp")" "$temperature" "$top_p" "$top_k" "$min_p" "$presence_penalty" "$repetition_penalty"
     done < <(flashchat_model_sampling_profiles "$model_id")
     i=$((i + 1))
     local marker=" "
