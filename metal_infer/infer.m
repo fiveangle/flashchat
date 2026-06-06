@@ -1130,6 +1130,49 @@ static uint16_t f32_to_bf16(float f) {
 }
 
 // ============================================================================
+// BF16 matrix-vector multiply (CPU path for unquantized MTP head weights)
+// W_bf16 is [out_dim][in_dim] packed as native BF16 (2 bytes per weight).
+// Converts on the fly to avoid a full float32 copy of the weight matrix.
+// ============================================================================
+
+static void fast_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+                                const float *x, float *out, int out_dim, int in_dim, int group_size);
+
+static void bf16_matvec(const uint16_t *W_bf16, const float *x, float *out, int out_dim, int in_dim) {
+    for (int i = 0; i < out_dim; i++) {
+        float sum = 0.0f;
+        const uint16_t *row = W_bf16 + (size_t)i * in_dim;
+        for (int j = 0; j < in_dim; j++) {
+            sum += bf16_to_f32(row[j]) * x[j];
+        }
+        out[i] = sum;
+    }
+}
+
+// Forward declarations; defined after g_metal is declared.
+static void mtp_gpu_bf16_dispatch(const uint16_t *W, const float *x, float *out, int out_dim, int in_dim);
+static void mtp_gpu_8bit_dispatch(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+                                    const float *x, float *out, int out_dim, int in_dim, int group_size);
+
+// Forward-declared helper that checks GPU availability and runs MTP attention.
+// Defined after g_metal is declared so it can inspect the context safely.
+static int mtp_try_gpu_attention(int ctx_len, const float *q, const float *q_gate, float *out);
+
+// Dispatch to either BF16 matvec, 8-bit GPU matmul, or CPU quantized dequant matvec.
+static inline void mtp_matvec(const uint32_t *W, const uint16_t *scales,
+                              const uint16_t *biases, const float *x,
+                              float *out, int out_dim, int in_dim,
+                              int group_size, int bf16_mode) {
+    if (bf16_mode) {
+        mtp_gpu_bf16_dispatch((const uint16_t *)W, x, out, out_dim, in_dim);
+    } else if (scales && biases) {
+        mtp_gpu_8bit_dispatch(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    } else {
+        fast_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
+// ============================================================================
 // JSON parser (minimal, for model_weights.json)
 // ============================================================================
 
@@ -1295,6 +1338,7 @@ typedef struct {
     uint32_t *ddown_w; uint16_t *ddown_s, *ddown_b;
     uint16_t *norm_w;
     int is_dense;   // resolved once at load: 1 = dense MLP head, 0 = MoE head
+    int bf16_mode;  // 1 = MTP weights kept in native BF16 (no quantization)
     int ready;
 } MTPWeightCache;
 
@@ -1406,20 +1450,27 @@ static MTPArtifacts detect_mtp_artifacts(WeightFile *wf, const char *model_path)
     mtp.enabled = g_mtp_predictions > 0;
     snprintf(mtp.packed_dir, sizeof(mtp.packed_dir), "%s", g_flashchat_mtp_experts_dir);
 
+    // Detect BF16 mode: weight exists but scales/biases do not.
+    int mtp_fc_bf16 = manifest_has_tensor(wf, "mtp.fc.weight") &&
+                      !manifest_has_tensor(wf, "mtp.fc.scales");
     mtp.tensors_present =
         manifest_has_tensor(wf, "mtp.fc.weight") &&
-        manifest_has_tensor(wf, "mtp.fc.scales") &&
-        manifest_has_tensor(wf, "mtp.fc.biases") &&
         manifest_has_tensor(wf, "mtp.pre_fc_norm_hidden.weight") &&
         manifest_has_tensor(wf, "mtp.pre_fc_norm_embedding.weight") &&
         manifest_has_tensor(wf, "mtp.layers.0.input_layernorm.weight") &&
         manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.weight") &&
-        manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.scales") &&
-        manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.biases") &&
         manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.weight") &&
-        manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.scales") &&
-        manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.biases") &&
         manifest_has_tensor(wf, "mtp.norm.weight");
+    if (mtp.tensors_present && !mtp_fc_bf16) {
+        // Quantized mode: require all scales/biases companions
+        mtp.tensors_present =
+            manifest_has_tensor(wf, "mtp.fc.scales") &&
+            manifest_has_tensor(wf, "mtp.fc.biases") &&
+            manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.scales") &&
+            manifest_has_tensor(wf, "mtp.layers.0.self_attn.q_proj.biases") &&
+            manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.scales") &&
+            manifest_has_tensor(wf, "mtp.layers.0.mlp.gate.biases");
+    }
 
     mtp.manifest_layers = mtp.tensors_present ? 1 : 0;
 
@@ -1483,32 +1534,63 @@ static void build_mtp_cache(WeightFile *wf) {
     g_mtp_cache.ddown_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.biases");
     g_mtp_cache.norm_w = get_tensor_ptr_optional(wf, "mtp.norm.weight");
 
+    // Detect BF16 mode: if the MTP fc.weight exists but its companion scales/biases
+    // do not, the extraction script kept MTP weights in native BF16.
+    g_mtp_cache.bf16_mode = (g_mtp_cache.fc_w != NULL &&
+                              (g_mtp_cache.fc_s == NULL || g_mtp_cache.fc_b == NULL));
+
     // Head type is fixed for the life of the process: resolve it once here so the
     // per-draft hot path only reads g_mtp_cache.is_dense (never re-derives it).
-    int moe_ff_present =
-        g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
-        g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
-        g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
-        g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
-        g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b;
-    int dense_ff_present =
-        g_mtp_cache.dgate_w && g_mtp_cache.dgate_s && g_mtp_cache.dgate_b &&
-        g_mtp_cache.dup_w && g_mtp_cache.dup_s && g_mtp_cache.dup_b &&
-        g_mtp_cache.ddown_w && g_mtp_cache.ddown_s && g_mtp_cache.ddown_b;
+    int moe_ff_present, dense_ff_present;
+    if (g_mtp_cache.bf16_mode) {
+        moe_ff_present =
+            g_mtp_cache.gate_w &&
+            g_mtp_cache.sg_w && g_mtp_cache.su_w && g_mtp_cache.sd_w &&
+            g_mtp_cache.seg_w;
+        dense_ff_present =
+            g_mtp_cache.dgate_w && g_mtp_cache.dup_w && g_mtp_cache.ddown_w;
+    } else {
+        moe_ff_present =
+            g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
+            g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
+            g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
+            g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
+            g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b;
+        dense_ff_present =
+            g_mtp_cache.dgate_w && g_mtp_cache.dgate_s && g_mtp_cache.dgate_b &&
+            g_mtp_cache.dup_w && g_mtp_cache.dup_s && g_mtp_cache.dup_b &&
+            g_mtp_cache.ddown_w && g_mtp_cache.ddown_s && g_mtp_cache.ddown_b;
+    }
     g_mtp_cache.is_dense = (!moe_ff_present && dense_ff_present);
 
-    int common_ready =
-        g_mtp_cache.pre_fc_norm_hidden_w &&
-        g_mtp_cache.pre_fc_norm_embedding_w &&
-        g_mtp_cache.fc_w && g_mtp_cache.fc_s && g_mtp_cache.fc_b &&
-        g_mtp_cache.layer_input_norm_w &&
-        g_mtp_cache.q_w && g_mtp_cache.q_s && g_mtp_cache.q_b &&
-        g_mtp_cache.k_w && g_mtp_cache.k_s && g_mtp_cache.k_b &&
-        g_mtp_cache.v_w && g_mtp_cache.v_s && g_mtp_cache.v_b &&
-        g_mtp_cache.o_w && g_mtp_cache.o_s && g_mtp_cache.o_b &&
-        g_mtp_cache.q_norm_w && g_mtp_cache.k_norm_w &&
-        g_mtp_cache.post_attn_norm_w &&
-        g_mtp_cache.norm_w;
+    int common_ready;
+    if (g_mtp_cache.bf16_mode) {
+        common_ready =
+            g_mtp_cache.pre_fc_norm_hidden_w &&
+            g_mtp_cache.pre_fc_norm_embedding_w &&
+            g_mtp_cache.fc_w &&
+            g_mtp_cache.layer_input_norm_w &&
+            g_mtp_cache.q_w &&
+            g_mtp_cache.k_w &&
+            g_mtp_cache.v_w &&
+            g_mtp_cache.o_w &&
+            g_mtp_cache.q_norm_w && g_mtp_cache.k_norm_w &&
+            g_mtp_cache.post_attn_norm_w &&
+            g_mtp_cache.norm_w;
+    } else {
+        common_ready =
+            g_mtp_cache.pre_fc_norm_hidden_w &&
+            g_mtp_cache.pre_fc_norm_embedding_w &&
+            g_mtp_cache.fc_w && g_mtp_cache.fc_s && g_mtp_cache.fc_b &&
+            g_mtp_cache.layer_input_norm_w &&
+            g_mtp_cache.q_w && g_mtp_cache.q_s && g_mtp_cache.q_b &&
+            g_mtp_cache.k_w && g_mtp_cache.k_s && g_mtp_cache.k_b &&
+            g_mtp_cache.v_w && g_mtp_cache.v_s && g_mtp_cache.v_b &&
+            g_mtp_cache.o_w && g_mtp_cache.o_s && g_mtp_cache.o_b &&
+            g_mtp_cache.q_norm_w && g_mtp_cache.k_norm_w &&
+            g_mtp_cache.post_attn_norm_w &&
+            g_mtp_cache.norm_w;
+    }
     // The draft path also reads embed_tokens (embed the next token) and lm_head
     // (project the draft hidden -> logits). Fold their presence into `ready` here,
     // once, so the per-request gate is a pure integer check — never a manifest probe.
@@ -1649,8 +1731,8 @@ static int mtp_preflight_forward(WeightFile *wf) {
     // Fusion order matches Qwen3-Next MTP reference: cat([norm_embedding, norm_hidden]).
     memcpy(fc_in, embedding_norm, g_cfg.hidden_dim * sizeof(float));
     memcpy(fc_in + g_cfg.hidden_dim, hidden_norm, g_cfg.hidden_dim * sizeof(float));
-    fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
-                        fc_in, fc_out, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
+               fc_in, fc_out, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size, g_mtp_cache.bf16_mode);
 
     float rms = vec_rms(fc_out, g_cfg.hidden_dim);
     int ok = isfinite(rms) && rms > 0.0f;
@@ -1712,19 +1794,19 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     // Fusion order matches Qwen3-Next MTP reference: cat([norm_embedding, norm_hidden]).
     memcpy(fc_in, embedding_norm, g_cfg.hidden_dim * sizeof(float));
     memcpy(fc_in + g_cfg.hidden_dim, hidden_norm, g_cfg.hidden_dim * sizeof(float));
-    fast_dequant_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
-                        fc_in, x, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.fc_w, g_mtp_cache.fc_s, g_mtp_cache.fc_b,
+               fc_in, x, g_cfg.hidden_dim, g_cfg.hidden_dim * 2, g_cfg.group_size, g_mtp_cache.bf16_mode);
     memcpy(residual, x, g_cfg.hidden_dim * sizeof(float));
     mtp_trace_vector(trace_call, "fc_out", x, g_cfg.hidden_dim);
 
     cpu_rms_norm(x, g_mtp_cache.layer_input_norm_w, normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "attn_input_norm", normed, g_cfg.hidden_dim);
-    fast_dequant_matvec(g_mtp_cache.q_w, g_mtp_cache.q_s, g_mtp_cache.q_b,
-                        normed, q_proj, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size);
-    fast_dequant_matvec(g_mtp_cache.k_w, g_mtp_cache.k_s, g_mtp_cache.k_b,
-                        normed, k, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
-    fast_dequant_matvec(g_mtp_cache.v_w, g_mtp_cache.v_s, g_mtp_cache.v_b,
-                        normed, v, kv_dim, g_cfg.hidden_dim, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.q_w, g_mtp_cache.q_s, g_mtp_cache.q_b,
+               normed, q_proj, q_proj_dim, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+    mtp_matvec(g_mtp_cache.k_w, g_mtp_cache.k_s, g_mtp_cache.k_b,
+               normed, k, kv_dim, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+    mtp_matvec(g_mtp_cache.v_w, g_mtp_cache.v_s, g_mtp_cache.v_b,
+               normed, v, kv_dim, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
     mtp_trace_vector(trace_call, "q_proj", q_proj, q_proj_dim);
     mtp_trace_vector(trace_call, "k_proj", k, kv_dim);
     mtp_trace_vector(trace_call, "v_proj", v, kv_dim);
@@ -1766,33 +1848,34 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     const float *kc = g_mtp_k_cache ? g_mtp_k_cache : k;
     const float *vc = g_mtp_v_cache ? g_mtp_v_cache : v;
     int ctx_len = g_mtp_kv_len > 0 ? g_mtp_kv_len : 1;
-    float attn_scale = 1.0f / sqrtf((float)g_cfg.head_dim);
-    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
-        int kv_h = h / heads_per_kv;
-        float *qh = q + h * g_cfg.head_dim;
-        float *scores = malloc(ctx_len * sizeof(float));
-        for (int p = 0; p < ctx_len; p++) {
-            const float *kp = kc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
-            scores[p] = dot * attn_scale;
+    if (!mtp_try_gpu_attention(ctx_len, q, q_gate, attn_out)) {
+        float attn_scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
+            int kv_h = h / heads_per_kv;
+            float *qh = q + h * g_cfg.head_dim;
+            float *scores = malloc(ctx_len * sizeof(float));
+            for (int p = 0; p < ctx_len; p++) {
+                const float *kp = kc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
+                scores[p] = dot * attn_scale;
+            }
+            cpu_softmax(scores, ctx_len);
+            float *oh = attn_out + h * g_cfg.head_dim;
+            for (int d = 0; d < g_cfg.head_dim; d++) oh[d] = 0.0f;
+            for (int p = 0; p < ctx_len; p++) {
+                const float *vp = vc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
+                for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+            }
+            free(scores);
         }
-        cpu_softmax(scores, ctx_len);
-        float *oh = attn_out + h * g_cfg.head_dim;
-        for (int d = 0; d < g_cfg.head_dim; d++) oh[d] = 0.0f;
-        for (int p = 0; p < ctx_len; p++) {
-            const float *vp = vc + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
-            for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+        for (int i = 0; i < q_dim; i++) {
+            attn_out[i] *= cpu_sigmoid(q_gate[i]);
         }
-        free(scores);
-    }
-    mtp_trace_vector(trace_call, "attn_out", attn_out, q_dim);
-    for (int i = 0; i < q_dim; i++) {
-        attn_out[i] *= cpu_sigmoid(q_gate[i]);
     }
     mtp_trace_vector(trace_call, "attn_gated", attn_out, q_dim);
-    fast_dequant_matvec(g_mtp_cache.o_w, g_mtp_cache.o_s, g_mtp_cache.o_b,
-                        attn_out, attn_projected, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.o_w, g_mtp_cache.o_s, g_mtp_cache.o_b,
+               attn_out, attn_projected, g_cfg.hidden_dim, q_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
     mtp_trace_vector(trace_call, "attn_projected", attn_projected, g_cfg.hidden_dim);
     for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = residual[i] + attn_projected[i];
     mtp_trace_vector(trace_call, "post_attn_residual", x, g_cfg.hidden_dim);
@@ -1807,14 +1890,14 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     // into x[], then fall through to the shared final norm below.
     int expert_index = -1;
     if (!g_mtp_cache.is_dense) {
-    fast_dequant_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
-                        h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size);
-    fast_dequant_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
-                        h_post, shared_gate, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-    fast_dequant_matvec(g_mtp_cache.su_w, g_mtp_cache.su_s, g_mtp_cache.su_b,
-                        h_post, shared_up, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-    fast_dequant_matvec(g_mtp_cache.seg_w, g_mtp_cache.seg_s, g_mtp_cache.seg_b,
-                        h_post, &shared_act[0], 1, g_cfg.hidden_dim, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
+               h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+    mtp_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
+               h_post, shared_gate, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+    mtp_matvec(g_mtp_cache.su_w, g_mtp_cache.su_s, g_mtp_cache.su_b,
+               h_post, shared_up, g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+    mtp_matvec(g_mtp_cache.seg_w, g_mtp_cache.seg_s, g_mtp_cache.seg_b,
+               h_post, &shared_act[0], 1, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
     float shared_gate_score = shared_act[0];
     mtp_trace_vector(trace_call, "gate_logits", gate_scores, g_cfg.num_experts);
     mtp_trace_top_values(trace_call, "gate_logits", gate_scores, g_cfg.num_experts);
@@ -1915,8 +1998,8 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
 
     cpu_swiglu(shared_gate, shared_up, shared_act, g_cfg.shared_intermediate);
     mtp_trace_vector(trace_call, "shared_act", shared_act, g_cfg.shared_intermediate);
-    fast_dequant_matvec(g_mtp_cache.sd_w, g_mtp_cache.sd_s, g_mtp_cache.sd_b,
-                        shared_act, shared_out, g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
+    mtp_matvec(g_mtp_cache.sd_w, g_mtp_cache.sd_s, g_mtp_cache.sd_b,
+               shared_act, shared_out, g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size, g_mtp_cache.bf16_mode);
     float shared_weight = cpu_sigmoid(shared_gate_score);
     mtp_trace_vector(trace_call, "shared_out", shared_out, g_cfg.hidden_dim);
     for (int i = 0; i < g_cfg.hidden_dim; i++) {
@@ -1935,13 +2018,13 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
             fprintf(stderr, "[mtp] forward failed: dense MLP allocation failure\n");
             goto cleanup;
         }
-        fast_dequant_matvec(g_mtp_cache.dgate_w, g_mtp_cache.dgate_s, g_mtp_cache.dgate_b,
-                            h_post, dg, inter, g_cfg.hidden_dim, g_cfg.group_size);
-        fast_dequant_matvec(g_mtp_cache.dup_w, g_mtp_cache.dup_s, g_mtp_cache.dup_b,
-                            h_post, du, inter, g_cfg.hidden_dim, g_cfg.group_size);
+        mtp_matvec(g_mtp_cache.dgate_w, g_mtp_cache.dgate_s, g_mtp_cache.dgate_b,
+                   h_post, dg, inter, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
+        mtp_matvec(g_mtp_cache.dup_w, g_mtp_cache.dup_s, g_mtp_cache.dup_b,
+                   h_post, du, inter, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
         cpu_swiglu(dg, du, da, inter);
-        fast_dequant_matvec(g_mtp_cache.ddown_w, g_mtp_cache.ddown_s, g_mtp_cache.ddown_b,
-                            da, dmlp_out, g_cfg.hidden_dim, inter, g_cfg.group_size);
+        mtp_matvec(g_mtp_cache.ddown_w, g_mtp_cache.ddown_s, g_mtp_cache.ddown_b,
+                   da, dmlp_out, g_cfg.hidden_dim, inter, g_cfg.group_size, g_mtp_cache.bf16_mode);
         mtp_trace_vector(trace_call, "dense_mlp_out", dmlp_out, g_cfg.hidden_dim);
         for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = x[i] + dmlp_out[i];
         free(dg); free(du); free(da); free(dmlp_out);
@@ -2717,6 +2800,7 @@ typedef struct {
     id<MTLComputePipelineState> matmulN_8_v3;
     id<MTLComputePipelineState> matmulN_8_v4;
     id<MTLComputePipelineState> matmulN_8_v5;
+    id<MTLComputePipelineState> bf16_matvec_pipe;
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -2767,6 +2851,8 @@ typedef struct {
     // GPU attention buffers (for full attention layers)
     id<MTLBuffer> buf_kv_k[MAX_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[MAX_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_mtp_kv_k;     // dedicated GPU K cache for MTP head attention
+    id<MTLBuffer> buf_mtp_kv_v;     // dedicated GPU V cache for MTP head attention
     id<MTLBuffer> buf_attn_q;       // [g_cfg.num_attn_heads * g_cfg.head_dim floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [g_cfg.num_attn_heads * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [g_cfg.num_attn_heads * g_cfg.head_dim floats] full attention output
@@ -2809,6 +2895,50 @@ typedef struct {
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
+
+// Forward declaration; full definition comes after the struct is complete.
+static void gpu_bf16_matvec(MetalCtx *ctx, const uint16_t *W_bf16, const float *x,
+                            float *out, int out_dim, int in_dim);
+
+// Defined here (after g_metal) so it can reference the global context.
+static void mtp_gpu_bf16_dispatch(const uint16_t *W, const float *x, float *out, int out_dim, int in_dim) {
+    if (g_metal && g_metal->bf16_matvec_pipe) {
+        gpu_bf16_matvec(g_metal, W, x, out, out_dim, in_dim);
+    } else {
+        bf16_matvec(W, x, out, out_dim, in_dim);
+    }
+}
+
+// Forward declaration; defined later in the file.
+static void gpu_dequant_matmulN(MetalCtx *ctx, const void *W_packed, const void *scales,
+                                const void *biases, const float *X, float *OUT,
+                                uint32_t out_dim, uint32_t in_dim, uint32_t group_size, uint32_t N);
+
+static void mtp_gpu_8bit_dispatch(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+                                    const float *x, float *out, int out_dim, int in_dim, int group_size) {
+    if (g_metal && g_metal->wf_buf) {
+        gpu_dequant_matmulN(g_metal, W, scales, biases, x, out, out_dim, in_dim, group_size, 1);
+    } else {
+        fast_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
+// Forward declaration; defined later in the file.
+static void gpu_mtp_attention(int seq_len, const float *q, const float *q_gate, float *out);
+
+static int mtp_try_gpu_attention(int ctx_len, const float *q, const float *q_gate, float *out) {
+    if (!dense_gpu_attn_enabled() || !g_metal || !g_metal->attn_scores_pipe ||
+        !g_metal->buf_mtp_kv_k || !g_metal->buf_mtp_kv_v ||
+        ctx_len > GPU_KV_SEQ) {
+        return 0;
+    }
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    size_t kv_bytes = (size_t)ctx_len * kv_dim * sizeof(float);
+    memcpy([g_metal->buf_mtp_kv_k contents], g_mtp_k_cache, kv_bytes);
+    memcpy([g_metal->buf_mtp_kv_v contents], g_mtp_v_cache, kv_bytes);
+    gpu_mtp_attention(ctx_len, q, q_gate, out);
+    return 1;
+}
 
 static MetalCtx *metal_setup(void) {
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
@@ -2878,6 +3008,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matmulN_8_v3  = makePipe(@"dequant_matmulN_8bit_v3");
     ctx->matmulN_8_v4  = makePipe(@"dequant_matmulN_8bit_v4");
     ctx->matmulN_8_v5  = makePipe(@"dequant_matmulN_8bit_v5");
+    ctx->bf16_matvec_pipe = makePipe(@"bf16_matvec");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec8_fast  = makePipe(@"dequant_matvec_8bit_fast");
@@ -3024,6 +3155,10 @@ static MetalCtx *metal_setup(void) {
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
         }
+        ctx->buf_mtp_kv_k = [ctx->device newBufferWithLength:kv_cache_size
+                                                      options:MTLResourceStorageModeShared];
+        ctx->buf_mtp_kv_v = [ctx->device newBufferWithLength:kv_cache_size
+                                                      options:MTLResourceStorageModeShared];
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)g_cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
@@ -3501,6 +3636,40 @@ static void gpu_dequant_matmulN(
     [cmdbuf waitUntilCompleted];
     memcpy(OUT, [obuf contents], os);
     g_prof_matmulN += now_ms() - _t_mm;
+}
+
+// ============================================================================
+// GPU BF16 matvec (for MTP head and other BF16 paths)
+// ============================================================================
+static void gpu_bf16_matvec(MetalCtx *ctx, const uint16_t *W_bf16, const float *x,
+                            float *out, int out_dim, int in_dim) {
+    if (!ctx || !ctx->bf16_matvec_pipe) { fprintf(stderr, "[gpu] bf16_matvec pipeline missing\n"); return; }
+    size_t wsz = (size_t)out_dim * in_dim * sizeof(uint16_t);
+    size_t xsz = (size_t)in_dim * sizeof(float);
+    size_t osz = (size_t)out_dim * sizeof(float);
+    static id<MTLBuffer> wbuf = nil, xbuf = nil, obuf = nil;
+    if (!wbuf || (size_t)[wbuf length] < wsz) wbuf = [ctx->device newBufferWithLength:wsz options:MTLResourceStorageModeShared];
+    if (!xbuf || (size_t)[xbuf length] < xsz) xbuf = [ctx->device newBufferWithLength:xsz options:MTLResourceStorageModeShared];
+    if (!obuf || (size_t)[obuf length] < osz) obuf = [ctx->device newBufferWithLength:osz options:MTLResourceStorageModeShared];
+    memcpy([wbuf contents], W_bf16, wsz);
+    memcpy([xbuf contents], x, xsz);
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->bf16_matvec_pipe];
+    [enc setBuffer:wbuf offset:0 atIndex:0];
+    [enc setBuffer:xbuf offset:0 atIndex:1];
+    [enc setBuffer:obuf offset:0 atIndex:2];
+    uint32_t od = (uint32_t)out_dim, idm = (uint32_t)in_dim;
+    [enc setBytes:&od length:4 atIndex:3];
+    [enc setBytes:&idm length:4 atIndex:4];
+    uint32_t num_tgs = ((uint32_t)out_dim + 255) / 256;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+    memcpy(out, [obuf contents], osz);
 }
 
 // One matmulN "job": dequant matmul of N input columns through one weight matrix.
@@ -5217,6 +5386,36 @@ static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const fl
       [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
     { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
       [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out offset:0 atIndex:2];
+      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
+      uint32_t tt=(uint32_t)(g_cfg.head_dim*g_cfg.num_attn_heads); [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
+      [e setBuffer:ctx->buf_attn_out offset:0 atIndex:0];[e setBuffer:ctx->buf_attn_gate offset:0 atIndex:1];[e setBytes:&qdim length:4 atIndex:2];
+      [e dispatchThreadgroups:MTLSizeMake((qdim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    [cmd commit]; [cmd waitUntilCompleted];
+    memcpy(out, [ctx->buf_attn_out contents], qdim * sizeof(float));
+}
+
+// GPU full-attention for the MTP head, using dedicated MTP KV buffers.
+// Caller must have copied the MTP KV cache into buf_mtp_kv_k/v first.
+static void gpu_mtp_attention(int seq_len, const float *q, const float *q_gate, float *out) {
+    MetalCtx *ctx = g_metal;
+    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
+    uint32_t hd = (uint32_t)g_cfg.head_dim, kvd = (uint32_t)kv_dim, sl = (uint32_t)seq_len;
+    uint32_t seq_stride = GPU_KV_SEQ, hpkv = (uint32_t)(g_cfg.num_attn_heads / g_cfg.num_kv_heads);
+    uint32_t qdim = (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim);
+    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    memcpy([ctx->buf_attn_q contents], q, qdim * sizeof(float));
+    memcpy([ctx->buf_attn_gate contents], q_gate, qdim * sizeof(float));
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_scores_pipe];
+      [e setBuffer:ctx->buf_attn_q offset:0 atIndex:0]; [e setBuffer:ctx->buf_mtp_kv_k offset:0 atIndex:1]; [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&scale length:4 atIndex:7];[e setBytes:&hpkv length:4 atIndex:8];[e setBytes:&sl length:4 atIndex:9];
+      [e dispatchThreadgroups:MTLSizeMake(sl*g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_softmax_pipe];
+      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBytes:&sl length:4 atIndex:1];[e setBytes:&seq_stride length:4 atIndex:2];
+      [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
+    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
+      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_mtp_kv_v offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out offset:0 atIndex:2];
       [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
       uint32_t tt=(uint32_t)(g_cfg.head_dim*g_cfg.num_attn_heads); [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
     { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
