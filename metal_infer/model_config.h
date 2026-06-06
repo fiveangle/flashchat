@@ -110,16 +110,53 @@ typedef struct {
 // JSON helpers
 // ============================================================================
 
+static const char *json_find_key_until(const char *json, const char *end, const char *key);
+
 static const char *json_find_key(const char *json, const char *key) {
+    return json_find_key_until(json, NULL, key);
+}
+
+static const char *json_find_key_until(const char *json, const char *end, const char *key) {
     size_t key_len = strlen(key);
     const char *p = json;
     while ((p = strstr(p, key)) != NULL) {
+        if (end && p >= end) return NULL;
         if (p > json && p[-1] == '"' && p[key_len] == '"') {
             const char *colon = p + key_len + 1;
+            if (end && colon >= end) return NULL;
             while (*colon && (*colon == ' ' || *colon == '\t' || *colon == '\n' || *colon == '\r')) colon++;
-            if (*colon == ':') return colon + 1;
+            if ((!end || colon < end) && *colon == ':') return colon + 1;
         }
         p += key_len;
+    }
+    return NULL;
+}
+
+static const char *json_object_end(const char *object_start) {
+    if (!object_start || *object_start != '{') return NULL;
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    for (const char *p = object_start; *p; p++) {
+        char c = *p;
+        if (in_string) {
+            if (escaped) {
+                escaped = 0;
+            } else if (c == '\\') {
+                escaped = 1;
+            } else if (c == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = 1;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) return p + 1;
+        }
     }
     return NULL;
 }
@@ -234,22 +271,34 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
         free(json);
         return -1;
     }
+    const char *model_object = strchr(model_start + strlen(model_key), '{');
+    const char *model_end = json_object_end(model_object);
+    if (!model_object || !model_end) {
+        fprintf(stderr, "ERROR: Model '%s' has malformed config object in %s\n", model_id, json_path);
+        free(json);
+        return -1;
+    }
+    // Keep every lookup scoped to this model object. The old loader searched
+    // from the selected model key to EOF, so entries without an explicit field
+    // could inherit a later model's value. That made Qwen-Qwen36-35B-A3B pick
+    // up Qwen3-Next's "thinking_capable": false, render a bare assistant turn
+    // instead of the Qwen <think> prefix, and stop after a couple of tokens.
 
     const char *p;
 #define CFG_INT(field, key_name) \
-    p = json_find_key(model_start, key_name); \
+    p = json_find_key_until(model_object, model_end, key_name); \
     if (p && json_parse_int(p, &cfg->field) != 0) { \
         fprintf(stderr, "WARNING: Failed to parse %s for model %s\n", key_name, model_id); \
     }
 
 #define CFG_FLOAT(field, key_name) \
-    p = json_find_key(model_start, key_name); \
+    p = json_find_key_until(model_object, model_end, key_name); \
     if (p && json_parse_float(p, &cfg->field) != 0) { \
         fprintf(stderr, "WARNING: Failed to parse %s for model %s\n", key_name, model_id); \
     }
 
 #define CFG_STR(field, key_name) \
-    p = json_find_key(model_start, key_name); \
+    p = json_find_key_until(model_object, model_end, key_name); \
     if (p && json_parse_string(p, cfg->field, sizeof(cfg->field)) != 0) { \
         fprintf(stderr, "WARNING: Failed to parse %s for model %s\n", key_name, model_id); \
     }
@@ -275,11 +324,11 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_INT(dense_intermediate, "intermediate_size");
     CFG_INT(full_attn_interval, "full_attention_interval");
 
-    p = json_find_key(model_start, "quantization");
+    p = json_find_key_until(model_object, model_end, "quantization");
     if (p) {
-        const char *bits_p = json_find_key(p, "bits");
+        const char *bits_p = json_find_key_until(p, model_end, "bits");
         if (bits_p) json_parse_int(bits_p, &cfg->bits);
-        const char *gs_p = json_find_key(p, "group_size");
+        const char *gs_p = json_find_key_until(p, model_end, "group_size");
         if (gs_p) json_parse_int(gs_p, &cfg->group_size);
     }
 
@@ -292,29 +341,29 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_FLOAT(rope_theta, "rope_theta");
     CFG_FLOAT(partial_rotary, "partial_rotary_factor");
 
-    p = json_find_key(model_start, "special_tokens");
+    p = json_find_key_until(model_object, model_end, "special_tokens");
     if (p) {
         const char *tp;
-        tp = json_find_key(p, "eos_1"); if (tp) json_parse_int(tp, &cfg->eos_token_1);
-        tp = json_find_key(p, "eos_2"); if (tp) json_parse_int(tp, &cfg->eos_token_2);
-        tp = json_find_key(p, "think_start"); if (tp) json_parse_int(tp, &cfg->think_start_token);
-        tp = json_find_key(p, "think_end"); if (tp) json_parse_int(tp, &cfg->think_end_token);
+        tp = json_find_key_until(p, model_end, "eos_1"); if (tp) json_parse_int(tp, &cfg->eos_token_1);
+        tp = json_find_key_until(p, model_end, "eos_2"); if (tp) json_parse_int(tp, &cfg->eos_token_2);
+        tp = json_find_key_until(p, model_end, "think_start"); if (tp) json_parse_int(tp, &cfg->think_start_token);
+        tp = json_find_key_until(p, model_end, "think_end"); if (tp) json_parse_int(tp, &cfg->think_end_token);
     }
 
     // Thinking capability defaults to ON (Qwen3 hybrid models). Instruct variants
     // set "thinking_capable": false so the server never injects a <think> block.
     cfg->thinking_capable = 1;
-    p = json_find_key(model_start, "thinking_capable");
+    p = json_find_key_until(model_object, model_end, "thinking_capable");
     if (p) {
         while (*p == ' ' || *p == ':' || *p == '\t') p++;
         if (*p == 'f' || *p == 'F' || *p == '0') cfg->thinking_capable = 0;
     }
 
-    p = json_find_key(model_start, "scripts");
+    p = json_find_key_until(model_object, model_end, "scripts");
     if (p) {
         const char *sp;
-        sp = json_find_key(p, "extract_weights"); if (sp) json_parse_string(sp, cfg->extract_weights_script, sizeof(cfg->extract_weights_script));
-        sp = json_find_key(p, "repack_experts"); if (sp) json_parse_string(sp, cfg->repack_experts_script, sizeof(cfg->repack_experts_script));
+        sp = json_find_key_until(p, model_end, "extract_weights"); if (sp) json_parse_string(sp, cfg->extract_weights_script, sizeof(cfg->extract_weights_script));
+        sp = json_find_key_until(p, model_end, "repack_experts"); if (sp) json_parse_string(sp, cfg->repack_experts_script, sizeof(cfg->repack_experts_script));
     }
 
 #undef CFG_INT
