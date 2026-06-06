@@ -32,6 +32,17 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local name="$1"
+    local needle="$2"
+    local path="$3"
+    if grep -q "$needle" "$path"; then
+        assert_fail "$name" "did not expect '$needle' in $path"
+    else
+        assert_pass "$name"
+    fi
+}
+
 TMPDIR="$(mktemp -d /tmp/flashchat-tool-template.XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -163,6 +174,7 @@ with open(sys.argv[1], "w") as f:
 PY
 
 "$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$NATIVE_REASONING_JSON" --render-output "$NATIVE_REASONING_DIR" >/dev/null 2>&1
+assert_not_contains "native 35B default system prompt avoids unsupported /think soft switch" "/think" "${NATIVE_REASONING_DIR}/system_prompt.txt"
 if tail -c 80 "${NATIVE_REASONING_DIR}/assembled_prompt.txt" | grep -q "<think>"; then
     assert_pass "native 35B parser keeps thinking capability scoped to selected model"
 else
