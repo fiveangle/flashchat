@@ -4319,6 +4319,8 @@ cmd_chat() {
     [ -n "$server_host" ] && chat_args="$chat_args --host $server_host"
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
     export FLASHCHAT_SERVER_HOST="$server_host"
+    export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
+    export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
     export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
     export FLASHCHAT_HISTORY_FILE="$(flashchat_get_history_file)"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"

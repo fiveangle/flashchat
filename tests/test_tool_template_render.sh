@@ -139,6 +139,37 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
+# The native 35B-A3B entry appears before later non-thinking Instruct entries.
+# The C registry parser must not let a later `"thinking_capable": false` leak
+# into this selected model, or Qwen thinking prompts render as bare assistant
+# turns and the model stops after a couple tokens.
+NATIVE_REASONING_JSON="${TMPDIR}/native_reasoning_request.json"
+NATIVE_REASONING_DIR="${TMPDIR}/native_reasoning_rendered"
+
+python3 - "$NATIVE_REASONING_JSON" <<'PY'
+import json
+import sys
+
+request = {
+    "model": "Qwen-Qwen36-35B-A3B",
+    "stream": False,
+    "reasoning": True,
+    "messages": [
+        {"role": "user", "content": "tell me a story"}
+    ]
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+"$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$NATIVE_REASONING_JSON" --render-output "$NATIVE_REASONING_DIR" >/dev/null 2>&1
+if tail -c 80 "${NATIVE_REASONING_DIR}/assembled_prompt.txt" | grep -q "<think>"; then
+    assert_pass "native 35B parser keeps thinking capability scoped to selected model"
+else
+    assert_fail "native 35B parser keeps thinking capability scoped to selected model" \
+        "expected reasoning-on prompt to end with assistant <think> opener"
+fi
+
 # ----- froggeric v19 chat-template fixes -----
 # Build a second request that exercises: developer role, <|think_off|> toggle,
 # preserved <think> on old assistant turn, empty-reasoning new assistant turn,

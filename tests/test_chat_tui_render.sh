@@ -19,14 +19,16 @@ trap cleanup EXIT
 
 mkdir -p "${TMPDIR}/home"
 port_file="${TMPDIR}/port"
+body_file="${TMPDIR}/request-body.txt"
 
-python3 - "$port_file" <<'PY' &
+python3 - "$port_file" "$body_file" <<'PY' &
 import json
 import socket
 import sys
 import time
 
 port_file = sys.argv[1]
+body_file = sys.argv[2]
 chunks = [
     "Here is code:\n\n",
     "```html <!DOCTYPE html> <html><body><canvas id=\"game\"></canvas></body></html>```\n",
@@ -45,7 +47,9 @@ with socket.socket() as server:
 
     conn, _ = server.accept()
     with conn:
-        conn.recv(65536)
+        request = conn.recv(65536)
+        with open(body_file, "wb") as f:
+            f.write(request)
         conn.sendall(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/event-stream\r\n"
@@ -73,13 +77,20 @@ fi
 port="$(cat "$port_file")"
 raw_output="$(
     printf 'hello\n/quit\n' |
-        HOME="${TMPDIR}/home" FLASHCHAT_MODEL=Mock "$CHAT" --host 127.0.0.1 --port "$port" --max-tokens 200 2>&1
+        HOME="${TMPDIR}/home" FLASHCHAT_MODEL=Mock FLASHCHAT_REASONING=1 FLASHCHAT_SHOW_THINKING=0 \
+            "$CHAT" --host 127.0.0.1 --port "$port" --max-tokens 200 2>&1
 )"
 clean_output="$(printf '%s\n' "$raw_output" | perl -pe 's/\e\[[0-9;]*[A-Za-z]//g')"
 
 if [[ "$clean_output" != *'<canvas id="game"></canvas>'* ]]; then
     echo "FAIL: one-line fenced HTML code was not rendered" >&2
     printf '%s\n' "$clean_output" >&2
+    exit 1
+fi
+
+if ! grep -q '"reasoning":true' "$body_file"; then
+    echo "FAIL: chat request did not preserve configured reasoning mode" >&2
+    cat "$body_file" >&2
     exit 1
 fi
 

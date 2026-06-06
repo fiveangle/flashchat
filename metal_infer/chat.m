@@ -50,6 +50,16 @@ static int json_escape(const char *src, char *buf, int bufsize) {
     return j;
 }
 
+static int flag_enabled(const char *value) {
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0) return 0;
+    if (strcasecmp(value, "false") == 0) return 0;
+    if (strcasecmp(value, "off") == 0) return 0;
+    if (strcasecmp(value, "no") == 0) return 0;
+    if (strcasecmp(value, "disabled") == 0) return 0;
+    return 1;
+}
+
 // ============================================================================
 // Session persistence
 // ============================================================================
@@ -240,7 +250,7 @@ static int connect_to_server(const char *host, int port) {
 }
 
 static int send_chat_request(const char *host, int port, const char *user_message, int max_tokens,
-                             const char *session_id, int show_thinking) {
+                             const char *session_id, int reasoning_enabled) {
     int sock = connect_to_server(host, port);
     if (sock < 0) return -1;
 
@@ -251,7 +261,7 @@ static int send_chat_request(const char *host, int port, const char *user_messag
     int body_len = snprintf(body, sizeof(body),
         "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
         "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\",\"reasoning\":%s}",
-        escaped, max_tokens, session_id, show_thinking ? "true" : "false");
+        escaped, max_tokens, session_id, reasoning_enabled ? "true" : "false");
 
     char request[MAX_INPUT_LINE * 4];
     int req_len = snprintf(request, sizeof(request),
@@ -566,7 +576,8 @@ static char *stream_response(int sock, int show_thinking) {
 int main(int argc, char **argv) {
     int port = 8000;
     int max_tokens = 8192;
-    int show_thinking = 0;
+    int reasoning_enabled = flag_enabled(getenv("FLASHCHAT_REASONING"));
+    int show_thinking = flag_enabled(getenv("FLASHCHAT_SHOW_THINKING"));
     const char *resume_id = NULL;
     const char *host = getenv("FLASHCHAT_SERVER_HOST");
     if (!host || !host[0] || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0) {
@@ -577,6 +588,8 @@ int main(int argc, char **argv) {
         {"host",        required_argument, 0, 'H'},
         {"port",        required_argument, 0, 'p'},
         {"max-tokens",  required_argument, 0, 't'},
+        {"reasoning",   no_argument,       0, 1000},
+        {"no-reasoning", no_argument,      0, 1001},
         {"show-think",  no_argument,       0, 's'},
         {"resume",      required_argument, 0, 'r'},
         {"sessions",    no_argument,       0, 'l'},
@@ -592,6 +605,8 @@ int main(int argc, char **argv) {
             case 'H': host = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 't': max_tokens = atoi(optarg); break;
+            case 1000: reasoning_enabled = 1; break;
+            case 1001: reasoning_enabled = 0; break;
             case 's': show_thinking = 1; break;
             case 'r': resume_id = optarg; break;
             case 'l': session_list(); return 0;
@@ -600,6 +615,8 @@ int main(int argc, char **argv) {
                 printf("  --host HOST      Server host (default: 127.0.0.1)\n");
                 printf("  --port N         Server port (default: 8000)\n");
                 printf("  --max-tokens N   Max response tokens (default: 8192)\n");
+                printf("  --reasoning      Enable model reasoning mode\n");
+                printf("  --no-reasoning   Disable model reasoning mode\n");
                 printf("  --show-think     Show <think> blocks (dimmed)\n");
                 printf("  --resume ID      Resume a previous session\n");
                 printf("  --sessions       List saved sessions\n");
@@ -689,7 +706,7 @@ int main(int argc, char **argv) {
         // Save user turn
         session_save_turn(session_id, "user", input_line);
 
-        sock = send_chat_request(host, port, input_line, max_tokens, session_id, show_thinking);
+        sock = send_chat_request(host, port, input_line, max_tokens, session_id, reasoning_enabled);
         if (sock < 0) continue;
 
         printf("\n");
@@ -817,7 +834,7 @@ int main(int argc, char **argv) {
             snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
 
             free(response);
-            sock = send_chat_request(host, port, tool_msg, max_tokens, session_id, show_thinking);
+            sock = send_chat_request(host, port, tool_msg, max_tokens, session_id, reasoning_enabled);
             free(tool_msg);
             if (sock < 0) { response = NULL; break; }
 
