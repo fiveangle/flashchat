@@ -1306,6 +1306,7 @@ static MTPWeightCache g_mtp_cache = {0};
 static float *g_mtp_k_cache = NULL;  // [GPU_KV_SEQ * num_kv_heads * head_dim]
 static float *g_mtp_v_cache = NULL;
 static int    g_mtp_kv_len = 0;
+static int    g_mtp_base_pos = 0;    // RoPE base position so draft matches verify
 
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps);
 static void fast_dequant_matvec(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
@@ -1526,6 +1527,7 @@ static void build_mtp_cache(WeightFile *wf) {
         g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ * kv_dim, sizeof(float));
     }
     g_mtp_kv_len = 0;
+    g_mtp_base_pos = 0;
 }
 
 static void mtp_trace_prepare_dir(void) {
@@ -1746,7 +1748,7 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         float inv_rms = 1.0f / sqrtf(sum_sq / g_cfg.head_dim + g_cfg.rms_norm_eps);
         for (int i = 0; i < g_cfg.head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(g_mtp_cache.k_norm_w[i]);
     }
-    int mtp_pos = g_mtp_kv_len;
+    int mtp_pos = g_mtp_base_pos + g_mtp_kv_len;
     apply_rotary_emb(q, k, mtp_pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
     mtp_trace_vector(trace_call, "q_rope", q, q_dim);
     mtp_trace_vector(trace_call, "q_gate", q_gate, q_dim);
@@ -6246,7 +6248,7 @@ static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
     double base_ms = now_ms() - t0;
 
     // ---- MTP verify/accept ----
-    RESET_STATE(); g_mtp_kv_len = 0;
+    RESET_STATE(); g_mtp_kv_len = 0; g_mtp_base_pos = 0;
     for (int p = 0; p < np; p++) { embed_lookup(wf, prompt[p], h); ref_forward_1(wf, h, kv, ls, fds, p, logits); }
     int t_next = cpu_argmax(logits, V);
     float *hcur = malloc(Hd*sizeof(float)); memcpy(hcur, h, Hd*sizeof(float));
@@ -6576,7 +6578,7 @@ static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next, int do
     // Real causal self-attention over committed MTP KV cache + the current token.
     // do_append persists the current token's K/V (committed-token rule); rollout
     // drafts pass do_append=0 (attend over context, don't pollute the cache).
-    apply_rotary_emb(q, k, g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    apply_rotary_emb(q, k, g_mtp_base_pos + g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
     int ncomm = (g_mtp_k_cache && g_mtp_v_cache) ? g_mtp_kv_len : 0;
     int ctx = ncomm + 1;  // committed positions + current token
     float ascale = 1.0f / sqrtf((float)g_cfg.head_dim);
@@ -6639,7 +6641,7 @@ static void dense_mtp_advance(WeightFile *wf, const float *hcur, int t) {
     fast_dequant_matvec(kw,ks,kb,normed,k,kvd,H,gsz);
     fast_dequant_matvec(vw,vs,vb,normed,v,kvd,H,gsz);
     for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
-    apply_rotary_emb(qdum, k, g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+    apply_rotary_emb(qdum, k, g_mtp_base_pos + g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
     memcpy(g_mtp_k_cache+(size_t)g_mtp_kv_len*kvd, k, kvd*4);
     memcpy(g_mtp_v_cache+(size_t)g_mtp_kv_len*kvd, v, kvd*4);
     g_mtp_kv_len++;
@@ -6686,7 +6688,7 @@ static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_ne
     // MTP self-attention KV cache (built from accepted tokens; one append per committed token)
     int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
     if (!g_mtp_k_cache) { g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); }
-    g_mtp_kv_len = 0;
+    g_mtp_kv_len = 0; g_mtp_base_pos = 0;
     GpuStateSnap snap; gpu_snap_alloc(&snap);
     float *ha=malloc(Hd*4),*hb=malloc(Hd*4),*la=malloc(V*4),*lb=malloc(V*4);
     g_prof_matmulN=g_prof_attncpu=g_prof_delta=0;  // reset profiler for the depth-2 MTP run
@@ -14067,7 +14069,8 @@ static void serve_loop(
         int mtp_shadow_checks = 0;   // drafts verified
         int mtp_pos_checks[8] = {0}; // per-position: how many times we checked that position
         int mtp_pos_hits[8]   = {0}; // per-position: how many times that position was accepted
-        g_mtp_kv_len = 0;  // fresh MTP attention context per generation
+        g_mtp_kv_len = 0;
+        g_mtp_base_pos = pos;  // sync MTP RoPE position with verify model
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
         }
@@ -15437,7 +15440,8 @@ int main(int argc, char **argv) {
         int mtp_pending_draft = -1;
         int mtp_shadow_hits = 0;
         int mtp_shadow_checks = 0;
-        g_mtp_kv_len = 0;  // fresh MTP attention context per generation
+        g_mtp_kv_len = 0;
+        g_mtp_base_pos = pos;  // sync MTP RoPE position with verify model
         if (mtp_shadow_available) {
             memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
         }
