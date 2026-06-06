@@ -2530,6 +2530,116 @@ manage_restore_runtime_only() {
     echo "Runtime artifacts restored without copying original safetensors blobs."
 }
 
+manage_reextract_weights() {
+    local model_id="$1"
+    local model_path runtime_dir weights_dir extract_script
+    model_path=$(flashchat_model_path_for_id "$model_id")
+    if [ -z "$model_path" ] || [ ! -d "$model_path" ]; then
+        echo "Model source not found for '$model_id'."
+        return 1
+    fi
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$model_path")
+    weights_dir="$runtime_dir"
+
+    if current_model_server_running "$model_id"; then
+        echo "WARNING: The Flashchat server is currently running with this model."
+        echo "Re-extracting weights while the server is active may cause crashes."
+        echo "Stop the server first with: flashchat serve --stop"
+        return 1
+    fi
+
+    echo "This will overwrite the existing non-expert weights for:"
+    echo "  $weights_dir/model_weights.bin"
+    echo "  $weights_dir/model_weights.json"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to re-extract weights:" || return 1
+
+    mkdir -p "$weights_dir" || return 1
+    rm -f "$weights_dir/model_weights.bin" "$weights_dir/model_weights.json"
+
+    extract_script=$(model_registry_script "$model_id" "extract_weights" "scripts/extract_weights.py")
+    local cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$model_path" --output "$weights_dir")
+    if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
+        cmd+=(--non-experts)
+        if model_mtp_artifacts_required "$model_id"; then
+            cmd+=(--include-mtp)
+        fi
+    fi
+    if ! run_python "${cmd[@]}"; then
+        echo "ERROR: Weight extraction failed." >&2
+        return 1
+    fi
+
+    if [ ! -f "$weights_dir/vocab.bin" ]; then
+        echo "Vocab not found — exporting tokenizer..."
+        if ! run_python "$SCRIPT_DIR/scripts/export_tokenizer.py" "$model_path/tokenizer.json" "$weights_dir/vocab.bin"; then
+            echo "WARNING: Vocabulary export failed." >&2
+        fi
+    fi
+
+    echo "Weights re-extracted successfully."
+}
+
+manage_reextract_experts() {
+    local model_id="$1"
+    local model_path runtime_dir weights_dir experts_dir repack_script
+    model_path=$(flashchat_model_path_for_id "$model_id")
+    if [ -z "$model_path" ] || [ ! -d "$model_path" ]; then
+        echo "Model source not found for '$model_id'."
+        return 1
+    fi
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$model_path")
+    weights_dir="$runtime_dir"
+    experts_dir="$weights_dir/packed_experts"
+
+    if current_model_server_running "$model_id"; then
+        echo "WARNING: The Flashchat server is currently running with this model."
+        echo "Re-extracting experts while the server is active may cause crashes."
+        echo "Stop the server first with: flashchat serve --stop"
+        return 1
+    fi
+
+    echo "This will overwrite the existing expert weights for:"
+    echo "  $experts_dir"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to re-extract experts:" || return 1
+
+    mkdir -p "$weights_dir" || return 1
+
+    repack_script=$(model_registry_script "$model_id" "repack_experts" "scripts/repack_experts.py")
+
+    if [ "${repack_script##*/}" != "compile_native_qwen.py" ]; then
+        local expert_index_path="$weights_dir/expert_index.json"
+        if [ -f "$expert_index_path" ] && ! expert_index_matches_model_path "$expert_index_path" "$model_path"; then
+            echo "Expert index points at a different model location. Regenerating..."
+            rm -f "$expert_index_path"
+        fi
+        if [ ! -f "$expert_index_path" ]; then
+            echo "Generating expert index from model safetensors..."
+            if ! run_python "$SCRIPT_DIR/scripts/generate_expert_index.py" --model "$model_path" --output "$weights_dir"; then
+                echo "ERROR: Expert index generation failed."
+                return 1
+            fi
+            echo "Expert index generated."
+        fi
+    fi
+
+    rm -rf "$experts_dir" "$weights_dir/packed_experts_lz4" "$weights_dir/packed_mtp_experts"
+
+    local cmd=("$SCRIPT_DIR/$repack_script" --model-id "$model_id")
+    if [ "${repack_script##*/}" = "compile_native_qwen.py" ]; then
+        cmd+=(--model "$model_path" --output "$weights_dir" --experts)
+        if model_mtp_artifacts_required "$model_id"; then
+            cmd+=(--mtp-experts)
+        fi
+    else
+        cmd+=(--index "$expert_index_path" --output "$experts_dir")
+    fi
+    if ! run_python "${cmd[@]}"; then
+        echo "ERROR: Expert extraction failed." >&2
+        return 1
+    fi
+    echo "Experts re-extracted successfully."
+}
+
 manage_model_menu() {
     local model_id="$1"
     local name runtime_label
@@ -2546,6 +2656,8 @@ manage_model_menu() {
         echo "  [3] Offload local model"
         echo "  [4] Install $runtime_label locally from offload"
         echo "  [5] Run from offload for this launch"
+        echo "  [6] Re-extract non-expert weights"
+        echo "  [7] Re-extract expert weights"
         echo "  [Q] Back"
         printf "> "
         read -r REPLY
@@ -2555,6 +2667,8 @@ manage_model_menu() {
             3) manage_offload_model "$model_id" || true ;;
             4) install_model_runtime_locally_from_offload "$model_id" || true ;;
             5) use_model_from_offload_repo "$model_id" || true ;;
+            6) manage_reextract_weights "$model_id" || true ;;
+            7) manage_reextract_experts "$model_id" || true ;;
             q|Q|"") return ;;
             *) echo "Please choose one of the listed actions." ;;
         esac
@@ -4200,32 +4314,33 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashchat_get_pid_file)
     
-    # Set environment for infer
+    # Set environment for infer.  Already-exported env vars take precedence
+    # over config values so ad-hoc testing (e.g. FLASHCHAT_MTP=3) is not
+    # silently clobbered by the config file.
     export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
-    # Pass the resolved runtime dirs so the server loads the selected quant variant.
     export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
     export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
     export FLASHCHAT_SERVER_PORT="$server_port"
-    export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
-    export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
-    export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
-    export FLASHCHAT_TOP_K="$(flashchat_get TOP_K)"
-    export FLASHCHAT_MIN_P="$(flashchat_get MIN_P)"
-    export FLASHCHAT_PRESENCE_PENALTY="$(flashchat_get PRESENCE_PENALTY)"
-    export FLASHCHAT_REPETITION_PENALTY="$(flashchat_get REPETITION_PENALTY)"
+    [ -z "${FLASHCHAT_REASONING}" ]                && export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
+    [ -z "${FLASHCHAT_TEMPERATURE}" ]              && export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
+    [ -z "${FLASHCHAT_TOP_P}" ]                    && export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
+    [ -z "${FLASHCHAT_TOP_K}" ]                    && export FLASHCHAT_TOP_K="$(flashchat_get TOP_K)"
+    [ -z "${FLASHCHAT_MIN_P}" ]                    && export FLASHCHAT_MIN_P="$(flashchat_get MIN_P)"
+    [ -z "${FLASHCHAT_PRESENCE_PENALTY}" ]       && export FLASHCHAT_PRESENCE_PENALTY="$(flashchat_get PRESENCE_PENALTY)"
+    [ -z "${FLASHCHAT_REPETITION_PENALTY}" ]     && export FLASHCHAT_REPETITION_PENALTY="$(flashchat_get REPETITION_PENALTY)"
     # FLASHCHAT_ACTIVE_EXPERTS is intentionally NOT re-exported from flashchat_get
     # (it has no user-config home, registry is K's home). If the user sets it in
     # their shell before invoking `flashchat serve`, bash propagates it to the
     # `infer` child naturally.
     export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
-    export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
-    export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
-    export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
-    export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
-    export FLASHCHAT_SYSTEM_PROMPT_CACHE="$(flashchat_get SYSTEM_PROMPT_CACHE)"
-    export FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
-    export FLASHCHAT_MTP="$(flashchat_get MTP)"
-    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
+    [ -z "${FLASHCHAT_SERVER_LOG}" ]               && export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
+    [ -z "${FLASHCHAT_SERVER_DEBUG}" ]             && export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
+    [ -z "${FLASHCHAT_SERVER_HTTP_LOG}" ]          && export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
+    [ -z "${FLASHCHAT_SHOW_THINKING}" ]            && export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
+    [ -z "${FLASHCHAT_SYSTEM_PROMPT_CACHE}" ]      && export FLASHCHAT_SYSTEM_PROMPT_CACHE="$(flashchat_get SYSTEM_PROMPT_CACHE)"
+    [ -z "${FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}" ] && export FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+    [ -z "${FLASHCHAT_MTP}" ]                      && export FLASHCHAT_MTP="$(flashchat_get MTP)"
+    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)"
     export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
     export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
 

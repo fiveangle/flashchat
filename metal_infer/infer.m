@@ -14091,6 +14091,9 @@ static void serve_loop(
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
         double t_gen = now_ms();
+        if (mtp_shadow_available && g_server_debug_enabled) {
+            g_prof_matmulN = g_prof_attncpu = g_prof_delta = 0.0;
+        }
         // Native Qwen3 generation prompt opens with <think>\n when reasoning
         // is on, so the model starts INSIDE the think block — generation will
         // emit content tokens, then </think>, then the actual response.
@@ -14245,10 +14248,13 @@ tool_call_checked:
                                                 effective_repetition_penalty, token_counts, req.reasoning_enabled)
 
             int mtp_did_spec = 0;
+            double mtp_iter_ms = 0, mtp_draft_ms = 0, mtp_verify_ms = 0, mtp_refwd_ms = 0;
             if (mtp_shadow_available) {
+                double _t_iter = g_server_debug_enabled ? now_ms() : 0.0;
                 // Roll out up to B-1 chained drafts from (backbone, seed=next_token).
                 int mtp_kv_L = g_mtp_kv_len, nd = 0;
                 {
+                    double _t_draft = g_server_debug_enabled ? now_ms() : 0.0;
                     float *mhp = mtp_backbone_hidden; int tok = next_token;
                     float emb[mtp_H];
                     for (int j = 0; j < mtp_B - 1; j++) {
@@ -14257,15 +14263,18 @@ tool_call_checked:
                         if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, 0) != 0 || dj < 0) break;
                         mtp_drafts[j] = dj; mhp = mtp_mh + (size_t)j*mtp_H; tok = dj; nd++;
                     }
+                    if (g_server_debug_enabled) mtp_draft_ms = now_ms() - _t_draft;
                 }
                 if (nd > 0) {
                     mtp_did_spec = 1;
                     int Nv = nd + 1;
+                    double _t_verify = g_server_debug_enabled ? now_ms() : 0.0;
                     gpu_snap_save(&mtp_snap, kv_caches);
                     embed_lookup(wf, next_token, mtp_hs);
                     for (int j = 0; j < nd; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
                     for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
                     fused_dense_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                    if (g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
                     // Accept the longest correct prefix.
                     int acc = 0;
                     for (int j = 0; j < nd; j++) {
@@ -14277,12 +14286,19 @@ tool_call_checked:
                     int seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);  // corrected (acc<nd) or bonus
                     if (acc < nd) {
                         // Partial: undo the speculative tail, re-forward the acc+1 committed positions.
+                        double _t_refwd = g_server_debug_enabled ? now_ms() : 0.0;
                         gpu_snap_restore(&mtp_snap, kv_caches);
                         embed_lookup(wf, next_token, mtp_hs);
                         for (int j = 0; j < acc; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
                         for (int t = 0; t < acc+1; t++) mtp_posv[t] = pos + t;
                         fused_dense_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
                         seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
+                        if (g_server_debug_enabled) mtp_refwd_ms = now_ms() - _t_refwd;
+                    }
+                    if (g_server_debug_enabled) {
+                        mtp_iter_ms = now_ms() - _t_iter;
+                        server_log_errorf("[mtp-debug] %s iter draft=%.2fms verify=%.2fms refwd=%.2fms total=%.2fms nd=%d acc=%d\n",
+                                          request_id, mtp_draft_ms, mtp_verify_ms, mtp_refwd_ms, mtp_iter_ms, nd, acc);
                     }
                     // MTP attention KV: keep only the committed prefix's entries (the
                     // rollout appended the input tokens; drop the rejected tail).
@@ -14398,6 +14414,16 @@ tool_call_checked:
                               gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
                               parsed_tool_call.is_tool_call ? " [tool_call]" : "",
                               mtp_summary);
+            if (mtp_shadow_available && g_server_debug_enabled) {
+                double gen_ms = now_ms() - t_gen;
+                double prof_total = g_prof_matmulN + g_prof_attncpu + g_prof_delta;
+                server_log_errorf("[mtp-prof] %s matmulN=%.0fms (%.1f%%) attn_cpu=%.0fms (%.1f%%) delta_gpu=%.0fms (%.1f%%) other=%.0fms (%.1f%%)\n",
+                                  request_id,
+                                  g_prof_matmulN, 100.0 * g_prof_matmulN / gen_ms,
+                                  g_prof_attncpu, 100.0 * g_prof_attncpu / gen_ms,
+                                  g_prof_delta, 100.0 * g_prof_delta / gen_ms,
+                                  gen_ms - prof_total, 100.0 * (gen_ms - prof_total) / gen_ms);
+            }
         }
         if (g_expert_cache) cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
         else if (g_malloc_cache) cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
