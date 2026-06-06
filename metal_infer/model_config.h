@@ -224,7 +224,7 @@ static int load_default_model_id(const char *json_path, char *out, size_t out_le
     return rc;
 }
 
-static int load_server_mtp_default(const char *json_path, int *out) {
+static int __attribute__((unused)) load_server_mtp_default(const char *json_path, int *out) {
     FILE *f = fopen(json_path, "rb");
     if (!f) return -1;
 
