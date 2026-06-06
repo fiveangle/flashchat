@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -10575,6 +10576,44 @@ static NSString *strip_think_directive(NSString *prompt) {
     return stripped;
 }
 
+static int is_tail_word_byte(unsigned char c) {
+    return isalnum(c) || c == '_';
+}
+
+static int repeated_tail_word_count(const char *text) {
+    if (!text || !text[0]) return 0;
+    const char *start = text;
+    const char *p = text + strlen(text);
+    char last[128] = {0};
+    int last_len = 0;
+    int repeats = 0;
+
+    while (p > start) {
+        while (p > start && !is_tail_word_byte((unsigned char)p[-1])) p--;
+        const char *end = p;
+        while (p > start && is_tail_word_byte((unsigned char)p[-1])) p--;
+        int len = (int)(end - p);
+        if (len <= 0) break;
+        if (len >= (int)sizeof(last)) len = (int)sizeof(last) - 1;
+
+        char word[128];
+        for (int i = 0; i < len; i++) {
+            word[i] = (char)tolower((unsigned char)p[i]);
+        }
+        word[len] = 0;
+
+        if (last_len == 0) {
+            memcpy(last, word, (size_t)len + 1);
+            last_len = len;
+            repeats = 1;
+            continue;
+        }
+        if (len != last_len || memcmp(word, last, (size_t)len) != 0) break;
+        repeats++;
+    }
+    return repeats;
+}
+
 // froggeric v18 "Smart False-Positive Error Detection": substring matching on
 // the word "error" is dangerous because successful API/JSON returns routinely
 // contain it as a key prefix (`error_rate`, `errors_logged`). We use strict
@@ -10643,7 +10682,7 @@ static int extract_think_toggle(NSMutableString *content_io) {
 static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *info) {
     if (info) memset(info, 0, sizeof(*info));
     char *base_c = load_system_prompt();
-    NSString *base = [NSString stringWithUTF8String:base_c ?: "You are a helpful assistant. /think"];
+    NSString *base = [NSString stringWithUTF8String:base_c ?: "You are a helpful assistant."];
     free(base_c);
     NSString *user_sys = req->system_prompt && req->system_prompt[0]
         ? [NSString stringWithUTF8String:req->system_prompt]
@@ -12100,7 +12139,7 @@ static char *load_system_prompt(void) {
     }
     if (path[0]) {
         FILE *f = fopen(path, "r");
-        if (!f) return strdup("You are a helpful assistant. /think");
+        if (!f) return strdup("You are a helpful assistant.");
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -12111,7 +12150,7 @@ static char *load_system_prompt(void) {
         fprintf(stderr, "[serve] Loaded custom system prompt from %s (%ld bytes)\n", path, sz);
         return buf;
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant.");
 }
 
 // Build the native Qwen3 tool-block exactly as the model's chat_template
@@ -12189,7 +12228,7 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
 __attribute__((unused))
 static PromptTokens *tokenize_chat_message_old(const char *user_content) {
     const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
@@ -14040,6 +14079,7 @@ static void serve_loop(
                         !(req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0]))
                        ? 1 : 0;
         int think_tokens = 0;
+        int think_budget_hit = 0;
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
@@ -14047,6 +14087,17 @@ static void serve_loop(
             if (next_token == g_cfg.think_end_token) in_think = 0;
             if (in_think) think_tokens++;
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
+                int tail_repeats = repeated_tail_word_count(gen_reasoning);
+                if (!think_budget_hit) {
+                    think_budget_hit = 1;
+                    if (tail_repeats > 5) {
+                        server_log_errorf("[serve] %s think_budget hit tokens=%d limit=%d tail_word_repeats=%d action=stop\n",
+                                          request_id, think_tokens, g_think_budget, tail_repeats);
+                        break;
+                    }
+                    server_log_errorf("[serve] %s think_budget hit tokens=%d limit=%d tail_word_repeats=%d action=force_think_end\n",
+                                      request_id, think_tokens, g_think_budget, tail_repeats);
+                }
                 next_token = g_cfg.think_end_token;
                 in_think = 0;
             }

@@ -511,9 +511,16 @@ static char *stream_response(int sock, int show_thinking) {
             if (ak) mtp_accepted = atoi(ak + 15);
         }
 
-        char *ck = strstr(line + 6, "\"content\":\"");
+        int is_reasoning_delta = 0;
+        char *ck = strstr(line + 6, "\"reasoning_content\":\"");
+        if (ck) {
+            ck += 21;
+            is_reasoning_delta = 1;
+        } else {
+            ck = strstr(line + 6, "\"content\":\"");
+            if (ck) ck += 11;
+        }
         if (!ck) continue;
-        ck += 11;
 
         char decoded[4096]; int di = 0;
         for (int i = 0; ck[i] && ck[i] != '"' && di < 4095; i++) {
@@ -531,20 +538,22 @@ static char *stream_response(int sock, int show_thinking) {
         decoded[di] = 0;
         if (!di) continue;
 
+        if (is_reasoning_delta) in_think = 1;
+        else in_think = 0;
         if (strstr(decoded, "<think>")) in_think = 1;
         if (strstr(decoded, "</think>")) { in_think = 0; tokens++; continue; }
         tokens++;
         if (!t_first) t_first = now_ms();
 
         // Accumulate non-thinking response
-        if (!in_think && resp_len + di < MAX_RESPONSE - 1) {
+        if (!is_reasoning_delta && !in_think && resp_len + di < MAX_RESPONSE - 1) {
             memcpy(response + resp_len, decoded, di);
             resp_len += di;
             response[resp_len] = 0;
         }
 
-        if (in_think && !show_thinking) continue;
-        if (in_think) printf(ANSI_DIM "%s" ANSI_RESET, decoded);
+        if (is_reasoning_delta && !show_thinking) continue;
+        if (is_reasoning_delta || in_think) printf(ANSI_DIM "%s" ANSI_RESET, decoded);
         else md_print(decoded);
         fflush(stdout);
     }
