@@ -1282,12 +1282,18 @@ typedef struct {
     uint16_t *q_norm_w;
     uint16_t *k_norm_w;
     uint16_t *post_attn_norm_w;
+    // MoE head feed-forward: router gate + shared expert (+ routed experts on SSD).
     uint32_t *gate_w; uint16_t *gate_s, *gate_b;
     uint32_t *sg_w;   uint16_t *sg_s, *sg_b;
     uint32_t *su_w;   uint16_t *su_s, *su_b;
     uint32_t *sd_w;   uint16_t *sd_s, *sd_b;
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b;
+    // Dense head feed-forward: plain gate/up/down swiglu (no router, no experts).
+    uint32_t *dgate_w; uint16_t *dgate_s, *dgate_b;
+    uint32_t *dup_w;   uint16_t *dup_s, *dup_b;
+    uint32_t *ddown_w; uint16_t *ddown_s, *ddown_b;
     uint16_t *norm_w;
+    int is_dense;   // resolved once at load: 1 = dense MLP head, 0 = MoE head
     int ready;
 } MTPWeightCache;
 
@@ -1463,8 +1469,33 @@ static void build_mtp_cache(WeightFile *wf) {
     g_mtp_cache.seg_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.weight");
     g_mtp_cache.seg_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.scales");
     g_mtp_cache.seg_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
+    // Dense MLP head tensors (mutually exclusive with the MoE set above).
+    g_mtp_cache.dgate_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.weight");
+    g_mtp_cache.dgate_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.scales");
+    g_mtp_cache.dgate_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.biases");
+    g_mtp_cache.dup_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.weight");
+    g_mtp_cache.dup_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.scales");
+    g_mtp_cache.dup_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.biases");
+    g_mtp_cache.ddown_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.weight");
+    g_mtp_cache.ddown_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.scales");
+    g_mtp_cache.ddown_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.biases");
     g_mtp_cache.norm_w = get_tensor_ptr_optional(wf, "mtp.norm.weight");
-    g_mtp_cache.ready =
+
+    // Head type is fixed for the life of the process: resolve it once here so the
+    // per-draft hot path only reads g_mtp_cache.is_dense (never re-derives it).
+    int moe_ff_present =
+        g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
+        g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
+        g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
+        g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
+        g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b;
+    int dense_ff_present =
+        g_mtp_cache.dgate_w && g_mtp_cache.dgate_s && g_mtp_cache.dgate_b &&
+        g_mtp_cache.dup_w && g_mtp_cache.dup_s && g_mtp_cache.dup_b &&
+        g_mtp_cache.ddown_w && g_mtp_cache.ddown_s && g_mtp_cache.ddown_b;
+    g_mtp_cache.is_dense = (!moe_ff_present && dense_ff_present);
+
+    int common_ready =
         g_mtp_cache.pre_fc_norm_hidden_w &&
         g_mtp_cache.pre_fc_norm_embedding_w &&
         g_mtp_cache.fc_w && g_mtp_cache.fc_s && g_mtp_cache.fc_b &&
@@ -1475,12 +1506,18 @@ static void build_mtp_cache(WeightFile *wf) {
         g_mtp_cache.o_w && g_mtp_cache.o_s && g_mtp_cache.o_b &&
         g_mtp_cache.q_norm_w && g_mtp_cache.k_norm_w &&
         g_mtp_cache.post_attn_norm_w &&
-        g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
-        g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
-        g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
-        g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
-        g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b &&
         g_mtp_cache.norm_w;
+    // The draft path also reads embed_tokens (embed the next token) and lm_head
+    // (project the draft hidden -> logits). Fold their presence into `ready` here,
+    // once, so the per-request gate is a pure integer check — never a manifest probe.
+    int head_io_present =
+        manifest_has_tensor(wf, "model.embed_tokens.weight") &&
+        manifest_has_tensor(wf, "model.embed_tokens.scales") &&
+        manifest_has_tensor(wf, "model.embed_tokens.biases") &&
+        manifest_has_tensor(wf, "lm_head.weight") &&
+        manifest_has_tensor(wf, "lm_head.scales") &&
+        manifest_has_tensor(wf, "lm_head.biases");
+    g_mtp_cache.ready = common_ready && head_io_present && (moe_ff_present || dense_ff_present);
 
     if (g_mtp_cache.ready && !g_mtp_k_cache) {
         int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
@@ -1759,6 +1796,14 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
 
     cpu_rms_norm(x, g_mtp_cache.post_attn_norm_w, h_post, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "post_attn_norm", h_post, g_cfg.hidden_dim);
+
+    // Feed-forward block — the only part of the drafter that differs between head
+    // types. Head type was resolved once at load (g_mtp_cache.is_dense); this is a
+    // single, perfectly-predicted branch around a multi-ms matvec block, not a
+    // per-element decision. Both branches leave the FFN contribution accumulated
+    // into x[], then fall through to the shared final norm below.
+    int expert_index = -1;
+    if (!g_mtp_cache.is_dense) {
     fast_dequant_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
                         h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size);
     fast_dequant_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
@@ -1796,7 +1841,7 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
             }
         }
     }
-    int expert_index = expert_indices[0];
+    expert_index = expert_indices[0];
     if (g_mtp_trace_enabled) {
         char selected[512];
         size_t off = (size_t)snprintf(selected, sizeof(selected),
@@ -1874,6 +1919,30 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     for (int i = 0; i < g_cfg.hidden_dim; i++) {
         x[i] = x[i] + moe_out[i] + shared_out[i] * shared_weight;
     }
+    } else {
+        // Dense head: plain gate/up swiglu over dense_intermediate, then down_proj,
+        // added straight onto the residual (no router, no experts, no shared expert).
+        int inter = g_cfg.dense_intermediate;
+        float *dg = calloc(inter, sizeof(float));
+        float *du = calloc(inter, sizeof(float));
+        float *da = calloc(inter, sizeof(float));
+        float *dmlp_out = calloc(g_cfg.hidden_dim, sizeof(float));
+        if (!dg || !du || !da || !dmlp_out) {
+            free(dg); free(du); free(da); free(dmlp_out);
+            fprintf(stderr, "[mtp] forward failed: dense MLP allocation failure\n");
+            goto cleanup;
+        }
+        fast_dequant_matvec(g_mtp_cache.dgate_w, g_mtp_cache.dgate_s, g_mtp_cache.dgate_b,
+                            h_post, dg, inter, g_cfg.hidden_dim, g_cfg.group_size);
+        fast_dequant_matvec(g_mtp_cache.dup_w, g_mtp_cache.dup_s, g_mtp_cache.dup_b,
+                            h_post, du, inter, g_cfg.hidden_dim, g_cfg.group_size);
+        cpu_swiglu(dg, du, da, inter);
+        fast_dequant_matvec(g_mtp_cache.ddown_w, g_mtp_cache.ddown_s, g_mtp_cache.ddown_b,
+                            da, dmlp_out, g_cfg.hidden_dim, inter, g_cfg.group_size);
+        mtp_trace_vector(trace_call, "dense_mlp_out", dmlp_out, g_cfg.hidden_dim);
+        for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = x[i] + dmlp_out[i];
+        free(dg); free(du); free(da); free(dmlp_out);
+    }
     cpu_rms_norm(x, g_mtp_cache.norm_w, final_normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "final_residual", x, g_cfg.hidden_dim);
     mtp_trace_vector(trace_call, "final_norm", final_normed, g_cfg.hidden_dim);
@@ -1886,7 +1955,12 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
                 fc_rms, layer_rms, final_rms, expert_index);
     }
     if (out_hidden) {
-        memcpy(out_hidden, final_normed, g_cfg.hidden_dim * sizeof(float));
+        // Chain the PRE-final-norm residual hidden (x), not final_normed. The rollout
+        // seed is the backbone's pre-final-norm hidden and each step re-applies
+        // pre_fc_norm_hidden internally; handing back the post-norm vector would
+        // double-normalize. final_normed exists only to feed lm_head just below.
+        // Matches the validated dense_mtp_draft convention.
+        memcpy(out_hidden, x, g_cfg.hidden_dim * sizeof(float));
     }
     if (out_draft_token) {
         *out_draft_token = -1;
@@ -1949,20 +2023,17 @@ static int mtp_preflight_decoder_layer(WeightFile *wf, const char *model_path) {
     return rc;
 }
 
-static int mtp_can_shadow_draft(WeightFile *wf) {
-    return g_mtp_predictions > 0 && g_mtp_cache.ready &&
-           get_tensor_info(wf, "lm_head.weight") &&
-           get_tensor_info(wf, "lm_head.scales") &&
-           get_tensor_info(wf, "lm_head.biases") &&
-           get_tensor_info(wf, "model.embed_tokens.weight") &&
-           get_tensor_info(wf, "model.embed_tokens.scales") &&
-           get_tensor_info(wf, "model.embed_tokens.biases");
+// Pure integer gate: every tensor the draft path needs (MTP head + embed_tokens +
+// lm_head) was resolved once at load and folded into g_mtp_cache.ready. No manifest
+// probing here — this is read on the per-request path and must stay branch-cheap.
+static int mtp_can_shadow_draft(void) {
+    return g_mtp_predictions > 0 && g_mtp_cache.ready;
 }
 
 static int mtp_shadow_draft_token(WeightFile *wf, const char *model_path,
                                   const float *backbone_hidden, int accepted_token,
                                   int *out_draft_token) {
-    if (!mtp_can_shadow_draft(wf) || accepted_token < 0 || accepted_token >= g_cfg.vocab_size) {
+    if (!mtp_can_shadow_draft() || accepted_token < 0 || accepted_token >= g_cfg.vocab_size) {
         if (out_draft_token) *out_draft_token = -1;
         return -1;
     }
@@ -13625,7 +13696,7 @@ static void serve_loop(
         int disk_cache_invalid = 0;
         int pos = 0;
 
-        if (cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
+        if (g_system_prompt_cache_enabled && cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
             // Cache hit: restore snapshot
             server_log_errorf("[serve] %s sys_prompt_cache hit hash=%llu tokens=%d\n",
                               request_id, req_sys_hash, cached_sys_token_count);
@@ -13691,12 +13762,14 @@ static void serve_loop(
             if (disk_cache_invalid) {
                 discard_system_prompt_disk_cache(model_path, req_sys_hash);
             }
-            if (cached_sys_hash != 0) {
-                server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%llu new_hash=%llu\n",
-                                  request_id, cached_sys_hash, req_sys_hash);
-            } else {
-                server_log_errorf("[serve] %s sys_prompt_cache miss new_hash=%llu tokens=%d\n",
-                                  request_id, req_sys_hash, sys_prompt_token_count);
+            if (g_system_prompt_cache_enabled) {
+                if (cached_sys_hash != 0) {
+                    server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%llu new_hash=%llu\n",
+                                      request_id, cached_sys_hash, req_sys_hash);
+                } else {
+                    server_log_errorf("[serve] %s sys_prompt_cache miss new_hash=%llu tokens=%d\n",
+                                      request_id, req_sys_hash, sys_prompt_token_count);
+                }
             }
             clear_runtime_state_serve(layer_states, kv_caches);
             req.used_snapshot = 0;
@@ -13770,20 +13843,23 @@ static void serve_loop(
                 else discard_deferred_experts();
                 pos++;
             }
-            // Save snapshot at system prompt boundary
+            // Save snapshot at system prompt boundary. When the cache is disabled we
+            // do NONE of this: no in-memory snapshot capture (allocations + KV-state
+            // memcpys), no disk write, and no "saved" log line. "Disabled" means the
+            // request always cold-prefills and leaves no cache state behind.
             int snapshot_saved = 0;
-            if (capture_system_prompt_snapshots(sys_token_end,
-                                                kv_snapshots,
-                                                la_conv_snapshots,
-                                                la_ssm_snapshots,
-                                                gpu_delta_snapshots,
-                                                gpu_conv_snapshots,
-                                                layer_states,
-                                                kv_caches) != 0) {
-                server_log_errorf("[serve] %s sys_prompt_cache snapshot allocation failed\n", request_id);
-            } else {
-                snapshot_saved = 1;
-                if (g_system_prompt_cache_enabled) {
+            if (g_system_prompt_cache_enabled) {
+                if (capture_system_prompt_snapshots(sys_token_end,
+                                                    kv_snapshots,
+                                                    la_conv_snapshots,
+                                                    la_ssm_snapshots,
+                                                    gpu_delta_snapshots,
+                                                    gpu_conv_snapshots,
+                                                    layer_states,
+                                                    kv_caches) != 0) {
+                    server_log_errorf("[serve] %s sys_prompt_cache snapshot allocation failed\n", request_id);
+                } else {
+                    snapshot_saved = 1;
                     char save_path[PATH_MAX];
                     int save_path_existed = 0;
                     if (system_prompt_cache_path(model_path, req_sys_hash, save_path, sizeof(save_path)) == 0 &&
@@ -13875,7 +13951,7 @@ static void serve_loop(
         }
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
-        int mtp_shadow_available = mtp_can_shadow_draft(wf);  // MTP enabled AND artifacts present
+        int mtp_shadow_available = mtp_can_shadow_draft();  // MTP enabled AND artifacts present (load-time resolved)
         int mtp_shadow_hits = 0;     // drafts accepted (real speculative decode)
         int mtp_shadow_checks = 0;   // drafts verified
         int mtp_pos_checks[8] = {0}; // per-position: how many times we checked that position
@@ -15195,7 +15271,7 @@ int main(int argc, char **argv) {
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
-        int mtp_shadow_available = mtp_can_shadow_draft(wf);
+        int mtp_shadow_available = mtp_can_shadow_draft();
         int mtp_pending_draft = -1;
         int mtp_shadow_hits = 0;
         int mtp_shadow_checks = 0;
