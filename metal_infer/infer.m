@@ -5689,14 +5689,15 @@ static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int pac
 // production, so it stays bit-faithful at any N.
 static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_fd) {
     int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    size_t esz = active_expert_size();
     float *hp = malloc((size_t)N*H*sizeof(float));
     int   *idx = malloc((size_t)N*K*sizeof(int));
     float *wt  = malloc((size_t)N*K*sizeof(float));
     for (int t = 0; t < N; t++)
         moe_route(wf, layer, hs+(size_t)t*H, hp+(size_t)t*H, idx+(size_t)t*K, wt+(size_t)t*K);
     float *moe = calloc((size_t)N*H, sizeof(float));
-    void *buf = malloc(active_expert_size());
-    float *eo = malloc(H*sizeof(float));
+
+    // Union of all unique experts across all tokens
     int *seen = calloc(g_cfg.num_experts, sizeof(int));
     int *uni  = malloc((size_t)N*K*sizeof(int)); int n_union = 0;
     for (int t = 0; t < N; t++) for (int k = 0; k < K; k++) {
@@ -5704,25 +5705,76 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         if (e >= 0 && e < g_cfg.num_experts && !seen[e]) { seen[e] = 1; uni[n_union++] = e; }
     }
     g_moe_last_union = n_union;
-    for (int u = 0; u < n_union; u++) {
-        int e = uni[u];
-        if (pread(packed_fd, buf, active_expert_size(), (off_t)e * active_expert_size()) != (ssize_t)active_expert_size()) continue;
-        for (int t = 0; t < N; t++) {
-            int kk = -1;
-            for (int k = 0; k < K; k++) if (idx[(size_t)t*K+k] == e) { kk = k; break; }
-            if (kk >= 0) {
-                routed_ffn_1(buf, hp+(size_t)t*H, eo);
-                cpu_vec_madd(moe+(size_t)t*H, eo, wt[(size_t)t*K+kk], H);
+
+    // If GPU is unavailable or the union exceeds our multi-expert buffer slots,
+    // fall back to the per-expert routed_ffn_1 path (slower but always correct).
+    if (!g_metal || n_union > MAX_K) {
+        void *buf = malloc(esz);
+        float *eo = malloc(H*sizeof(float));
+        for (int u = 0; u < n_union; u++) {
+            int e = uni[u];
+            if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
+            for (int t = 0; t < N; t++) {
+                int kk = -1;
+                for (int k = 0; k < K; k++) if (idx[(size_t)t*K+k] == e) { kk = k; break; }
+                if (kk >= 0) {
+                    routed_ffn_1(buf, hp+(size_t)t*H, eo);
+                    cpu_vec_madd(moe+(size_t)t*H, eo, wt[(size_t)t*K+kk], H);
+                }
             }
         }
+        free(buf); free(eo);
+    } else {
+        // Fast path: load union experts into GPU buffers once, then dispatch
+        // all K experts for each token in a single command buffer (one
+        // commit+wait per token instead of one per expert).
+        int *union_slot = malloc(g_cfg.num_experts * sizeof(int));
+        for (int i = 0; i < g_cfg.num_experts; i++) union_slot[i] = -1;
+        for (int u = 0; u < n_union; u++) union_slot[uni[u]] = u;
+
+        void *buf = malloc(esz);
+        for (int u = 0; u < n_union; u++) {
+            int e = uni[u];
+            if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
+            memcpy([g_metal->buf_multi_expert_data[u] contents], buf, esz);
+        }
+        free(buf);
+
+        for (int t = 0; t < N; t++) {
+            int valid[MAX_K] = {0};
+            id<MTLBuffer> __strong expert_bufs[MAX_K] = {nil};
+            for (int k = 0; k < K; k++) {
+                int e = idx[(size_t)t*K+k];
+                int slot = union_slot[e];
+                if (slot < 0) continue;
+                valid[slot] = 1;
+                expert_bufs[slot] = g_metal->buf_multi_expert_data[slot];
+            }
+            memcpy([g_metal->buf_multi_expert_input contents],
+                   hp + (size_t)t * H, (size_t)H * sizeof(float));
+
+            id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+            gpu_encode_experts_batched(g_metal, cmd, MAX_K, valid, expert_bufs);
+            [cmd commit]; [cmd waitUntilCompleted];
+
+            for (int k = 0; k < K; k++) {
+                int e = idx[(size_t)t*K+k];
+                int slot = union_slot[e];
+                if (slot < 0) continue;
+                float *out = (float *)[g_metal->buf_multi_expert_out[slot] contents];
+                cpu_vec_madd(moe + (size_t)t * H, out, wt[(size_t)t*K+k], H);
+            }
+        }
+        free(union_slot);
     }
+
     float *shared = malloc(H*sizeof(float));
     for (int t = 0; t < N; t++) {
         shared_expert_1(wf, layer, hp+(size_t)t*H, shared);
         for (int i = 0; i < H; i++)
             hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[i];
     }
-    free(hp); free(idx); free(wt); free(moe); free(buf); free(eo); free(seen); free(uni); free(shared);
+    free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared);
 }
 
 // Stage 3 unit test: moe_block_2 must match two independent moe_block_1 calls.
