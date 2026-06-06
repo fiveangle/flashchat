@@ -1876,3 +1876,28 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+
+// ============================================================================
+// Kernel 13: BF16 matrix-vector multiply (for MTP head and other BF16 paths)
+// ============================================================================
+// Simple row-wise matvec over native BF16 weights.
+// Weights are stored as uint16_t bfloat16 values in row-major order.
+// Dispatch: (out_dim + 255) / 256 threadgroups, 256 threads each.
+
+kernel void bf16_matvec(
+    device const uint16_t* W [[buffer(0)]],
+    device const float*    x [[buffer(1)]],
+    device float*          out [[buffer(2)]],
+    constant uint&         out_dim [[buffer(3)]],
+    constant uint&         in_dim  [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    float sum = 0.0f;
+    device const uint16_t* row = W + tid * in_dim;
+    for (uint j = 0; j < in_dim; j++) {
+        sum += bf16_to_f32(row[j]) * x[j];
+    }
+    out[tid] = sum;
+}
