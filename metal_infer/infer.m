@@ -10614,6 +10614,26 @@ static int repeated_tail_word_count(const char *text) {
     return repeats;
 }
 
+static int repeated_tail_token_ngram(const int *tokens, int count, int max_width, int *out_width) {
+    if (out_width) *out_width = 0;
+    for (int width = 1; width <= max_width; width++) {
+        int repeats = 1;
+        if (count < width * 6) continue;
+        const int *tail = tokens + count - width;
+        for (;;) {
+            int prev_start = count - (repeats + 1) * width;
+            if (prev_start < 0) break;
+            if (memcmp(tokens + prev_start, tail, (size_t)width * sizeof(int)) != 0) break;
+            repeats++;
+        }
+        if (repeats > 5) {
+            if (out_width) *out_width = width;
+            return repeats;
+        }
+    }
+    return 0;
+}
+
 // froggeric v18 "Smart False-Positive Error Detection": substring matching on
 // the word "error" is dangerous because successful API/JSON returns routinely
 // contain it as a key prefix (`error_rate`, `errors_logged`). We use strict
@@ -14065,6 +14085,8 @@ static void serve_loop(
         // 65536 bytes is a generous bound.
         char *gen_reasoning = calloc(1, 65536);
         int gen_reasoning_len = 0;
+        int *gen_tokens = calloc((size_t)req.max_tokens + 1, sizeof(int));
+        int gen_token_count = 0;
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
@@ -14115,6 +14137,16 @@ static void serve_loop(
             }
 
             int is_think_marker = (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token);
+            if (!is_think_marker && gen_tokens && gen_token_count < req.max_tokens) {
+                gen_tokens[gen_token_count++] = next_token;
+                int repeat_width = 0;
+                int repeat_count = repeated_tail_token_ngram(gen_tokens, gen_token_count, 8, &repeat_width);
+                if (repeat_count > 5 && gen_count >= 128) {
+                    server_log_errorf("[serve] %s repeat_guard hit generated=%d token_ngram_width=%d repeats=%d action=stop\n",
+                                      request_id, gen_count, repeat_width, repeat_count);
+                    break;
+                }
+            }
             if (!is_think_marker && tok_str) {
                 int tlen = (int)strlen(tok_str);
                 if (in_think) {
@@ -14373,6 +14405,7 @@ tool_call_checked:
         free(final_json);
         free(gen_response);
         free(gen_reasoning);
+        free(gen_tokens);
         free(token_counts);
         parsed_tool_call_free(&parsed_tool_call);
         free(tool_call_buf);
