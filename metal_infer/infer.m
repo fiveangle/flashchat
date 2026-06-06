@@ -75,6 +75,7 @@
 #include <sys/wait.h>
 #include <compression.h>
 #include <dirent.h>
+#include <libgen.h>
 
 #include "model_config.h"
 
@@ -1484,55 +1485,57 @@ static MTPArtifacts detect_mtp_artifacts(WeightFile *wf, const char *model_path)
     return mtp;
 }
 
-static void build_mtp_cache(WeightFile *wf) {
+static void build_mtp_cache(WeightFile *wf, WeightFile *bf16_wf) {
     memset(&g_mtp_cache, 0, sizeof(g_mtp_cache));
-    g_mtp_cache.pre_fc_norm_hidden_w = get_tensor_ptr_optional(wf, "mtp.pre_fc_norm_hidden.weight");
-    g_mtp_cache.pre_fc_norm_embedding_w = get_tensor_ptr_optional(wf, "mtp.pre_fc_norm_embedding.weight");
-    g_mtp_cache.fc_w = get_tensor_ptr_optional(wf, "mtp.fc.weight");
-    g_mtp_cache.fc_s = get_tensor_ptr_optional(wf, "mtp.fc.scales");
-    g_mtp_cache.fc_b = get_tensor_ptr_optional(wf, "mtp.fc.biases");
-    g_mtp_cache.layer_input_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.input_layernorm.weight");
-    g_mtp_cache.q_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.weight");
-    g_mtp_cache.q_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.scales");
-    g_mtp_cache.q_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_proj.biases");
-    g_mtp_cache.k_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.weight");
-    g_mtp_cache.k_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.scales");
-    g_mtp_cache.k_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_proj.biases");
-    g_mtp_cache.v_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.weight");
-    g_mtp_cache.v_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.scales");
-    g_mtp_cache.v_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.v_proj.biases");
-    g_mtp_cache.o_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.weight");
-    g_mtp_cache.o_s = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.scales");
-    g_mtp_cache.o_b = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.o_proj.biases");
-    g_mtp_cache.q_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.q_norm.weight");
-    g_mtp_cache.k_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.self_attn.k_norm.weight");
-    g_mtp_cache.post_attn_norm_w = get_tensor_ptr_optional(wf, "mtp.layers.0.post_attention_layernorm.weight");
-    g_mtp_cache.gate_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.weight");
-    g_mtp_cache.gate_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.scales");
-    g_mtp_cache.gate_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate.biases");
-    g_mtp_cache.sg_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.weight");
-    g_mtp_cache.sg_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.scales");
-    g_mtp_cache.sg_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.gate_proj.biases");
-    g_mtp_cache.su_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.weight");
-    g_mtp_cache.su_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.scales");
-    g_mtp_cache.su_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.up_proj.biases");
-    g_mtp_cache.sd_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.weight");
-    g_mtp_cache.sd_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.scales");
-    g_mtp_cache.sd_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert.down_proj.biases");
-    g_mtp_cache.seg_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.weight");
-    g_mtp_cache.seg_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.scales");
-    g_mtp_cache.seg_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
+    // When a separate BF16 weight file is provided, load MTP tensors from it.
+    WeightFile *mtp_wf = bf16_wf ? bf16_wf : wf;
+    g_mtp_cache.pre_fc_norm_hidden_w = get_tensor_ptr_optional(mtp_wf, "mtp.pre_fc_norm_hidden.weight");
+    g_mtp_cache.pre_fc_norm_embedding_w = get_tensor_ptr_optional(mtp_wf, "mtp.pre_fc_norm_embedding.weight");
+    g_mtp_cache.fc_w = get_tensor_ptr_optional(mtp_wf, "mtp.fc.weight");
+    g_mtp_cache.fc_s = get_tensor_ptr_optional(mtp_wf, "mtp.fc.scales");
+    g_mtp_cache.fc_b = get_tensor_ptr_optional(mtp_wf, "mtp.fc.biases");
+    g_mtp_cache.layer_input_norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.input_layernorm.weight");
+    g_mtp_cache.q_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.q_proj.weight");
+    g_mtp_cache.q_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.q_proj.scales");
+    g_mtp_cache.q_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.q_proj.biases");
+    g_mtp_cache.k_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.k_proj.weight");
+    g_mtp_cache.k_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.k_proj.scales");
+    g_mtp_cache.k_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.k_proj.biases");
+    g_mtp_cache.v_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.v_proj.weight");
+    g_mtp_cache.v_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.v_proj.scales");
+    g_mtp_cache.v_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.v_proj.biases");
+    g_mtp_cache.o_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.o_proj.weight");
+    g_mtp_cache.o_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.o_proj.scales");
+    g_mtp_cache.o_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.o_proj.biases");
+    g_mtp_cache.q_norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.q_norm.weight");
+    g_mtp_cache.k_norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.self_attn.k_norm.weight");
+    g_mtp_cache.post_attn_norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.post_attention_layernorm.weight");
+    g_mtp_cache.gate_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate.weight");
+    g_mtp_cache.gate_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate.scales");
+    g_mtp_cache.gate_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate.biases");
+    g_mtp_cache.sg_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.gate_proj.weight");
+    g_mtp_cache.sg_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.gate_proj.scales");
+    g_mtp_cache.sg_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.gate_proj.biases");
+    g_mtp_cache.su_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.up_proj.weight");
+    g_mtp_cache.su_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.up_proj.scales");
+    g_mtp_cache.su_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.up_proj.biases");
+    g_mtp_cache.sd_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.down_proj.weight");
+    g_mtp_cache.sd_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.down_proj.scales");
+    g_mtp_cache.sd_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert.down_proj.biases");
+    g_mtp_cache.seg_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.weight");
+    g_mtp_cache.seg_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.scales");
+    g_mtp_cache.seg_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
     // Dense MLP head tensors (mutually exclusive with the MoE set above).
-    g_mtp_cache.dgate_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.weight");
-    g_mtp_cache.dgate_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.scales");
-    g_mtp_cache.dgate_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.gate_proj.biases");
-    g_mtp_cache.dup_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.weight");
-    g_mtp_cache.dup_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.scales");
-    g_mtp_cache.dup_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.up_proj.biases");
-    g_mtp_cache.ddown_w = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.weight");
-    g_mtp_cache.ddown_s = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.scales");
-    g_mtp_cache.ddown_b = get_tensor_ptr_optional(wf, "mtp.layers.0.mlp.down_proj.biases");
-    g_mtp_cache.norm_w = get_tensor_ptr_optional(wf, "mtp.norm.weight");
+    g_mtp_cache.dgate_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.weight");
+    g_mtp_cache.dgate_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.scales");
+    g_mtp_cache.dgate_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.biases");
+    g_mtp_cache.dup_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.weight");
+    g_mtp_cache.dup_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.scales");
+    g_mtp_cache.dup_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.biases");
+    g_mtp_cache.ddown_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.weight");
+    g_mtp_cache.ddown_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.scales");
+    g_mtp_cache.ddown_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.biases");
+    g_mtp_cache.norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.norm.weight");
 
     // Detect BF16 mode: if the MTP fc.weight exists but its companion scales/biases
     // do not, the extraction script kept MTP weights in native BF16.
@@ -15342,7 +15345,20 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[mtp] artifacts detected but disabled; using existing decode path\n");
         }
         if (g_mtp_predictions > 0) {
-            build_mtp_cache(wf);
+            // Check for separate BF16 MTP weights in a sibling bf16/ directory.
+            WeightFile *bf16_mtp_wf = NULL;
+            char bf16_weights_path[PATH_MAX];
+            char bf16_manifest_path[PATH_MAX];
+            const char *wf_dir = dirname(strdup(weights_path));
+            snprintf(bf16_weights_path, sizeof(bf16_weights_path), "%s/bf16/mtp_weights.bin", wf_dir);
+            snprintf(bf16_manifest_path, sizeof(bf16_manifest_path), "%s/bf16/mtp_weights.json", wf_dir);
+            if (access(bf16_weights_path, R_OK) == 0 && access(bf16_manifest_path, R_OK) == 0) {
+                bf16_mtp_wf = open_weights(bf16_weights_path, bf16_manifest_path);
+                if (bf16_mtp_wf) {
+                    fprintf(stderr, "[mtp] loaded BF16 predictor weights from %s\n", bf16_weights_path);
+                }
+            }
+            build_mtp_cache(wf, bf16_mtp_wf);
         }
         {
             const char *env_overlap = getenv("FLASHCHAT_MTP_OVERLAP");
