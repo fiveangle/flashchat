@@ -2563,6 +2563,9 @@ manage_reextract_weights() {
         if model_mtp_artifacts_required "$model_id"; then
             cmd+=(--include-mtp)
         fi
+        if [ "$(flashchat_get MTP_BF16)" = "1" ]; then
+            cmd+=(--bf16-mtp)
+        fi
     fi
     if ! run_python "${cmd[@]}"; then
         echo "ERROR: Weight extraction failed." >&2
@@ -2951,6 +2954,14 @@ prompt_config_interactive() {
     else
         echo "MTP=\"${REPLY}\"" >> /tmp/flashchat_new_config
     fi
+
+    # MTP BF16 Predictor (separate BF16 weights for higher acceptance)
+    local default_mtp_bf16
+    default_mtp_bf16=$(flashchat_get MTP_BF16)
+    printf "Use BF16 predictor weights instead of quantized (0=quantized, 1=BF16) [%s]: " "$default_mtp_bf16"
+    read -r REPLY
+    echo ""
+    echo "MTP_BF16=\"${REPLY:-$default_mtp_bf16}\"" >> /tmp/flashchat_new_config
 
     # Show Thinking
     local default_think
@@ -3504,6 +3515,9 @@ prompt_extract_weights() {
             cmd+=(--non-experts)
             if model_mtp_artifacts_required "$model_id"; then
                 cmd+=(--include-mtp)
+            fi
+            if [ "$(flashchat_get MTP_BF16)" = "1" ]; then
+                cmd+=(--bf16-mtp)
             fi
         fi
         if run_python "${cmd[@]}"; then
