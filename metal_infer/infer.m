@@ -14330,6 +14330,61 @@ tool_call_checked:
                     for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
                     fused_dense_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
                     if (g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
+
+                    // One-shot debug: compare draft logits vs verify logits for position 0
+                    if (g_server_debug_enabled && nd > 0) {
+                        float *draft_logits = calloc(mtp_V, sizeof(float));
+                        if (draft_logits) {
+                            float *draft_normed = calloc(mtp_H, sizeof(float));
+                            if (draft_normed) {
+                                uint16_t *mtp_nw = get_tensor_ptr(wf, "mtp.norm.weight");
+                                if (mtp_nw) cpu_rms_norm(mtp_mh, mtp_nw, draft_normed, mtp_H, g_cfg.rms_norm_eps);
+                                else memcpy(draft_normed, mtp_mh, (size_t)mtp_H * sizeof(float));
+                                lm_head_forward(wf, draft_normed, draft_logits);
+                                int draft_top = cpu_argmax(draft_logits, mtp_V);
+                                int verify_top = cpu_argmax(mtp_ln, mtp_V);
+                                double max_diff = 0.0;
+                                for (int i = 0; i < mtp_V; i++) {
+                                    double diff = fabs(draft_logits[i] - mtp_ln[i]);
+                                    if (diff > max_diff) max_diff = diff;
+                                }
+                                // Top-5 from verify
+                                int vtop[5] = {-1,-1,-1,-1,-1}; double vscore[5];
+                                for (int i = 0; i < 5; i++) {
+                                    int best = -1; float best_s = -1e30f;
+                                    for (int j = 0; j < mtp_V; j++) {
+                                        int used = 0;
+                                        for (int k = 0; k < i; k++) if (vtop[k] == j) { used = 1; break; }
+                                        if (!used && mtp_ln[j] > best_s) { best_s = mtp_ln[j]; best = j; }
+                                    }
+                                    vtop[i] = best; vscore[i] = best_s;
+                                }
+                                // Top-5 from draft
+                                int dtop[5] = {-1,-1,-1,-1,-1}; double dscore[5];
+                                for (int i = 0; i < 5; i++) {
+                                    int best = -1; float best_s = -1e30f;
+                                    for (int j = 0; j < mtp_V; j++) {
+                                        int used = 0;
+                                        for (int k = 0; k < i; k++) if (dtop[k] == j) { used = 1; break; }
+                                        if (!used && draft_logits[j] > best_s) { best_s = draft_logits[j]; best = j; }
+                                    }
+                                    dtop[i] = best; dscore[i] = best_s;
+                                }
+                                server_log_errorf("[mtp-debug] %s pos0 draft_top=%d verify_top=%d max_diff=%.2f\n", request_id, draft_top, verify_top, max_diff);
+                                char topbuf[512]; int off = 0;
+                                off += snprintf(topbuf+off, sizeof(topbuf)-off, "[mtp-debug] %s verify_top5=", request_id);
+                                for (int i = 0; i < 5; i++) off += snprintf(topbuf+off, sizeof(topbuf)-off, "%d:%.2f ", vtop[i], vscore[i]);
+                                server_log_errorf("%s\n", topbuf);
+                                off = 0;
+                                off += snprintf(topbuf+off, sizeof(topbuf)-off, "[mtp-debug] %s draft_top5=", request_id);
+                                for (int i = 0; i < 5; i++) off += snprintf(topbuf+off, sizeof(topbuf)-off, "%d:%.2f ", dtop[i], dscore[i]);
+                                server_log_errorf("%s\n", topbuf);
+                                free(draft_normed);
+                            }
+                            free(draft_logits);
+                        }
+                    }
+
                     // Accept the longest correct prefix.
                     int acc = 0;
                     for (int j = 0; j < nd; j++) {
