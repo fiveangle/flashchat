@@ -362,6 +362,65 @@ def compile_non_experts(model_path, output_dir, weight_map, headers, entry, nati
     print(f"Wrote {output_dir / 'model_weights.json'}")
 
 
+def compile_bf16_mtp(model_path, output_dir, weight_map, headers, entry, native_config, dry_run):
+    """Extract MTP head weights in native BF16 to a separate flashchat/bf16/ directory.
+
+    This keeps the BF16 predictor path alive alongside the quantized 8-bit path,
+    so researchers can A/B them without re-downloading safetensors.
+    """
+    bf16_dir = output_dir / "bf16"
+    bf16_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = bf16_dir / "mtp_weights.bin"
+    manifest = {
+        "model": str(model_path),
+        "num_tensors": 0,
+        "tensors": {},
+        "config": build_manifest_config(entry, native_config),
+    }
+
+    # Collect only MTP tensors
+    mtp_tensors = []
+    for name, filename in weight_map.items():
+        san = sanitize_name(name)
+        if san.startswith("mtp.") and not is_routed_expert(name):
+            mtp_tensors.append((san, name, filename))
+    mtp_tensors.sort()
+
+    print(f"BF16 MTP tensors planned: {len(mtp_tensors)}")
+    if dry_run:
+        print(f"Dry run: would write {len(mtp_tensors)} BF16 MTP tensors")
+        return
+
+    offset = 0
+    total_bytes = 0
+    started = time.time()
+    with open(bin_path, "wb") as out_f:
+        for idx, (san, orig, filename) in enumerate(mtp_tensors, 1):
+            header, data_start = headers[filename]
+            meta = header[orig]
+            raw = read_tensor_raw(model_path, filename, header, data_start, orig)
+            if should_shift_native_norm(san, meta):
+                raw = shift_native_norm_data(raw)
+            start, offset = write_aligned(out_f, offset, raw)
+            manifest["tensors"][san] = {
+                "offset": start,
+                "size": len(raw),
+                "shape": meta["shape"],
+                "dtype": meta["dtype"],
+            }
+            total_bytes += len(raw)
+            if idx % 25 == 0 or idx == len(mtp_tensors):
+                print(f"  [{idx}/{len(mtp_tensors)}] {total_bytes / 1e6:.1f} MB written")
+
+    manifest["num_tensors"] = len(manifest["tensors"])
+    with open(bf16_dir / "mtp_weights.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    elapsed = time.time() - started
+    print(f"Wrote {bin_path} ({total_bytes / 1e6:.1f} MB in {elapsed:.1f}s)")
+    print(f"Wrote {bf16_dir / 'mtp_weights.json'}")
+
+
 def build_expert_sources(weight_map, prefix):
     sources = defaultdict(lambda: {"stacked": {}, "individual": defaultdict(dict)})
     for name, filename in weight_map.items():
@@ -498,13 +557,14 @@ def main():
     parser.add_argument("--experts", action="store_true", help="Compile routed expert packed layer artifacts")
     parser.add_argument("--mtp-experts", action="store_true", help="Compile MTP routed expert packed layer artifacts")
     parser.add_argument("--include-mtp", action="store_true", help="Include MTP tensors in model_weights artifacts")
+    parser.add_argument("--bf16-mtp", action="store_true", help="Extract MTP head weights in native BF16 to a separate flashchat/bf16/ directory (kept alongside quantized weights for research/fallback)")
     parser.add_argument("--dry-run", action="store_true", help="Validate plan without writing artifacts")
     parser.add_argument("--limit-tensors", type=int, default=None, help="Only compile the first N non-expert tensors")
     parser.add_argument("--name-regex", default=None, help="Only compile non-expert tensors whose sanitized name matches")
     parser.add_argument("--max-experts", type=int, default=None, help="Only compile the first N routed experts in each selected layer")
     args = parser.parse_args()
 
-    if not args.non_experts and not args.experts and not args.mtp_experts:
+    if not args.non_experts and not args.experts and not args.mtp_experts and not args.bf16_mtp:
         args.non_experts = True
         args.experts = True
 
@@ -531,6 +591,8 @@ def main():
     if args.non_experts:
         compile_non_experts(model_path, output_dir, weight_map, headers, entry, native_config,
                             args.include_mtp, args.dry_run, args.limit_tensors, args.name_regex)
+    if args.bf16_mtp:
+        compile_bf16_mtp(model_path, output_dir, weight_map, headers, entry, native_config, args.dry_run)
     if args.experts:
         layers = parse_layers(args.layers, entry["num_hidden_layers"])
         compile_routed_experts(model_path, output_dir, weight_map, headers, entry,
