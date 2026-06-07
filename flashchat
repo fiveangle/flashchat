@@ -523,14 +523,16 @@ cmd_config() {
 # -----------------------------------------------------------------------------
 cmd_config_interactive() {
     # Clear environment variable overrides so the summary reflects the config
-    # file, not stale values from previous `flashchat serve` runs.
+    # file, not stale values from previous `flashchat serve` runs or
+    # `use_model_from_offload_repo` path redirects.
     unset FLASHCHAT_REASONING FLASHCHAT_TEMPERATURE FLASHCHAT_TOP_P \
           FLASHCHAT_TOP_K FLASHCHAT_MIN_P FLASHCHAT_PRESENCE_PENALTY \
           FLASHCHAT_REPETITION_PENALTY FLASHCHAT_SERVER_LOG \
           FLASHCHAT_SERVER_DEBUG FLASHCHAT_SERVER_HTTP_LOG \
           FLASHCHAT_SHOW_THINKING FLASHCHAT_SYSTEM_PROMPT_CACHE \
           FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES FLASHCHAT_MTP \
-          FLASHCHAT_MTP_BF16
+          FLASHCHAT_MTP_BF16 FLASHCHAT_MODEL_PATH FLASHCHAT_WEIGHTS_DIR \
+          FLASHCHAT_EXPERTS_DIR
     flashchat_load_config
     
     echo ""
@@ -2084,6 +2086,10 @@ use_model_from_offload_repo() {
         echo "Offloaded model has no snapshot directory."
         return 1
     fi
+    # Save old path overrides so we can restore them when the menu exits.
+    _FLASHCHAT_OLD_MODEL_PATH="${FLASHCHAT_MODEL_PATH:-}"
+    _FLASHCHAT_OLD_WEIGHTS_DIR="${FLASHCHAT_WEIGHTS_DIR:-}"
+    _FLASHCHAT_OLD_EXPERTS_DIR="${FLASHCHAT_EXPERTS_DIR:-}"
     export FLASHCHAT_MODEL_PATH="$snapshot"
     runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$snapshot")
     runtime_label=$(model_runtime_label "$model_id")
@@ -2724,7 +2730,25 @@ manage_model_menu() {
             6) manage_reextract_weights "$model_id" || true ;;
             7) manage_reextract_experts "$model_id" || true ;;
             8) manage_extract_bf16_mtp "$model_id" || true ;;
-            q|Q|"") return ;;
+            q|Q|"")
+                # Restore path overrides from use_model_from_offload_repo if any
+                if [ -n "${_FLASHCHAT_OLD_MODEL_PATH:-}" ]; then
+                    export FLASHCHAT_MODEL_PATH="$_FLASHCHAT_OLD_MODEL_PATH"
+                elif [ -n "${FLASHCHAT_MODEL_PATH:-}" ]; then
+                    unset FLASHCHAT_MODEL_PATH
+                fi
+                if [ -n "${_FLASHCHAT_OLD_WEIGHTS_DIR:-}" ]; then
+                    export FLASHCHAT_WEIGHTS_DIR="$_FLASHCHAT_OLD_WEIGHTS_DIR"
+                elif [ -n "${FLASHCHAT_WEIGHTS_DIR:-}" ]; then
+                    unset FLASHCHAT_WEIGHTS_DIR
+                fi
+                if [ -n "${_FLASHCHAT_OLD_EXPERTS_DIR:-}" ]; then
+                    export FLASHCHAT_EXPERTS_DIR="$_FLASHCHAT_OLD_EXPERTS_DIR"
+                elif [ -n "${FLASHCHAT_EXPERTS_DIR:-}" ]; then
+                    unset FLASHCHAT_EXPERTS_DIR
+                fi
+                unset _FLASHCHAT_OLD_MODEL_PATH _FLASHCHAT_OLD_WEIGHTS_DIR _FLASHCHAT_OLD_EXPERTS_DIR
+                return ;;
             *) echo "Please choose one of the listed actions." ;;
         esac
     done
@@ -2811,15 +2835,17 @@ prompt_config_options() {
 
 prompt_config_interactive() {
     # Clear environment variable overrides so the config file is authoritative.
-    # Without this, values exported by previous `flashchat serve` runs would
-    # override the config file and the wizard would show stale defaults.
+    # Without this, values exported by previous `flashchat serve` runs or
+    # `use_model_from_offload_repo` redirects would override the config file
+    # and the wizard would show stale defaults.
     unset FLASHCHAT_REASONING FLASHCHAT_TEMPERATURE FLASHCHAT_TOP_P \
           FLASHCHAT_TOP_K FLASHCHAT_MIN_P FLASHCHAT_PRESENCE_PENALTY \
           FLASHCHAT_REPETITION_PENALTY FLASHCHAT_SERVER_LOG \
           FLASHCHAT_SERVER_DEBUG FLASHCHAT_SERVER_HTTP_LOG \
           FLASHCHAT_SHOW_THINKING FLASHCHAT_SYSTEM_PROMPT_CACHE \
           FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES FLASHCHAT_MTP \
-          FLASHCHAT_MTP_BF16
+          FLASHCHAT_MTP_BF16 FLASHCHAT_MODEL_PATH FLASHCHAT_WEIGHTS_DIR \
+          FLASHCHAT_EXPERTS_DIR
     flashchat_load_config
 
     rm -f /tmp/flashchat_new_config
@@ -4927,45 +4953,68 @@ cmd_benchmark() {
     
     target="$1"
     
-    # Load config and export environment variables
+    # Load config and pass environment variables directly to make
+    # without `export` so they do not leak into the parent shell.
     flashchat_load_config
-    export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
-    export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
-    export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
-    export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
-    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
-    export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
+    local _model_path _weights_dir _experts_dir _model_config _sessions_dir _system_prompt
+    _model_path="$(flashchat_get MODEL_PATH)"
+    _weights_dir="$(flashchat_get WEIGHTS_DIR)"
+    _experts_dir="$(flashchat_get EXPERTS_DIR)"
+    _model_config="$(flashchat_get MODEL_CONFIG)"
+    _sessions_dir="$(flashchat_get sessions_dir)"
+    _system_prompt="$(flashchat_get system_prompt_file)"
     
     ensure_binaries
     
     case "$target" in
         run)
             echo "Running: single expert forward pass..."
-            make -C "$SCRIPT_DIR" run
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" run
             ;;
         verify)
             echo "Running: Metal vs CPU verification..."
-            make -C "$SCRIPT_DIR" verify
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" verify
             ;;
         bench)
             echo "Running: single expert benchmark (10 iterations)..."
-            make -C "$SCRIPT_DIR" bench
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" bench
             ;;
         moe)
             echo "Running: MoE forward (K experts, single layer)..."
-            make -C "$SCRIPT_DIR" moe
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" moe
             ;;
         moebench)
             echo "Running: MoE benchmark (10 iterations)..."
-            make -C "$SCRIPT_DIR" moebench
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" moebench
             ;;
         full)
             echo "Running: Full model forward (K=4)..."
-            make -C "$SCRIPT_DIR" full
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" full
             ;;
         fullbench)
             echo "Running: Full benchmark (3 iterations)..."
-            make -C "$SCRIPT_DIR" fullbench
+            FLASHCHAT_MODEL_PATH="$_model_path" FLASHCHAT_WEIGHTS_DIR="$_weights_dir" \
+                FLASHCHAT_EXPERTS_DIR="$_experts_dir" FLASHCHAT_MODEL_CONFIG="$_model_config" \
+                FLASHCHAT_SESSIONS_DIR="$_sessions_dir" FLASHCHAT_SYSTEM_PROMPT="$_system_prompt" \
+                make -C "$SCRIPT_DIR" fullbench
             ;;
         *)
             echo "Unknown benchmark: $target"
