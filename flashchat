@@ -2582,6 +2582,47 @@ manage_reextract_weights() {
     echo "Weights re-extracted successfully."
 }
 
+manage_extract_bf16_mtp() {
+    local model_id="$1"
+    local model_path runtime_dir extract_script
+    model_path=$(flashchat_model_path_for_id "$model_id")
+    if [ -z "$model_path" ] || [ ! -d "$model_path" ]; then
+        echo "Model source not found for '$model_id'."
+        return 1
+    fi
+    runtime_dir=$(flashchat_model_runtime_dir "$model_id" "$model_path")
+
+    if current_model_server_running "$model_id"; then
+        echo "WARNING: The Flashchat server is currently running with this model."
+        echo "Extracting BF16 MTP weights while the server is active may cause crashes."
+        echo "Stop the server first with: flashchat serve --stop"
+        return 1
+    fi
+
+    if ! model_mtp_artifacts_required "$model_id"; then
+        echo "Model '$model_id' does not require MTP artifacts."
+        return 1
+    fi
+
+    echo "This will extract BF16 MTP predictor weights (~60 MB) into:"
+    echo "  ${runtime_dir}/bf16/"
+    confirm_exact_model_id "$model_id" "Type the exact model ID to extract BF16 MTP weights:" || return 1
+
+    extract_script=$(model_registry_script "$model_id" "extract_weights" "scripts/extract_weights.py")
+    local cmd=()
+    if [ "${extract_script##*/}" = "compile_native_qwen.py" ]; then
+        cmd=("$SCRIPT_DIR/$extract_script" --model-id "$model_id" --model "$model_path" --output "$runtime_dir" --bf16-mtp)
+    else
+        echo "ERROR: BF16 MTP extraction is only supported for native Qwen models." >&2
+        return 1
+    fi
+    if ! run_python "${cmd[@]}"; then
+        echo "ERROR: BF16 MTP extraction failed." >&2
+        return 1
+    fi
+    echo "BF16 MTP weights extracted successfully."
+}
+
 manage_reextract_experts() {
     local model_id="$1"
     local model_path runtime_dir weights_dir experts_dir repack_script
@@ -2661,6 +2702,7 @@ manage_model_menu() {
         echo "  [5] Run from offload for this launch"
         echo "  [6] Re-extract non-expert weights"
         echo "  [7] Re-extract expert weights"
+        echo "  [8] Extract BF16 MTP predictor weights only"
         echo "  [Q] Back"
         printf "> "
         read -r REPLY
@@ -2672,6 +2714,7 @@ manage_model_menu() {
             5) use_model_from_offload_repo "$model_id" || true ;;
             6) manage_reextract_weights "$model_id" || true ;;
             7) manage_reextract_experts "$model_id" || true ;;
+            8) manage_extract_bf16_mtp "$model_id" || true ;;
             q|Q|"") return ;;
             *) echo "Please choose one of the listed actions." ;;
         esac
