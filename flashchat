@@ -522,6 +522,15 @@ cmd_config() {
 # Command: config (interactive menu version)
 # -----------------------------------------------------------------------------
 cmd_config_interactive() {
+    # Clear environment variable overrides so the summary reflects the config
+    # file, not stale values from previous `flashchat serve` runs.
+    unset FLASHCHAT_REASONING FLASHCHAT_TEMPERATURE FLASHCHAT_TOP_P \
+          FLASHCHAT_TOP_K FLASHCHAT_MIN_P FLASHCHAT_PRESENCE_PENALTY \
+          FLASHCHAT_REPETITION_PENALTY FLASHCHAT_SERVER_LOG \
+          FLASHCHAT_SERVER_DEBUG FLASHCHAT_SERVER_HTTP_LOG \
+          FLASHCHAT_SHOW_THINKING FLASHCHAT_SYSTEM_PROMPT_CACHE \
+          FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES FLASHCHAT_MTP \
+          FLASHCHAT_MTP_BF16
     flashchat_load_config
     
     echo ""
@@ -2801,6 +2810,18 @@ prompt_config_options() {
 }
 
 prompt_config_interactive() {
+    # Clear environment variable overrides so the config file is authoritative.
+    # Without this, values exported by previous `flashchat serve` runs would
+    # override the config file and the wizard would show stale defaults.
+    unset FLASHCHAT_REASONING FLASHCHAT_TEMPERATURE FLASHCHAT_TOP_P \
+          FLASHCHAT_TOP_K FLASHCHAT_MIN_P FLASHCHAT_PRESENCE_PENALTY \
+          FLASHCHAT_REPETITION_PENALTY FLASHCHAT_SERVER_LOG \
+          FLASHCHAT_SERVER_DEBUG FLASHCHAT_SERVER_HTTP_LOG \
+          FLASHCHAT_SHOW_THINKING FLASHCHAT_SYSTEM_PROMPT_CACHE \
+          FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES FLASHCHAT_MTP \
+          FLASHCHAT_MTP_BF16
+    flashchat_load_config
+
     rm -f /tmp/flashchat_new_config
     touch /tmp/flashchat_new_config
     
@@ -2981,12 +3002,11 @@ prompt_config_interactive() {
     echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=\"${REPLY:-$default_sys_cache_entries}\"" >> /tmp/flashchat_new_config
 
     # Multi-token Prediction
+    # Always use the user's current MTP config value as the default, not the
+    # profile's fallback. The profile value is a default-for-new-users; the
+    # wizard should show what is currently configured.
     local default_mtp
-    if [ "${selected_profile:-custom}" != "custom" ]; then
-        default_mtp=$(flashchat_model_sampling_profile_field "$selected_model" "$selected_profile" "mtp_default_predictions")
-    else
-        default_mtp=$(flashchat_get MTP)
-    fi
+    default_mtp=$(flashchat_get MTP)
     printf "Multi-token prediction (blank=registry default, 0=disabled, 1=automatic, 2+=predictor batch size) [%s]: " "$(mtp_label "$default_mtp")"
     read -r REPLY
     echo ""
@@ -4371,36 +4391,54 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashchat_get_pid_file)
     
-    # Set environment for infer.  Already-exported env vars take precedence
-    # over config values so ad-hoc testing (e.g. FLASHCHAT_MTP=3) is not
-    # silently clobbered by the config file.
-    export FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)"
-    export FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)"
-    export FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)"
-    export FLASHCHAT_SERVER_PORT="$server_port"
-    [ -z "${FLASHCHAT_REASONING}" ]                && export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
-    [ -z "${FLASHCHAT_TEMPERATURE}" ]              && export FLASHCHAT_TEMPERATURE="$(flashchat_get TEMPERATURE)"
-    [ -z "${FLASHCHAT_TOP_P}" ]                    && export FLASHCHAT_TOP_P="$(flashchat_get TOP_P)"
-    [ -z "${FLASHCHAT_TOP_K}" ]                    && export FLASHCHAT_TOP_K="$(flashchat_get TOP_K)"
-    [ -z "${FLASHCHAT_MIN_P}" ]                    && export FLASHCHAT_MIN_P="$(flashchat_get MIN_P)"
-    [ -z "${FLASHCHAT_PRESENCE_PENALTY}" ]       && export FLASHCHAT_PRESENCE_PENALTY="$(flashchat_get PRESENCE_PENALTY)"
-    [ -z "${FLASHCHAT_REPETITION_PENALTY}" ]     && export FLASHCHAT_REPETITION_PENALTY="$(flashchat_get REPETITION_PENALTY)"
-    # FLASHCHAT_ACTIVE_EXPERTS is intentionally NOT re-exported from flashchat_get
-    # (it has no user-config home, registry is K's home). If the user sets it in
-    # their shell before invoking `flashchat serve`, bash propagates it to the
-    # `infer` child naturally.
-    export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
-    [ -z "${FLASHCHAT_SERVER_LOG}" ]               && export FLASHCHAT_SERVER_LOG="$(flashchat_get SERVER_LOG_PATH)"
-    [ -z "${FLASHCHAT_SERVER_DEBUG}" ]             && export FLASHCHAT_SERVER_DEBUG="$(flashchat_get SERVER_DEBUG)"
-    [ -z "${FLASHCHAT_SERVER_HTTP_LOG}" ]          && export FLASHCHAT_SERVER_HTTP_LOG="$(flashchat_get SERVER_HTTP_LOG)"
-    [ -z "${FLASHCHAT_SHOW_THINKING}" ]            && export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
-    [ -z "${FLASHCHAT_SYSTEM_PROMPT_CACHE}" ]      && export FLASHCHAT_SYSTEM_PROMPT_CACHE="$(flashchat_get SYSTEM_PROMPT_CACHE)"
-    [ -z "${FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}" ] && export FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
-    [ -z "${FLASHCHAT_MTP}" ]                      && export FLASHCHAT_MTP="$(flashchat_get MTP)"
-    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)"
-    export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
-    export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+    # Build environment for infer.  Pass variables directly to the child
+    # without `export` so they do not leak into the parent shell and
+    # override the config file on subsequent `flashchat config` runs.
+    # User-set env vars (e.g. FLASHCHAT_MTP=3) are preserved when present.
+    local _reasoning _temperature _top_p _top_k _min_p _presence _repetition
+    local _server_log _server_debug _server_http_log _show_thinking
+    local _sys_cache _sys_cache_entries _mtp
+    [ -n "${FLASHCHAT_REASONING}" ]                && _reasoning="$FLASHCHAT_REASONING"                || _reasoning="$(flashchat_get REASONING)"
+    [ -n "${FLASHCHAT_TEMPERATURE}" ]              && _temperature="$FLASHCHAT_TEMPERATURE"              || _temperature="$(flashchat_get TEMPERATURE)"
+    [ -n "${FLASHCHAT_TOP_P}" ]                    && _top_p="$FLASHCHAT_TOP_P"                    || _top_p="$(flashchat_get TOP_P)"
+    [ -n "${FLASHCHAT_TOP_K}" ]                    && _top_k="$FLASHCHAT_TOP_K"                    || _top_k="$(flashchat_get TOP_K)"
+    [ -n "${FLASHCHAT_MIN_P}" ]                    && _min_p="$FLASHCHAT_MIN_P"                    || _min_p="$(flashchat_get MIN_P)"
+    [ -n "${FLASHCHAT_PRESENCE_PENALTY}" ]       && _presence="$FLASHCHAT_PRESENCE_PENALTY"       || _presence="$(flashchat_get PRESENCE_PENALTY)"
+    [ -n "${FLASHCHAT_REPETITION_PENALTY}" ]     && _repetition="$FLASHCHAT_REPETITION_PENALTY"     || _repetition="$(flashchat_get REPETITION_PENALTY)"
+    [ -n "${FLASHCHAT_SERVER_LOG}" ]               && _server_log="$FLASHCHAT_SERVER_LOG"               || _server_log="$(flashchat_get SERVER_LOG_PATH)"
+    [ -n "${FLASHCHAT_SERVER_DEBUG}" ]             && _server_debug="$FLASHCHAT_SERVER_DEBUG"             || _server_debug="$(flashchat_get SERVER_DEBUG)"
+    [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ]          && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG"          || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
+    [ -n "${FLASHCHAT_SHOW_THINKING}" ]            && _show_thinking="$FLASHCHAT_SHOW_THINKING"            || _show_thinking="$(flashchat_get SHOW_THINKING)"
+    [ -n "${FLASHCHAT_SYSTEM_PROMPT_CACHE}" ]      && _sys_cache="$FLASHCHAT_SYSTEM_PROMPT_CACHE"      || _sys_cache="$(flashchat_get SYSTEM_PROMPT_CACHE)"
+    [ -n "${FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}" ] && _sys_cache_entries="$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES" || _sys_cache_entries="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+    [ -n "${FLASHCHAT_MTP}" ]                      && _mtp="$FLASHCHAT_MTP"                      || _mtp="$(flashchat_get MTP)"
+    # FLASHCHAT_ACTIVE_EXPERTS is intentionally NOT passed here
+    # (it has no user-config home, registry is K's home). If the user sets it
+    # in their shell before invoking `flashchat serve`, bash propagates it to
+    # the infer child naturally.
 
+    FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)" \
+    FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)" \
+    FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)" \
+    FLASHCHAT_SERVER_PORT="$server_port" \
+    FLASHCHAT_MODEL="$(flashchat_get MODEL)" \
+    FLASHCHAT_REASONING="$_reasoning" \
+    FLASHCHAT_TEMPERATURE="$_temperature" \
+    FLASHCHAT_TOP_P="$_top_p" \
+    FLASHCHAT_TOP_K="$_top_k" \
+    FLASHCHAT_MIN_P="$_min_p" \
+    FLASHCHAT_PRESENCE_PENALTY="$_presence" \
+    FLASHCHAT_REPETITION_PENALTY="$_repetition" \
+    FLASHCHAT_SERVER_LOG="$_server_log" \
+    FLASHCHAT_SERVER_DEBUG="$_server_debug" \
+    FLASHCHAT_SERVER_HTTP_LOG="$_server_http_log" \
+    FLASHCHAT_SHOW_THINKING="$_show_thinking" \
+    FLASHCHAT_SYSTEM_PROMPT_CACHE="$_sys_cache" \
+    FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$_sys_cache_entries" \
+    FLASHCHAT_MTP="$_mtp" \
+    FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
+    FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
+    FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
     "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" > /dev/null 2>&1 &
     local infer_pid=$!
     
@@ -4489,14 +4527,13 @@ cmd_chat() {
     local chat_args=""
     [ -n "$server_port" ] && chat_args="--port $server_port"
     [ -n "$server_host" ] && chat_args="$chat_args --host $server_host"
-    export FLASHCHAT_MODEL="$(flashchat_get MODEL)"
-    export FLASHCHAT_SERVER_HOST="$server_host"
-    export FLASHCHAT_REASONING="$(flashchat_get REASONING)"
-    export FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)"
-    export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
-    export FLASHCHAT_HISTORY_FILE="$(flashchat_get_history_file)"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
     
+    FLASHCHAT_MODEL="$(flashchat_get MODEL)" \
+    FLASHCHAT_SERVER_HOST="$server_host" \
+    FLASHCHAT_REASONING="$(flashchat_get REASONING)" \
+    FLASHCHAT_SHOW_THINKING="$(flashchat_get SHOW_THINKING)" \
+    FLASHCHAT_SESSIONS_DIR="$(flashchat_get sessions_dir)" \
     ./chat $chat_args
     
     cd "$old_pwd"
