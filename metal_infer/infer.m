@@ -4202,6 +4202,34 @@ static void gpu_swiglu(MetalCtx *ctx, const float *gate, const float *up, float 
     memcpy(out, [obuf contents], sz);
 }
 
+// Two independent swiglus (one per batched token) in ONE command buffer.
+// Same kernel and per-element math as gpu_swiglu — faithful, half the round-trips.
+static void gpu_swiglu_2(MetalCtx *ctx, const float *g1, const float *u1, float *o1,
+                         const float *g2, const float *u2, float *o2, int dim) {
+    static id<MTLBuffer> gbuf = nil, ubuf = nil, obuf = nil;
+    size_t sz = (size_t)dim * sizeof(float);
+    if (!gbuf || (size_t)[gbuf length] < 2*sz) gbuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
+    if (!ubuf || (size_t)[ubuf length] < 2*sz) ubuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
+    if (!obuf || (size_t)[obuf length] < 2*sz) obuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
+    memcpy([gbuf contents], g1, sz); memcpy((char *)[gbuf contents] + sz, g2, sz);
+    memcpy([ubuf contents], u1, sz); memcpy((char *)[ubuf contents] + sz, u2, sz);
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:ctx->swiglu];
+    uint32_t d = (uint32_t)dim;
+    for (int t = 0; t < 2; t++) {
+        [e setBuffer:gbuf offset:t*sz atIndex:0];
+        [e setBuffer:ubuf offset:t*sz atIndex:1];
+        [e setBuffer:obuf offset:t*sz atIndex:2];
+        [e setBytes:&d length:4 atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((d + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    [e endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    memcpy(o1, [obuf contents], sz); memcpy(o2, (char *)[obuf contents] + sz, sz);
+}
+
 // ============================================================================
 // Batched GPU matmul: encode N independent matmuls sharing the same input
 // into ONE command buffer, reducing dispatch overhead by N-1 round-trips.
@@ -6003,6 +6031,28 @@ static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_p
     free(scores);
 }
 
+// Batched routing for two tokens: post-attn norm on CPU (same as moe_route), then
+// ONE matmul2 for both tokens' router logits (bit-exact per Stage 1, replaces two
+// matvec round-trips), then per-token softmax/topk/normalize identical to moe_route.
+static void moe_route_2(WeightFile *wf, int layer, const float *ha, const float *hb,
+                        float *hpa, float *hpb, int *ia, float *wa, int *ib, float *wb) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, gsz = g_cfg.group_size;
+    char nm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", layer);
+    uint16_t *post_w = get_tensor_ptr(wf, nm);
+    cpu_rms_norm(ha, post_w, hpa, H, g_cfg.rms_norm_eps);
+    cpu_rms_norm(hb, post_w, hpb, H, g_cfg.rms_norm_eps);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", layer);   uint32_t *gw = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.scales", layer);   uint16_t *gs = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.biases", layer);   uint16_t *gb = get_tensor_ptr(wf, nm);
+    float *sa = malloc(g_cfg.num_experts * sizeof(float));
+    float *sb = malloc(g_cfg.num_experts * sizeof(float));
+    gpu_dequant_matmul2(g_metal, gw, gs, gb, hpa, hpb, sa, sb, g_cfg.num_experts, H, gsz);
+    cpu_softmax(sa, g_cfg.num_experts); cpu_topk(sa, g_cfg.num_experts, K, ia, wa); cpu_normalize_weights(wa, K);
+    cpu_softmax(sb, g_cfg.num_experts); cpu_topk(sb, g_cfg.num_experts, K, ib, wb); cpu_normalize_weights(wb, K);
+    free(sa); free(sb);
+}
+
 // Shared expert + gate for one token: returns shared_out (gated), needs h_post.
 static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, float *shared_out) {
     int H = g_cfg.hidden_dim, SI = g_cfg.shared_intermediate, gsz = g_cfg.group_size;
@@ -6040,12 +6090,14 @@ static void shared_expert_2(WeightFile *wf, int layer, const float *hpa, const f
     float *sua = malloc(SI*sizeof(float)), *sub_ = malloc(SI*sizeof(float));
     float *saa = malloc(SI*sizeof(float)), *sab = malloc(SI*sizeof(float));
     float scorea = 0, scoreb = 0;
-    gpu_dequant_matmul2(g_metal, sgw, sgs, sgb, hpa, hpb, sga, sgb_, SI, H, gsz);
-    gpu_dequant_matmul2(g_metal, suw, sus, sub, hpa, hpb, sua, sub_, SI, H, gsz);
-    gpu_swiglu(g_metal, sga, sua, saa, SI);  // GPU swiglu => bit-faithful to production MoE
-    gpu_swiglu(g_metal, sgb_, sub_, sab, SI);
+    // gate/up/gate-score all read hpa/hpb: one command buffer (3 round-trips -> 1).
+    { MM2Job se_jobs[3] = {
+        {sgw,sgs,sgb,  hpa,hpb, sga,sgb_,        (uint32_t)SI,(uint32_t)H,(uint32_t)gsz},
+        {suw,sus,sub,  hpa,hpb, sua,sub_,        (uint32_t)SI,(uint32_t)H,(uint32_t)gsz},
+        {segw,segs,segb,hpa,hpb,&scorea,&scoreb, 1u,          (uint32_t)H,(uint32_t)gsz} };
+      gpu_dequant_matmul2_batch(g_metal, se_jobs, 3); }
+    gpu_swiglu_2(g_metal, sga, sua, saa, sgb_, sub_, sab, SI);  // GPU swiglu => bit-faithful to production MoE
     gpu_dequant_matmul2(g_metal, sdw, sds, sdb, saa, sab, out_a, out_b, H, SI, gsz);
-    gpu_dequant_matmul2(g_metal, segw, segs, segb, hpa, hpb, &scorea, &scoreb, 1, H, gsz);
     float wa = cpu_sigmoid(scorea), wb = cpu_sigmoid(scoreb);
     for (int i = 0; i < H; i++) { out_a[i] *= wa; out_b[i] *= wb; }
     free(sga); free(sgb_); free(sua); free(sub_); free(saa); free(sab);
@@ -6070,44 +6122,100 @@ static void moe_block_1(WeightFile *wf, int layer, float *hidden, int packed_fd)
     free(h_post); free(moe_out); free(buf); free(eo); free(shared_out);
 }
 
+static double g_mb2_route, g_mb2_load, g_mb2_gpu, g_mb2_shared;
+
 static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int packed_fd) {
     int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    double _t = now_ms();
     float *hpa = malloc(H*sizeof(float)), *hpb = malloc(H*sizeof(float));
     int ia[64], ib[64]; float wa[64], wb[64];
-    moe_route(wf, layer, ha, hpa, ia, wa);
-    moe_route(wf, layer, hb, hpb, ib, wb);
+    if (g_metal) {
+        moe_route_2(wf, layer, ha, hb, hpa, hpb, ia, wa, ib, wb);
+    } else {
+        moe_route(wf, layer, ha, hpa, ia, wa);
+        moe_route(wf, layer, hb, hpb, ib, wb);
+    }
+    g_mb2_route += now_ms() - _t;
     float *moe_a = calloc(H, sizeof(float)), *moe_b = calloc(H, sizeof(float));
-    void *buf = malloc(active_expert_size());
-    float *oa = malloc(H*sizeof(float)), *ob = malloc(H*sizeof(float));
 
-    // Union of the two routes: load each unique expert once.
+    // Union size for the overlap instrumentation (the fast path below loads
+    // per-token rather than per-union; page cache makes the duplicate preads free).
     int seen[1024]; int n_union = 0; int uni[128];
     for (int e = 0; e < g_cfg.num_experts && e < 1024; e++) seen[e] = 0;
     for (int k = 0; k < K; k++) { if (!seen[ia[k]]) { seen[ia[k]] = 1; uni[n_union++] = ia[k]; } }
     for (int k = 0; k < K; k++) { if (!seen[ib[k]]) { seen[ib[k]] = 1; uni[n_union++] = ib[k]; } }
     g_moe_last_union = n_union;
 
-    for (int u = 0; u < n_union; u++) {
-        int e = uni[u];
-        if (pread(packed_fd, buf, active_expert_size(), (off_t)e * active_expert_size()) != (ssize_t)active_expert_size()) continue;
-        int ka = -1, kb = -1;
-        for (int k = 0; k < K; k++) { if (ia[k] == e) ka = k; if (ib[k] == e) kb = k; }
-        if (ka >= 0 && kb >= 0) {
-            routed_ffn_2(buf, hpa, hpb, oa, ob);
-            cpu_vec_madd(moe_a, oa, wa[ka], H);
-            cpu_vec_madd(moe_b, ob, wb[kb], H);
-        } else if (ka >= 0) {
-            routed_ffn_1(buf, hpa, oa);
-            cpu_vec_madd(moe_a, oa, wa[ka], H);
-        } else if (kb >= 0) {
-            routed_ffn_1(buf, hpb, ob);
-            cpu_vec_madd(moe_b, ob, wb[kb], H);
+    size_t esz = active_expert_size();
+    if (g_metal && K <= MAX_K) {
+        // Fast faithful path: per token, pread its K experts straight into the
+        // production multi-expert slots and encode all of them into ONE command
+        // buffer via gpu_encode_experts_batched — the same per-expert kernels and
+        // buffers as production CMD3 (and as routed_ffn_1), so per-expert math is
+        // unchanged. This replaces one commit+wait per (expert, token) pair with
+        // 2 commits per layer, which is what the batched-2 cost_ratio lives on.
+        const int *idxs[2] = { ia, ib }; const float *wts[2] = { wa, wb };
+        const float *hps[2] = { hpa, hpb }; float *outs[2] = { moe_a, moe_b };
+        for (int t = 0; t < 2; t++) {
+            int valid[MAX_K] = {0};
+            id<MTLBuffer> __strong expert_bufs[MAX_K] = {nil};
+            _t = now_ms();
+            // Parallel preads (same pattern as the production expert loader):
+            // each slot is independent, page-cache reads scale across cores.
+            {
+                const int *t_idx = idxs[t];
+                int *valid_p = valid;
+                id<MTLBuffer> __strong *bufs_p = expert_bufs;
+                dispatch_apply((size_t)K, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
+                    int e = t_idx[k];
+                    if (pread(packed_fd, [g_metal->buf_multi_expert_data[k] contents], esz,
+                              (off_t)e * (off_t)esz) == (ssize_t)esz) {
+                        valid_p[k] = 1;
+                        bufs_p[k] = g_metal->buf_multi_expert_data[k];
+                    }
+                });
+            }
+            g_mb2_load += now_ms() - _t; _t = now_ms();
+            memcpy([g_metal->buf_multi_expert_input contents], hps[t], (size_t)H * sizeof(float));
+            id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+            gpu_encode_experts_batched(g_metal, cmd, K, valid, expert_bufs);
+            [cmd commit]; [cmd waitUntilCompleted];
+            for (int k = 0; k < K; k++) {
+                if (!valid[k]) continue;
+                cpu_vec_madd(outs[t], (float *)[g_metal->buf_multi_expert_out[k] contents],
+                             wts[t][k], H);
+            }
+            g_mb2_gpu += now_ms() - _t;
         }
+    } else {
+        // Slow faithful fallback (K > MAX_K slots): one round-trip per expert.
+        void *buf = malloc(esz);
+        float *oa = malloc(H*sizeof(float)), *ob = malloc(H*sizeof(float));
+        for (int u = 0; u < n_union; u++) {
+            int e = uni[u];
+            if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
+            int ka = -1, kb = -1;
+            for (int k = 0; k < K; k++) { if (ia[k] == e) ka = k; if (ib[k] == e) kb = k; }
+            if (ka >= 0 && kb >= 0) {
+                routed_ffn_2(buf, hpa, hpb, oa, ob);
+                cpu_vec_madd(moe_a, oa, wa[ka], H);
+                cpu_vec_madd(moe_b, ob, wb[kb], H);
+            } else if (ka >= 0) {
+                routed_ffn_1(buf, hpa, oa);
+                cpu_vec_madd(moe_a, oa, wa[ka], H);
+            } else if (kb >= 0) {
+                routed_ffn_1(buf, hpb, ob);
+                cpu_vec_madd(moe_b, ob, wb[kb], H);
+            }
+        }
+        free(buf); free(oa); free(ob);
     }
+    _t = now_ms();
     float *sa = malloc(H*sizeof(float)), *sb = malloc(H*sizeof(float));
     shared_expert_2(wf, layer, hpa, hpb, sa, sb);
+    g_mb2_shared += now_ms() - _t;
     for (int i = 0; i < H; i++) { ha[i] = ha[i] + moe_a[i] + sa[i]; hb[i] = hb[i] + moe_b[i] + sb[i]; }
-    free(hpa); free(hpb); free(moe_a); free(moe_b); free(buf); free(oa); free(ob); free(sa); free(sb);
+    free(hpa); free(hpb); free(moe_a); free(moe_b); free(sa); free(sb);
 }
 
 // N-position MoE block: faithful generalization of moe_block_2 for the depth-N
@@ -6794,21 +6902,31 @@ static void batched_rollback_apply(GpuStateSnap *s, KVCache **kv) {
 // 4d-ii: the amortized batched 2-position forward on faithful GPU primitives.
 // full-attn = attn_block_2, linear = linear_block_2 (GPU delta-net), MoE = moe_block_2.
 // All weight-bound matmuls are batched (matmul2); operates on production GPU state.
+static double g_vf2_prof_attn, g_vf2_prof_linear, g_vf2_prof_moe, g_vf2_prof_head;
+
 static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
                                   KVCache **kv, int *fds, int pos_a, int pos_b,
                                   float *log_a, float *log_b, GpuStateSnap *rb) {
     int Hd = g_cfg.hidden_dim;
+    static int s_prof = -1;
+    if (s_prof < 0) s_prof = getenv("FLASHCHAT_VF2_PROF") ? 1 : 0;
+    double _tp = 0;
     for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+        if (s_prof) _tp = now_ms();
         if (((layer + 1) % g_cfg.full_attn_interval) == 0) {
             if (rb) rb->kvlen[layer] = kv[layer]->len;  // pre-token-a KV len (rollback)
             attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
+            if (s_prof) g_vf2_prof_attn += now_ms() - _tp;
         } else {
             linear_block_2(wf, layer, ha, hb, rb);      // captures post-a delta/conv if rb
+            if (s_prof) g_vf2_prof_linear += now_ms() - _tp;
         }
+        if (s_prof) _tp = now_ms();
         if (g_cfg.num_experts == 0)
             dense_mlp_block_2(wf, layer, ha, hb);
         else
             moe_block_2(wf, layer, ha, hb, fds[layer]);
+        if (s_prof) g_vf2_prof_moe += now_ms() - _tp;
         if (getenv("MTP_VF2_DBG")) {
             double na2=0; for(int i=0;i<Hd;i++) na2+=ha[i]*ha[i];
             int is_full=((layer+1)%g_cfg.full_attn_interval)==0;
@@ -6816,6 +6934,7 @@ static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
             fprintf(stderr,"[vf2-dbg] layer %2d %s |ha|=%.4f rel_vs_prod=%.3e\n",layer,is_full?"FULL":"lin ",sqrt(na2),rel);
         }
     }
+    if (s_prof) _tp = now_ms();
     uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
     float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
     cpu_rms_norm(ha, norm_w, na, Hd, g_cfg.rms_norm_eps);
@@ -6824,6 +6943,13 @@ static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
     gpu_dequant_matmul2(g_metal, (uint32_t*)((char*)wf->data+wi->offset), (uint16_t*)((char*)wf->data+si->offset),
                         (uint16_t*)((char*)wf->data+bi->offset), na, nb, log_a, log_b, g_cfg.vocab_size, Hd, g_cfg.group_size);
     free(na); free(nb);
+    if (s_prof) {
+        g_vf2_prof_head += now_ms() - _tp;
+        fprintf(stderr, "[vf2-prof] cumulative: attn=%.1fms linear=%.1fms moe+shared=%.1fms head=%.1fms "
+                        "| moe: route=%.1f load=%.1f gpu=%.1f shared=%.1f\n",
+                g_vf2_prof_attn, g_vf2_prof_linear, g_vf2_prof_moe, g_vf2_prof_head,
+                g_mb2_route, g_mb2_load, g_mb2_gpu, g_mb2_shared);
+    }
 }
 
 // 4d-ii validation: fused_layer_forward_2 must match two sequential production
