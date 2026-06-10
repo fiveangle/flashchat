@@ -379,8 +379,17 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     cfg->num_full_attn_layers = cfg->num_layers / cfg->full_attn_interval;
     cfg->num_linear_layers    = cfg->num_layers - cfg->num_full_attn_layers;
 
-    if (cfg->bits == 0) cfg->bits = 4;
-    if (cfg->group_size == 0) cfg->group_size = 64;
+    // Quantization width and group size define how every weight is dequantized; a
+    // wrong value yields garbage, so they are required — never silently defaulted.
+    // (All registry entries specify them.)
+    if (cfg->bits == 0) {
+        fprintf(stderr, "ERROR: model config is missing quantization.bits (required, no default)\n");
+        return -1;
+    }
+    if (cfg->group_size == 0) {
+        fprintf(stderr, "ERROR: model config is missing quantization.group_size (required, no default)\n");
+        return -1;
+    }
     if (cfg->bits != 4 && cfg->bits != 8) {
         fprintf(stderr, "ERROR: quantization bits %d is not supported\n", cfg->bits);
         return -1;

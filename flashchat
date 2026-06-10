@@ -316,8 +316,8 @@ cmd_status() {
     echo ""
     echo "Model: $(flashchat_get MODEL) ($(flashchat_get MODEL_REPO))"
     echo "Quantization: $(current_quantization_label)"
-    echo "Context window size: $(flashchat_get MAX_TOKENS) tokens"
     echo "Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
+    echo "Max response length: $(flashchat_get MAX_TOKENS) tokens"
     echo "Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
@@ -493,7 +493,7 @@ cmd_config() {
     echo "Model: $(flashchat_get MODEL)"
     echo "Quantization: $(current_quantization_label)"
     echo "Repository: $(flashchat_get MODEL_REPO)"
-    echo "Context window size: $(flashchat_get MAX_TOKENS) tokens | Sampling profile: $(flashchat_get SAMPLING_PROFILE) | Reasoning: $(flashchat_get REASONING)"
+    echo "Max response length: $(flashchat_get MAX_TOKENS) tokens | Sampling profile: $(flashchat_get SAMPLING_PROFILE) | Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (creativity) | Top-p: $(flashchat_get TOP_P) (nucleus)"
     echo "Top-k: $(flashchat_get TOP_K) | Min-p: $(flashchat_get MIN_P) | Presence penalty: $(flashchat_get PRESENCE_PENALTY) | Repetition penalty: $(flashchat_get REPETITION_PENALTY)"
     local _ae_eff _ae_mdl
@@ -540,7 +540,7 @@ cmd_config_interactive() {
     echo "  -Model: $(flashchat_get MODEL)"
     echo "  -Quantization: $(current_quantization_label)"
     echo "  -Repository: $(flashchat_get MODEL_REPO)"
-    echo "  -Context window size: $(flashchat_get MAX_TOKENS) tokens"
+    echo "  -Max response length: $(flashchat_get MAX_TOKENS) tokens"
     echo "  -Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
     echo "  -Reasoning enabled (0/1): $(flashchat_get REASONING)"
     echo "  -Temperature (0.0-2.0): $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
@@ -2866,10 +2866,11 @@ prompt_config_interactive() {
     echo "Selected model: $selected_model (${selected_quant_bits}-bit)"
     echo ""
     
-    # Max Tokens
+    # Max response length (max tokens generated per response; sent as API max_tokens).
+    # NOTE: this is NOT the context window — that is bounded by GPU_KV_SEQ in the engine.
     local default_tokens
     default_tokens=$(flashchat_get MAX_TOKENS)
-    printf "Context window limit [%s]: " "$default_tokens"
+    printf "Max response length [%s]: " "$default_tokens"
     read -r REPLY
     echo ""
     echo "MAX_TOKENS=\"${REPLY:-$default_tokens}\"" >> /tmp/flashchat_new_config
@@ -3067,7 +3068,11 @@ prompt_config_interactive() {
     read -r REPLY
     echo ""
     echo "COLOR_OUTPUT=\"${REPLY:-$default_color}\"" >> /tmp/flashchat_new_config
-    
+    # Stamp schema version last (matches _flashchat_migrate_config's append position),
+    # so a freshly-written config is complete and an unchanged re-run still compares
+    # equal to the migrated on-disk config ("No changes made").
+    echo "CONFIG_SCHEMA_VERSION=\"$FLASHCHAT_CONFIG_SCHEMA_VERSION\"" >> /tmp/flashchat_new_config
+
     # Save config only if changed
     local old_config
     old_config=$(cat "$(flashchat_get CONFIG_FILE)")
@@ -3956,6 +3961,10 @@ server_runtime_signature() {
         echo "MODEL_REPO=$(flashchat_get MODEL_REPO)"
         echo "MODEL_PATH=$(flashchat_get MODEL_PATH)"
         echo "MODEL_CONFIG=$(file_signature_part "$(flashchat_get MODEL_CONFIG)")"
+        # Hash the whole user config file: the engine reads it directly, so ANY edit
+        # to it must invalidate the running server. This makes the signature robust to
+        # new settings without having to enumerate every key below.
+        echo "CONFIG_FILE=$(file_signature_part "$(flashchat_get CONFIG_FILE)")"
         echo "SERVER_PORT=$effective_port"
         echo "TEMPERATURE=$(flashchat_get TEMPERATURE)"
         echo "SAMPLING_PROFILE=$(flashchat_get SAMPLING_PROFILE)"
@@ -4417,55 +4426,29 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashchat_get_pid_file)
     
-    # Build environment for infer.  Pass variables directly to the child
-    # without `export` so they do not leak into the parent shell and
-    # override the config file on subsequent `flashchat config` runs.
-    # User-set env vars (e.g. FLASHCHAT_MTP=3) are preserved when present.
-    local _reasoning _temperature _top_p _top_k _min_p _presence _repetition
-    local _server_log _server_debug _server_http_log _show_thinking
-    local _sys_cache _sys_cache_entries _mtp
-    [ -n "${FLASHCHAT_REASONING}" ]                && _reasoning="$FLASHCHAT_REASONING"                || _reasoning="$(flashchat_get REASONING)"
-    [ -n "${FLASHCHAT_TEMPERATURE}" ]              && _temperature="$FLASHCHAT_TEMPERATURE"              || _temperature="$(flashchat_get TEMPERATURE)"
-    [ -n "${FLASHCHAT_TOP_P}" ]                    && _top_p="$FLASHCHAT_TOP_P"                    || _top_p="$(flashchat_get TOP_P)"
-    [ -n "${FLASHCHAT_TOP_K}" ]                    && _top_k="$FLASHCHAT_TOP_K"                    || _top_k="$(flashchat_get TOP_K)"
-    [ -n "${FLASHCHAT_MIN_P}" ]                    && _min_p="$FLASHCHAT_MIN_P"                    || _min_p="$(flashchat_get MIN_P)"
-    [ -n "${FLASHCHAT_PRESENCE_PENALTY}" ]       && _presence="$FLASHCHAT_PRESENCE_PENALTY"       || _presence="$(flashchat_get PRESENCE_PENALTY)"
-    [ -n "${FLASHCHAT_REPETITION_PENALTY}" ]     && _repetition="$FLASHCHAT_REPETITION_PENALTY"     || _repetition="$(flashchat_get REPETITION_PENALTY)"
-    [ -n "${FLASHCHAT_SERVER_LOG}" ]               && _server_log="$FLASHCHAT_SERVER_LOG"               || _server_log="$(flashchat_get SERVER_LOG_PATH)"
-    [ -n "${FLASHCHAT_SERVER_DEBUG}" ]             && _server_debug="$FLASHCHAT_SERVER_DEBUG"             || _server_debug="$(flashchat_get SERVER_DEBUG)"
-    [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ]          && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG"          || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
-    [ -n "${FLASHCHAT_SHOW_THINKING}" ]            && _show_thinking="$FLASHCHAT_SHOW_THINKING"            || _show_thinking="$(flashchat_get SHOW_THINKING)"
-    [ -n "${FLASHCHAT_SYSTEM_PROMPT_CACHE}" ]      && _sys_cache="$FLASHCHAT_SYSTEM_PROMPT_CACHE"      || _sys_cache="$(flashchat_get SYSTEM_PROMPT_CACHE)"
-    [ -n "${FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES}" ] && _sys_cache_entries="$FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES" || _sys_cache_entries="$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
-    [ -n "${FLASHCHAT_MTP}" ]                      && _mtp="$FLASHCHAT_MTP"                      || _mtp="$(flashchat_get MTP)"
-    # FLASHCHAT_ACTIVE_EXPERTS is intentionally NOT passed here
-    # (it has no user-config home, registry is K's home). If the user sets it
-    # in their shell before invoking `flashchat serve`, bash propagates it to
-    # the infer child naturally.
+    # Launch infer with config as the single source of truth for persistent
+    # settings (sampling, MTP, cache, reasoning, model id): the engine reads the
+    # config file directly via --config. Launch-resolved values (the model weights
+    # path) are passed as explicit CLI flags, visible in `ps`. There is no longer an
+    # env bridge for settings — a stray FLASHCHAT_TEMPERATURE/FLASHCHAT_MTP in the
+    # shell is intentionally ignored by the engine; edit the config to change them.
+    # Only infra paths/flags (log destination, sessions/system-prompt/registry
+    # locations) are still passed via the environment.
+    local _model_path _config_file _server_log _server_debug _server_http_log
+    _model_path="$(flashchat_get MODEL_PATH)"
+    _config_file="$(flashchat_get CONFIG_FILE)"
+    [ -n "${FLASHCHAT_SERVER_LOG}" ]      && _server_log="$FLASHCHAT_SERVER_LOG"           || _server_log="$(flashchat_get SERVER_LOG_PATH)"
+    [ -n "${FLASHCHAT_SERVER_DEBUG}" ]    && _server_debug="$FLASHCHAT_SERVER_DEBUG"       || _server_debug="$(flashchat_get SERVER_DEBUG)"
+    [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ] && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG" || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
 
-    FLASHCHAT_MODEL_PATH="$(flashchat_get MODEL_PATH)" \
-    FLASHCHAT_WEIGHTS_DIR="$(flashchat_get WEIGHTS_DIR)" \
-    FLASHCHAT_EXPERTS_DIR="$(flashchat_get EXPERTS_DIR)" \
-    FLASHCHAT_SERVER_PORT="$server_port" \
-    FLASHCHAT_MODEL="$(flashchat_get MODEL)" \
-    FLASHCHAT_REASONING="$_reasoning" \
-    FLASHCHAT_TEMPERATURE="$_temperature" \
-    FLASHCHAT_TOP_P="$_top_p" \
-    FLASHCHAT_TOP_K="$_top_k" \
-    FLASHCHAT_MIN_P="$_min_p" \
-    FLASHCHAT_PRESENCE_PENALTY="$_presence" \
-    FLASHCHAT_REPETITION_PENALTY="$_repetition" \
     FLASHCHAT_SERVER_LOG="$_server_log" \
     FLASHCHAT_SERVER_DEBUG="$_server_debug" \
     FLASHCHAT_SERVER_HTTP_LOG="$_server_http_log" \
-    FLASHCHAT_SHOW_THINKING="$_show_thinking" \
-    FLASHCHAT_SYSTEM_PROMPT_CACHE="$_sys_cache" \
-    FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES="$_sys_cache_entries" \
-    FLASHCHAT_MTP="$_mtp" \
     FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
     FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
     FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
-    "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" > /dev/null 2>&1 &
+    "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" \
+        --config "$_config_file" --model "$_model_path" > /dev/null 2>&1 &
     local infer_pid=$!
     
     # Wait for server to be ready
@@ -4554,6 +4537,11 @@ cmd_chat() {
     [ -n "$server_port" ] && chat_args="--port $server_port"
     [ -n "$server_host" ] && chat_args="$chat_args --host $server_host"
     [ -n "$resume_id" ] && chat_args="$chat_args --resume $resume_id"
+    # Honor the configured response length (max tokens per response) in the chat
+    # client too, so config MAX_TOKENS applies consistently (chat + one-shot prompt).
+    local _max_tokens
+    _max_tokens="$(flashchat_get MAX_TOKENS)"
+    [ -n "$_max_tokens" ] && chat_args="$chat_args --max-tokens $_max_tokens"
     
     FLASHCHAT_MODEL="$(flashchat_get MODEL)" \
     FLASHCHAT_SERVER_HOST="$server_host" \

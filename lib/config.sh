@@ -20,6 +20,11 @@ FLASHCHAT_CONFIG_DIR="${HOME}/.config/flashchat"
 FLASHCHAT_CONFIG_FILE=""
 FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG:-${FLASHCHAT_REPO_ROOT}/assets/model_configs.json}"
 
+# Config schema version. Bump when a new persistent key is added so existing user
+# configs get the new key backfilled on next load (see _flashchat_migrate_config).
+# Because the engine now reads the config file directly, the file must be complete.
+FLASHCHAT_CONFIG_SCHEMA_VERSION="1"
+
 # Default configuration values
 FLASHCHAT_DEFAULT_MODEL="mlx-community-Qwen36-35B-A3B-4bit"
 FLASHCHAT_DEFAULT_MAX_TOKENS="8192"
@@ -46,6 +51,7 @@ FLASHCHAT_DEFAULT_HUGGINGFACE_CACHE_DIR="${HOME}/.cache/huggingface/hub"
 FLASHCHAT_DEFAULT_OFFLOAD_DIR=""
 
 # Config values (set after loading)
+CONFIG_SCHEMA_VERSION=""
 MODEL=""
 MODEL_REPO=""
 MAX_TOKENS=""
@@ -397,9 +403,47 @@ _flashchat_source_config() {
 # -----------------------------------------------------------------------------
 # Load configuration with priority
 # -----------------------------------------------------------------------------
+# Backfill any persistent keys missing from an existing config file, then stamp the
+# schema version. APPEND-ONLY: existing keys and values are never modified or
+# reordered, so this can never corrupt a user's settings — it only adds keys that
+# are absent (with the value already resolved by flashchat_load_config). Idempotent:
+# once the file carries the current schema version, this returns immediately.
+# Must be called AFTER all values are resolved (defaults/profile applied).
+_flashchat_migrate_config() {
+    local file="$1"
+    [ -n "$file" ] && [ -f "$file" ] || return 0
+    local file_version
+    file_version=$(sed -n 's/^CONFIG_SCHEMA_VERSION="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$file" 2>/dev/null | head -1)
+    [ "$file_version" = "$FLASHCHAT_CONFIG_SCHEMA_VERSION" ] && return 0
+
+    local key added=0
+    for key in MODEL HUGGINGFACE_CACHE_DIR OFFLOAD_DIR MAX_TOKENS SAMPLING_PROFILE \
+               REASONING TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY \
+               SERVER_PORT SERVER_HOST SERVER_LOG_PATH SERVER_DEBUG SERVER_HTTP_LOG \
+               SYSTEM_PROMPT_CACHE SYSTEM_PROMPT_CACHE_MAX_ENTRIES MTP MTP_BF16 \
+               SHOW_THINKING COLOR_OUTPUT; do
+        if ! grep -qE "^${key}=" "$file" 2>/dev/null; then
+            printf '%s="%s"\n' "$key" "${!key}" >> "$file"
+            added=$((added + 1))
+        fi
+    done
+
+    if grep -qE '^CONFIG_SCHEMA_VERSION=' "$file" 2>/dev/null; then
+        sed -i '' "s/^CONFIG_SCHEMA_VERSION=.*/CONFIG_SCHEMA_VERSION=\"$FLASHCHAT_CONFIG_SCHEMA_VERSION\"/" "$file" 2>/dev/null || true
+    else
+        printf 'CONFIG_SCHEMA_VERSION="%s"\n' "$FLASHCHAT_CONFIG_SCHEMA_VERSION" >> "$file"
+    fi
+    if [ "$added" -gt 0 ]; then
+        echo "Config migrated to schema v${FLASHCHAT_CONFIG_SCHEMA_VERSION}: backfilled $added missing key(s) in $file" >&2
+    fi
+    CONFIG_SCHEMA_VERSION="$FLASHCHAT_CONFIG_SCHEMA_VERSION"
+    return 0
+}
+
 flashchat_load_config() {
     mkdir -p "$FLASHCHAT_CONFIG_DIR"
 
+    CONFIG_SCHEMA_VERSION=""
     MODEL=""
     MODEL_REPO=""
     MAX_TOKENS=""
@@ -559,6 +603,11 @@ flashchat_load_config() {
     
     # Compute derived paths
     _flashchat_compute_paths
+
+    # Ensure the on-disk config is complete for the current schema (append-only),
+    # so the engine — which reads the file directly — sees every key. Never fails
+    # the load.
+    _flashchat_migrate_config "$FLASHCHAT_CONFIG_FILE" || true
 }
 
 # -----------------------------------------------------------------------------
@@ -567,6 +616,7 @@ flashchat_load_config() {
 flashchat_get() {
     local key="$1"
     case "$key" in
+        CONFIG_SCHEMA_VERSION) echo "$CONFIG_SCHEMA_VERSION" ;;
         MODEL) echo "$MODEL" ;;
         MODEL_REPO) echo "$MODEL_REPO" ;;
         MAX_TOKENS) echo "$MAX_TOKENS" ;;
@@ -610,6 +660,7 @@ flashchat_create_default_config() {
     cat > "$config_file" << EOF
 # Flashchat Configuration
 # Generated on $(date)
+CONFIG_SCHEMA_VERSION="${FLASHCHAT_CONFIG_SCHEMA_VERSION}"
 
 # Model Settings
 MODEL="${MODEL:-$(flashchat_default_model)}"

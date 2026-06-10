@@ -91,8 +91,9 @@ ModelConfig g_cfg;
 #define MAX_SEQ_LEN 1048576
 #define GPU_KV_SEQ  8192
 
-// Default model path (overridden by --model flag)
-#define MODEL_PATH_DEFAULT "/Volumes/usr/Users/speedster/dev/flashchat/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+// Model path has NO hardcoded default. It must be supplied explicitly (--model or
+// config); a missing model path is a fatal error, never a silent fallback to some
+// other model's weights (which would load and generate garbage). See main().
 
 // ============================================================================
 // Timing helper
@@ -549,22 +550,55 @@ static char g_flashchat_lz4_experts_dir[PATH_MAX] = {0};
 static char g_flashchat_model_path[PATH_MAX] = {0};
 
 static void configure_flashchat_artifact_dirs(const char *model_path) {
-    const char *env_weights_dir = getenv("FLASHCHAT_WEIGHTS_DIR");
-    const char *env_experts_dir = getenv("FLASHCHAT_EXPERTS_DIR");
+    // Artifact dirs are derived deterministically from the (CLI-supplied) model
+    // path — no env bridge. g_cfg.bits is guaranteed valid by load_model_config,
+    // which now errors on a missing quantization width.
     snprintf(g_flashchat_model_path, sizeof(g_flashchat_model_path), "%s", model_path ? model_path : "");
-    if (env_weights_dir && env_weights_dir[0]) {
-        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s", env_weights_dir);
-    } else {
-        int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
-        snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s/flashchat/q%d", model_path, bits);
-    }
-    if (env_experts_dir && env_experts_dir[0]) {
-        snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s", env_experts_dir);
-    } else {
-        snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s/packed_experts", g_flashchat_weights_dir);
-    }
+    snprintf(g_flashchat_weights_dir, sizeof(g_flashchat_weights_dir), "%s/flashchat/q%d", model_path ? model_path : "", g_cfg.bits);
+    snprintf(g_flashchat_experts_dir, sizeof(g_flashchat_experts_dir), "%s/packed_experts", g_flashchat_weights_dir);
     snprintf(g_flashchat_mtp_experts_dir, sizeof(g_flashchat_mtp_experts_dir), "%s/packed_mtp_experts", g_flashchat_weights_dir);
     snprintf(g_flashchat_lz4_experts_dir, sizeof(g_flashchat_lz4_experts_dir), "%s/packed_experts_lz4", g_flashchat_weights_dir);
+}
+
+// Fail loud, before any inference, if a required model artifact is missing — rather
+// than discovering it mid-pread and producing a confusing partial failure or garbage.
+// Checks the core files (weights/manifest/vocab) and, for MoE models, every per-layer
+// expert file. Returns 0 if all present; otherwise prints each missing path and
+// returns the number missing. The caller treats nonzero as fatal.
+static int validate_required_artifacts(const char *weights_path, const char *manifest_path,
+                                       const char *vocab_path, const char *experts_dir,
+                                       int num_layers, int num_experts) {
+    int missing = 0;
+    const char *core[] = { weights_path, manifest_path, vocab_path };
+    const char *core_label[] = { "weights", "manifest", "vocab" };
+    for (int i = 0; i < 3; i++) {
+        if (!core[i] || access(core[i], R_OK) != 0) {
+            fprintf(stderr, "FATAL: required %s file not found: %s\n",
+                    core_label[i], core[i] ? core[i] : "(null)");
+            missing++;
+        }
+    }
+    if (num_experts > 0 && experts_dir && experts_dir[0]) {
+        int expert_missing = 0, expert_reported = 0;
+        for (int layer = 0; layer < num_layers; layer++) {
+            char layer_path[PATH_MAX];
+            snprintf(layer_path, sizeof(layer_path), "%s/layer_%02d.bin", experts_dir, layer);
+            if (access(layer_path, R_OK) != 0) {
+                expert_missing++;
+                // Cap the per-layer spew but still make the failure unambiguous.
+                if (expert_reported < 4) {
+                    fprintf(stderr, "FATAL: missing expert layer file: %s\n", layer_path);
+                    expert_reported++;
+                }
+            }
+        }
+        if (expert_missing > expert_reported) {
+            fprintf(stderr, "FATAL: ...and %d more expert layer file(s) missing under %s\n",
+                    expert_missing - expert_reported, experts_dir);
+        }
+        missing += expert_missing;
+    }
+    return missing;
 }
 
 #define ANE_DENSE_MAX_PROJECTIONS 512
@@ -2358,27 +2392,25 @@ static int g_tokenizer_loaded = 0;
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
     
-    const char *env_weights_dir = getenv("FLASHCHAT_WEIGHTS_DIR");
-    const char *env_model_path = getenv("FLASHCHAT_MODEL_PATH");
+    // Vocab path candidates derive from the artifact dirs already configured from
+    // the CLI model path (no env bridge).
     char runtime_vocab_fc[1024];
     char model_vocab_fc[1024];
     char model_vocab[1024];
-    const char *weights_dir = (env_weights_dir && env_weights_dir[0])
-        ? env_weights_dir
-        : (g_flashchat_weights_dir[0] ? g_flashchat_weights_dir : NULL);
+    const char *weights_dir = g_flashchat_weights_dir[0] ? g_flashchat_weights_dir : NULL;
+    const char *mp = g_flashchat_model_path[0] ? g_flashchat_model_path : NULL;
     if (weights_dir) {
         snprintf(runtime_vocab_fc, sizeof(runtime_vocab_fc), "%s/vocab.bin", weights_dir);
     }
-    if (env_model_path) {
-        int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
-        snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/q%d/vocab.bin", env_model_path, bits);
-        snprintf(model_vocab, sizeof(model_vocab), "%s/vocab.bin", env_model_path);
+    if (mp) {
+        snprintf(model_vocab_fc, sizeof(model_vocab_fc), "%s/flashchat/q%d/vocab.bin", mp, g_cfg.bits);
+        snprintf(model_vocab, sizeof(model_vocab), "%s/vocab.bin", mp);
     }
-    
+
     const char *paths[] = {
         weights_dir ? runtime_vocab_fc : NULL,
-        env_model_path ? model_vocab_fc : NULL,
-        env_model_path ? model_vocab : NULL,
+        mp ? model_vocab_fc : NULL,
+        mp ? model_vocab : NULL,
         "tokenizer.bin",
         "metal_infer/tokenizer.bin",
         "vocab.bin",
@@ -14788,6 +14820,13 @@ enum {
     OPT_MTP_GENERATE_DENSE,
     OPT_MTP_VERIFY_FORWARDN,
     OPT_MTP_GENERATE_DEPTH3,
+    OPT_CONFIG,
+    OPT_TEMPERATURE,
+    OPT_TOP_P,
+    OPT_TOP_K,
+    OPT_MIN_P,
+    OPT_PRESENCE_PENALTY,
+    OPT_REPETITION_PENALTY,
 };
 
 static void print_usage(const char *prog) {
@@ -14825,16 +14864,19 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        // Support FLASHCHAT_MODEL_PATH environment variable
-        const char *env_model_path = getenv("FLASHCHAT_MODEL_PATH");
-        const char *model_path = env_model_path ? env_model_path : MODEL_PATH_DEFAULT;
+        // Config is the single source of truth: persistent settings come from the
+        // config file (via --config, or the default path below) and the model
+        // registry; launch-resolved values come from CLI flags. There is NO env
+        // bridge for settings and NO hardcoded model-path default — a missing model
+        // path is fatal, never a silent guess.
+        const char *model_path = NULL;     // from --model / config MODEL_PATH; required
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
-        const char *env_model_id = getenv("FLASHCHAT_MODEL");
-        const char *model_id = (env_model_id && env_model_id[0]) ? env_model_id : NULL;
+        const char *model_id = NULL;       // from --model-id / config MODEL
+        const char *config_file_override = NULL;   // from --config <path>
         int max_tokens = 20;
         int K = 0;  // 0 = use g_cfg.num_experts_per_tok after config load; --k overrides
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -14860,37 +14902,37 @@ int main(int argc, char **argv) {
         int mtp_verify_forwardN_requested = 0;
         int mtp_generate_depth3_requested = 0;
         
-        // Support FLASHCHAT_SERVER_PORT environment variable
-        const char *env_serve_port = getenv("FLASHCHAT_SERVER_PORT");
-        int serve_port = env_serve_port ? atoi(env_serve_port) : 0;
-        const char *env_temperature = getenv("FLASHCHAT_TEMPERATURE");
-        const char *env_top_p = getenv("FLASHCHAT_TOP_P");
-        const char *env_top_k = getenv("FLASHCHAT_TOP_K");
-        const char *env_min_p = getenv("FLASHCHAT_MIN_P");
-        const char *env_presence_penalty = getenv("FLASHCHAT_PRESENCE_PENALTY");
-        const char *env_repetition_penalty = getenv("FLASHCHAT_REPETITION_PENALTY");
+        int serve_port = 0;   // from --serve <port>
+
+        // CLI sampling overrides (convenience knobs, not correctness-critical).
+        // A has_* flag of 0 (or top_k -1) means "not provided"; applied AFTER the
+        // config file so an explicit flag wins. (Plain has-flags rather than NaN
+        // sentinels because -ffast-math makes NaN/isnan unreliable.)
+        float cli_temperature = 0, cli_top_p = 0, cli_min_p = 0;
+        float cli_presence_penalty = 0, cli_repetition_penalty = 0;
+        int cli_top_k = -1;
+        int has_cli_temperature = 0, has_cli_top_p = 0, has_cli_min_p = 0;
+        int has_cli_presence_penalty = 0, has_cli_repetition_penalty = 0;
+
+        // Pre-scan argv for --config so the config-file parser below uses the right
+        // file (getopt runs after the parse). Accepts "--config PATH" and "--config=PATH".
+        for (int ai = 1; ai < argc; ai++) {
+            if (strcmp(argv[ai], "--config") == 0 && ai + 1 < argc) {
+                config_file_override = argv[ai + 1];
+            } else if (strncmp(argv[ai], "--config=", 9) == 0) {
+                config_file_override = argv[ai] + 9;
+            }
+        }
+
+        // Dev/advanced env knobs that are NOT user-facing settings remain available
+        // as environment overrides (benchmark / diagnostic use only). Everything that
+        // is a real setting now comes from the config file, not the environment.
         const char *env_active_experts = getenv("FLASHCHAT_ACTIVE_EXPERTS");
         const char *env_tool_call_greedy = getenv("FLASHCHAT_TOOL_CALL_GREEDY");
-        const char *env_reasoning = getenv("FLASHCHAT_REASONING");
-        const char *env_show_thinking = getenv("FLASHCHAT_SHOW_THINKING");
-        const char *env_system_prompt_cache = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE");
-        const char *env_system_prompt_cache_max_entries = getenv("FLASHCHAT_SYSTEM_PROMPT_CACHE_MAX_ENTRIES");
-        const char *env_mtp = getenv("FLASHCHAT_MTP");
         const char *env_mtp_active_experts = getenv("FLASHCHAT_MTP_ACTIVE_EXPERTS");
         const char *env_mtp_trace = getenv("FLASHCHAT_MTP_TRACE");
         const char *env_mtp_trace_top = getenv("FLASHCHAT_MTP_TRACE_TOP");
         const char *env_mtp_trace_dir = getenv("FLASHCHAT_MTP_TRACE_DIR");
-        if (env_temperature && env_temperature[0]) g_default_temperature = strtof(env_temperature, NULL);
-        if (env_top_p && env_top_p[0]) g_default_top_p = strtof(env_top_p, NULL);
-        if (env_top_k && env_top_k[0]) g_default_top_k = atoi(env_top_k);
-        if (env_min_p && env_min_p[0]) g_default_min_p = strtof(env_min_p, NULL);
-        if (env_presence_penalty && env_presence_penalty[0]) g_default_presence_penalty = strtof(env_presence_penalty, NULL);
-        if (env_repetition_penalty && env_repetition_penalty[0]) g_default_repetition_penalty = strtof(env_repetition_penalty, NULL);
-        // FLASHCHAT_ACTIVE_EXPERTS: ad-hoc override for K (active experts per token).
-        // Useful for K-sweep benchmarks. Has the same precedence as --k (whichever
-        // is parsed last wins; --k is parsed via getopt below, env is read here, so
-        // a CLI --k passed simultaneously will override the env). Empty/0 = no
-        // override, use g_cfg.num_experts_per_tok from registry.
         if (env_active_experts && env_active_experts[0]) {
             int v = atoi(env_active_experts);
             if (v > 0) {
@@ -14903,22 +14945,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[init] FLASHCHAT_TOOL_CALL_GREEDY=%d (sampling inside <tool_call>...</tool_call> %s)\n",
                     g_tool_call_greedy_enabled,
                     g_tool_call_greedy_enabled ? "forced greedy" : "uses request sampling");
-        }
-        if (env_reasoning && env_reasoning[0]) {
-            g_default_reasoning_enabled = server_flag_enabled(env_reasoning);
-        }
-        if (env_show_thinking && env_show_thinking[0]) {
-            g_show_thinking_enabled = server_flag_enabled(env_show_thinking);
-        }
-        if (env_system_prompt_cache && env_system_prompt_cache[0]) {
-            g_system_prompt_cache_enabled = server_flag_enabled(env_system_prompt_cache);
-        }
-        if (env_system_prompt_cache_max_entries && env_system_prompt_cache_max_entries[0]) {
-            g_system_prompt_cache_max_entries = atoi(env_system_prompt_cache_max_entries);
-            if (g_system_prompt_cache_max_entries < 0) g_system_prompt_cache_max_entries = 0;
-        }
-        if (env_mtp && env_mtp[0]) {
-            g_mtp_predictions = parse_mtp_predictions(env_mtp);
         }
         if (env_mtp_active_experts && env_mtp_active_experts[0]) {
             g_mtp_active_experts = atoi(env_mtp_active_experts);
@@ -14933,17 +14959,26 @@ int main(int argc, char **argv) {
             snprintf(g_mtp_trace_dir, sizeof(g_mtp_trace_dir), "%s", env_mtp_trace_dir);
         }
 
-        // Also try to read config from ~/.config/flashchat/config if env vars not set
-        const char *home = getenv("HOME");
-        if (home) {
-            char config_path[1024];
-            snprintf(config_path, sizeof(config_path), "%s/.config/flashchat/config", home);
-            
-            FILE *cfg = fopen(config_path, "r");
+        // ---- Read persistent settings from the config file (single source) ----
+        // Default to ~/.config/flashchat/config; --config overrides. Values here are
+        // applied directly; explicit CLI flags parsed below take precedence (model
+        // id/path are guarded by !already-set; sampling overrides are applied after).
+        {
+            const char *home = getenv("HOME");
+            char config_path[1024] = {0};
+            if (config_file_override && config_file_override[0]) {
+                snprintf(config_path, sizeof(config_path), "%s", config_file_override);
+            } else if (home) {
+                snprintf(config_path, sizeof(config_path), "%s/.config/flashchat/config", home);
+            }
+            FILE *cfg = config_path[0] ? fopen(config_path, "r") : NULL;
             if (cfg) {
                 char line[512];
                 while (fgets(line, sizeof(line), cfg)) {
-                    if (!env_model_id && strncmp(line, "MODEL=", 6) == 0) {
+                    // model id/path: config provides them; an explicit --model-id /
+                    // --model on the CLI (parsed below) overrides, so only take the
+                    // config value if not already set.
+                    if (!model_id && strncmp(line, "MODEL=", 6) == 0) {
                         char *val = line + 6;
                         char *quote = strchr(val, '"');
                         if (quote) {
@@ -14952,77 +14987,75 @@ int main(int argc, char **argv) {
                             model_id = strdup(quote + 1);
                         }
                     }
-                    // Parse MODEL_PATH from config file (for when env var not set)
-                    if (strncmp(line, "MODEL_PATH=", 11) == 0) {
-                        if (!env_model_path) {
-                            char *val = line + 11;
-                            char *quote = strchr(val, '"');
-                            if (quote) {
-                                char *end_quote = strchr(quote + 1, '"');
-                                if (end_quote) *end_quote = '\0';
-                                model_path = strdup(quote + 1);
-                            }
+                    if (!model_path && strncmp(line, "MODEL_PATH=", 11) == 0) {
+                        char *val = line + 11;
+                        char *quote = strchr(val, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            model_path = strdup(quote + 1);
                         }
                     }
-                    if (!env_temperature && strncmp(line, "TEMPERATURE=", 12) == 0) {
-                        char *val = line + 12;
-                        char *quote = strchr(val, '"');
+                    // Sampling defaults: set directly from config; explicit --temperature
+                    // / --top-p / ... CLI overrides are applied after getopt below.
+                    if (strncmp(line, "TEMPERATURE=", 12) == 0) {
+                        char *quote = strchr(line + 12, '"');
                         if (quote) g_default_temperature = strtof(quote + 1, NULL);
                     }
-                    if (!env_top_p && strncmp(line, "TOP_P=", 6) == 0) {
-                        char *val = line + 6;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "TOP_P=", 6) == 0) {
+                        char *quote = strchr(line + 6, '"');
                         if (quote) g_default_top_p = strtof(quote + 1, NULL);
                     }
-                    if (!env_top_k && strncmp(line, "TOP_K=", 6) == 0) {
-                        char *val = line + 6;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "TOP_K=", 6) == 0) {
+                        char *quote = strchr(line + 6, '"');
                         if (quote) g_default_top_k = atoi(quote + 1);
                     }
-                    if (!env_min_p && strncmp(line, "MIN_P=", 6) == 0) {
-                        char *val = line + 6;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "MIN_P=", 6) == 0) {
+                        char *quote = strchr(line + 6, '"');
                         if (quote) g_default_min_p = strtof(quote + 1, NULL);
                     }
-                    if (!env_presence_penalty && strncmp(line, "PRESENCE_PENALTY=", 17) == 0) {
-                        char *val = line + 17;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "PRESENCE_PENALTY=", 17) == 0) {
+                        char *quote = strchr(line + 17, '"');
                         if (quote) g_default_presence_penalty = strtof(quote + 1, NULL);
                     }
-                    if (!env_repetition_penalty && strncmp(line, "REPETITION_PENALTY=", 19) == 0) {
-                        char *val = line + 19;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "REPETITION_PENALTY=", 19) == 0) {
+                        char *quote = strchr(line + 19, '"');
                         if (quote) g_default_repetition_penalty = strtof(quote + 1, NULL);
                     }
-                    if (!env_show_thinking && strncmp(line, "SHOW_THINKING=", 14) == 0) {
-                        char *val = line + 14;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "REASONING=", 10) == 0) {
+                        char *quote = strchr(line + 10, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            g_default_reasoning_enabled = server_flag_enabled(quote + 1);
+                        }
+                    }
+                    if (strncmp(line, "SHOW_THINKING=", 14) == 0) {
+                        char *quote = strchr(line + 14, '"');
                         if (quote) {
                             char *end_quote = strchr(quote + 1, '"');
                             if (end_quote) *end_quote = '\0';
                             g_show_thinking_enabled = server_flag_enabled(quote + 1);
                         }
                     }
-                    if (!env_system_prompt_cache && strncmp(line, "SYSTEM_PROMPT_CACHE=", 20) == 0) {
-                        char *val = line + 20;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "SYSTEM_PROMPT_CACHE=", 20) == 0) {
+                        char *quote = strchr(line + 20, '"');
                         if (quote) {
                             char *end_quote = strchr(quote + 1, '"');
                             if (end_quote) *end_quote = '\0';
                             g_system_prompt_cache_enabled = server_flag_enabled(quote + 1);
                         }
                     }
-                    if (!env_system_prompt_cache_max_entries && strncmp(line, "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=", 32) == 0) {
-                        char *val = line + 32;
-                        char *quote = strchr(val, '"');
+                    if (strncmp(line, "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=", 32) == 0) {
+                        char *quote = strchr(line + 32, '"');
                         if (quote) {
                             g_system_prompt_cache_max_entries = atoi(quote + 1);
                             if (g_system_prompt_cache_max_entries < 0) g_system_prompt_cache_max_entries = 0;
                         }
                     }
-                    if (!env_mtp && strncmp(line, "MTP=", 4) == 0) {
-                        char *val = line + 4;
-                        char *quote = strchr(val, '"');
+                    // MTP from config; --mtp / --no-mtp (parsed below) override.
+                    if (strncmp(line, "MTP=", 4) == 0) {
+                        char *quote = strchr(line + 4, '"');
                         if (quote) {
                             char *end_quote = strchr(quote + 1, '"');
                             if (end_quote) *end_quote = '\0';
@@ -15078,6 +15111,13 @@ int main(int argc, char **argv) {
             {"mtp-generate-dense", no_argument,   0, OPT_MTP_GENERATE_DENSE},
             {"mtp-verify-forwardN", no_argument,  0, OPT_MTP_VERIFY_FORWARDN},
             {"mtp-generate-depth3", no_argument,  0, OPT_MTP_GENERATE_DEPTH3},
+            {"config",        required_argument, 0, OPT_CONFIG},
+            {"temperature",   required_argument, 0, OPT_TEMPERATURE},
+            {"top-p",         required_argument, 0, OPT_TOP_P},
+            {"top-k",         required_argument, 0, OPT_TOP_K},
+            {"min-p",         required_argument, 0, OPT_MIN_P},
+            {"presence-penalty",   required_argument, 0, OPT_PRESENCE_PENALTY},
+            {"repetition-penalty", required_argument, 0, OPT_REPETITION_PENALTY},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -15085,8 +15125,8 @@ int main(int argc, char **argv) {
         int c;
         while ((c = getopt_long(argc, argv, "I:m:w:j:v:p:P:t:k:C:M:R:B:LSTFEGh", long_options, NULL)) != -1) {
             switch (c) {
-                case 'I': model_id = optarg; break;
-                case 'm': model_path = optarg; break;
+                case 'I': model_id = (optarg && optarg[0]) ? optarg : NULL; break;
+                case 'm': model_path = (optarg && optarg[0]) ? optarg : NULL; break;
                 case 'w': weights_path = optarg; break;
                 case 'j': manifest_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
@@ -15134,10 +15174,25 @@ int main(int argc, char **argv) {
                 case OPT_MTP_GENERATE_DENSE: mtp_generate_dense_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_DEPTH3: mtp_generate_depth3_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_CONFIG: config_file_override = optarg; break;  // already pre-scanned
+                case OPT_TEMPERATURE: cli_temperature = strtof(optarg, NULL); has_cli_temperature = 1; break;
+                case OPT_TOP_P: cli_top_p = strtof(optarg, NULL); has_cli_top_p = 1; break;
+                case OPT_TOP_K: cli_top_k = atoi(optarg); break;
+                case OPT_MIN_P: cli_min_p = strtof(optarg, NULL); has_cli_min_p = 1; break;
+                case OPT_PRESENCE_PENALTY: cli_presence_penalty = strtof(optarg, NULL); has_cli_presence_penalty = 1; break;
+                case OPT_REPETITION_PENALTY: cli_repetition_penalty = strtof(optarg, NULL); has_cli_repetition_penalty = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
         }
+
+        // Apply CLI sampling overrides last so an explicit flag wins over config.
+        if (has_cli_temperature) g_default_temperature = cli_temperature;
+        if (has_cli_top_p) g_default_top_p = cli_top_p;
+        if (cli_top_k >= 0) g_default_top_k = cli_top_k;
+        if (has_cli_min_p) g_default_min_p = cli_min_p;
+        if (has_cli_presence_penalty) g_default_presence_penalty = cli_presence_penalty;
+        if (has_cli_repetition_penalty) g_default_repetition_penalty = cli_repetition_penalty;
 
         const char *config_json_path = resolve_model_config_path();
 
@@ -15224,7 +15279,19 @@ int main(int argc, char **argv) {
                     g_mtp_trace_dir[0] ? " dir=" : "",
                     g_mtp_trace_dir[0] ? g_mtp_trace_dir : "");
         }
-        configure_flashchat_artifact_dirs(model_path);
+        // A model path is required for any path that actually loads the model.
+        // Pure file-debug tools (tool-call parse, request render, cache round-trip)
+        // never touch the model, so they may run without one.
+        int pure_debug_request = (parse_tool_call_path != NULL) ||
+                                 (render_request_path != NULL) ||
+                                 cache_roundtrip_test_requested;
+        if (!model_path && !pure_debug_request) {
+            fprintf(stderr,
+                    "FATAL: no model path provided. Pass --model <path>, or set MODEL_PATH "
+                    "in the config. The engine will not guess a model location.\n");
+            return 1;
+        }
+        configure_flashchat_artifact_dirs(model_path ? model_path : "");
 
         // K (active experts per token) defaults to the model's num_experts_per_tok
         // from config — i.e. exactly what the model was trained with. Previously
@@ -15277,6 +15344,21 @@ int main(int argc, char **argv) {
             snprintf(default_vocab, sizeof(default_vocab),
                      "%s/vocab.bin", g_flashchat_weights_dir);
             vocab_path = default_vocab;
+        }
+
+        // ---- Preflight: fail loud now if any required artifact is missing ----
+        // Better a clear startup error naming the missing file than a confusing
+        // mid-inference pread failure or silently-wrong output.
+        {
+            int missing = validate_required_artifacts(weights_path, manifest_path, vocab_path,
+                                                      g_flashchat_experts_dir,
+                                                      g_cfg.num_layers, g_cfg.num_experts);
+            if (missing > 0) {
+                fprintf(stderr, "FATAL: %d required model artifact(s) missing for model_path=%s "
+                                "(weights_dir=%s). Refusing to run.\n",
+                        missing, model_path ? model_path : "(null)", g_flashchat_weights_dir);
+                return 1;
+            }
         }
 
         // ---- Initialize Metal ----
