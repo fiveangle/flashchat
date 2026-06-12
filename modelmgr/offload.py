@@ -207,12 +207,34 @@ def _walk_tree(root: str):
             yield rel, ("link" if os.path.islink(full) else "file")
 
 
+def _adopt_existing(src: str, dst: str, rel: str, journal: Journal,
+                    progress=None) -> bool:
+    """Adopt a pre-journal archive copy (e.g. from the old mv-based offload):
+    if dst already exists with matching size AND matching content hash,
+    journal it instead of rewriting it. Content is verified for real because
+    full offload deletes the source afterwards — a size match alone is never
+    grounds for skipping the copy."""
+    if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(src):
+        return False
+    if progress:
+        progress("verify-existing", 0, 0, rel)
+    src_digest, src_size = sha256_file(src)
+    dst_digest, _dst_size = sha256_file(dst)
+    if src_digest != dst_digest:
+        return False  # stale/corrupt archive copy: fall through to recopy
+    journal.mark_file(rel, src_size, src_digest)
+    journal.save()
+    return True
+
+
 def transfer_tree(src_root: str, dest_root: str, journal: Journal,
                   progress=None, relpaths=None) -> int:
     """Copy a tree into dest_root with journaled resume; returns bytes copied.
 
     Symlinks are journaled (relative targets preserved), never expanded —
     this is what keeps shared artifacts single-copy on any filesystem.
+    Destination files from a pre-journal archive are adopted (hash-verified,
+    not rewritten) rather than re-copied.
     """
     copied = 0
     entries = list(_walk_tree(src_root))
@@ -227,13 +249,15 @@ def transfer_tree(src_root: str, dest_root: str, journal: Journal,
             journal.save()
             continue
         size = os.path.getsize(src)
+        dst = os.path.join(dest_root, rel)
         if journal.file_done(rel, size):
-            dst = os.path.join(dest_root, rel)
             if os.path.isfile(dst) and os.path.getsize(dst) == size:
                 continue  # resumed: already transferred
+        elif _adopt_existing(src, dst, rel, journal, progress=progress):
+            continue  # legacy archive copy verified in place
         if progress:
             progress("offload", i + 1, total_files, rel)
-        digest, size = copy_file_verified(src, os.path.join(dest_root, rel))
+        digest, size = copy_file_verified(src, dst)
         journal.mark_file(rel, size, digest)
         journal.save()
         copied += size
@@ -327,11 +351,13 @@ def offload_originals(manifest: Manifest, snapshot: str, offload_dir: str,
     moved = 0
     for i, (rel, target) in enumerate(blob_files):
         blob_rel = os.path.join("blobs", os.path.basename(target))
+        blob_dst = os.path.join(dest, blob_rel)
         size = os.path.getsize(target)
-        if not journal.file_done(blob_rel, size):
+        if not journal.file_done(blob_rel, size) and \
+           not _adopt_existing(target, blob_dst, blob_rel, journal, progress=progress):
             if progress:
                 progress("offload", i + 1, len(blob_files), rel)
-            digest, size = copy_file_verified(target, os.path.join(dest, blob_rel))
+            digest, size = copy_file_verified(target, blob_dst)
             journal.mark_file(blob_rel, size, digest)
         if os.path.islink(os.path.join(snapshot, rel)):
             journal.mark_link(os.path.join("snapshots", os.path.basename(snapshot), rel),
@@ -363,11 +389,20 @@ def offload_full(manifest: Manifest, snapshot: str, offload_dir: str,
     """Archive the whole repo tree (originals + runtime artifacts), then
     delete it locally. Snapshot/variant symlinks travel as journal entries."""
     repo_root = os.path.dirname(os.path.dirname(snapshot))
-    needed = paths.dir_size_bytes(repo_root)
+    dest = dest_repo_dir(offload_dir, manifest)
+    # Free-space requirement excludes files the archive already holds at
+    # matching size (resumed transfers and adoptable pre-journal copies).
+    needed = 0
+    for rel, kind in _walk_tree(repo_root):
+        if kind != "file":
+            continue
+        size = os.path.getsize(os.path.join(repo_root, rel))
+        dst = os.path.join(dest, rel)
+        if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
+            needed += size
     report = preflight(offload_dir, needed_bytes=needed)
     if not report.ok:
         raise OffloadError("; ".join(report.errors))
-    dest = dest_repo_dir(offload_dir, manifest)
     journal = Journal(dest)
     copied = transfer_tree(repo_root, dest, journal, progress=progress)
     shutil.rmtree(repo_root)

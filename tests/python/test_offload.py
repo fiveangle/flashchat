@@ -1,6 +1,7 @@
 """Offload subsystem: preflight probing, journaled transfer/resume, restores."""
 
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -133,6 +134,73 @@ class TestFullOffload(OffloadBase):
         self.assertTrue(os.path.isfile(
             os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.bin")))
         self.assertFalse(os.path.isdir(os.path.join(repo_root, "blobs")))
+
+
+class TestLegacyArchiveAdoption(OffloadBase):
+    """Pre-journal archives (from the old mv-based offload) must be adopted
+    by hash verification, never blindly re-copied — and never blindly
+    trusted on size alone, since full offload deletes the source."""
+
+    def _make_legacy_archive(self, repo_root):
+        """Simulate an old mv-style archive: identical tree, no journal."""
+        dest_repo = offload.dest_repo_dir(self.dest, self.moe)
+        shutil.copytree(repo_root, dest_repo, symlinks=True)
+        return dest_repo
+
+    def test_identical_legacy_archive_adopted_without_recopy(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        dest_repo = self._make_legacy_archive(repo_root)
+
+        weights_dst = os.path.join(
+            dest_repo, os.path.relpath(snapshot, repo_root),
+            "flashchat", "q4", "model_weights.bin")
+        before = os.stat(weights_dst).st_mtime_ns
+
+        copied = offload.offload_full(self.moe, snapshot, self.dest)
+        self.assertEqual(copied, 0, "identical archive must be adopted, not re-copied")
+        self.assertEqual(os.stat(weights_dst).st_mtime_ns, before,
+                         "adopted file must not be rewritten")
+        journal = offload.Journal(dest_repo)
+        self.assertTrue(journal.data["files"], "adoption must populate the journal")
+        for entry in journal.data["files"].values():
+            self.assertTrue(entry.get("sha256"), "adopted entries carry verified hashes")
+        # source was deleted only after every file verified
+        self.assertFalse(os.path.exists(repo_root))
+        self.assertGreater(offload.restore_full(self.moe, self.cache, self.dest), 0)
+
+    def test_stale_same_size_archive_copy_is_recopied(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        dest_repo = self._make_legacy_archive(repo_root)
+        victim = os.path.join(
+            dest_repo, os.path.relpath(snapshot, repo_root),
+            "flashchat", "q4", "model_weights.bin")
+        with open(victim, "r+b") as f:
+            f.write(b"X")  # same size, different content
+
+        copied = offload.offload_full(self.moe, snapshot, self.dest)
+        self.assertGreater(copied, 0, "stale copy must be replaced")
+        journal = offload.Journal(dest_repo)
+        rel = os.path.relpath(victim, dest_repo)
+        from modelmgr.artifacts import sha256_file
+        self.assertEqual(journal.data["files"][rel]["sha256"], sha256_file(victim)[0])
+
+    def test_offload_originals_adopts_existing_blobs(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        dest_repo = offload.dest_repo_dir(self.dest, self.moe)
+        shutil.copytree(os.path.join(repo_root, "blobs"),
+                        os.path.join(dest_repo, "blobs"))
+        blob_dst = next(os.path.join(dest_repo, "blobs", n)
+                        for n in os.listdir(os.path.join(dest_repo, "blobs")))
+        before = os.stat(blob_dst).st_mtime_ns
+
+        moved = offload.offload_originals(self.moe, snapshot, self.dest)
+        self.assertGreater(moved, 0)
+        self.assertEqual(os.stat(blob_dst).st_mtime_ns, before,
+                         "existing identical blob must be adopted, not rewritten")
+        self.assertEqual(offload.archive_state(self.moe, self.dest), "originals")
 
 
 class TestTransferEngine(OffloadBase):
