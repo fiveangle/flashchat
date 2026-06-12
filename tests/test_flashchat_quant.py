@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT))
 
-from flashchat_quant import (  # noqa: E402
+from modelmgr.quant import (  # noqa: E402
     bf16_to_f32,
     convert_8bit_to_4bit,
     dequantize_4bit_affine_rows,
@@ -21,7 +21,7 @@ from flashchat_quant import (  # noqa: E402
     split_qwen_gate_up_proj,
     unpack_8bit_rows,
 )
-from compile_native_qwen import (  # noqa: E402
+from modelmgr.steps.compile_native import (  # noqa: E402
     build_expert_sources,
     expand_native_projection_matrix,
     expert_source_layout,
@@ -30,7 +30,7 @@ from compile_native_qwen import (  # noqa: E402
     should_shift_native_norm,
     shift_native_norm_data,
 )
-from repack_experts import build_components  # noqa: E402
+from modelmgr.steps.repack_experts import build_components  # noqa: E402
 
 
 def require(condition, message):

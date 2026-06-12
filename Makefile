@@ -12,21 +12,14 @@
 #   make chat      — build interactive chat TUI
 #   make api-smoke — run HTTP API smoke test
 #   make cli-smoke — run Flashchat CLI smoke test
-#   make manage-smoke — run model management storage smoke test
+#   make manage-smoke — run model management integration test (Python core via launcher)
 #   make tool-template-smoke — run native tool template render/parser smoke test
 #   make quant-helper-smoke — run native checkpoint quantization helper tests
 #   make tokenizer-export-smoke — run tokenizer export helper tests
 #   make native-qwen-compile-smoke — run native Qwen BF16 compiler smoke test
-#   make mpp-tensorops-smoke — run Metal 4 MPP TensorOps compile smoke test
-#   make mpp-tensorops-runtime-smoke — run Metal 4 MPP TensorOps runtime smoke test
-#   make mpp-tensorops-bench — benchmark TensorOps affine matmul against current v5
-#   make private-ane-probe — opt-in private ANE in-memory MIL probe
-#   make private-ane-dense-probe — opt-in private ANE dense projection probe
-#   make private-ane-dense-mlp-block-probe — opt-in private ANE fused dense MLP block probe
 #   make mtp-config-smoke — run MTP config/profile precedence smoke test
-#   make model-add-config-smoke — run add-model configuration smoke test
-#   make model-edit-config-smoke — run edit-model registry smoke test
-#   make profile-edit-config-smoke — run edit-profile registry smoke test
+#   make py-tests — run modelmgr unit tests
+#   make registry / registry-check — regenerate/verify assets/model_configs.json
 #   make test      — run all functional smoke tests
 #   make help      — list available targets
 #   make clean     — remove build artifacts
@@ -46,7 +39,7 @@ CC = clang
 endif
 OPT ?= aggressive
 
-FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate -framework IOSurface
+FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 BASE_CFLAGS = -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 BASE_LDFLAGS = -lpthread -lcompression -ldl
 
@@ -116,7 +109,7 @@ CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mpp-tensorops-smoke mpp-tensorops-runtime-smoke mpp-tensorops-bench private-ane-probe private-ane-dense-probe private-ane-dense-mlp-block-probe mtp-config-smoke model-add-config-smoke model-edit-config-smoke profile-edit-config-smoke test bench-api bench-report
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -131,7 +124,8 @@ define RUN_ENGINE_BENCH
 		echo "Run ./flashchat setup first, or select a configured model with downloaded weights."; \
 		exit 1; \
 	fi; \
-	packed_dir="$$FLASHCHAT_MODEL_PATH/flashchat/packed_experts"; \
+	bits="$$(flashchat_model_quant_bits "$$FLASHCHAT_MODEL")"; \
+	packed_dir="$$FLASHCHAT_MODEL_PATH/flashchat/q$${bits:-4}/packed_experts"; \
 	if [[ ! -f "$$packed_dir/layer_00.bin" ]]; then \
 		echo "ERROR: Engine benchmark artifacts are not available for $$FLASHCHAT_MODEL."; \
 		echo "Expected: $$packed_dir/layer_00.bin"; \
@@ -181,23 +175,16 @@ help:
 	@printf "\n"
 	@printf "Tests:\n"
 	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
-	@printf "  make manage-smoke  Run model management storage smoke test\n"
+	@printf "  make manage-smoke  Run model management integration test\n"
 	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
 	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
 	@printf "  make quant-helper-smoke  Run native checkpoint quantization helper tests\n"
 	@printf "  make tokenizer-export-smoke  Run tokenizer export helper tests\n"
 	@printf "  make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test\n"
-	@printf "  make mpp-tensorops-smoke  Run Metal 4 MPP TensorOps compile smoke test\n"
-	@printf "  make mpp-tensorops-runtime-smoke  Run Metal 4 MPP TensorOps runtime smoke test\n"
-	@printf "  make mpp-tensorops-bench  Benchmark TensorOps affine matmul against current v5\n"
-	@printf "  make private-ane-probe  Opt-in private ANE in-memory MIL probe\n"
-	@printf "  make private-ane-dense-probe  Opt-in private ANE dense projection probe\n"
-	@printf "  make private-ane-dense-mlp-block-probe  Opt-in private ANE fused dense MLP block probe\n"
 	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
-	@printf "  make model-add-config-smoke  Run add-model configuration smoke test\n"
-	@printf "  make model-edit-config-smoke  Run edit-model registry smoke test\n"
-	@printf "  make profile-edit-config-smoke  Run edit-profile registry smoke test\n"
+	@printf "  make py-tests  Run modelmgr unit tests\n"
+	@printf "  make registry-check  Verify assets/model_configs.json matches the manifests\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
 	@printf "  make bench-api     Run API performance regression benchmark (per registry model)\n"
@@ -324,11 +311,25 @@ bench-api: $(INFER_TARGET)
 bench-report:
 	python3 tests/bench_report.py
 
+# assets/model_configs.json is GENERATED from assets/models/*.json (the
+# per-model manifests). Edit the manifests, then run `make registry`.
+registry:
+	python3 -m modelmgr resolve --all -o assets/model_configs.json
+
+registry-check:
+	@python3 -m modelmgr resolve --all -q -o /tmp/flashchat_registry_check.json && \
+	python3 -c "import json,sys; a=json.load(open('assets/model_configs.json')); b=json.load(open('/tmp/flashchat_registry_check.json')); sys.exit(0 if a==b else ('assets/model_configs.json is out of sync with assets/models/*.json -- run: make registry', 1)[1])" && \
+	echo "registry in sync"
+
+py-tests:
+	@FLASHCHAT_CONFIG_DIR="$$(mktemp -d /tmp/flashchat-py-tests.XXXXXX)" \
+		python3 -m unittest discover -s tests/python -t tests/python
+
 cli-smoke:
 	bash tests/test_flashchat_cli.sh
 
 manage-smoke:
-	bash tests/test_flashchat_manage.sh
+	bash tests/test_modelmgr_cli.sh
 
 chat-render-smoke: $(CHAT_TARGET)
 	bash tests/test_chat_tui_render.sh
@@ -348,37 +349,7 @@ tokenizer-export-smoke:
 native-qwen-compile-smoke: $(INFER_TARGET)
 	bash tests/test_native_qwen_compile.sh
 
-mpp-tensorops-smoke:
-	bash tests/test_mpp_tensorops_compile.sh
-
-mpp-tensorops-runtime-smoke:
-	bash tests/test_mpp_tensorops_runtime.sh
-
-mpp-tensorops-bench:
-	bash tests/bench_mpp_tensorops.sh
-
-private-ane-probe:
-	bash tests/test_private_ane_probe.sh
-
-private-ane-dense-probe:
-	bash tests/test_private_ane_dense_projection_probe.sh
-
-private-ane-dense-mlp-block-probe:
-	bash tests/test_private_ane_dense_mlp_block_probe.sh
-
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-model-add-config-smoke:
-	bash tests/test_model_add_config.sh
-
-model-edit-config-smoke:
-	bash tests/test_model_edit_config.sh
-
-profile-edit-config-smoke:
-	bash tests/test_profile_edit_config.sh
-
-model-quant-config-smoke:
-	bash tests/test_model_quant_config.sh
-
-test: cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke model-add-config-smoke model-edit-config-smoke profile-edit-config-smoke model-quant-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke

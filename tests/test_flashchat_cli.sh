@@ -246,11 +246,10 @@ echo "=== Models Command ==="
 echo ""
 
 run_test "model registry json valid" python3 -m json.tool "${REPO_ROOT}/assets/model_configs.json"
-run_test_contains "models basic" "Flashchat Models" "$FLASHCHAT" models
-run_test_contains "models current marker" "* Current model" "$FLASHCHAT" models
-run_test_contains "models artifact status" "experts:" "$FLASHCHAT" models
-run_test_contains "models add option shown" "Add a model" "$FLASHCHAT" models
-run_test_contains "models add option supported type" "qwen3_5_moe" "$FLASHCHAT" models
+run_test_contains "models basic" "HF cache:" "$FLASHCHAT" models
+run_test_contains "models current marker" "<- selected" "$FLASHCHAT" models
+run_test_contains "models repo shown" "Repo:" "$FLASHCHAT" models
+run_test_contains "models variant status" "q4:" "$FLASHCHAT" models
 
 # ---------------------------------------------------------------------------
 # Manage command
@@ -260,10 +259,9 @@ echo ""
 echo "=== Manage Command ==="
 echo ""
 
-run_test_contains "manage list basic" "Flashchat Manage Models" "$FLASHCHAT" manage --list
-run_test_contains "manage HuggingFace cache dir" "HuggingFace cache directory:" "$FLASHCHAT" manage --list
-run_test_contains "manage offload dir" "Offload directory:" "$FLASHCHAT" manage --list
-run_test_contains "manage runtime status" "runtime:" "$FLASHCHAT" manage --list
+run_test_contains "manage list basic" "HF cache:" "$FLASHCHAT" manage --list
+run_test_contains "manage offload dir" "Offload dir:" "$FLASHCHAT" manage --list
+run_test_contains "manage variant status" "q4:" "$FLASHCHAT" manage --list
 
 # ---------------------------------------------------------------------------
 # Sessions command
@@ -442,6 +440,8 @@ echo "$STUBBORN_PID" > "${TMPDIR}/.config/flashchat/server.pid"
 echo "stale-signature" > "${TMPDIR}/.config/flashchat/server.signature"
 
 menu_output=""
+# Menu input: [N]ew dialog -> the stale-server restart prompt gets 'n'
+# (decline -> "New dialog was not started."), then 'q' quits the menu.
 if menu_output=$(printf 'nnq' | "$FLASHCHAT" --config "$RESTART_CONFIG" 2>&1); then
     if echo "$menu_output" | grep -q "New dialog was not started." && \
        echo "$menu_output" | grep -q "Goodbye!"; then

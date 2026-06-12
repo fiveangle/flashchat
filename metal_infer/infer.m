@@ -44,10 +44,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
-#import <dlfcn.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -417,11 +414,9 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 // Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
-static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0, g_prof_ane_dense = 0;
-static double g_prof_ane_dense_copy_in = 0, g_prof_ane_dense_eval = 0, g_prof_ane_dense_copy_out = 0;
+static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
 static double g_prof_dense_chunk_attn = 0, g_prof_dense_chunk_mlp = 0;
 static int g_prof_dense_chunk_layers = 0;
-static int g_ane_dense_eval_count = 0;
 // Per-layer production reference (token a) for MTP_VF2_DBG divergence probe.
 static float *g_vf2_ref[64] = {0}; static int g_vf2_ref_on = 0;
 // matmulN kernel select. 0 = v3 (one row/simdgroup), 1 = tiled-X v4, 2 = v5 (multi-row
@@ -458,14 +453,6 @@ static int g_dense_gpu_attn = -1;
 static inline int dense_gpu_attn_enabled(void) {
     if (g_dense_gpu_attn < 0) g_dense_gpu_attn = getenv("FLASHCHAT_DENSE_GPU_ATTN") ? 1 : 0;
     return g_dense_gpu_attn;
-}
-static int g_private_ane_dense = -1;
-static inline int private_ane_dense_enabled(void) {
-    if (g_private_ane_dense < 0) {
-        const char *v = getenv("FLASHCHAT_PRIVATE_ANE_DENSE");
-        g_private_ane_dense = server_flag_enabled(v) ? 1 : 0;
-    }
-    return g_private_ane_dense;
 }
 static int g_dense_gpu_swiglu = -1;
 static inline int dense_gpu_swiglu_enabled(void) {
@@ -508,11 +495,11 @@ static void configure_arch_perf(void) {
     g_dense_fused_mlp = (dense && server_flag_enabled(getenv("FLASHCHAT_DENSE_FUSED_MLP"))) ? 1 : 0;
     (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
     fprintf(stderr,
-        "[perf] arch=%s experts=%d | batched_prefill=%d delta_batch=%d dense_gpu_attn=%d dense_gpu_swiglu=%d dense_fused_mlp=%d private_ane_dense=%d matmulN=v%d | "
+        "[perf] arch=%s experts=%d | batched_prefill=%d delta_batch=%d dense_gpu_attn=%d dense_gpu_swiglu=%d dense_fused_mlp=%d matmulN=v%d | "
         "mtp=%s\n",
         dense ? "dense" : "moe", g_cfg.num_experts,
         g_batched_prefill, g_delta_dispatch_batch, g_dense_gpu_attn,
-        dense_gpu_swiglu_enabled(), dense_fused_mlp_enabled(), private_ane_dense_enabled(),
+        dense_gpu_swiglu_enabled(), dense_fused_mlp_enabled(),
         matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
         dense ? "faithful (dense)" : "shadow-only (MoE speculative is not faithful)");
 }
@@ -600,338 +587,6 @@ static int validate_required_artifacts(const char *weights_path, const char *man
         missing += expert_missing;
     }
     return missing;
-}
-
-#define ANE_DENSE_MAX_PROJECTIONS 512
-#define ANE_DENSE_MAX_OUTPUTS 4
-
-typedef struct {
-    char artifact_dir[PATH_MAX];
-    char modelc_dir[PATH_MAX];
-    char tensor_name[256];
-    int tokens;
-    int input_dim;
-    int output_dim;
-    int num_outputs;
-    int output_start[ANE_DENSE_MAX_OUTPUTS];
-    int output_dim_part[ANE_DENSE_MAX_OUTPUTS];
-    IOSurfaceRef input_surface;
-    IOSurfaceRef output_surface[ANE_DENSE_MAX_OUTPUTS];
-    void *model_ref;
-    void *request_ref;
-    int loaded;
-    int failed;
-} ANEDenseProjection;
-
-static ANEDenseProjection g_ane_dense_projections[ANE_DENSE_MAX_PROJECTIONS];
-static int g_ane_dense_projection_count = 0;
-static int g_ane_dense_scanned = 0;
-static int g_ane_dense_available = -1;
-static char g_ane_dense_dir[PATH_MAX] = {0};
-
-static int private_ane_available(void) {
-    if (g_ane_dense_available >= 0) return g_ane_dense_available;
-    if (dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW) == NULL) {
-        g_ane_dense_available = 0;
-        return 0;
-    }
-    Class device_info = NSClassFromString(@"_ANEDeviceInfo");
-    if (device_info) {
-        BOOL has_ane = ((BOOL(*)(Class, SEL))objc_msgSend)(device_info, @selector(hasANE));
-        g_ane_dense_available = has_ane ? 1 : 0;
-    } else {
-        g_ane_dense_available = 1;
-    }
-    return g_ane_dense_available;
-}
-
-static int ane_dense_add_manifest(NSString *artifact_dir) {
-    if (g_ane_dense_projection_count >= ANE_DENSE_MAX_PROJECTIONS) return 0;
-    NSString *manifest_path = [artifact_dir stringByAppendingPathComponent:@"manifest.json"];
-    NSData *data = [NSData dataWithContentsOfFile:manifest_path];
-    if (!data) return 0;
-    NSError *error = nil;
-    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-    if (!root) return 0;
-    NSString *kind = root[@"kind"];
-    if (![kind isKindOfClass:[NSString class]] ||
-        (![kind isEqualToString:@"private_ane_dense_projection_probe"] &&
-         ![kind isEqualToString:@"private_ane_dense_mlp_block_probe"])) return 0;
-    NSDictionary *quant = root[@"quantization"];
-    NSNumber *bits = quant[@"bits"];
-    if (!bits || [bits intValue] != 4) return 0;
-    NSNumber *tokens = root[@"tokens"];
-    NSNumber *input_dim = root[@"input_dim"];
-    NSNumber *output_dim = root[@"output_dim"];
-    NSString *tensor = root[@"sanitized_tensor"] ?: root[@"source_tensor"];
-    NSString *mlmodelc = root[@"mlmodelc"];
-    NSArray *outputs = root[@"outputs"];
-    if (!tokens || !input_dim || !output_dim || !tensor || !mlmodelc || !outputs) return 0;
-    if ([outputs count] <= 0 || [outputs count] > ANE_DENSE_MAX_OUTPUTS) return 0;
-
-    NSString *modelc_dir = [artifact_dir stringByAppendingPathComponent:mlmodelc];
-    NSString *mil_path = [modelc_dir stringByAppendingPathComponent:@"model.mil"];
-    NSString *weight_path = [[modelc_dir stringByAppendingPathComponent:@"weights"] stringByAppendingPathComponent:@"weight.bin"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:mil_path] ||
-        ![[NSFileManager defaultManager] fileExistsAtPath:weight_path]) return 0;
-
-    ANEDenseProjection *p = &g_ane_dense_projections[g_ane_dense_projection_count++];
-    memset(p, 0, sizeof(*p));
-    snprintf(p->artifact_dir, sizeof(p->artifact_dir), "%s", [artifact_dir fileSystemRepresentation]);
-    snprintf(p->modelc_dir, sizeof(p->modelc_dir), "%s", [modelc_dir fileSystemRepresentation]);
-    snprintf(p->tensor_name, sizeof(p->tensor_name), "%s", [tensor UTF8String]);
-    p->tokens = [tokens intValue];
-    p->input_dim = [input_dim intValue];
-    p->output_dim = [output_dim intValue];
-    p->num_outputs = (int)[outputs count];
-    for (int i = 0; i < p->num_outputs; i++) {
-        NSDictionary *entry = outputs[i];
-        p->output_start[i] = [entry[@"start"] intValue];
-        p->output_dim_part[i] = [entry[@"dim"] intValue];
-    }
-    return 1;
-}
-
-static void ane_dense_scan_dir(void) {
-    if (g_ane_dense_scanned) return;
-    g_ane_dense_scanned = 1;
-    if (!private_ane_dense_enabled()) return;
-    if (g_cfg.num_experts != 0 || g_cfg.bits != 4) {
-        fprintf(stderr, "[ane-dense] disabled for this model (requires dense q4)\n");
-        return;
-    }
-    if (!private_ane_available()) {
-        fprintf(stderr, "[ane-dense] private ANE runtime unavailable\n");
-        return;
-    }
-
-    const char *env_dir = getenv("FLASHCHAT_ANE_DENSE_DIR");
-    if (env_dir && env_dir[0]) {
-        snprintf(g_ane_dense_dir, sizeof(g_ane_dense_dir), "%s", env_dir);
-    } else {
-        snprintf(g_ane_dense_dir, sizeof(g_ane_dense_dir), "%s/ane_dense", g_flashchat_weights_dir);
-    }
-
-    @autoreleasepool {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *root = [NSString stringWithUTF8String:g_ane_dense_dir];
-        BOOL is_dir = NO;
-        if (![fm fileExistsAtPath:root isDirectory:&is_dir] || !is_dir) {
-            fprintf(stderr, "[ane-dense] no artifact directory: %s\n", g_ane_dense_dir);
-            return;
-        }
-        if (ane_dense_add_manifest(root)) {
-            fprintf(stderr, "[ane-dense] loaded 1 artifact from %s\n", g_ane_dense_dir);
-            return;
-        }
-        NSArray *children = [fm contentsOfDirectoryAtPath:root error:nil];
-        for (NSString *child in children) {
-            NSString *path = [root stringByAppendingPathComponent:child];
-            BOOL child_is_dir = NO;
-            if ([fm fileExistsAtPath:path isDirectory:&child_is_dir] && child_is_dir) {
-                ane_dense_add_manifest(path);
-            }
-        }
-        fprintf(stderr, "[ane-dense] loaded %d artifacts from %s\n",
-                g_ane_dense_projection_count, g_ane_dense_dir);
-    }
-}
-
-static ANEDenseProjection *ane_dense_find_projection(const char *tensor_name, int N, int input_dim, int output_dim) {
-    ane_dense_scan_dir();
-    if (!private_ane_dense_enabled() || g_ane_dense_projection_count <= 0) return NULL;
-    for (int i = 0; i < g_ane_dense_projection_count; i++) {
-        ANEDenseProjection *p = &g_ane_dense_projections[i];
-        if (!p->failed &&
-            p->tokens == N &&
-            p->input_dim == input_dim &&
-            p->output_dim == output_dim &&
-            strcmp(p->tensor_name, tensor_name) == 0) {
-            return p;
-        }
-    }
-    return NULL;
-}
-
-static IOSurfaceRef ane_dense_make_surface(size_t bytes) {
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(bytes),
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1,
-        (id)kIOSurfaceBytesPerRow: @(bytes),
-        (id)kIOSurfaceAllocSize: @(bytes),
-        (id)kIOSurfacePixelFormat: @0
-    });
-}
-
-static NSString *ane_dense_write_model_files(id model, NSData *mil, NSData *weights) {
-    id hex_id = ((id(*)(id, SEL))objc_msgSend)(model, @selector(hexStringIdentifier));
-    NSString *tmp_dir = [NSTemporaryDirectory() stringByAppendingPathComponent:hex_id ?: @"flashchat-ane-dense"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm createDirectoryAtPath:[tmp_dir stringByAppendingPathComponent:@"weights"]
-        withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
-    if (![mil writeToFile:[tmp_dir stringByAppendingPathComponent:@"model.mil"] atomically:YES]) return nil;
-    if (![weights writeToFile:[tmp_dir stringByAppendingPathComponent:@"weights/weight.bin"] atomically:YES]) return nil;
-    if (![weights writeToFile:[tmp_dir stringByAppendingPathComponent:@"coremldata.bin"] atomically:YES]) return nil;
-    return tmp_dir;
-}
-
-static int ane_dense_load_projection(ANEDenseProjection *p) {
-    if (p->loaded) return 1;
-    if (p->failed) return 0;
-    @autoreleasepool {
-        Class desc_class = NSClassFromString(@"_ANEInMemoryModelDescriptor");
-        Class model_class = NSClassFromString(@"_ANEInMemoryModel");
-        Class request_class = NSClassFromString(@"_ANERequest");
-        Class surface_class = NSClassFromString(@"_ANEIOSurfaceObject");
-        if (!desc_class || !model_class || !request_class || !surface_class) {
-            p->failed = 1;
-            return 0;
-        }
-
-        NSString *modelc_dir = [NSString stringWithUTF8String:p->modelc_dir];
-        NSData *mil = [NSData dataWithContentsOfFile:[modelc_dir stringByAppendingPathComponent:@"model.mil"]];
-        NSData *weights = [NSData dataWithContentsOfFile:
-            [[modelc_dir stringByAppendingPathComponent:@"weights"] stringByAppendingPathComponent:@"weight.bin"]];
-        if (!mil || !weights) {
-            p->failed = 1;
-            return 0;
-        }
-
-        NSDictionary *weight_entry = @{@"offset": @0, @"data": weights};
-        NSDictionary *weight_map = @{
-            @"@model_path/weights/weight.bin": weight_entry,
-            @"@model_path/coremldata.bin": weight_entry,
-        };
-        id desc = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
-            desc_class, @selector(modelWithMILText:weights:optionsPlist:), mil, weight_map, nil);
-        id model = desc ? ((id(*)(Class, SEL, id))objc_msgSend)(
-            model_class, @selector(inMemoryModelWithDescriptor:), desc) : nil;
-        if (!model) {
-            fprintf(stderr, "[ane-dense] model creation failed for %s\n", p->tensor_name);
-            p->failed = 1;
-            return 0;
-        }
-
-        NSError *error = nil;
-        BOOL cached_before = ((BOOL(*)(id, SEL))objc_msgSend)(model, @selector(compiledModelExists));
-        double t0 = now_ms();
-        BOOL temp_compile = p->num_outputs > 1;
-        NSString *tmp_model_dir = nil;
-        if (temp_compile && !(tmp_model_dir = ane_dense_write_model_files(model, mil, weights))) {
-            fprintf(stderr, "[ane-dense] temp model write failed for %s\n", p->tensor_name);
-            p->failed = 1;
-            return 0;
-        }
-        BOOL ok = temp_compile ? 0 : ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-            model, @selector(loadWithQoS:options:error:), 21, @{}, &error);
-        if (!ok || temp_compile) {
-            if (!temp_compile) {
-                temp_compile = 1;
-                tmp_model_dir = ane_dense_write_model_files(model, mil, weights);
-                if (!tmp_model_dir) {
-                    fprintf(stderr, "[ane-dense] temp model write failed for %s\n", p->tensor_name);
-                    p->failed = 1;
-                    return 0;
-                }
-            }
-            error = nil;
-            ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(compileWithQoS:options:error:), 21, @{}, &error);
-            if (ok) {
-                error = nil;
-                ok = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(loadWithQoS:options:error:), 21, @{}, &error);
-            }
-        }
-        if (tmp_model_dir) {
-            [[NSFileManager defaultManager] removeItemAtPath:tmp_model_dir error:nil];
-        }
-        if (!ok) {
-            fprintf(stderr, "[ane-dense] load failed for %s: %s\n",
-                    p->tensor_name, error ? [[error description] UTF8String] : "unknown");
-            p->failed = 1;
-            return 0;
-        }
-
-        size_t input_bytes = (size_t)p->tokens * p->input_dim * sizeof(float);
-        p->input_surface = ane_dense_make_surface(input_bytes);
-        id input_obj = ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-            surface_class, @selector(objectWithIOSurface:), p->input_surface);
-
-        NSMutableArray *output_objs = [NSMutableArray array];
-        NSMutableArray *output_indices = [NSMutableArray array];
-        for (int i = 0; i < p->num_outputs; i++) {
-            size_t bytes = (size_t)p->tokens * p->output_dim_part[i] * sizeof(float);
-            p->output_surface[i] = ane_dense_make_surface(bytes);
-            id output_obj = ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-                surface_class, @selector(objectWithIOSurface:), p->output_surface[i]);
-            [output_objs addObject:output_obj];
-            [output_indices addObject:@(i)];
-        }
-        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
-            request_class, @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
-            @[input_obj], @[@0], output_objs, output_indices, nil, nil, @0);
-        if (!p->input_surface || !request) {
-            p->failed = 1;
-            return 0;
-        }
-        p->model_ref = (__bridge_retained void *)model;
-        p->request_ref = (__bridge_retained void *)request;
-        p->loaded = 1;
-        fprintf(stderr, "[ane-dense] loaded %s cached=%d temp=%d load=%.2fms\n",
-                p->tensor_name, cached_before ? 1 : 0, temp_compile ? 1 : 0, now_ms() - t0);
-        return 1;
-    }
-}
-
-static int ane_dense_project(const char *tensor_name, const float *X, float *OUT,
-                             int N, int input_dim, int output_dim) {
-    ANEDenseProjection *p = ane_dense_find_projection(tensor_name, N, input_dim, output_dim);
-    if (!p) return 0;
-    if (!ane_dense_load_projection(p)) return 0;
-    @autoreleasepool {
-        id model = (__bridge id)p->model_ref;
-        id request = (__bridge id)p->request_ref;
-        size_t input_bytes = (size_t)N * input_dim * sizeof(float);
-        double t_copy_in = now_ms();
-        IOSurfaceLock(p->input_surface, 0, NULL);
-        memcpy(IOSurfaceGetBaseAddress(p->input_surface), X, input_bytes);
-        IOSurfaceUnlock(p->input_surface, 0, NULL);
-        double copy_in_elapsed = now_ms() - t_copy_in;
-        g_prof_ane_dense_copy_in += copy_in_elapsed;
-
-        NSError *error = nil;
-        double t_eval = now_ms();
-        BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-            model, @selector(evaluateWithQoS:options:request:error:), 21, @{}, request, &error);
-        double elapsed = now_ms() - t_eval;
-        if (!ok) {
-            fprintf(stderr, "[ane-dense] eval failed for %s: %s\n",
-                    p->tensor_name, error ? [[error description] UTF8String] : "unknown");
-            p->failed = 1;
-            return 0;
-        }
-        double t_copy_out = now_ms();
-        for (int i = 0; i < p->num_outputs; i++) {
-            int start = p->output_start[i];
-            int dim = p->output_dim_part[i];
-            IOSurfaceLock(p->output_surface[i], kIOSurfaceLockReadOnly, NULL);
-            const float *src = (const float *)IOSurfaceGetBaseAddress(p->output_surface[i]);
-            for (int t = 0; t < N; t++) {
-                memcpy(OUT + (size_t)t * output_dim + start,
-                       src + (size_t)t * dim,
-                       (size_t)dim * sizeof(float));
-            }
-            IOSurfaceUnlock(p->output_surface[i], kIOSurfaceLockReadOnly, NULL);
-        }
-        double copy_out_elapsed = now_ms() - t_copy_out;
-        g_prof_ane_dense_copy_out += copy_out_elapsed;
-        g_prof_ane_dense_eval += elapsed;
-        g_prof_ane_dense += copy_in_elapsed + elapsed + copy_out_elapsed;
-        g_ane_dense_eval_count++;
-        return 1;
-    }
 }
 
 // ============================================================================
@@ -3852,7 +3507,6 @@ typedef struct {
     const float *X;          // host input  [N][in_dim]
     float *OUT;              // host output [N][out_dim]
     uint32_t out_dim, in_dim, group_size, N;
-    const char *tensor_name;
 } MMJob;
 
 // Batched matmulN: encode several independent matmulN jobs into ONE command buffer
@@ -3866,19 +3520,6 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
     if (nj <= 0) return;
     enum { MAX_BATCH = 8 };
     if (nj > MAX_BATCH) nj = MAX_BATCH;
-    MMJob fallback[MAX_BATCH];
-    int nf = 0;
-    for (int j = 0; j < nj; j++) {
-        if (jobs[j].tensor_name &&
-            ane_dense_project(jobs[j].tensor_name, jobs[j].X, jobs[j].OUT,
-                              (int)jobs[j].N, (int)jobs[j].in_dim, (int)jobs[j].out_dim)) {
-            continue;
-        }
-        fallback[nf++] = jobs[j];
-    }
-    if (nf <= 0) return;
-    jobs = fallback;
-    nj = nf;
     if (nj == 1) { // no batching benefit; reuse the single path
         gpu_dequant_matmulN(ctx, jobs[0].W, jobs[0].S, jobs[0].B, jobs[0].X, jobs[0].OUT,
                             jobs[0].out_dim, jobs[0].in_dim, jobs[0].group_size, jobs[0].N);
@@ -4051,7 +3692,7 @@ static void gpu_dequant_matmul2_batch(MetalCtx *ctx, MM2Job *jobs, int nj) {
         memcpy(Xs[j], jobs[j].x0, jobs[j].in_dim * sizeof(float));
         memcpy(Xs[j] + jobs[j].in_dim, jobs[j].x1, jobs[j].in_dim * sizeof(float));
         mj[j] = (MMJob){ jobs[j].W, jobs[j].S, jobs[j].B, Xs[j], Os[j],
-                         jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size, 2, NULL };
+                         jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size, 2 };
     }
     gpu_dequant_matmulN_batch(ctx, mj, nj);
     for (int j = 0; j < nj; j++) {
@@ -5602,8 +5243,8 @@ static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
     cpu_rms_norm(hb, post_w, hp + H, H, g_cfg.rms_norm_eps);
     float *g2 = malloc((size_t)2*inter*sizeof(float)), *u2 = malloc((size_t)2*inter*sizeof(float)), *a2 = malloc((size_t)2*inter*sizeof(float));
     { MMJob gu_jobs[2] = {
-        {gw,gs,gb,hp,g2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2,NULL},
-        {uw,us,ub,hp,u2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2,NULL} };
+        {gw,gs,gb,hp,g2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2},
+        {uw,us,ub,hp,u2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2} };
       gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
     cpu_swiglu(g2,         u2,         a2,         inter);
     cpu_swiglu(g2 + inter, u2 + inter, a2 + inter, inter);
@@ -5728,7 +5369,6 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     int is_full = ((layer+1)%g_cfg.full_attn_interval)==0;
     char nm[256];
     #define LW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d." suf,layer), get_tensor_ptr(wf,nm))
-    #define LWN(buf,suf) (snprintf(buf,sizeof(buf),"model.layers.%d." suf,layer), get_tensor_ptr(wf,buf))
     uint16_t *iln=LW("input_layernorm.weight"), *paln=LW("post_attention_layernorm.weight");
     float *res=malloc((size_t)N*H*4), *nmd=malloc((size_t)N*H*4);
     memcpy(res, hs, (size_t)N*H*4);
@@ -5738,17 +5378,16 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         int qpd=g_cfg.num_attn_heads*g_cfg.head_dim*2, qd=g_cfg.num_attn_heads*g_cfg.head_dim, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, hpk=g_cfg.num_attn_heads/g_cfg.num_kv_heads;
         int fa_idx=(layer+1)/g_cfg.full_attn_interval-1;   // GPU KV mirror slot for this full-attn layer
         int dgpu = dense_gpu_attn_enabled() && g_metal && g_metal->attn_scores_pipe && fa_idx>=0 && fa_idx<g_cfg.num_full_attn_layers;
-        char qw_name[256], kw_name[256], vw_name[256], ow_name[256];
-        uint32_t *qw=LWN(qw_name,"self_attn.q_proj.weight");uint16_t *qs=LW("self_attn.q_proj.scales"),*qb=LW("self_attn.q_proj.biases");
-        uint32_t *kw=LWN(kw_name,"self_attn.k_proj.weight");uint16_t *ks=LW("self_attn.k_proj.scales"),*kb=LW("self_attn.k_proj.biases");
-        uint32_t *vw=LWN(vw_name,"self_attn.v_proj.weight");uint16_t *vs=LW("self_attn.v_proj.scales"),*vb=LW("self_attn.v_proj.biases");
-        uint32_t *ow=LWN(ow_name,"self_attn.o_proj.weight");uint16_t *os=LW("self_attn.o_proj.scales"),*ob=LW("self_attn.o_proj.biases");
+        uint32_t *qw=LW("self_attn.q_proj.weight");uint16_t *qs=LW("self_attn.q_proj.scales"),*qb=LW("self_attn.q_proj.biases");
+        uint32_t *kw=LW("self_attn.k_proj.weight");uint16_t *ks=LW("self_attn.k_proj.scales"),*kb=LW("self_attn.k_proj.biases");
+        uint32_t *vw=LW("self_attn.v_proj.weight");uint16_t *vs=LW("self_attn.v_proj.scales"),*vb=LW("self_attn.v_proj.biases");
+        uint32_t *ow=LW("self_attn.o_proj.weight");uint16_t *os=LW("self_attn.o_proj.scales"),*ob=LW("self_attn.o_proj.biases");
         uint16_t *qn=LW("self_attn.q_norm.weight"),*kn=LW("self_attn.k_norm.weight");
         float *qp=malloc((size_t)N*qpd*4),*kk=malloc((size_t)N*kvd*4),*vv=malloc((size_t)N*kvd*4),*ao=malloc((size_t)N*qd*4);
         { MMJob qkv_jobs[3] = {
-            {qw,qs,qb,nmd,qp,(uint32_t)qpd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,qw_name},
-            {kw,ks,kb,nmd,kk,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,kw_name},
-            {vw,vs,vb,nmd,vv,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,vw_name} };
+            {qw,qs,qb,nmd,qp,(uint32_t)qpd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {kw,ks,kb,nmd,kk,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {vw,vs,vb,nmd,vv,(uint32_t)kvd,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
           gpu_dequant_matmulN_batch(g_metal, qkv_jobs, 3); }
         float ascale=1.f/sqrtf((float)g_cfg.head_dim);
         int base_len = kv->len;   // sequence length before this chunk (token t lands at base_len+t)
@@ -5785,25 +5424,24 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         }
         free(q_all); free(qg_all);
         float *ap=malloc((size_t)N*H*4);
-        { MMJob o_job = {ow,os,ob,ao,ap,(uint32_t)H,(uint32_t)qd,(uint32_t)gsz,(uint32_t)N,ow_name};
+        { MMJob o_job = {ow,os,ob,ao,ap,(uint32_t)H,(uint32_t)qd,(uint32_t)gsz,(uint32_t)N};
           gpu_dequant_matmulN_batch(g_metal, &o_job, 1); }
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
         free(qp);free(kk);free(vv);free(ao);free(ap);
     } else {
         int li=layer-(layer+1)/g_cfg.full_attn_interval, qkv_dim=g_cfg.linear_conv_dim, z_dim=g_cfg.linear_total_value, nvh=g_cfg.linear_num_v_heads, nkh=g_cfg.linear_num_k_heads;
-        char qkv_name[256], z_name[256], b_name[256], a_name[256], ol_name[256];
-        uint32_t *qkvw=LWN(qkv_name,"linear_attn.in_proj_qkv.weight");uint16_t *qkvs=LW("linear_attn.in_proj_qkv.scales"),*qkvb=LW("linear_attn.in_proj_qkv.biases");
-        uint32_t *zw=LWN(z_name,"linear_attn.in_proj_z.weight");uint16_t *zs=LW("linear_attn.in_proj_z.scales"),*zb=LW("linear_attn.in_proj_z.biases");
-        uint32_t *bw=LWN(b_name,"linear_attn.in_proj_b.weight");uint16_t *bs=LW("linear_attn.in_proj_b.scales"),*bb_=LW("linear_attn.in_proj_b.biases");
-        uint32_t *aw=LWN(a_name,"linear_attn.in_proj_a.weight");uint16_t *as_=LW("linear_attn.in_proj_a.scales"),*ab=LW("linear_attn.in_proj_a.biases");
-        uint32_t *olw=LWN(ol_name,"linear_attn.out_proj.weight");uint16_t *ols=LW("linear_attn.out_proj.scales"),*olb=LW("linear_attn.out_proj.biases");
+        uint32_t *qkvw=LW("linear_attn.in_proj_qkv.weight");uint16_t *qkvs=LW("linear_attn.in_proj_qkv.scales"),*qkvb=LW("linear_attn.in_proj_qkv.biases");
+        uint32_t *zw=LW("linear_attn.in_proj_z.weight");uint16_t *zs=LW("linear_attn.in_proj_z.scales"),*zb=LW("linear_attn.in_proj_z.biases");
+        uint32_t *bw=LW("linear_attn.in_proj_b.weight");uint16_t *bs=LW("linear_attn.in_proj_b.scales"),*bb_=LW("linear_attn.in_proj_b.biases");
+        uint32_t *aw=LW("linear_attn.in_proj_a.weight");uint16_t *as_=LW("linear_attn.in_proj_a.scales"),*ab=LW("linear_attn.in_proj_a.biases");
+        uint32_t *olw=LW("linear_attn.out_proj.weight");uint16_t *ols=LW("linear_attn.out_proj.scales"),*olb=LW("linear_attn.out_proj.biases");
         uint16_t *convw=LW("linear_attn.conv1d.weight"),*gnw=LW("linear_attn.norm.weight"); float *Alog=(float*)LW("linear_attn.A_log"); uint16_t *dtb=LW("linear_attn.dt_bias");
         float *qkv=malloc((size_t)N*qkv_dim*4),*z=malloc((size_t)N*z_dim*4),*be=malloc((size_t)N*nvh*4),*al=malloc((size_t)N*nvh*4),*gated=malloc((size_t)N*z_dim*4);
         { MMJob in_jobs[4] = {
-            {qkvw,qkvs,qkvb,nmd,qkv,(uint32_t)qkv_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,qkv_name},
-            {zw,zs,zb,nmd,z,(uint32_t)z_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,z_name},
-            {bw,bs,bb_,nmd,be,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,b_name},
-            {aw,as_,ab,nmd,al,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,a_name} };
+            {qkvw,qkvs,qkvb,nmd,qkv,(uint32_t)qkv_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {zw,zs,zb,nmd,z,(uint32_t)z_dim,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {bw,bs,bb_,nmd,be,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {aw,as_,ab,nmd,al,(uint32_t)nvh,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
           gpu_dequant_matmulN_batch(g_metal, in_jobs, 4); }
         NSUInteger cvo=(NSUInteger)((const char*)convw-(const char*)[g_metal->wf_buf contents]),alo=(NSUInteger)((const char*)Alog-(const char*)[g_metal->wf_buf contents]),dto=(NSUInteger)((const char*)dtb-(const char*)[g_metal->wf_buf contents]),gno=(NSUInteger)((const char*)gnw-(const char*)[g_metal->wf_buf contents]);
         uint32_t cd=g_cfg.linear_conv_dim,kd=g_cfg.linear_key_dim,vd2=g_cfg.linear_value_dim,khpv=(uint32_t)(nvh/nkh); float invs=1.f/sqrtf((float)g_cfg.linear_key_dim);
@@ -5824,7 +5462,7 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
                 g_prof_delta += now_ms() - _t_dl;
                 memcpy(gated+(size_t)t*z_dim,[g_metal->batch_out[6] contents],z_dim*4);
             }
-            { MMJob ol_job = {olw,ols,olb,gated,ap,(uint32_t)H,(uint32_t)z_dim,(uint32_t)gsz,(uint32_t)N,ol_name};
+            { MMJob ol_job = {olw,ols,olb,gated,ap,(uint32_t)H,(uint32_t)z_dim,(uint32_t)gsz,(uint32_t)N};
               gpu_dequant_matmulN_batch(g_metal, &ol_job, 1); }
         }
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
@@ -5837,33 +5475,28 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     if (g_cfg.num_experts == 0) {
         double t_dense_mlp = g_timing_enabled ? now_ms() : 0.0;
         // dense MLP (N positions)
-        char gate_name[256], up_name[256], down_name[256];
-        uint32_t *gw=LWN(gate_name,"mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
-        uint32_t *uw=LWN(up_name,"mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
-        uint32_t *dw=LWN(down_name,"mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
+        uint32_t *gw=LW("mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
+        uint32_t *uw=LW("mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
+        uint32_t *dw=LW("mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
         float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
         float *oN=malloc((size_t)N*H*4);
-        char mlp_block_name[256];
-        snprintf(mlp_block_name,sizeof(mlp_block_name),"model.layers.%d.mlp.block",layer);
-        if (!ane_dense_project(mlp_block_name, hp, oN, N, H, H)) {
-            if (!dense_fused_mlp_enabled() ||
+        if (!dense_fused_mlp_enabled() ||
                 !gpu_dense_mlp_N(g_metal, gw, gs, gb, uw, us, ub, dw, ds, db,
                                  hp, oN, (uint32_t)H, (uint32_t)inter, (uint32_t)gsz, (uint32_t)N)) {
                 float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4);
                 { MMJob gu_jobs[2] = {
-                    {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,gate_name},
-                    {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N,up_name} };
+                    {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+                    {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
                   gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
                 if (dense_gpu_swiglu_enabled() && g_metal && g_metal->swiglu) {
                     gpu_swiglu(g_metal, gN, uN, aN, (int)((size_t)N * inter));
                 } else {
                     for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
                 }
-                { MMJob down_job = {dw,ds,db,aN,oN,(uint32_t)H,(uint32_t)inter,(uint32_t)gsz,(uint32_t)N,down_name};
+                { MMJob down_job = {dw,ds,db,aN,oN,(uint32_t)H,(uint32_t)inter,(uint32_t)gsz,(uint32_t)N};
                   gpu_dequant_matmulN_batch(g_metal, &down_job, 1); }
                 free(gN);free(uN);free(aN);
             }
-        }
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
         if (g_timing_enabled) {
             g_prof_dense_chunk_mlp += now_ms() - t_dense_mlp;
@@ -5874,7 +5507,6 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         // MoE experts (N positions) — reuses the faithful production expert kernel.
         moe_block_N(wf, layer, hs, N, packed_fd);
     }
-    #undef LWN
     #undef LW
     free(res);free(nmd);
 }
@@ -16289,12 +15921,6 @@ int main(int argc, char **argv) {
                        g_prof_dense_chunk_layers,
                        g_prof_dense_chunk_attn, g_prof_dense_chunk_mlp);
             }
-        }
-        if (g_ane_dense_eval_count > 0) {
-            double ane_total = g_prof_ane_dense_copy_in + g_prof_ane_dense_eval + g_prof_ane_dense_copy_out;
-            printf("ANE dense:      %d evals %.1f ms (in %.1f, eval %.1f, out %.1f)\n",
-                   g_ane_dense_eval_count, ane_total,
-                   g_prof_ane_dense_copy_in, g_prof_ane_dense_eval, g_prof_ane_dense_copy_out);
         }
         printf("Tokens:         %d generated\n", total_generated);
         if (total_generated > 1) {

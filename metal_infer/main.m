@@ -1554,9 +1554,11 @@ int main(int argc, char **argv) {
         }
         if (num_active_experts > g_cfg.num_experts) num_active_experts = g_cfg.num_experts;
 
-        // Determine experts base path under the per-model Flashchat artifact directory.
+        // Determine experts base path under the per-model Flashchat artifact
+        // directory (per-quant subdirs since the q4/q8 layout normalization).
         char experts_base[1024];
-        snprintf(experts_base, sizeof(experts_base), "%s/flashchat/packed_experts", model_path);
+        snprintf(experts_base, sizeof(experts_base), "%s/flashchat/q%d/packed_experts",
+                 model_path, g_cfg.bits);
 
         if (layer_idx < 0 || layer_idx >= g_cfg.num_layers) {
             fprintf(stderr, "ERROR: Layer %d is out of range for %s (valid: 0-%d)\n",

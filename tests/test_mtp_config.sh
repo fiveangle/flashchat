@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# MTP precedence through lib/config.sh: profile default -> server default ->
+# config override -> env override. (Wizard-side MTP handling is covered by
+# the Python tests in tests/python/.)
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -8,6 +12,7 @@ TEST_ROOT="debug/fresh-envs/$(date +%Y%m%d-%H%M%S)-mtp-config-smoke"
 HOME_DIR="$TEST_ROOT/home"
 CONFIG_JSON="$TEST_ROOT/model_configs.json"
 mkdir -p "$HOME_DIR/.config/flashchat"
+trap 'rm -rf "$TEST_ROOT"' EXIT
 
 python3 - "$ROOT/assets/model_configs.json" "$CONFIG_JSON" <<'PY'
 import json
@@ -54,38 +59,12 @@ if [ "$env_value" != "2" ]; then
     exit 1
 fi
 
+# Empty MTP in config falls back to the profile's default.
 cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
 MODEL="mlx-community-Qwen36-35B-A3B-4bit"
 SAMPLING_PROFILE="instruct"
-MTP="0"
-MAX_TOKENS="1"
-SERVER_PORT="19996"
-SERVER_HOST="127.0.0.1"
-SERVER_LOG_PATH="/tmp/flashchat-mtp-config-smoke-logs"
-HUGGINGFACE_CACHE_DIR="/tmp/flashchat-mtp-config-smoke-hf"
-OFFLOAD_DIR=""
-SERVER_DEBUG="0"
-SERVER_HTTP_LOG="0"
-SYSTEM_PROMPT_CACHE="1"
-SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
-SHOW_THINKING="0"
-COLOR_OUTPUT="0"
+MTP=""
 EOF
-
-{
-    printf 'y'
-    for _ in $(seq 1 12); do
-        printf '\n'
-    done
-    printf 'auto\n'
-    printf '\n'
-    printf '\n'
-} | HOME="$HOME_DIR" FLASHCHAT_MODEL_CONFIG="$CONFIG_JSON" ./flashchat config >/dev/null 2>&1
-
-if ! grep -q '^MTP=""$' "$HOME_DIR/.config/flashchat/config"; then
-    echo "FAIL: config wizard did not write blank MTP for auto" >&2
-    exit 1
-fi
 
 auto_value=$(run_get_mtp bash -c 'source lib/config.sh; flashchat_load_config; flashchat_get MTP')
 if [ "$auto_value" != "3" ]; then
@@ -93,6 +72,7 @@ if [ "$auto_value" != "3" ]; then
     exit 1
 fi
 
+# Without a profile default, the server default applies.
 python3 - "$CONFIG_JSON" <<'PY'
 import json
 import sys
@@ -108,59 +88,6 @@ PY
 server_default_value=$(run_get_mtp bash -c 'source lib/config.sh; flashchat_load_config; flashchat_get MTP')
 if [ "$server_default_value" != "2" ]; then
     echo "FAIL: server MTP default expected 2, got '$server_default_value'" >&2
-    exit 1
-fi
-
-python3 - "$CONFIG_JSON" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]["sampling_profiles"]["instruct"]["mtp_default_predictions"] = 3
-with open(sys.argv[1], "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
-
-cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
-MODEL="mlx-community-Qwen36-35B-A3B-4bit"
-SAMPLING_PROFILE="custom"
-MTP="2"
-MAX_TOKENS="1"
-SERVER_PORT="19996"
-SERVER_HOST="127.0.0.1"
-SERVER_LOG_PATH="/tmp/flashchat-mtp-config-smoke-logs"
-HUGGINGFACE_CACHE_DIR="/tmp/flashchat-mtp-config-smoke-hf"
-OFFLOAD_DIR=""
-SERVER_DEBUG="0"
-SERVER_HTTP_LOG="0"
-SYSTEM_PROMPT_CACHE="1"
-SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
-SHOW_THINKING="0"
-COLOR_OUTPUT="0"
-EOF
-
-{
-    printf 'y'
-    printf '\n'
-    printf '\n'
-    printf '2\n'
-    for _ in $(seq 1 12); do
-        printf '\n'
-    done
-} | HOME="$HOME_DIR" FLASHCHAT_MODEL_CONFIG="$CONFIG_JSON" ./flashchat config >/dev/null 2>&1
-
-if ! grep -q '^SAMPLING_PROFILE="thinking-coding"$' "$HOME_DIR/.config/flashchat/config"; then
-    echo "FAIL: config wizard did not save selected canned profile" >&2
-    exit 1
-fi
-if ! grep -q '^MTP=""$' "$HOME_DIR/.config/flashchat/config"; then
-    echo "FAIL: config wizard did not preserve auto MTP for canned profile" >&2
-    exit 1
-fi
-if ! grep -q '^TEMPERATURE="0.6"$' "$HOME_DIR/.config/flashchat/config"; then
-    echo "FAIL: config wizard did not write canned profile temperature" >&2
     exit 1
 fi
 

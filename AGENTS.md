@@ -45,29 +45,32 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 ```
 metal_infer/
-  infer.m           # Main inference engine (~7000 lines)
-  shaders.metal     # Metal compute kernels (~1300 lines)
-  chat.m            # Interactive chat TUI (~760 lines)
+  infer.m           # Main inference engine
+  shaders.metal     # Metal compute kernels
+  chat.m            # Interactive chat TUI
   main.m            # MoE-only benchmark
   tokenizer.h       # Single-header C BPE tokenizer
   linenoise.c/h     # Line editing library
-  discarded/        # Historical optimization experiments not in active testing
 
-scripts/
-  extract_weights.py        # Dispatch to model-specific non-expert extraction
-  repack_experts.py         # Dispatch to model-specific expert repacking
-  generate_expert_index.py  # Generate per-model expert_index.json
-  export_tokenizer.py       # Export tokenizer vocabulary
-  models/                   # Model-specific extraction/repack implementations
+modelmgr/           # Model management core (registry, manifests, recipes,
+                    # artifact hashing/verify, offload, migration, TUIs)
+                    # — see docs/MODEL_FRAMEWORK.md
+  steps/            # Shared step library (download, tokenizer, extract,
+                    # repack, compile_native, materialize)
+  tui/              # Onboarding, config wizard, manage flows
+
+assets/models/      # Per-model manifests; assets/model_configs.json is
+                    # GENERATED from them (`make registry`)
 
 tests/
   test_flashchat_cli.sh     # CLI regression test
+  test_modelmgr_cli.sh      # Model management integration test
   test_api_smoke.sh         # HTTP API smoke test
+  python/                   # modelmgr unit tests (make py-tests)
 
 root/
   Makefile          # Project build/test surface
-  progress.py       # Results visualization
-  assets/*.tsv      # Durable experiment/API metric logs
+  assets/api_perf_log.tsv   # Durable API perf trend log (make bench-api)
 ```
 
 ## Build Commands
@@ -103,14 +106,13 @@ make fullbench      # Full forward benchmark (3 iterations)
 ./metal_infer/infer --prompt "Hello" --tokens 20 --timing
 
 # Framework regression tests
-./tests/test_flashchat_cli.sh
-./tests/test_flashchat_manage.sh
-./tests/test_tool_template_render.sh
-make cli-smoke
-make manage-smoke
+make cli-smoke      # tests/test_flashchat_cli.sh
+make manage-smoke   # tests/test_modelmgr_cli.sh
+make py-tests       # tests/python/ (modelmgr unit tests)
+make registry-check # assets/model_configs.json matches assets/models/*.json
 make tool-template-smoke
 make api-smoke
-make test
+make test           # everything
 
 # Performance regression benchmark (server-level, per model) + trend report
 make bench-api

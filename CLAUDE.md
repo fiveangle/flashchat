@@ -1,14 +1,10 @@
 # Flashchat: Running a 397B Parameter Model on a Laptop
 
-> **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
-
 Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
 
 The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
 
 ## Results
-
-![Progress](progress.png)
 
 | Configuration | tok/s | Quality | Notes |
 |--------------|-------|---------|-------|
@@ -67,11 +63,10 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 ```bash
 make
 
-# First-time setup is normally handled by ./flashchat.
-# Direct setup scripts live under scripts/.
-python3 scripts/extract_weights.py --model-id qwen3.6-35B-A3B --model /path/to/model --output /path/to/model/flashchat
-python3 scripts/export_tokenizer.py /path/to/model/tokenizer.json /path/to/model/flashchat/vocab.bin
-python3 scripts/repack_experts.py --model-id qwen3.6-35B-A3B --index /path/to/model/flashchat/expert_index.json
+# First-time setup (download, extraction, dedup, offload offers) is handled
+# by ./flashchat — onboarding runs on first launch; the management core is
+# the modelmgr/ Python package (see docs/MODEL_FRAMEWORK.md). Manual
+# artifact operations (verify/regenerate/archive) live in `./flashchat manage`.
 
 ./metal_infer/infer --prompt "Explain quantum computing" --tokens 100
 
@@ -92,23 +87,25 @@ metal_infer/
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
 
-scripts/
-  extract_weights.py        # Dispatches non-expert extraction by model ID
-  repack_experts.py         # Dispatches 4-bit expert packing by model ID
-  generate_expert_index.py  # Creates expert_index.json from safetensors
-  export_tokenizer.py       # Creates vocab.bin from tokenizer.json
-  models/                   # Model-specific setup implementations
+modelmgr/      # Model management core (registry, recipes, steps,
+                       # artifact hashing/verify, offload, migration, TUIs)
+  steps/               # Shared step library (download, tokenizer, extract,
+                       # repack, compile_native, materialize)
+  tui/                 # Onboarding, config wizard, manage flows
 
-progress.py            # Results visualization (Q2/Q4 tracks)
+assets/models/         # Per-model manifests (one JSON per base model);
+                       # assets/model_configs.json is GENERATED from them
+                       # (`make registry`) for the C engine's legacy parser
+
 Makefile               # Project build/test surface
-results.tsv            # Experiment log (58 experiments)
 
 <model_dir>/
   flashchat/
-    model_weights.bin  # Non-expert weights (5.5GB, extracted from safetensors)
-    model_weights.json # Tensor manifest
-    vocab.bin          # Vocabulary (8MB, extracted from tokenizer.json)
-    packed_experts/    # Expert weights (~218GB, extracted from safetensors)
+    shared/            # Variant-independent artifacts (vocab.bin, bf16 MTP),
+                       # symlinked into each variant dir
+    q4/, q8/           # Per-variant runtime artifacts: model_weights.bin/.json,
+                       # packed_experts/, packed_mtp_experts/, and
+                       # .flashchat_artifacts.json integrity manifests
 ```
 
 ## What We Tried (and What Worked)
