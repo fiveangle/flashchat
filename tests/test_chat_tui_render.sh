@@ -67,6 +67,20 @@ with socket.socket() as server:
                 line = "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n\n"
                 conn.sendall(line.encode("utf-8"))
                 time.sleep(0.01)
+            usage = {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "completion_tokens": 2559,
+                    "thinking_tokens": 1249,
+                    "response_tokens": 1120,
+                    "ttft_ms": 2200,
+                    "generation_ms": 159938,
+                    "thinking_ms": 78063,
+                    "response_ms": 70000,
+                },
+            }
+            line = "data: " + json.dumps(usage, separators=(",", ":")) + "\n\n"
+            conn.sendall(line.encode("utf-8"))
             conn.sendall(b"data: [DONE]\n\n")
 PY
 SERVER_PID=$!
@@ -95,6 +109,11 @@ if [[ "$clean_output" != *'<canvas id="game"></canvas>'* ]]; then
 fi
 if [[ "$clean_output" == *'SECRET_THINK_STEP'* ]]; then
     echo "FAIL: hidden reasoning_content was rendered with show thinking disabled" >&2
+    printf '%s\n' "$clean_output" >&2
+    exit 1
+fi
+if [[ "$clean_output" != *'2559 tokens, 16.0 tok/s, TTFT 2.2s (1249@16.0tok/s think, 1120@16.0tok/s response)'* ]]; then
+    echo "FAIL: chat footer did not render server timing breakdown" >&2
     printf '%s\n' "$clean_output" >&2
     exit 1
 fi

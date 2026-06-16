@@ -248,7 +248,7 @@ echo ""
 run_test "model registry json valid" python3 -m json.tool "${REPO_ROOT}/assets/model_configs.json"
 run_test_contains "models basic" "HF cache:" "$FLASHCHAT" models
 run_test_contains "models current marker" "<- selected" "$FLASHCHAT" models
-run_test_contains "models repo shown" "Repo:" "$FLASHCHAT" models
+run_test_contains "models repo shown" "Qwen/Qwen3.6-35B-A3B" "$FLASHCHAT" models
 run_test_contains "models variant status" "q4:" "$FLASHCHAT" models
 
 # ---------------------------------------------------------------------------
@@ -307,6 +307,55 @@ run_test_contains "config offload dir" "Offload dir:" bash -c "echo 'n' | $FLASH
 run_test_contains "config sampling profile" "Sampling profile:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config sampling knobs" "Top-k:" bash -c "echo 'n' | $FLASHCHAT  config"
 run_test_contains "config system prompt cache" "System prompt cache:" bash -c "echo 'n' | $FLASHCHAT  config"
+
+THINKING_GUARD_FUNCS="${TMPDIR}/flashchat-functions.sh"
+awk '/^main "\$@"/{exit} {print}' "$FLASHCHAT" > "$THINKING_GUARD_FUNCS"
+
+make_thinking_guard_config() {
+    local path="$1"
+    cat > "$path" <<EOF
+MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+SAMPLING_PROFILE="thinking-general"
+REASONING="1"
+SHOW_THINKING="0"
+EOF
+}
+
+guard_config="${TMPDIR}/thinking_guard_no.conf"
+make_thinking_guard_config "$guard_config"
+if output=$(HOME="${TMPDIR}/thinking-guard-home-no" FLASHCHAT_CONFIG_FILE_OVERRIDE="$guard_config" \
+    bash -c 'source "$1"; flashchat_load_config >/dev/null; set +e; confirm_show_thinking_for_chat <<< ""; rc=$?; set -e; echo "rc=$rc"; grep "^SHOW_THINKING" "$FLASHCHAT_CONFIG_FILE"' "$FLASHCHAT" "$THINKING_GUARD_FUNCS" 2>&1) &&
+    echo "$output" | grep -q 'rc=0' &&
+    echo "$output" | grep -q 'SHOW_THINKING="0"' &&
+    echo "$output" | grep -q 'Show Thinking will stay disabled'; then
+    assert_pass "chat thinking guard default no"
+else
+    assert_fail "chat thinking guard default no" "${output:-no output}"
+fi
+
+guard_config="${TMPDIR}/thinking_guard_yes.conf"
+make_thinking_guard_config "$guard_config"
+if output=$(HOME="${TMPDIR}/thinking-guard-home-yes" FLASHCHAT_CONFIG_FILE_OVERRIDE="$guard_config" \
+    bash -c 'source "$1"; flashchat_load_config >/dev/null; set +e; confirm_show_thinking_for_chat <<< "y"; rc=$?; set -e; echo "rc=$rc"; grep "^SHOW_THINKING" "$FLASHCHAT_CONFIG_FILE"' "$FLASHCHAT" "$THINKING_GUARD_FUNCS" 2>&1) &&
+    echo "$output" | grep -q 'rc=0' &&
+    echo "$output" | grep -q 'SHOW_THINKING="1"' &&
+    echo "$output" | grep -q 'Show Thinking enabled'; then
+    assert_pass "chat thinking guard yes persists setting"
+else
+    assert_fail "chat thinking guard yes persists setting" "${output:-no output}"
+fi
+
+guard_config="${TMPDIR}/thinking_guard_exit.conf"
+make_thinking_guard_config "$guard_config"
+if output=$(HOME="${TMPDIR}/thinking-guard-home-exit" FLASHCHAT_CONFIG_FILE_OVERRIDE="$guard_config" \
+    bash -c 'source "$1"; flashchat_load_config >/dev/null; set +e; confirm_show_thinking_for_chat <<< "x"; rc=$?; set -e; echo "rc=$rc"; grep "^SHOW_THINKING" "$FLASHCHAT_CONFIG_FILE"' "$FLASHCHAT" "$THINKING_GUARD_FUNCS" 2>&1) &&
+    echo "$output" | grep -q 'rc=2' &&
+    echo "$output" | grep -q 'SHOW_THINKING="0"' &&
+    echo "$output" | grep -q 'Returning to the previous menu'; then
+    assert_pass "chat thinking guard exits to menu"
+else
+    assert_fail "chat thinking guard exits to menu" "${output:-no output}"
+fi
 
 # Config --reset and --full-reset: test in isolated temp config
 reset_config="${TMPDIR}/reset_config"

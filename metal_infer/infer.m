@@ -10806,17 +10806,27 @@ static int sse_send_reasoning_delta(int fd, const char *request_id, const char *
     return (wr <= 0) ? -1 : 0;
 }
 
-static void sse_send_done(int fd, const char *request_id, int mtp_drafts, int mtp_accepted,
+typedef struct {
+    int total_tokens;
+    int think_tokens;
+    int response_tokens;
+    double total_ms;
+    double ttft_ms;
+    double think_ms;
+    double response_ms;
+} GenerationMetrics;
+
+static void sse_send_done(int fd, const char *request_id, const GenerationMetrics *metrics,
+                          int mtp_drafts, int mtp_accepted,
                           const int *mtp_pos_checks, const int *mtp_pos_hits) {
-    char chunk[1024];
+    char chunk[2048];
     long created = sse_created_timestamp();
     // Attach MTP (multi-token prediction) shadow-draft stats as a usage extension
     // on the terminal chunk so streaming clients can surface acceptance rate.
-    // Omitted when no drafts were made (mtp_drafts == 0).
-    char usage[256] = "";
+    char usage[1024] = "";
+    char mtp_fields[256] = "";
     if (mtp_drafts > 0) {
         double acc = (double)mtp_accepted / (double)mtp_drafts;
-        // Build per-position acceptance JSON array, e.g. [0.81,0.63,0.41]
         char pos_arr[128] = "[";
         int pos_len = 1;
         int npos = 0;
@@ -10826,9 +10836,19 @@ static void sse_send_done(int fd, const char *request_id, int mtp_drafts, int mt
                                 "%s%.4f", j ? "," : "", pr);
         }
         strncat(pos_arr, "]", sizeof(pos_arr) - (size_t)pos_len - 1);
-        snprintf(usage, sizeof(usage),
-                 ",\"usage\":{\"mtp_drafts\":%d,\"mtp_accepted\":%d,\"mtp_acceptance\":%.4f,\"mtp_per_pos\":%s}",
+        snprintf(mtp_fields, sizeof(mtp_fields),
+                 ",\"mtp_drafts\":%d,\"mtp_accepted\":%d,\"mtp_acceptance\":%.4f,\"mtp_per_pos\":%s",
                  mtp_drafts, mtp_accepted, acc, npos > 0 ? pos_arr : "[]");
+    }
+    if (metrics) {
+        snprintf(usage, sizeof(usage),
+                 ",\"usage\":{\"completion_tokens\":%d,\"thinking_tokens\":%d,\"response_tokens\":%d,"
+                 "\"ttft_ms\":%.0f,\"generation_ms\":%.0f,\"thinking_ms\":%.0f,\"response_ms\":%.0f%s}",
+                 metrics->total_tokens, metrics->think_tokens, metrics->response_tokens,
+                 metrics->ttft_ms, metrics->total_ms, metrics->think_ms, metrics->response_ms,
+                 mtp_fields);
+    } else if (mtp_fields[0]) {
+        snprintf(usage, sizeof(usage), ",\"usage\":{%s}", mtp_fields + 1);
     }
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
@@ -13153,7 +13173,7 @@ static void serve_loop(
                               request_id, fixed_title);
             if (req.stream) {
                 sse_send_delta(client_fd, request_id, fixed_title);
-                sse_send_done(client_fd, request_id, 0, 0, NULL, NULL);
+                sse_send_done(client_fd, request_id, NULL, 0, 0, NULL, NULL);
             } else {
                 char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL, NULL);
                 if (final_json) {
@@ -13491,6 +13511,7 @@ static void serve_loop(
                                          req.top_k, req.min_p, effective_presence_penalty,
                                          effective_repetition_penalty, token_counts,
                                          req.reasoning_enabled);
+        double t_first_token = now_ms();
         server_log_errorf("[serve] %s first_token=%d%s\n", request_id, next_token,
                           (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
 
@@ -13510,7 +13531,9 @@ static void serve_loop(
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
         int gen_count = 0;
-        double t_gen = now_ms();
+        int response_tokens = 0;
+        double t_gen = t_first_token;
+        double t_first_response = 0.0;
         if (mtp_shadow_available && g_server_debug_enabled) {
             g_prof_matmulN = g_prof_attncpu = g_prof_delta = 0.0;
         }
@@ -13560,6 +13583,10 @@ static void serve_loop(
             }
 
             int is_think_marker = (next_token == g_cfg.think_start_token || next_token == g_cfg.think_end_token);
+            if (!in_think && !is_think_marker) {
+                response_tokens++;
+                if (t_first_response <= 0.0) t_first_response = now_ms();
+            }
             if (!is_think_marker && gen_tokens && gen_token_count < req.max_tokens) {
                 gen_tokens[gen_token_count++] = next_token;
                 int repeat_width = 0;
@@ -13864,7 +13891,19 @@ tool_call_checked:
                 else sse_send_response_tool_call(client_fd, request_id, &parsed_tool_call);
             }
             if (is_chat && !parsed_tool_call.is_tool_call) {
-                sse_send_done(client_fd, request_id, mtp_shadow_checks, mtp_shadow_hits, mtp_pos_checks, mtp_pos_hits);
+                double t_done = now_ms();
+                GenerationMetrics metrics = {
+                    .total_tokens = gen_count,
+                    .think_tokens = think_tokens,
+                    .response_tokens = response_tokens,
+                    .total_ms = t_done - t_gen,
+                    .ttft_ms = t_first_token - t_prefill,
+                    .think_ms = think_tokens > 0
+                        ? ((t_first_response > 0.0 ? t_first_response : t_done) - t_gen)
+                        : 0.0,
+                    .response_ms = t_first_response > 0.0 ? t_done - t_first_response : 0.0,
+                };
+                sse_send_done(client_fd, request_id, &metrics, mtp_shadow_checks, mtp_shadow_hits, mtp_pos_checks, mtp_pos_hits);
             } else if (!is_chat) {
                 sse_send_response_done(client_fd, request_id, final_json);
             }
@@ -13882,9 +13921,21 @@ tool_call_checked:
                                         " %.2f", pr);
                 }
             }
-            server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)%s%s\n",
-                              request_id, gen_count, now_ms() - t_gen,
-                              gen_count > 0 ? gen_count * 1000.0 / (now_ms() - t_gen) : 0.0,
+            double gen_ms = now_ms() - t_gen;
+            double think_ms = think_tokens > 0 ? ((t_first_response > 0.0 ? t_first_response : now_ms()) - t_gen) : 0.0;
+            double response_ms = t_first_response > 0.0 ? now_ms() - t_first_response : 0.0;
+            char phase_summary[192] = "";
+            if (think_tokens > 0 || response_tokens > 0) {
+                snprintf(phase_summary, sizeof(phase_summary),
+                         ", TTFT %.1fs (%d@%.1ftok/s think, %d@%.1ftok/s response)",
+                         (t_first_token - t_prefill) / 1000.0,
+                         think_tokens, think_ms > 0.0 ? think_tokens * 1000.0 / think_ms : 0.0,
+                         response_tokens, response_ms > 0.0 ? response_tokens * 1000.0 / response_ms : 0.0);
+            }
+            server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s%s)%s%s\n",
+                              request_id, gen_count, gen_ms,
+                              gen_count > 0 && gen_ms > 0.0 ? gen_count * 1000.0 / gen_ms : 0.0,
+                              phase_summary,
                               parsed_tool_call.is_tool_call ? " [tool_call]" : "",
                               mtp_summary);
             if (mtp_shadow_available && g_server_debug_enabled) {

@@ -481,6 +481,22 @@ static void md_print(const char *text) {
     }
 }
 
+static int json_int_field(const char *json, const char *field, int fallback) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", field);
+    char *p = strstr(json, pattern);
+    if (!p) return fallback;
+    return atoi(p + strlen(pattern));
+}
+
+static double json_double_field(const char *json, const char *field, double fallback) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", field);
+    char *p = strstr(json, pattern);
+    if (!p) return fallback;
+    return atof(p + strlen(pattern));
+}
+
 // Stream SSE response, accumulate text, return malloc'd response string
 static char *stream_response(int sock, int show_thinking) {
     FILE *stream = fdopen(sock, "r");
@@ -488,6 +504,9 @@ static char *stream_response(int sock, int show_thinking) {
 
     int header_done = 0, in_think = 0, tokens = 0;
     int mtp_drafts = -1, mtp_accepted = -1;  // MTP shadow-draft stats from final chunk usage
+    int usage_available = 0;
+    int usage_total_tokens = 0, usage_think_tokens = 0, usage_response_tokens = 0;
+    double usage_ttft_ms = 0, usage_generation_ms = 0, usage_think_ms = 0, usage_response_ms = 0;
     double t_start = now_ms(), t_first = 0;
     md_reset();  // fresh markdown state for each response
 
@@ -509,6 +528,16 @@ static char *stream_response(int sock, int show_thinking) {
             mtp_drafts = atoi(mk + 13);
             char *ak = strstr(line + 6, "\"mtp_accepted\":");
             if (ak) mtp_accepted = atoi(ak + 15);
+        }
+        if (strstr(line + 6, "\"completion_tokens\":")) {
+            usage_available = 1;
+            usage_total_tokens = json_int_field(line + 6, "completion_tokens", 0);
+            usage_think_tokens = json_int_field(line + 6, "thinking_tokens", 0);
+            usage_response_tokens = json_int_field(line + 6, "response_tokens", 0);
+            usage_ttft_ms = json_double_field(line + 6, "ttft_ms", 0.0);
+            usage_generation_ms = json_double_field(line + 6, "generation_ms", 0.0);
+            usage_think_ms = json_double_field(line + 6, "thinking_ms", 0.0);
+            usage_response_ms = json_double_field(line + 6, "response_ms", 0.0);
         }
 
         int is_reasoning_delta = 0;
@@ -565,7 +594,34 @@ static char *stream_response(int sock, int show_thinking) {
     double gen_time = t_first > 0 ? t_end - t_first : 0;
     int gen_tokens = tokens > 1 ? tokens - 1 : 0;
     printf("\n\n");
-    if (gen_tokens > 0 && gen_time > 0) {
+    if (usage_available && usage_total_tokens > 0 && usage_generation_ms > 0) {
+        char detail[192] = "";
+        char *w = detail;
+        size_t rem = sizeof(detail);
+        if (usage_think_tokens > 0) {
+            int n = snprintf(w, rem, "%d@%.1ftok/s think",
+                             usage_think_tokens,
+                             usage_think_ms > 0 ? usage_think_tokens * 1000.0 / usage_think_ms : 0.0);
+            w += n; rem = (n > 0 && (size_t)n < rem) ? rem - (size_t)n : 0;
+        }
+        if (usage_response_tokens > 0 && rem > 0) {
+            snprintf(w, rem, "%s%d@%.1ftok/s response",
+                     detail[0] ? ", " : "",
+                     usage_response_tokens,
+                     usage_response_ms > 0 ? usage_response_tokens * 1000.0 / usage_response_ms : 0.0);
+        }
+        char mtp[64] = "";
+        if (mtp_drafts > 0)
+            snprintf(mtp, sizeof(mtp), ", MTP %.0f%% (%d/%d)",
+                     100.0 * mtp_accepted / mtp_drafts, mtp_accepted, mtp_drafts);
+        printf("[%d tokens, %.1f tok/s, TTFT %.1fs%s%s%s%s]\n\n",
+               usage_total_tokens, usage_total_tokens * 1000.0 / usage_generation_ms,
+               usage_ttft_ms / 1000.0,
+               detail[0] ? " (" : "",
+               detail,
+               detail[0] ? ")" : "",
+               mtp);
+    } else if (gen_tokens > 0 && gen_time > 0) {
         char mtp[64] = "";
         if (mtp_drafts > 0)
             snprintf(mtp, sizeof(mtp), ", MTP %.0f%% (%d/%d)",

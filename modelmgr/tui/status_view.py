@@ -9,8 +9,16 @@ from . import common
 def variant_glyph(status: ModelStatus, vname: str) -> str:
     v = status.variants[vname]
     if v.ready:
-        return common.green("ready")
+        size = f" ({paths.human_bytes(v.local_bytes)})" if v.local_bytes else ""
+        return common.green(f"ready{size}")
+    if v.offloaded:
+        size = f" ({paths.human_bytes(v.offload_bytes)})" if v.offload_bytes else ""
+        return common.yellow(f"offloaded{size}")
     line = status.summary_line(vname)
+    if line == "not extracted":
+        source_bytes = status.originals_bytes or status.offload_originals_bytes
+        if source_bytes:
+            line = f"{line} ({paths.human_bytes(source_bytes)} source)"
     if "attention" in line:
         return common.red(line)
     return common.yellow(line)
@@ -21,11 +29,12 @@ def print_model_block(index: int, status: ModelStatus, current=None) -> None:
     marker = "*" if current and current[0].id == m.id else " "
     enabled = "" if status.enabled else common.dim(" (disabled)")
     user = common.dim(" (user-added)") if m.user_defined else ""
-    print(f"[{index}]{marker} {common.bold(m.name)}{enabled}{user}")
-    print(f"     Repo: {m.hf_repo}")
+    print(f"[{index}]{marker} {common.bold(m.hf_repo)}{enabled}{user}")
     where = []
     if status.originals_local:
         where.append(f"originals local ({paths.human_bytes(status.originals_bytes)})")
+    elif status.originals_offloaded:
+        where.append(f"original weights offloaded ({paths.human_bytes(status.offload_originals_bytes)})")
     elif status.snapshot:
         where.append("originals not local")
     else:

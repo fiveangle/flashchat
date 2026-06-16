@@ -67,6 +67,70 @@ current_quantization_label() {
     echo "${bits}-bit"
 }
 
+flashchat_set_config_value() {
+    local key="$1"
+    local value="$2"
+    local config_file
+    config_file="$(flashchat_get CONFIG_FILE)"
+    mkdir -p "$(dirname "$config_file")"
+    if [ -f "$config_file" ] && grep -qE "^${key}=" "$config_file"; then
+        sed -i '' "s/^${key}=.*/${key}=\"${value}\"/" "$config_file"
+    else
+        printf '%s="%s"\n' "$key" "$value" >> "$config_file"
+    fi
+}
+
+confirm_show_thinking_for_chat() {
+    local reasoning show_thinking
+    reasoning="$(flashchat_get REASONING)"
+    show_thinking="$(flashchat_get SHOW_THINKING)"
+    if [ "$reasoning" != "1" ] || [ "$show_thinking" = "1" ]; then
+        return 0
+    fi
+
+    local model_id quant profile_id profile_label profile reply
+    model_id="$(flashchat_get MODEL)"
+    quant="$(current_quantization_label)"
+    profile_id="$(flashchat_get SAMPLING_PROFILE)"
+    profile_id="${profile_id:-custom}"
+    profile_label="$(flashchat_model_sampling_profile_field "$model_id" "$profile_id" "label" 2>/dev/null || true)"
+    if [ -n "$profile_label" ] && [ "$profile_label" != "$profile_id" ]; then
+        profile="${profile_label} (${profile_id})"
+    else
+        profile="$profile_id"
+    fi
+
+    echo ""
+    echo "${model_id}, ${quant}, ${profile}"
+    echo ""
+    echo "Enables Thinking, but your personal settings have \"Show Thinking\" disabled."
+    echo "Would you like to enable Show Thinking?"
+    echo ""
+    echo "  [y] Yes, enable Show Thinking"
+    echo "  [N] No, keep it hidden"
+    echo "  [x] Exit to previous menu"
+    if ! read -p "> " -n 1 -r reply; then
+        reply=""
+    fi
+    echo ""
+
+    case "$reply" in
+        y|Y)
+            flashchat_set_config_value "SHOW_THINKING" "1"
+            SHOW_THINKING="1"
+            echo "Show Thinking enabled."
+            ;;
+        x|X)
+            echo "Returning to the previous menu."
+            return 2
+            ;;
+        *)
+            echo "Show Thinking will stay disabled."
+            ;;
+    esac
+    return 0
+}
+
 mtp_label() {
     local v="$1"
     case "$v" in
@@ -1195,6 +1259,17 @@ cmd_chat() {
     # stdin from the session. Warn and proceed (server may already run).
     if ! run_python -m modelmgr ensure --non-interactive >/dev/null 2>&1; then
         echo "Note: the configured model is not fully set up — run './flashchat config' if this fails."
+    fi
+
+    local thinking_guard_rc
+    set +e
+    confirm_show_thinking_for_chat
+    thinking_guard_rc=$?
+    set -e
+    if [ "$thinking_guard_rc" -eq 2 ]; then
+        return 0
+    elif [ "$thinking_guard_rc" -ne 0 ]; then
+        return "$thinking_guard_rc"
     fi
     
     local server_port
