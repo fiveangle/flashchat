@@ -77,6 +77,8 @@ with socket.socket() as server:
                     "generation_ms": 159938,
                     "thinking_ms": 78063,
                     "response_ms": 70000,
+                    "experts_mib_per_sec": 432.1,
+                    "experts_mib_per_sec_per_expert": 54.0,
                 },
             }
             line = "data: " + json.dumps(usage, separators=(",", ":")) + "\n\n"
@@ -112,7 +114,7 @@ if [[ "$clean_output" == *'SECRET_THINK_STEP'* ]]; then
     printf '%s\n' "$clean_output" >&2
     exit 1
 fi
-if [[ "$clean_output" != *'2559 tokens, 16.0 tok/s, TTFT 2.2s (1249@16.0tok/s think, 1120@16.0tok/s response)'* ]]; then
+if [[ "$clean_output" != *'2559 tokens, 16.0 tok/s, TTFT 2.2s (1249@16.0tok/s think, 1120@16.0tok/s response), experts 432.1 MiB/s, 54.0 MiB/s/expert'* ]]; then
     echo "FAIL: chat footer did not render server timing breakdown" >&2
     printf '%s\n' "$clean_output" >&2
     exit 1

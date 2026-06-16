@@ -6,7 +6,10 @@ variant offers to build it; add-model writes to models.d/ instead of
 mutating the shipped registry.
 """
 
-from .. import configfile, resolved
+import os
+import re
+
+from .. import configfile, paths, resolved
 from ..registry import Registry, resolved_id
 from ..status import all_statuses, selected_model
 from . import build, common, status_view
@@ -16,6 +19,19 @@ _SAMPLING_KEYS = (("temperature", "TEMPERATURE"), ("top_p", "TOP_P"),
                   ("presence_penalty", "PRESENCE_PENALTY"),
                   ("repetition_penalty", "REPETITION_PENALTY"),
                   ("reasoning", "REASONING"))
+
+
+def _runtime_max_active_experts() -> int:
+    header = os.path.join(paths.REPO_ROOT, "metal_infer", "model_config.h")
+    try:
+        with open(header) as f:
+            for line in f:
+                m = re.match(r"\s*#define\s+MAX_K\s+(\d+)\b", line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return 16
 
 
 def run(registry: Registry) -> None:
@@ -89,6 +105,9 @@ def _print_summary(registry: Registry) -> None:
           f"(max entries: {configfile.get('SYSTEM_PROMPT_CACHE_MAX_ENTRIES', '2')})")
     print(f"MTP: {configfile.get('MTP', '') or '(registry default)'}"
           f" | Show thinking: {configfile.get('SHOW_THINKING', '0')}")
+    active = configfile.get("ACTIVE_EXPERTS", "")
+    if current and current[0].num_experts_per_tok > 0:
+        print(f"Active experts (K): {active or current[0].num_experts_per_tok}")
     print()
 
 
@@ -190,8 +209,13 @@ def _select_sampling_profile(manifest) -> dict:
         print(common.dim(f"     {p.get('description', '')} "
                          f"temp={p.get('temperature')} top_p={p.get('top_p')} "
                          f"reasoning={p.get('reasoning')}"))
-    print(f"  {len(names) + 1}) custom — set each parameter yourself")
-    default = names.index(current) + 1 if current in names else 1
+    custom_idx = len(names) + 1
+    custom_mark = " (current)" if current == "custom" else ""
+    print(f"  {custom_idx}) custom — set each parameter yourself{custom_mark}")
+    if current == "custom":
+        default = custom_idx
+    else:
+        default = names.index(current) + 1 if current in names else 1
     choice = common.select_number(len(names) + 1, "Profile", default=default)
     if choice is None:
         return {}
@@ -206,6 +230,19 @@ def _select_sampling_profile(manifest) -> dict:
     out = {"SAMPLING_PROFILE": "custom"}
     for key, cfg_key in _SAMPLING_KEYS:
         out[cfg_key] = common.prompt(key, configfile.get(cfg_key, ""))
+    if manifest.num_experts_per_tok > 0:
+        default_k = str(manifest.num_experts_per_tok)
+        max_k = _runtime_max_active_experts()
+        current_k = configfile.get("ACTIVE_EXPERTS", "")
+        if current_k and current_k.isdigit() and int(current_k) > max_k:
+            print(common.yellow(f"  saved K={current_k} exceeds runtime max {max_k}; using {max_k}"))
+            current_k = str(max_k)
+        current_k = current_k or default_k
+        value = common.prompt(f"Active experts (K, default {default_k}, max {max_k})", current_k)
+        if value.isdigit() and int(value) > max_k:
+            print(common.yellow(f"  K={value} exceeds runtime max {max_k}; saving {max_k}"))
+            value = str(max_k)
+        out["ACTIVE_EXPERTS"] = "" if value == default_k else value
     return out
 
 

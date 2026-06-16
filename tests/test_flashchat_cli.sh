@@ -555,6 +555,17 @@ else
     else
         assert_fail "serve restarts stale runtime" "old_pid=$old_pid new_pid=$new_pid output=$output"
     fi
+    server_log="${TMPDIR}/logs/server.log"
+    if grep -q "Runtime configuration:" "$server_log" && \
+       grep -q "active_per_token=" "$server_log" && \
+       grep -q "expert_size_per_token=" "$server_log" && \
+       grep -q "sampling: temp=" "$server_log" && \
+       grep -q "system_prompt_cache:" "$server_log" && \
+       grep -q "custom_user_system_prompt: .*not present" "$server_log"; then
+        assert_pass "server log shows resolved runtime config"
+    else
+        assert_fail "server log shows resolved runtime config" "missing runtime config block in $server_log"
+    fi
 
     # Test flashchat prompt (now that server is running)
     output=$("$FLASHCHAT" prompt "Say hello" 2>/dev/null)
@@ -562,6 +573,11 @@ else
         assert_pass "prompt with running server"
     else
         assert_fail "prompt with running server" "no completion response"
+    fi
+    if grep -q "generated=.*experts .* MiB/s, .* MiB/s/expert" "$server_log"; then
+        assert_pass "server log shows generated expert throughput"
+    else
+        assert_fail "server log shows generated expert throughput" "missing generated expert throughput in $server_log"
     fi
 fi
 

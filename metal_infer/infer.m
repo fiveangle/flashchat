@@ -129,6 +129,9 @@ static int g_mtp_trace_topn = 8;
 static char g_mtp_trace_dir[PATH_MAX] = {0};
 static int g_mtp_trace_dir_ready = 0;
 static uint64_t g_mtp_trace_call = 0;
+static char g_custom_system_prompt_path[PATH_MAX] = {0};
+static int g_custom_system_prompt_loaded = 0;
+static long g_custom_system_prompt_bytes = 0;
 static float g_default_temperature = 0.7f;
 static float g_default_top_p = 0.8f;
 static int g_default_top_k = 20;
@@ -192,6 +195,21 @@ static void server_log_close(void) {
     g_server_log_fd = -1;
     fclose(g_server_log);
     g_server_log = NULL;
+}
+
+static const char *custom_system_prompt_path(void) {
+    if (g_custom_system_prompt_path[0]) return g_custom_system_prompt_path;
+    const char *prompt_env = getenv("FLASHCHAT_SYSTEM_PROMPT");
+    if (prompt_env && prompt_env[0]) {
+        snprintf(g_custom_system_prompt_path, sizeof(g_custom_system_prompt_path), "%s", prompt_env);
+    } else {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(g_custom_system_prompt_path, sizeof(g_custom_system_prompt_path),
+                     "%s/.config/flashchat/system.md", home);
+        }
+    }
+    return g_custom_system_prompt_path[0] ? g_custom_system_prompt_path : NULL;
 }
 
 static int server_flag_enabled(const char *value) {
@@ -297,17 +315,6 @@ static void server_log_open(void) {
     fprintf(g_server_log, "[serve] Logging started\n");
     server_log_timestamp(g_server_log);
     fprintf(g_server_log, "[serve] Build: %s\n", FLASHCHAT_BUILD_STAMP);
-    server_log_timestamp(g_server_log);
-    fprintf(g_server_log, "[serve] Show thinking: %s\n", g_show_thinking_enabled ? "enabled" : "disabled");
-    server_log_timestamp(g_server_log);
-    fprintf(g_server_log, "[serve] Sampling defaults: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
-            g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
-            g_default_presence_penalty, g_default_repetition_penalty);
-    server_log_timestamp(g_server_log);
-    if (g_mtp_predictions > 0)
-        fprintf(g_server_log, "[serve] MTP: predictor batch size %d (draft/verify speculative decode)\n", g_mtp_predictions);
-    else
-        fprintf(g_server_log, "[serve] MTP: disabled\n");
     if (g_server_debug_enabled) {
         server_log_timestamp(g_server_log);
         fprintf(g_server_log, "[serve] Debug request dumping enabled\n");
@@ -10060,6 +10067,49 @@ static int repeated_tail_token_ngram(const int *tokens, int count, int max_width
     return 0;
 }
 
+static int tail_question_fragment_treadmill_count(const char *text) {
+    if (!text || !text[0]) return 0;
+    size_t len = strlen(text);
+    size_t start = len > 4096 ? len - 4096 : 0;
+    const char *s = text + start;
+    int count = 0;
+    int max_count = 0;
+    const char *frag_start = s;
+
+    for (const char *p = s; ; p++) {
+        char c = *p;
+        if (c == '?' || c == '!' || c == '.' || c == ',' || c == ';' || c == '\0') {
+            const char *a = frag_start;
+            const char *b = p;
+            while (a < b && isspace((unsigned char)*a)) a++;
+            while (b > a && isspace((unsigned char)b[-1])) b--;
+            int words = 0;
+            int chars = 0;
+            int in_word = 0;
+            for (const char *q = a; q < b; q++) {
+                if (is_tail_word_byte((unsigned char)*q)) {
+                    chars++;
+                    if (!in_word) {
+                        words++;
+                        in_word = 1;
+                    }
+                } else {
+                    in_word = 0;
+                }
+            }
+            if (c == '?' && words >= 1 && words <= 3 && chars <= 24) {
+                count++;
+                if (count > max_count) max_count = count;
+            } else if (words > 0 || c == '\0') {
+                count = 0;
+            }
+            frag_start = p + 1;
+        }
+        if (c == '\0') break;
+    }
+    return max_count;
+}
+
 // froggeric v18 "Smart False-Positive Error Detection": substring matching on
 // the word "error" is dangerous because successful API/JSON returns routinely
 // contain it as a key prefix (`error_rate`, `errors_logged`). We use strict
@@ -10814,6 +10864,8 @@ typedef struct {
     double ttft_ms;
     double think_ms;
     double response_ms;
+    double experts_mib_per_sec;
+    double experts_mib_per_sec_per_expert;
 } GenerationMetrics;
 
 static void sse_send_done(int fd, const char *request_id, const GenerationMetrics *metrics,
@@ -10843,9 +10895,11 @@ static void sse_send_done(int fd, const char *request_id, const GenerationMetric
     if (metrics) {
         snprintf(usage, sizeof(usage),
                  ",\"usage\":{\"completion_tokens\":%d,\"thinking_tokens\":%d,\"response_tokens\":%d,"
-                 "\"ttft_ms\":%.0f,\"generation_ms\":%.0f,\"thinking_ms\":%.0f,\"response_ms\":%.0f%s}",
+                 "\"ttft_ms\":%.0f,\"generation_ms\":%.0f,\"thinking_ms\":%.0f,\"response_ms\":%.0f,"
+                 "\"experts_mib_per_sec\":%.1f,\"experts_mib_per_sec_per_expert\":%.1f%s}",
                  metrics->total_tokens, metrics->think_tokens, metrics->response_tokens,
                  metrics->ttft_ms, metrics->total_ms, metrics->think_ms, metrics->response_ms,
+                 metrics->experts_mib_per_sec, metrics->experts_mib_per_sec_per_expert,
                  mtp_fields);
     } else if (mtp_fields[0]) {
         snprintf(usage, sizeof(usage), ",\"usage\":{%s}", mtp_fields + 1);
@@ -11595,15 +11649,10 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
 
 // Load custom system prompt from ~/.config/flashchat/system.md, or use default
 static char *load_system_prompt(void) {
-    const char *home = getenv("HOME");
-    char path[1024] = {0};
-    const char *prompt_env = getenv("FLASHCHAT_SYSTEM_PROMPT");
-    if (prompt_env && prompt_env[0]) {
-        snprintf(path, sizeof(path), "%s", prompt_env);
-    } else if (home) {
-        snprintf(path, sizeof(path), "%s/.config/flashchat/system.md", home);
-    }
-    if (path[0]) {
+    const char *path = custom_system_prompt_path();
+    g_custom_system_prompt_loaded = 0;
+    g_custom_system_prompt_bytes = 0;
+    if (path && path[0]) {
         FILE *f = fopen(path, "r");
         if (!f) return strdup("You are a helpful assistant.");
         fseek(f, 0, SEEK_END);
@@ -11613,7 +11662,9 @@ static char *load_system_prompt(void) {
         size_t n = fread(buf, 1, sz, f);
         buf[n] = 0;
         fclose(f);
-        fprintf(stderr, "[serve] Loaded custom system prompt from %s (%ld bytes)\n", path, sz);
+        g_custom_system_prompt_loaded = 1;
+        g_custom_system_prompt_bytes = sz;
+        fprintf(stderr, "[serve] Loaded custom_user_system_prompt from %s (%ld bytes)\n", path, sz);
         return buf;
     }
     return strdup("You are a helpful assistant.");
@@ -12972,12 +13023,16 @@ cleanup:
 
 static void serve_loop(
     int port,
+    const char *config_path,
     const char *model_path,
+    const char *weights_path,
+    const char *manifest_path,
+    const char *vocab_path,
     WeightFile *wf, Vocabulary *vocab,
     void **layer_states, KVCache **kv_caches,
     void **layer_mmaps, int *layer_fds,
     float *hidden, float *logits,
-    uint16_t *final_norm_w, int K)
+    uint16_t *final_norm_w, int K, int max_tokens)
 {
     g_server_shutdown_signal = 0;
     g_server_listen_fd = -1;
@@ -13007,6 +13062,62 @@ static void serve_loop(
     server_logf("[serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health\n");
     if (g_server_log_path[0]) {
         server_logf("[serve] Persistent log: %s\n", g_server_log_path);
+    }
+    server_logf("[serve] Runtime configuration:\n");
+    server_logf("[serve]   model: %s (%s)\n",
+                g_cfg.model_name[0] ? g_cfg.model_name : "(unnamed)",
+                g_cfg.model_id[0] ? g_cfg.model_id : "(unknown)");
+    if (g_cfg.hf_repo[0]) {
+        server_logf("[serve]   repo: %s\n", g_cfg.hf_repo);
+    }
+    server_logf("[serve]   model_path: %s\n", model_path ? model_path : "(none)");
+    server_logf("[serve]   config_file: %s\n", config_path && config_path[0] ? config_path : "(none)");
+    server_logf("[serve]   weights: %s\n", weights_path ? weights_path : "(unknown)");
+    server_logf("[serve]   manifest: %s\n", manifest_path ? manifest_path : "(unknown)");
+    server_logf("[serve]   vocab: %s\n", vocab_path ? vocab_path : "(unknown)");
+    server_logf("[serve]   quantization: %d-bit group_size=%d\n", g_cfg.bits, g_cfg.group_size);
+    server_logf("[serve]   architecture: layers=%d hidden=%d vocab=%d heads=%d kv_heads=%d head_dim=%d full_attn=%d linear_attn=%d\n",
+                g_cfg.num_layers, g_cfg.hidden_dim, g_cfg.vocab_size,
+                g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim,
+                g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
+    if (g_cfg.num_experts > 0) {
+        size_t expert_bytes = active_expert_size();
+        double expert_size_per_token_mib = ((double)expert_bytes * (double)K) / (1024.0 * 1024.0);
+        server_logf("[serve]   experts: total=%d active_per_token=%d trained_active_per_token=%d expert_size=%zu expert_size_per_token=%.1f MiB\n",
+                    g_cfg.num_experts, K, g_cfg.num_experts_per_tok,
+                    expert_bytes, expert_size_per_token_mib);
+    } else {
+        server_logf("[serve]   experts: dense model (active_per_token=0)\n");
+    }
+    server_logf("[serve]   max_response_tokens: %d\n", max_tokens);
+    server_logf("[serve]   reasoning: %s\n", g_default_reasoning_enabled ? "enabled" : "disabled");
+    server_logf("[serve]   show_thinking: %s\n", g_show_thinking_enabled ? "enabled" : "disabled");
+    server_logf("[serve]   sampling: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
+                g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
+                g_default_presence_penalty, g_default_repetition_penalty);
+    if (g_mtp_predictions > 0) {
+        server_logf("[serve]   mtp: predictor_batch=%d mtp_active_experts=%d\n",
+                    g_mtp_predictions, g_mtp_active_experts);
+    } else {
+        server_logf("[serve]   mtp: disabled\n");
+    }
+    server_logf("[serve]   gpu_linear_attention: %s\n", gpu_linear_attn_enabled ? "enabled" : "disabled");
+    server_logf("[serve]   system_prompt_cache: %s max_entries=%d\n",
+                g_system_prompt_cache_enabled ? "enabled" : "disabled",
+                g_system_prompt_cache_max_entries);
+    server_logf("[serve]   server_debug: %s http_log: %s\n",
+                g_server_debug_enabled ? "enabled" : "disabled",
+                g_server_http_log_enabled ? "enabled" : "disabled");
+    const char *system_prompt = custom_system_prompt_path();
+    if (system_prompt && system_prompt[0]) {
+        if (g_custom_system_prompt_loaded) {
+            server_logf("[serve]   custom_user_system_prompt: %s (loaded, %ld bytes)\n",
+                        system_prompt, g_custom_system_prompt_bytes);
+        } else if (access(system_prompt, R_OK) == 0) {
+            server_logf("[serve]   custom_user_system_prompt: %s (present, not loaded yet)\n", system_prompt);
+        } else {
+            server_logf("[serve]   custom_user_system_prompt: %s (not present; using built-in default)\n", system_prompt);
+        }
     }
     server_logf("[serve] Persistent system prompt cache: %s (max entries: %d)\n",
                 g_system_prompt_cache_enabled ? "enabled" : "disabled",
@@ -13609,6 +13720,12 @@ static void serve_loop(
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
+                    int question_fragments = tail_question_fragment_treadmill_count(gen_response);
+                    if (question_fragments >= 48 && gen_count >= 128) {
+                        server_log_errorf("[serve] %s semantic_loop_guard hit generated=%d question_fragments=%d action=stop\n",
+                                          request_id, gen_count, question_fragments);
+                        break;
+                    }
                 }
                 if (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE) {
                     if (append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, tok_str, (size_t)tlen) == 0 &&
@@ -13892,6 +14009,10 @@ tool_call_checked:
             }
             if (is_chat && !parsed_tool_call.is_tool_call) {
                 double t_done = now_ms();
+                double prompt_to_done_ms = t_done - t_prefill;
+                double expert_size_per_token_mib = g_cfg.num_experts > 0
+                    ? ((double)active_expert_size() * (double)K) / (1024.0 * 1024.0)
+                    : 0.0;
                 GenerationMetrics metrics = {
                     .total_tokens = gen_count,
                     .think_tokens = think_tokens,
@@ -13902,7 +14023,13 @@ tool_call_checked:
                         ? ((t_first_response > 0.0 ? t_first_response : t_done) - t_gen)
                         : 0.0,
                     .response_ms = t_first_response > 0.0 ? t_done - t_first_response : 0.0,
+                    .experts_mib_per_sec = (gen_count > 0 && prompt_to_done_ms > 0.0)
+                        ? expert_size_per_token_mib * (double)gen_count * 1000.0 / prompt_to_done_ms
+                        : 0.0,
                 };
+                metrics.experts_mib_per_sec_per_expert = K > 0
+                    ? metrics.experts_mib_per_sec / (double)K
+                    : 0.0;
                 sse_send_done(client_fd, request_id, &metrics, mtp_shadow_checks, mtp_shadow_hits, mtp_pos_checks, mtp_pos_hits);
             } else if (!is_chat) {
                 sse_send_response_done(client_fd, request_id, final_json);
@@ -13922,6 +14049,14 @@ tool_call_checked:
                 }
             }
             double gen_ms = now_ms() - t_gen;
+            double prompt_to_done_ms = now_ms() - t_prefill;
+            double expert_size_per_token_mib = g_cfg.num_experts > 0
+                ? ((double)active_expert_size() * (double)K) / (1024.0 * 1024.0)
+                : 0.0;
+            double experts_mib_per_sec = (gen_count > 0 && prompt_to_done_ms > 0.0)
+                ? expert_size_per_token_mib * (double)gen_count * 1000.0 / prompt_to_done_ms
+                : 0.0;
+            double experts_mib_per_sec_per_expert = K > 0 ? experts_mib_per_sec / (double)K : 0.0;
             double think_ms = think_tokens > 0 ? ((t_first_response > 0.0 ? t_first_response : now_ms()) - t_gen) : 0.0;
             double response_ms = t_first_response > 0.0 ? now_ms() - t_first_response : 0.0;
             char phase_summary[192] = "";
@@ -13932,9 +14067,10 @@ tool_call_checked:
                          think_tokens, think_ms > 0.0 ? think_tokens * 1000.0 / think_ms : 0.0,
                          response_tokens, response_ms > 0.0 ? response_tokens * 1000.0 / response_ms : 0.0);
             }
-            server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s%s)%s%s\n",
+            server_log_errorf("[serve] %s generated=%d tokens in %.0fms (%.2f tok/s, experts %.1f MiB/s, %.1f MiB/s/expert%s)%s%s\n",
                               request_id, gen_count, gen_ms,
                               gen_count > 0 && gen_ms > 0.0 ? gen_count * 1000.0 / gen_ms : 0.0,
+                              experts_mib_per_sec, experts_mib_per_sec_per_expert,
                               phase_summary,
                               parsed_tool_call.is_tool_call ? " [tool_call]" : "",
                               mtp_summary);
@@ -14050,8 +14186,10 @@ int main(int argc, char **argv) {
         const char *prompt_text = NULL;
         const char *model_id = NULL;       // from --model-id / config MODEL
         const char *config_file_override = NULL;   // from --config <path>
+        char loaded_config_path[1024] = {0};
         int max_tokens = 20;
         int K = 0;  // 0 = use g_cfg.num_experts_per_tok after config load; --k overrides
+        const char *K_source = NULL;
         const char *render_request_path = NULL;
         const char *render_output_dir = NULL;
         const char *render_kind = "auto";
@@ -14108,6 +14246,7 @@ int main(int argc, char **argv) {
             int v = atoi(env_active_experts);
             if (v > 0) {
                 K = v;
+                K_source = "FLASHCHAT_ACTIVE_EXPERTS";
                 fprintf(stderr, "[init] FLASHCHAT_ACTIVE_EXPERTS=%d overrides config K\n", v);
             }
         }
@@ -14141,6 +14280,9 @@ int main(int argc, char **argv) {
                 snprintf(config_path, sizeof(config_path), "%s", config_file_override);
             } else if (home) {
                 snprintf(config_path, sizeof(config_path), "%s/.config/flashchat/config", home);
+            }
+            if (config_path[0]) {
+                snprintf(loaded_config_path, sizeof(loaded_config_path), "%s", config_path);
             }
             FILE *cfg = config_path[0] ? fopen(config_path, "r") : NULL;
             if (cfg) {
@@ -14233,6 +14375,16 @@ int main(int argc, char **argv) {
                             g_mtp_predictions = parse_mtp_predictions(quote + 1);
                         }
                     }
+                    if (strncmp(line, "ACTIVE_EXPERTS=", 15) == 0) {
+                        char *quote = strchr(line + 15, '"');
+                        if (quote) {
+                            int v = atoi(quote + 1);
+                            if (v > 0 && K <= 0) {
+                                K = v;
+                                K_source = "ACTIVE_EXPERTS config";
+                            }
+                        }
+                    }
                 }
                 fclose(cfg);
             }
@@ -14300,7 +14452,7 @@ int main(int argc, char **argv) {
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
-                case 'k': K = atoi(optarg); break;
+                case 'k': K = atoi(optarg); K_source = "--k"; break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
@@ -14470,8 +14622,8 @@ int main(int argc, char **argv) {
             K = g_cfg.num_experts_per_tok > 0 ? g_cfg.num_experts_per_tok : 4;
             fprintf(stderr, "[init] K=%d active experts (from config num_experts_per_tok)\n", K);
         } else {
-            fprintf(stderr, "[init] K=%d active experts (--k override; config wants %d)\n",
-                    K, g_cfg.num_experts_per_tok);
+            fprintf(stderr, "[init] K=%d active experts (%s override; config wants %d)\n",
+                    K, K_source ? K_source : "runtime", g_cfg.num_experts_per_tok);
         }
         if (K > MAX_K) {
             fprintf(stderr, "[init] WARNING: requested K=%d exceeds MAX_K=%d (Metal buffer slots); "
@@ -14759,10 +14911,10 @@ int main(int argc, char **argv) {
         // ---- Serve mode: enter HTTP server loop (never returns) ----
         if (serve_port > 0) {
             reset_delta_net_state();
-            serve_loop(serve_port, model_path, wf, vocab,
+            serve_loop(serve_port, loaded_config_path, model_path, weights_path, manifest_path, vocab_path, wf, vocab,
                        layer_states, kv_caches,
                        (void **)layer_mmaps, layer_fds,
-                       hidden, logits, final_norm_w, K);
+                       hidden, logits, final_norm_w, K, max_tokens);
             // serve_loop never returns, but cleanup just in case
             free(hidden); free(logits);
             return 0;

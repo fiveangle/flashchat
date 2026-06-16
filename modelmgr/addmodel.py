@@ -12,7 +12,7 @@ from . import paths
 from .manifest import parse_manifest
 from .registry import Registry
 
-SUPPORTED_MODEL_TYPES = {"qwen3_5_moe"}
+SUPPORTED_MODEL_TYPES = {"qwen3_5_moe", "qwen3_next"}
 
 _NATIVE_MOE_ARTIFACTS = {
     "model_weights.bin": {"step": "compile_native:non_experts",
@@ -112,13 +112,15 @@ def derive_manifest(hf_repo: str, hf_config: dict, registry: Registry,
 
     model_id = hf_repo.replace("/", "-").replace(".", "").lower()
     if native:
-        artifacts = _NATIVE_DENSE_ARTIFACTS if dense else _NATIVE_MOE_ARTIFACTS
+        artifacts = json.loads(json.dumps(_NATIVE_DENSE_ARTIFACTS if dense else _NATIVE_MOE_ARTIFACTS))
         offered = variants or ["q4", "q8"]
         shared = {"vocab.bin": {"step": "export_tokenizer"}}
         if mtp_layers:
             shared["bf16/mtp_weights.bin"] = {
                 "step": "compile_native:bf16_mtp", "optional": True,
                 "companions": ["bf16/mtp_weights.json"]}
+        else:
+            artifacts.pop("bf16/", None)
     else:
         artifacts = _MLX_ARTIFACTS
         bits = int(qc.get("bits", 4) or 4)

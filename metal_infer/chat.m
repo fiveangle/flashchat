@@ -507,6 +507,8 @@ static char *stream_response(int sock, int show_thinking) {
     int usage_available = 0;
     int usage_total_tokens = 0, usage_think_tokens = 0, usage_response_tokens = 0;
     double usage_ttft_ms = 0, usage_generation_ms = 0, usage_think_ms = 0, usage_response_ms = 0;
+    double usage_experts_mib_per_sec = 0.0;
+    double usage_experts_mib_per_sec_per_expert = 0.0;
     double t_start = now_ms(), t_first = 0;
     md_reset();  // fresh markdown state for each response
 
@@ -538,6 +540,8 @@ static char *stream_response(int sock, int show_thinking) {
             usage_generation_ms = json_double_field(line + 6, "generation_ms", 0.0);
             usage_think_ms = json_double_field(line + 6, "thinking_ms", 0.0);
             usage_response_ms = json_double_field(line + 6, "response_ms", 0.0);
+            usage_experts_mib_per_sec = json_double_field(line + 6, "experts_mib_per_sec", 0.0);
+            usage_experts_mib_per_sec_per_expert = json_double_field(line + 6, "experts_mib_per_sec_per_expert", 0.0);
         }
 
         int is_reasoning_delta = 0;
@@ -614,12 +618,17 @@ static char *stream_response(int sock, int show_thinking) {
         if (mtp_drafts > 0)
             snprintf(mtp, sizeof(mtp), ", MTP %.0f%% (%d/%d)",
                      100.0 * mtp_accepted / mtp_drafts, mtp_accepted, mtp_drafts);
-        printf("[%d tokens, %.1f tok/s, TTFT %.1fs%s%s%s%s]\n\n",
+        char experts[64] = "";
+        if (usage_experts_mib_per_sec > 0.0)
+            snprintf(experts, sizeof(experts), ", experts %.1f MiB/s, %.1f MiB/s/expert",
+                     usage_experts_mib_per_sec, usage_experts_mib_per_sec_per_expert);
+        printf("[%d tokens, %.1f tok/s, TTFT %.1fs%s%s%s%s%s]\n\n",
                usage_total_tokens, usage_total_tokens * 1000.0 / usage_generation_ms,
                usage_ttft_ms / 1000.0,
                detail[0] ? " (" : "",
                detail,
                detail[0] ? ")" : "",
+               experts,
                mtp);
     } else if (gen_tokens > 0 && gen_time > 0) {
         char mtp[64] = "";

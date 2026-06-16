@@ -96,6 +96,10 @@ class Manifest:
         return int(self.architecture.get("num_experts", 0)) == 0
 
     @property
+    def num_experts_per_tok(self) -> int:
+        return int(self.architecture.get("num_experts_per_tok", 0) or 0)
+
+    @property
     def mtp_artifacts_required(self) -> bool:
         # Mirrors the old bash model_mtp_artifacts_required(): native models
         # with an MTP head carry mtp_num_hidden_layers; quantized community

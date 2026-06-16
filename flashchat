@@ -395,7 +395,13 @@ cmd_status() {
     local _ae_eff _ae_mdl
     _ae_eff="$(flashchat_effective_active_experts)"
     _ae_mdl="$(flashchat_model_active_experts "$(flashchat_get MODEL)")"
-    if [ -n "${FLASHCHAT_ACTIVE_EXPERTS:-}" ] && [ "${FLASHCHAT_ACTIVE_EXPERTS}" -gt 0 ] 2>/dev/null; then
+    local _ae_cfg
+    _ae_cfg="$(flashchat_get ACTIVE_EXPERTS)"
+    if [ -n "$_ae_cfg" ] && [ "$_ae_cfg" -gt "$FLASHCHAT_MAX_ACTIVE_EXPERTS" ] 2>/dev/null; then
+        echo "Active experts (K): ${_ae_eff} (custom profile requested ${_ae_cfg}, clamped to runtime max ${FLASHCHAT_MAX_ACTIVE_EXPERTS}; model trained with K=${_ae_mdl:-?})"
+    elif [ -n "$_ae_cfg" ] && [ "$_ae_cfg" -gt 0 ] 2>/dev/null; then
+        echo "Active experts (K): ${_ae_eff} (custom profile override; model trained with K=${_ae_mdl:-?})"
+    elif [ -n "${FLASHCHAT_ACTIVE_EXPERTS:-}" ] && [ "${FLASHCHAT_ACTIVE_EXPERTS}" -gt 0 ] 2>/dev/null; then
         echo "Active experts (K): ${_ae_eff} (FLASHCHAT_ACTIVE_EXPERTS override; model trained with K=${_ae_mdl:-?})"
     else
         echo "Active experts (K): ${_ae_eff} (from model registry num_experts_per_tok)"
@@ -1206,6 +1212,7 @@ cmd_serve() {
     FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
     FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
     FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
+    FLASHCHAT_ACTIVE_EXPERTS="$(flashchat_get ACTIVE_EXPERTS)" \
     "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" \
         --config "$_config_file" --model "$_model_path" > /dev/null 2>&1 &
     local infer_pid=$!

@@ -41,6 +41,7 @@ class TestGoldenEquivalence(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        os.environ["FLASHCHAT_CONFIG_DIR"] = _TMP_CONFIG
         with open(GOLDEN) as f:
             cls.golden = json.load(f)
         cls.view = resolved.render(Registry.load(), include_all=True)
@@ -122,6 +123,7 @@ class TestStrstrScoping(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        os.environ["FLASHCHAT_CONFIG_DIR"] = _TMP_CONFIG
         cls.registry = Registry.load()
         cls.view = resolved.render(cls.registry, include_all=True)
         cls.text = json.dumps(cls.view, indent=2)
@@ -150,6 +152,7 @@ class TestStrstrScoping(unittest.TestCase):
 
 class TestLegacyLookup(unittest.TestCase):
     def test_every_legacy_id_maps_back(self):
+        os.environ["FLASHCHAT_CONFIG_DIR"] = _TMP_CONFIG
         registry = Registry.load()
         with open(GOLDEN) as f:
             golden = json.load(f)

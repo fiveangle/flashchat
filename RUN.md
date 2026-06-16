@@ -241,6 +241,7 @@ TOP_K="20"
 MIN_P="0.0"
 PRESENCE_PENALTY="1.5"
 REPETITION_PENALTY="1.0"
+ACTIVE_EXPERTS=""
 
 # Server Settings
 SERVER_PORT="8000"
@@ -258,7 +259,7 @@ COLOR_OUTPUT="1"
 
 `SYSTEM_PROMPT_CACHE` stores compressed, model-local snapshots under the selected runtime directory, such as `<model>/flashchat/q4/system_prompt_cache/` or `<model>/flashchat/q8/system_prompt_cache/`, so repeated server runs with the same harness/system prompt can skip the expensive system prompt prefill. The cache is bounded by `SYSTEM_PROMPT_CACHE_MAX_ENTRIES`.
 
-`SAMPLING_PROFILE` selects a model-supported generation profile from `assets/model_configs.json`. Use `custom` to edit `REASONING`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`, `PRESENCE_PENALTY`, and `REPETITION_PENALTY` directly.
+`SAMPLING_PROFILE` selects a model-supported generation profile from `assets/model_configs.json`. Use `custom` to edit `REASONING`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`, `PRESENCE_PENALTY`, `REPETITION_PENALTY`, and `ACTIVE_EXPERTS` directly. Leave `ACTIVE_EXPERTS` empty to use the model registry's `num_experts_per_tok` value. `ACTIVE_EXPERTS` cannot exceed the native runtime's `MAX_K` limit.
 
 Flashchat records a runtime signature for servers it starts. If model selection, model registry data, server-affecting settings, or infer source/binary state changes while the server is running, the next Flashchat-managed server use restarts the owned server before reuse.
 
