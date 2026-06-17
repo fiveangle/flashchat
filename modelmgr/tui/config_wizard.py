@@ -10,8 +10,9 @@ import os
 import re
 
 from .. import configfile, paths, resolved
+from ..artifacts import source_mtp_tensors_present
 from ..registry import Registry, resolved_id
-from ..status import all_statuses, selected_model
+from ..status import all_statuses, hf_cache_dir, selected_model
 from . import build, common, status_view
 
 _SAMPLING_KEYS = (("temperature", "TEMPERATURE"), ("top_p", "TOP_P"),
@@ -62,7 +63,7 @@ def run(registry: Registry) -> None:
     changes.update(_select_sampling_profile(manifest))
     changes.update(_server_settings())
     changes.update(_storage_settings())
-    changes.update(_advanced_settings())
+    changes.update(_advanced_settings(manifest))
 
     configfile.update(changes)
     resolved.write(registry)
@@ -283,10 +284,11 @@ def _storage_settings() -> dict:
     return out
 
 
-def _advanced_settings() -> dict:
+def _advanced_settings(manifest) -> dict:
     if not common.confirm("Configure advanced options (debug, MTP, cache)?", default=False):
         return {}
     out = {}
+    mtp_raw = ""
     for key, label, default in (
             ("SERVER_DEBUG", "Server debug logging (0/1)", "0"),
             ("SERVER_HTTP_LOG", "HTTP traffic log (0/1)", "0"),
@@ -297,7 +299,52 @@ def _advanced_settings() -> dict:
             ("SHOW_THINKING", "Show thinking tokens (0/1)", "0"),
             ("COLOR_OUTPUT", "Color output (0/1)", "1")):
         value = common.prompt(label, configfile.get(key, default))
-        if key == "MTP" and value.lower() == "auto":
-            value = ""  # empty = registry/profile default (legacy semantics)
+        if key == "MTP":
+            mtp_raw = value
+            if value.lower() == "auto":
+                value = ""  # empty = registry/profile default (legacy semantics)
         out[key] = value
+    _warn_if_mtp_unsupported(manifest, mtp_raw, out)
     return out
+
+
+def _mtp_value_enables(raw: str) -> bool:
+    """Mirror the engine's parse_mtp_predictions truthiness: 0/off/no/false and
+    empty (registry default) do not actively request MTP; auto/on/yes and any
+    positive integer do."""
+    s = (raw or "").strip().lower()
+    if s in ("", "0", "off", "no", "false"):
+        return False
+    if s in ("auto", "on", "yes", "true"):
+        return True
+    return s.isdigit() and int(s) > 0
+
+
+def _warn_if_mtp_unsupported(manifest, mtp_raw: str, out: dict) -> None:
+    """If the user is enabling MTP for a model whose checkpoint has no MTP head,
+    say so and offer to turn it back off. Authoritative source-side safetensors
+    scan, falling back to the manifest's declared capability when the model
+    isn't downloaded."""
+    if not _mtp_value_enables(mtp_raw):
+        return
+    snapshot = paths.snapshot_dir(hf_cache_dir(), manifest.hf_repo)
+    supported = source_mtp_tensors_present(snapshot)
+    confident = supported is not None
+    if supported is None:
+        supported = manifest.mtp_artifacts_required
+    if supported:
+        return
+    if confident:
+        print(common.yellow(
+            f"\n  ⚠ {manifest.name} has no MTP head — its checkpoint ships no "
+            "mtp.* tensors, so multi-token prediction will have no effect "
+            "(the server decodes normally and logs it as inactive)."))
+        if common.confirm("Disable MTP for this model?", default=True):
+            out["MTP"] = "0"
+    else:
+        print(common.yellow(
+            f"\n  ⚠ couldn't verify MTP support for {manifest.name} (model not "
+            "downloaded); the registry lists no MTP head for it. If it truly has "
+            "none, MTP will have no effect."))
+        if common.confirm("Disable MTP for now?", default=False):
+            out["MTP"] = "0"

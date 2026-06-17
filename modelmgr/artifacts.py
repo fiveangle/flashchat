@@ -317,6 +317,23 @@ def mtp_tensors_present(weights_json_path: str, dense: bool = False) -> bool:
     return True
 
 
+def source_mtp_tensors_present(model_path: str) -> bool | None:
+    """Whether the ORIGINAL checkpoint ships an MTP/nextn head, by scanning the
+    safetensors weight map for mtp.*/nextn tensors. Returns None when it cannot be
+    determined (no index present — e.g. the model isn't downloaded) so callers can
+    fall back to the manifest's declared capability. This is the authoritative
+    source-side check, independent of whether addmodel captured the MTP config."""
+    if not model_path:
+        return None
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    return any("mtp" in k.lower() or "nextn" in k.lower() for k in weight_map)
+
+
 def packed_layer_files(packed_dir: str, num_layers: int) -> list:
     """Missing layer_NN.bin files (empty list when complete)."""
     missing = []
