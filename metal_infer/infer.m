@@ -124,6 +124,20 @@ static int g_system_prompt_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
 static int g_mtp_predictions = -1;
 static int g_mtp_active_experts = 1;
+// Draft-model expert acceleration (empirical probe + genuine speedup): keep the
+// MTP head's single expert layer RAM-resident instead of pread-per-draft, and run
+// its dequant on the GPU instead of the CPU. Both are bit-identical to the legacy
+// pread+CPU path, so acceptance is unchanged — these only cut draft wall-clock.
+// Flags read once at load; -1 means "not yet resolved from env".
+static int g_mtp_resident_enabled = -1;   // FLASHCHAT_MTP_RESIDENT (default on)
+static int g_mtp_gpu_experts_enabled = -1; // FLASHCHAT_MTP_GPU_EXPERTS (default on)
+static void *g_mtp_expert_resident = NULL; // whole packed_mtp_experts/layer_00.bin
+static size_t g_mtp_expert_resident_size = 0;
+// MTP artifact-detection result, captured at load so the serve config dump can
+// explain (in server.log) WHY MTP is inactive — load-time prints go to stderr,
+// which the server wrapper redirects to /dev/null.
+static int g_mtp_tensors_present = 0;
+static int g_mtp_packed_experts_present = 0;
 static int g_mtp_trace_enabled = 0;
 static int g_mtp_trace_topn = 8;
 static char g_mtp_trace_dir[PATH_MAX] = {0};
@@ -1155,6 +1169,55 @@ static void build_mtp_cache(WeightFile *wf, WeightFile *bf16_wf) {
     }
     g_mtp_kv_len = 0;
     g_mtp_base_pos = 0;
+
+    // Resolve draft-expert acceleration flags once (default on; set to 0 to disable).
+    if (g_mtp_resident_enabled < 0) {
+        const char *e = getenv("FLASHCHAT_MTP_RESIDENT");
+        g_mtp_resident_enabled = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (g_mtp_gpu_experts_enabled < 0) {
+        const char *e = getenv("FLASHCHAT_MTP_GPU_EXPERTS");
+        g_mtp_gpu_experts_enabled = (e && e[0] == '0') ? 0 : 1;
+    }
+
+    // Pull the MTP head's single expert layer fully into RAM so the draft path
+    // never pread()s from SSD per token. Only meaningful for MoE models; guarded
+    // and self-documenting so a failed/huge alloc cleanly falls back to pread.
+    if (g_mtp_cache.ready && g_mtp_resident_enabled && g_cfg.num_experts > 0 &&
+        !g_mtp_expert_resident) {
+        size_t esz = active_expert_size();
+        size_t total = (size_t)g_cfg.num_experts * esz;
+        char packed_path[PATH_MAX];
+        snprintf(packed_path, sizeof(packed_path), "%s/layer_00.bin",
+                 g_flashchat_mtp_experts_dir);
+        int fd = open(packed_path, O_RDONLY);
+        if (fd >= 0) {
+            void *buf = malloc(total);
+            if (buf) {
+                ssize_t got = pread(fd, buf, total, 0);
+                if (got == (ssize_t)total) {
+                    g_mtp_expert_resident = buf;
+                    g_mtp_expert_resident_size = total;
+                    fprintf(stderr,
+                            "[mtp] expert layer RAM-resident: %.2f GiB (%d experts), "
+                            "dequant=%s\n",
+                            (double)total / (1024.0 * 1024.0 * 1024.0),
+                            g_cfg.num_experts,
+                            g_mtp_gpu_experts_enabled ? "GPU" : "CPU");
+                } else {
+                    free(buf);
+                    fprintf(stderr,
+                            "[mtp] resident load short read (%zd/%zu) — using pread\n",
+                            got, total);
+                }
+            } else {
+                fprintf(stderr,
+                        "[mtp] resident alloc failed (%.2f GiB) — using pread\n",
+                        (double)total / (1024.0 * 1024.0 * 1024.0));
+            }
+            close(fd);
+        }
+    }
 }
 
 static void mtp_trace_prepare_dir(void) {
@@ -1489,45 +1552,70 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     }
 
     char packed_path[PATH_MAX];
-    snprintf(packed_path, sizeof(packed_path), "%s/layer_00.bin", g_flashchat_mtp_experts_dir);
-    int fd = open(packed_path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "[mtp] forward failed: cannot open %s: %s\n", packed_path, strerror(errno));
-        goto cleanup;
+    // Source experts from the RAM-resident layer when available; otherwise fall
+    // back to the legacy per-draft pread. Both produce identical bytes.
+    int use_resident = (g_mtp_expert_resident != NULL);
+    int fd = -1;
+    if (!use_resident) {
+        snprintf(packed_path, sizeof(packed_path), "%s/layer_00.bin", g_flashchat_mtp_experts_dir);
+        fd = open(packed_path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "[mtp] forward failed: cannot open %s: %s\n", packed_path, strerror(errno));
+            goto cleanup;
+        }
     }
     size_t esz = active_expert_size();
-    void *expert_data = malloc(esz);
+    void *expert_data = use_resident ? NULL : malloc(esz);
     float *eg = calloc(g_cfg.moe_intermediate, sizeof(float));
     float *eu = calloc(g_cfg.moe_intermediate, sizeof(float));
     float *ea = calloc(g_cfg.moe_intermediate, sizeof(float));
     float *eo = calloc(g_cfg.hidden_dim, sizeof(float));
-    if (!expert_data || !eg || !eu || !ea || !eo) {
-        close(fd);
+    if ((!use_resident && !expert_data) || !eg || !eu || !ea || !eo) {
+        if (fd >= 0) close(fd);
         free(expert_data); free(eg); free(eu); free(ea); free(eo);
         fprintf(stderr, "[mtp] forward failed: expert allocation failure\n");
         goto cleanup;
     }
+    // mtp_matvec -> mtp_gpu_8bit_dispatch already falls back to CPU dequant when
+    // Metal isn't ready, so gating on the flag alone is safe here (g_metal is
+    // declared later in the file).
+    int gpu_experts = g_mtp_gpu_experts_enabled;
     for (int k = 0; k < mtp_k; k++) {
         int eidx = expert_indices[k];
-        ssize_t nread = pread(fd, expert_data, esz, (off_t)eidx * (off_t)esz);
-        if (nread != (ssize_t)esz) {
-            fprintf(stderr, "[mtp] forward warning: expert %d read failed (%zd/%zu)\n",
-                    eidx, nread, esz);
-            continue;
+        char *ed;
+        if (use_resident) {
+            ed = (char *)g_mtp_expert_resident + (size_t)eidx * esz;
+        } else {
+            ssize_t nread = pread(fd, expert_data, esz, (off_t)eidx * (off_t)esz);
+            if (nread != (ssize_t)esz) {
+                fprintf(stderr, "[mtp] forward warning: expert %d read failed (%zd/%zu)\n",
+                        eidx, nread, esz);
+                continue;
+            }
+            ed = (char *)expert_data;
         }
-        uint32_t *gw = (uint32_t *)expert_data;
-        uint16_t *gs_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size);
-        uint16_t *gb_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size);
-        uint32_t *uw = (uint32_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size);
-        uint16_t *us_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size);
-        uint16_t *ub_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size);
-        uint32_t *dw = (uint32_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size);
-        uint16_t *ds_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size);
-        uint16_t *db_p = (uint16_t *)((char *)expert_data + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size);
-        cpu_dequant_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-        cpu_dequant_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
-        cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
-        cpu_dequant_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
+        uint32_t *gw = (uint32_t *)ed;
+        uint16_t *gs_p = (uint16_t *)(ed + g_cfg.gate_w_size);
+        uint16_t *gb_p = (uint16_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size);
+        uint32_t *uw = (uint32_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size);
+        uint16_t *us_p = (uint16_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size);
+        uint16_t *ub_p = (uint16_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size);
+        uint32_t *dw = (uint32_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size);
+        uint16_t *ds_p = (uint16_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size);
+        uint16_t *db_p = (uint16_t *)(ed + g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size + g_cfg.down_s_size);
+        if (gpu_experts) {
+            // Same GPU dequant kernel the projections use (gpu_dequant_matmulN);
+            // bit-identical to cpu_dequant_matvec, just on faster hardware.
+            mtp_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size, 0);
+            mtp_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size, 0);
+            cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
+            mtp_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size, 0);
+        } else {
+            cpu_dequant_matvec(gw, gs_p, gb_p, h_post, eg, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+            cpu_dequant_matvec(uw, us_p, ub_p, h_post, eu, g_cfg.moe_intermediate, g_cfg.hidden_dim, g_cfg.group_size);
+            cpu_swiglu(eg, eu, ea, g_cfg.moe_intermediate);
+            cpu_dequant_matvec(dw, ds_p, db_p, ea, eo, g_cfg.hidden_dim, g_cfg.moe_intermediate, g_cfg.group_size);
+        }
         if (g_mtp_trace_enabled && k == 0) {
             mtp_trace_vector(trace_call, "expert0_gate", eg, g_cfg.moe_intermediate);
             mtp_trace_vector(trace_call, "expert0_up", eu, g_cfg.moe_intermediate);
@@ -1536,7 +1624,7 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         }
         cpu_vec_madd(moe_out, eo, expert_weights[k], g_cfg.hidden_dim);
     }
-    close(fd);
+    if (fd >= 0) close(fd);
     free(expert_data);
     free(eg); free(eu); free(ea); free(eo);
     mtp_trace_vector(trace_call, "moe_out", moe_out, g_cfg.hidden_dim);
@@ -1704,7 +1792,7 @@ static void mtp_overlap_report(int shadow_hits, int shadow_checks) {
     // the same two tokens (0.5 = perfect overlap/2x potential, 1.0 = break-even).
     double io_ratio = (double)g_overlap_union_sum / (double)g_overlap_separate_sum;
 
-    fprintf(stderr, "[mtp] expert overlap: layer-pairs=%d mean_active=%.2f/layer "
+    server_log_errorf("[mtp] expert overlap: layer-pairs=%d mean_active=%.2f/layer "
                     "overlap=%.1f%% batched_io_vs_separate=%.3f\n",
             g_overlap_layer_pairs, mean_single, 100.0 * overlap_frac, io_ratio);
 
@@ -1716,7 +1804,7 @@ static void mtp_overlap_report(int shadow_hits, int shadow_checks) {
         //   single_per_tok / (union_per_batch / (1+A)) = (1+A) * single/union.
         double single_over_union = (double)g_overlap_single_sum / (double)g_overlap_union_sum;
         double projected = (1.0 + A) * single_over_union;
-        fprintf(stderr, "[mtp] projection: acceptance=%.1f%% -> I/O-bound speedup ~%.2fx "
+        server_log_errorf("[mtp] projection: acceptance=%.1f%% -> I/O-bound speedup ~%.2fx "
                         "(>1 worth building, ~1 break-even). GPU compute not modeled.\n",
                 100.0 * A, projected);
     }
@@ -13095,9 +13183,18 @@ static void serve_loop(
     server_logf("[serve]   sampling: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
                 g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
                 g_default_presence_penalty, g_default_repetition_penalty);
-    if (g_mtp_predictions > 0) {
+    if (g_mtp_predictions > 0 && g_mtp_cache.ready) {
         server_logf("[serve]   mtp: predictor_batch=%d mtp_active_experts=%d\n",
                     g_mtp_predictions, g_mtp_active_experts);
+    } else if (g_mtp_predictions > 0) {
+        // Requested but the head never loaded — almost always missing artifacts.
+        // This is the line that explains an empty MTP log; load-time detail prints
+        // go to stderr (→ /dev/null under the server wrapper).
+        server_logf("[serve]   mtp: requested(batch=%d) but INACTIVE — head not loaded "
+                    "(mtp_tensors=%s packed_mtp_experts=%s); decoding without MTP\n",
+                    g_mtp_predictions,
+                    g_mtp_tensors_present ? "yes" : "no",
+                    g_mtp_packed_experts_present ? "yes" : "no");
     } else {
         server_logf("[serve]   mtp: disabled\n");
     }
@@ -14709,6 +14806,8 @@ int main(int argc, char **argv) {
         }
 
         MTPArtifacts mtp = detect_mtp_artifacts(wf, model_path);
+        g_mtp_tensors_present = mtp.tensors_present;
+        g_mtp_packed_experts_present = mtp.packed_experts_present;
         if (g_mtp_predictions > 0) {
             if (mtp.tensors_present && mtp.packed_experts_present) {
                 fprintf(stderr, "[mtp] enabled; predictor batch size=%d; artifacts detected (%s)\n",
