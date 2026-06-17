@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="30.0.4">
+  <diagram name="Flashchat Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageWidth="1850" pageHeight="1120" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Flashchat — 397B MoE inference on a laptop: Python control plane builds artifacts, C/Metal data plane runs them" style="text;html=1;align=center;verticalAlign=middle;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="200" y="10" width="1450" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="Terminal user&#xa;( ./flashchat &lt;cmd&gt; )" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="360" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="IDE / opencode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="700" y="60" width="300" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="API clients&#xa;( POST /v1/chat/completions )" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1180" y="60" width="380" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="wrap" value="flashchat — bash CLI wrapper   ( lib/config.sh : flashchat_get )" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=30;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="140" y="170" width="1420" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="wrap_body" value="subcommands:  serve · chat · prompt · status · config / config-interactive · manage · models · sessions · benchmark" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="wrap">
+          <mxGeometry x="20" y="44" width="1380" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cp" value="CONTROL PLANE — modelmgr/ (Python):  build &amp; verify model artifacts" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=34;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="140" y="350" width="720" height="510" as="geometry" />
+        </mxCell>
+        <mxCell id="cp_tui" value="TUIs  (modelmgr/tui/)&#xa;onboarding · config_wizard · manage&#xa;build · status_view · common" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="cp">
+          <mxGeometry x="20" y="46" width="680" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="cp_reg" value="Registry / model definition&#xa;registry · manifest · addmodel&#xa;resolved → resolved_models.json · configfile" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="cp">
+          <mxGeometry x="20" y="132" width="680" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="cp_build" value="Build pipeline&#xa;recipes.plan → runner → steps/ :&#xa;download · extract_weights · tokenizer&#xa;compile_native · repack_experts · expert_index&#xa;quant · materialize" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="cp">
+          <mxGeometry x="20" y="224" width="680" height="108" as="geometry" />
+        </mxCell>
+        <mxCell id="cp_int" value="Integrity / storage&#xa;artifacts ( verify · .flashchat_artifacts.json )&#xa;status · offload ( archive / restore ) · migrate&#xa;server.guard_model_not_serving" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="cp">
+          <mxGeometry x="20" y="346" width="680" height="96" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dp" value="DATA PLANE — metal_infer/ (C · Obj-C · Metal):  run inference" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=34;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="940" y="350" width="760" height="510" as="geometry" />
+        </mxCell>
+        <mxCell id="dp_entry" value="Engine entry&#xa;infer.m ( --serve | --prompt | chat ) · chat.m · main.m&#xa;model_config.h ( g_cfg ) · tokenizer.h ( C BPE )" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="dp">
+          <mxGeometry x="20" y="44" width="720" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="dp_load" value="Load&#xa;parse resolved_models.json → g_cfg · open_weights() mmap ~5.5GB&#xa;build_mtp_cache · Metal init + compile shaders" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="dp">
+          <mxGeometry x="20" y="116" width="720" height="64" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dp_pipe" value="Per-token decode pipeline   ( × 60 layers: 45 GatedDeltaNet + 15 full-attn )" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=26;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=12;" vertex="1" parent="dp">
+          <mxGeometry x="20" y="190" width="720" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="p1" value="CMD1&#xa;attn proj +&#xa;GatedDeltaNet&#xa;(BLAS)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="dp_pipe">
+          <mxGeometry x="12" y="44" width="155" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="CMD2&#xa;o_proj + norm +&#xa;router +&#xa;shared expert" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="dp_pipe">
+          <mxGeometry x="187" y="44" width="155" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p3" value="I/O  pread&#xa;K active experts&#xa;from SSD&#xa;(OS page cache)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="dp_pipe">
+          <mxGeometry x="362" y="44" width="155" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="p4" value="CMD3  (deferred)&#xa;expert forward&#xa;(FMA dequant) +&#xa;MoE combine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="dp_pipe">
+          <mxGeometry x="537" y="44" width="155" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="pe1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="dp_pipe" source="p1" target="p2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="pe2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="dp_pipe" source="p2" target="p3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="pe3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="dp_pipe" source="p3" target="p4"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="dp_shaders" value="shaders.metal&#xa;4-bit dequant matvec / matmulN ( FMA, multi-row v5 ) · fused SwiGLU&#xa;RMSNorm · batched GPU attention ( Q·Kᵀ / softmax / scores·V ) · RoPE · MoE combine" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=8;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="dp">
+          <mxGeometry x="20" y="350" width="720" height="68" as="geometry" />
+        </mxCell>
+
+        <mxCell id="art" value="ARTIFACTS ON DISK   —   &lt;model&gt;/flashchat/{ shared , q4 , q8 }/    ·    the bridge between the two planes" style="swimlane;rounded=0;whiteSpace=wrap;html=1;startSize=30;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="140" y="920" width="1560" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="art_body" value="model_weights.bin / .json     ·     packed_experts/layer_NN.bin     ·     packed_mtp_experts/     ·     vocab.bin     ·     .flashchat_artifacts.json     ·     resolved_models.json" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#ffffff;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="art">
+          <mxGeometry x="20" y="44" width="1520" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="x_e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.15;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="e1" target="wrap"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x_e3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="e3" target="wrap"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x_e2" value="HTTP /v1/chat/completions" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0;entryDx=0;entryDy=0;fontSize=11;" edge="1" parent="1" source="e2" target="dp">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="1760" y="95" /><mxPoint x="1760" y="350" /></Array></mxGeometry>
+        </mxCell>
+
+        <mxCell id="x_wc" value="config · build · manage" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;fontSize=11;" edge="1" parent="1" source="wrap" target="cp"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x_wd" value="serve → launch infer" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.4;entryY=0;entryDx=0;entryDy=0;fontSize=11;" edge="1" parent="1" source="wrap" target="dp"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="x_ca" value="writes + hashes artifacts" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.2;entryY=0;entryDx=0;entryDy=0;fontSize=11;" edge="1" parent="1" source="cp" target="art"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x_ad" value="mmap weights · stream K experts / token" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.8;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;fontSize=11;" edge="1" parent="1" source="art" target="dp"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="x_guard" value="guard: no rebuild while serving" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;fontSize=11;endArrow=open;startArrow=open;" edge="1" parent="1" source="cp" target="dp"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
