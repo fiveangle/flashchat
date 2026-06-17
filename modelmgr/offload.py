@@ -1,4 +1,4 @@
-"""Offload storage: move model data to external (NAS/USB) volumes safely.
+"""Offload storage: archive model data to external (NAS/USB) volumes safely.
 
 Design rules learned from the failures of the old `mv`-based implementation:
 
@@ -8,8 +8,8 @@ Design rules learned from the failures of the old `mv`-based implementation:
   immediately with the exact failing syscall instead of mid-transfer.
 - **Never `mv` across filesystems**: every file is streamed (8 MiB chunks,
   sha256 computed during the read), written to `<name>.partial`, fsynced,
-  renamed, journaled. Source bytes are deleted only after the whole
-  operation's file set is journaled done.
+  renamed, journaled. Operations that free local space delete source bytes
+  only after the operation's file set is journaled done.
 - **Resume for free**: a killed transfer re-runs and skips files the
   journal marks done (size-checked).
 - **No duplicate bytes on the archive**: symlinks (HF blob links,
@@ -35,6 +35,7 @@ _CHUNK = 8 * 1024 * 1024
 
 # Sidecar files HF puts beside snapshots that are worthless on the archive.
 _SKIP_NAMES = {".DS_Store", ".lock"}
+_FULL_ARCHIVE_SKIP_DIRS = {"system_prompt_cache"}
 
 
 class OffloadError(RuntimeError):
@@ -194,11 +195,12 @@ def copy_file_verified(src: str, dst: str, progress=None) -> tuple[str, int]:
     return h.hexdigest(), size
 
 
-def _walk_tree(root: str):
+def _walk_tree(root: str, skip_dirs=None):
     """Yield (relpath, kind) for files and symlinks under root; kind in
     {'file', 'link'}. Directories are implicit."""
+    skip_dirs = set(skip_dirs or ())
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
+        dirnames[:] = sorted(n for n in dirnames if n not in skip_dirs)
         for name in sorted(filenames):
             if name in _SKIP_NAMES or name.endswith(".partial"):
                 continue
@@ -207,13 +209,41 @@ def _walk_tree(root: str):
             yield rel, ("link" if os.path.islink(full) else "file")
 
 
+def _rel_contains_component(rel: str, component: str) -> bool:
+    return component in rel.split(os.sep)
+
+
+def _prune_archive_dirs(dest_root: str, journal: Journal, skip_dirs) -> None:
+    """Remove sensitive/private directories from an existing archive refresh."""
+    skip_dirs = set(skip_dirs or ())
+    if not skip_dirs:
+        return
+
+    changed = False
+    for bucket in ("files", "links"):
+        for rel in list(journal.data[bucket]):
+            if any(_rel_contains_component(rel, dirname) for dirname in skip_dirs):
+                del journal.data[bucket][rel]
+                changed = True
+
+    if os.path.isdir(dest_root):
+        for dirpath, dirnames, _filenames in os.walk(dest_root):
+            for dirname in list(dirnames):
+                if dirname in skip_dirs:
+                    shutil.rmtree(os.path.join(dirpath, dirname), ignore_errors=True)
+                    dirnames.remove(dirname)
+
+    if changed:
+        journal.save()
+
+
 def _adopt_existing(src: str, dst: str, rel: str, journal: Journal,
                     progress=None) -> bool:
     """Adopt a pre-journal archive copy (e.g. from the old mv-based offload):
     if dst already exists with matching size AND matching content hash,
     journal it instead of rewriting it. Content is verified for real because
-    full offload deletes the source afterwards — a size match alone is never
-    grounds for skipping the copy."""
+    the archive may later be used as the source of truth — a size match alone
+    is never grounds for skipping the copy."""
     if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(src):
         return False
     if progress:
@@ -228,7 +258,7 @@ def _adopt_existing(src: str, dst: str, rel: str, journal: Journal,
 
 
 def transfer_tree(src_root: str, dest_root: str, journal: Journal,
-                  progress=None, relpaths=None) -> int:
+                  progress=None, relpaths=None, skip_dirs=None) -> int:
     """Copy a tree into dest_root with journaled resume; returns bytes copied.
 
     Symlinks are journaled (relative targets preserved), never expanded —
@@ -237,7 +267,7 @@ def transfer_tree(src_root: str, dest_root: str, journal: Journal,
     not rewritten) rather than re-copied.
     """
     copied = 0
-    entries = list(_walk_tree(src_root))
+    entries = list(_walk_tree(src_root, skip_dirs=skip_dirs))
     if relpaths is not None:
         wanted = set(relpaths)
         entries = [e for e in entries if e[0] in wanted]
@@ -386,14 +416,16 @@ def restore_originals(manifest: Manifest, snapshot: str, offload_dir: str,
 
 def offload_full(manifest: Manifest, snapshot: str, offload_dir: str,
                  progress=None) -> int:
-    """Archive the whole repo tree (originals + runtime artifacts), then
-    delete it locally. Snapshot/variant symlinks travel as journal entries."""
+    """Archive the whole repo tree (originals + runtime artifacts) while
+    keeping local files in place. Snapshot/variant symlinks travel as journal
+    entries. system_prompt_cache is intentionally never archived because it can
+    contain prompt-derived user data."""
     repo_root = os.path.dirname(os.path.dirname(snapshot))
     dest = dest_repo_dir(offload_dir, manifest)
     # Free-space requirement excludes files the archive already holds at
     # matching size (resumed transfers and adoptable pre-journal copies).
     needed = 0
-    for rel, kind in _walk_tree(repo_root):
+    for rel, kind in _walk_tree(repo_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS):
         if kind != "file":
             continue
         size = os.path.getsize(os.path.join(repo_root, rel))
@@ -404,9 +436,9 @@ def offload_full(manifest: Manifest, snapshot: str, offload_dir: str,
     if not report.ok:
         raise OffloadError("; ".join(report.errors))
     journal = Journal(dest)
-    copied = transfer_tree(repo_root, dest, journal, progress=progress)
-    shutil.rmtree(repo_root)
-    return copied
+    _prune_archive_dirs(dest, journal, _FULL_ARCHIVE_SKIP_DIRS)
+    return transfer_tree(repo_root, dest, journal, progress=progress,
+                         skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
 
 
 def restore_full(manifest: Manifest, cache_dir: str, offload_dir: str,

@@ -169,17 +169,28 @@ def _backfill_hashes(manifest, snapshot, progress=None) -> None:
     print(common.green("hash baselines recorded"))
 
 
-def _build_missing(registry, manifest, status) -> None:
-    missing = [v for v, vs in status.variants.items() if not vs.ready]
-    if not missing:
-        print("all variants are already built")
-        return
-    for i, v in enumerate(missing, 1):
-        print(f"  {i}) {v} — {status.summary_line(v)}")
-    choice = common.select_number(len(missing), "Build which variant")
-    if choice is None:
-        return
-    build.ensure_variant_built(registry, manifest, missing[int(choice) - 1])
+def _rebuild_artifacts(registry, manifest, status, targets, variants) -> None:
+    """Executor: delete the given (scope, rel, spec) artifacts, then (re)build the
+    named variants. The recipe planner sees the holes and heals them plus any
+    dependents. Callers are responsible for the serving guard and confirmation."""
+    for scope, rel, spec in targets:
+        root = (paths.shared_dir(status.snapshot) if scope == "shared"
+                else paths.variant_dir(status.snapshot, scope))
+        target_path = os.path.join(root, rel.rstrip("/"))
+        if os.path.isdir(target_path) and not os.path.islink(target_path):
+            shutil.rmtree(target_path)
+        elif os.path.lexists(target_path):
+            os.unlink(target_path)
+        adir = ArtifactDir(root, manifest.id, scope if scope != "shared" else "shared")
+        adir.forget(rel)
+        for companion in spec.companions:
+            cpath = os.path.join(root, companion)
+            if os.path.lexists(cpath):
+                os.unlink(cpath)
+            adir.forget(companion)
+        adir.commit()
+    for v in variants:
+        build.ensure_variant_built(registry, manifest, v, assume_yes=True)
 
 
 def _build_repair(registry, manifest, status) -> None:
@@ -257,12 +268,20 @@ def _archive_originals(registry, manifest, status) -> None:
     if not od:
         print("no OFFLOAD_DIR configured — set it in './flashchat config'")
         return
+    print("This archives only the original Hugging Face safetensors source blobs "
+          f"to {od}.")
+    print("After each blob is copied and journaled, the local blob file is "
+          "deleted. Built Flashchat runtime artifacts stay local, so ready "
+          "variants remain usable; rebuilding or regenerating artifacts may "
+          "require restoring the originals.")
     if not status.any_ready:
         print(common.yellow(
             "no runtime variant is built yet — archiving the originals now "
             "means they must be restored before extraction"))
         if not common.confirm("Archive anyway?", default=False):
             return
+    elif not common.confirm("Archive originals and remove local source blobs?", default=False):
+        return
     progress = common.ProgressLine()
     try:
         moved = offload.offload_originals(manifest, status.snapshot, od, progress=progress)
@@ -286,14 +305,18 @@ def _full_offload(registry, manifest, status) -> None:
         print("no OFFLOAD_DIR configured")
         return
     size = paths.dir_size_bytes(os.path.dirname(os.path.dirname(status.snapshot)))
-    print(f"This moves everything ({paths.human_bytes(size)}) to {od} and "
-          f"removes the local copy. The model stops being usable until restored.")
-    if not common.confirm_exact(manifest.id, "full offload"):
+    print(f"This archives the local Hugging Face model directory "
+          f"({paths.human_bytes(size)}) to {od}.")
+    print("Local files are not deleted, so the model remains usable after the "
+          "archive is refreshed.")
+    print("system_prompt_cache directories are skipped and never written to the "
+          "archive because they may contain prompt-derived user data.")
+    if not common.confirm("Archive full model copy now?", default=False):
         return
     progress = common.ProgressLine()
     try:
         moved = offload.offload_full(manifest, status.snapshot, od, progress=progress)
-        print(common.green(f"offloaded {paths.human_bytes(moved)}"))
+        print(common.green(f"archived {paths.human_bytes(moved)}"))
         resolved.write(registry)
     except offload.OffloadError as e:
         print(common.red(str(e)))

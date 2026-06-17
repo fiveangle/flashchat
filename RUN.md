@@ -171,13 +171,16 @@ Manages local and offloaded model storage. The manage view shows each supported 
 
 Available storage actions:
 
-- Remove original HuggingFace safetensors blobs after the generated runtime files are complete
+- Archive original HuggingFace safetensors blobs to `OFFLOAD_DIR`, then remove
+  those local source blobs after verification. Built runtime artifacts stay
+  local, so ready variants remain usable.
 - Delete a local model cache repo
-- Offload a whole HuggingFace cache repo to `OFFLOAD_DIR`
-- Fully reload an offloaded model back to the local HuggingFace cache
+- Archive a full HuggingFace cache repo copy to `OFFLOAD_DIR` without deleting
+  local files. `system_prompt_cache` directories are never archived.
+- Fully reload an archived model back to the local HuggingFace cache
 - Restore only the generated runtime files for a selected model/quantization from offload storage
 
-Destructive actions require typing the exact model ID. Local model storage uses one global HuggingFace hub cache directory configured as `HUGGINGFACE_CACHE_DIR`, defaulting to `~/.cache/huggingface/hub`. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
+Destructive delete actions require typing the exact model ID. Local model storage uses one global HuggingFace hub cache directory configured as `HUGGINGFACE_CACHE_DIR`, defaulting to `~/.cache/huggingface/hub`. Offload storage uses one global directory configured as `OFFLOAD_DIR` in `~/.config/flashchat/config` or overridden with `FLASHCHAT_OFFLOAD_DIR`.
 
 ### Status
 

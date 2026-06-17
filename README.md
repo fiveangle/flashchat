@@ -48,7 +48,7 @@ I've extended the original project from a reasearch project to usable system inc
 - Persistant prompt caching
 - MTP support (tho MoE architecture does not lend itself well to MTP)
 - Full server-side API debugging capability (speed metrics, full HTTP payload dumping, timing, etc)
-- Model offload management (allows keeping runtime-only artifacts on Apple Fabric SSD while original weights and files can be stored on nearline USB/NAS)
+- Model archive/offload management (allows keeping runtime-only artifacts on Apple Fabric SSD while original weights or full HF repo copies can be stored on nearline USB/NAS)
 
 ## Model Support
 

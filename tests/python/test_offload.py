@@ -106,8 +106,10 @@ class TestFullOffload(OffloadBase):
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
 
         copied = offload.offload_full(self.moe, snapshot, self.dest)
-        self.assertFalse(os.path.exists(repo_root))
+        self.assertTrue(os.path.exists(repo_root), "full archive must keep local files")
         self.assertEqual(offload.archive_state(self.moe, self.dest), "full")
+        from modelmgr.artifacts import variant_ready
+        self.assertTrue(variant_ready(self.moe, "q4", snapshot))
 
         dest_repo = offload.dest_repo_dir(self.dest, self.moe)
         journal = offload.Journal(dest_repo)
@@ -116,6 +118,7 @@ class TestFullOffload(OffloadBase):
         self.assertTrue(link_rels)
         self.assertFalse(any(r.endswith("q4/vocab.bin") for r in journal.data["files"]))
 
+        shutil.rmtree(repo_root)
         restored = offload.restore_full(self.moe, self.cache, self.dest)
         self.assertEqual(restored, copied)
         new_snapshot = paths.snapshot_dir(self.cache, self.moe.hf_repo)
@@ -123,13 +126,44 @@ class TestFullOffload(OffloadBase):
         link = os.path.join(paths.variant_dir(snapshot, "q4"), "vocab.bin")
         self.assertTrue(os.path.islink(link))
         self.assertTrue(os.path.exists(link))
-        from modelmgr.artifacts import variant_ready
         self.assertTrue(variant_ready(self.moe, "q4", snapshot))
+
+    def test_full_archive_skips_system_prompt_cache(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        cache_file = os.path.join(paths.variant_dir(snapshot, "q4"),
+                                  "system_prompt_cache", "secret.fcache")
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            f.write("prompt-derived cache")
+        dest_repo = offload.dest_repo_dir(self.dest, self.moe)
+        old_rel = os.path.join(os.path.relpath(paths.variant_dir(snapshot, "q4"), repo_root),
+                               "system_prompt_cache", "old.fcache")
+        old_dst = os.path.join(dest_repo, old_rel)
+        os.makedirs(os.path.dirname(old_dst), exist_ok=True)
+        with open(old_dst, "w") as f:
+            f.write("old prompt-derived cache")
+        old_journal = offload.Journal(dest_repo)
+        old_journal.mark_file(old_rel, os.path.getsize(old_dst), "old")
+        old_journal.save()
+
+        offload.offload_full(self.moe, snapshot, self.dest)
+
+        self.assertTrue(os.path.isfile(cache_file), "local cache must remain")
+        journal = offload.Journal(dest_repo)
+        self.assertFalse(any("system_prompt_cache" in rel
+                             for rel in journal.data["files"]))
+        self.assertFalse(any("system_prompt_cache" in rel
+                             for rel in journal.data["links"]))
+        self.assertFalse(os.path.exists(os.path.join(
+            dest_repo, os.path.relpath(cache_file, repo_root))))
+        self.assertFalse(os.path.exists(old_dst))
 
     def test_restore_runtime_only_skips_blobs(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
         offload.offload_full(self.moe, snapshot, self.dest)
+        shutil.rmtree(repo_root)
         offload.restore_runtime_only(self.moe, self.cache, self.dest)
         self.assertTrue(os.path.isfile(
             os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.bin")))
@@ -139,7 +173,7 @@ class TestFullOffload(OffloadBase):
 class TestLegacyArchiveAdoption(OffloadBase):
     """Pre-journal archives (from the old mv-based offload) must be adopted
     by hash verification, never blindly re-copied — and never blindly
-    trusted on size alone, since full offload deletes the source."""
+    trusted on size alone, since the archive may be restored later."""
 
     def _make_legacy_archive(self, repo_root):
         """Simulate an old mv-style archive: identical tree, no journal."""
@@ -165,9 +199,7 @@ class TestLegacyArchiveAdoption(OffloadBase):
         self.assertTrue(journal.data["files"], "adoption must populate the journal")
         for entry in journal.data["files"].values():
             self.assertTrue(entry.get("sha256"), "adopted entries carry verified hashes")
-        # source was deleted only after every file verified
-        self.assertFalse(os.path.exists(repo_root))
-        self.assertGreater(offload.restore_full(self.moe, self.cache, self.dest), 0)
+        self.assertTrue(os.path.exists(repo_root), "full archive keeps local files")
 
     def test_stale_same_size_archive_copy_is_recopied(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
@@ -246,6 +278,7 @@ class TestTransferEngine(OffloadBase):
         victim = next(r for r in journal.data["files"] if r.endswith("model_weights.bin"))
         with open(os.path.join(dest_repo, victim), "r+b") as f:
             f.write(b"X")  # same size, corrupted content
+        shutil.rmtree(repo_root)
         with self.assertRaisesRegex(offload.OffloadError, "hash verification"):
             offload.restore_full(self.moe, self.cache, self.dest)
 

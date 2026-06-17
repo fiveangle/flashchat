@@ -129,7 +129,8 @@ def offer_offload_originals(registry: Registry, manifest: Manifest, snapshot: st
     print(f"\nThe original model files ({paths.human_bytes(size)}) are no longer "
           f"needed for inference — the runtime artifacts are self-contained.")
     print(f"They can be archived to {od} and restored any time "
-          f"(needed again only to re-extract artifacts).")
+          f"(needed again only to re-extract artifacts). After verification, "
+          f"the local original blob files will be removed.")
     reply = common.prompt("Archive originals now? [y/N/never]", "n").lower()
     if reply == "never":
         registry.state.never_offload.append(manifest.id)
