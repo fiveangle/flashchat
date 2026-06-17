@@ -2,8 +2,9 @@
 
 The automation (onboarding, ensure, post-build offers) handles the normal
 lifecycle; this menu exists for everything flashchat does not do on its
-own: per-artifact verification against hash baselines, force-regeneration
-after suspected corruption, deleting variants, and manual archive moves.
+own: per-artifact verification against hash baselines, building/repairing
+artifacts (creating what is missing and rebuilding what fails verification),
+deleting variants, and manual archive moves.
 """
 
 import os
@@ -74,21 +75,22 @@ def _model_menu(registry: Registry, manifest) -> None:
     while True:
         status = _state_lines(registry, manifest)
         print("""
- [v] re-check (quick verify)      [h] deep verify (full hash)
- [b] build missing artifacts      [r] regenerate an artifact...
- [o] archive originals            [f] full offload (everything)
- [l] restore from archive...      [d] delete a variant...
- [x] delete local model           [q] back""")
+ [v] re-check (quick verify)      [h] deep verify (full hash; offers to repair)
+ [b] build / repair               create missing + rebuild broken artifacts
+ [a] archive originals            DELETE local source blobs (copy kept in archive)
+ [c] copy model to offload storage (non-destructive backup)
+ [l] restore from archive...      [d] delete a variant (frees its q4/q8 disk)
+ [x] delete local model           remove ALL local files for this model
+ [q] back""")
         choice = common.prompt("Action", "q").lower()
         if choice in ("q", ""):
             return
         handler = {
             "v": lambda: None,  # loop re-renders
-            "h": lambda: _deep_verify(manifest, status),
-            "b": lambda: _build_missing(registry, manifest, status),
-            "r": lambda: _regenerate(registry, manifest, status),
-            "o": lambda: _archive_originals(registry, manifest, status),
-            "f": lambda: _full_offload(registry, manifest, status),
+            "h": lambda: _deep_verify(registry, manifest, status),
+            "b": lambda: _build_repair(registry, manifest, status),
+            "a": lambda: _archive_originals(registry, manifest, status),
+            "c": lambda: _full_offload(registry, manifest, status),
             "l": lambda: _restore_menu(registry, manifest),
             "d": lambda: _delete_variant(registry, manifest, status),
             "x": lambda: _delete_local(registry, manifest, status),
@@ -97,13 +99,14 @@ def _model_menu(registry: Registry, manifest) -> None:
             handler()
 
 
-def _deep_verify(manifest, status) -> None:
+def _deep_verify(registry, manifest, status) -> None:
     if not status.snapshot:
         print("model is not local")
         return
     progress = common.ProgressLine()
     total_bad = 0
     unhashed = []
+    corrupt = []  # (scope, rel, spec) for rebuildable corrupt artifacts
     for scope, states in [("shared", shared_status(manifest, status.snapshot, deep=True,
                                                    progress=None))] + [
             (v, variant_status(manifest, v, status.snapshot, deep=True, progress=None))
@@ -113,11 +116,33 @@ def _deep_verify(manifest, status) -> None:
             if s.state in ("hash-mismatch", "size-mismatch", "invalid"):
                 print(common.red(f"  CORRUPT: {label} — {s.state} {s.detail}"))
                 total_bad += 1
+                spec = (manifest.shared_artifacts.get(s.relpath) if scope == "shared"
+                        else manifest.variant(scope).artifacts.get(s.relpath))
+                if spec is not None and spec.step:
+                    corrupt.append((scope, s.relpath, spec))
             elif s.state == "unhashed":
                 unhashed.append((scope, s.relpath))
     progress.finish()
     if total_bad == 0:
         print(common.green("deep verify passed — all hashed artifacts match"))
+    elif corrupt:
+        # The only thing the old standalone "regenerate" did, now driven by the
+        # check that actually detected the problem.
+        print(common.yellow(
+            f"\n{len(corrupt)} corrupt artifact(s) can be rebuilt "
+            "(they will be DELETED, then regenerated)."))
+        if common.confirm("Rebuild them now?", default=False):
+            err = guard_model_not_serving(
+                [resolved_id(manifest, v) for v in manifest.variants])
+            if err:
+                print(common.red(err))
+            else:
+                variants = sorted({sc for sc, _r, _s in corrupt if sc != "shared"}
+                                  or {manifest.default_variant})
+                if any(sc == "shared" for sc, _r, _s in corrupt) \
+                        and manifest.default_variant not in variants:
+                    variants.append(manifest.default_variant)
+                _rebuild_artifacts(registry, manifest, status, corrupt, variants)
     if unhashed:
         print(f"{len(unhashed)} artifact(s) have no hash baseline yet "
               "(adopted from the pre-hash layout).")
@@ -157,47 +182,71 @@ def _build_missing(registry, manifest, status) -> None:
     build.ensure_variant_built(registry, manifest, missing[int(choice) - 1])
 
 
-def _regenerate(registry, manifest, status) -> None:
+def _build_repair(registry, manifest, status) -> None:
+    """Bring the model to ready: create anything MISSING and rebuild anything that
+    fails verification. Replaces the old build-missing / regenerate split — there is
+    no 'variant vs artifact' choice; you pick what to fix, it fixes all of it."""
     if not status.snapshot:
         print("model is not local")
         return
-    err = guard_model_not_serving(
-        [resolved_id(manifest, v) for v in manifest.variants])
+    not_ready = [v for v in manifest.variants if not status.variants[v].ready]
+    if not not_ready:
+        print(common.green("all variants are built and verified — nothing to repair"))
+        return
+    if len(not_ready) > 1:
+        for i, v in enumerate(not_ready, 1):
+            print(f"  {i}) {v} — {status.summary_line(v)}")
+        print(f"  {len(not_ready) + 1}) all of them")
+        choice = common.select_number(len(not_ready) + 1, "Build/repair which")
+        if choice is None:
+            return
+        chosen = (not_ready if int(choice) == len(not_ready) + 1
+                  else [not_ready[int(choice) - 1]])
+    else:
+        chosen = not_ready
+
+    # Partition unsatisfied, buildable artifacts into create (absent) vs rebuild
+    # (present-but-broken). Only specs with a build `step` can be (re)generated.
+    create = []                 # display labels for missing artifacts
+    rebuild_targets = []        # (scope, rel, spec) to delete-then-rebuild
+    rebuild_labels = []         # display labels with the failure reason
+
+    def _consider(scope, s, spec):
+        if spec is None or not spec.step or s.satisfied:
+            return
+        if s.state == "missing":
+            create.append(f"{scope}/{s.relpath}")
+        else:
+            rebuild_targets.append((scope, s.relpath, spec))
+            detail = s.state + (f": {s.detail}" if s.detail else "")
+            rebuild_labels.append(f"{scope}/{s.relpath} ({detail})")
+
+    for v in chosen:
+        var = manifest.variant(v)
+        for s in variant_status(manifest, v, status.snapshot):
+            _consider(v, s, var.artifacts.get(s.relpath))
+    for s in shared_status(manifest, status.snapshot, want_optional=False):
+        _consider("shared", s, manifest.shared_artifacts.get(s.relpath))
+
+    if not create and not rebuild_targets:
+        print("nothing buildable is missing or broken for the selected variant(s)")
+        return
+
+    print("\nbuild / repair plan:")
+    if create:
+        print("  create (missing): " + ", ".join(sorted(set(create))))
+    if rebuild_labels:
+        print("  rebuild (broken): " + ", ".join(rebuild_labels))
+    print("  (re)build variant(s): " + ", ".join(chosen))
+    if rebuild_targets:
+        print(common.yellow("  the 'broken' artifacts above will be DELETED, then rebuilt"))
+    if not common.confirm("Proceed?", default=False):
+        return
+    err = guard_model_not_serving([resolved_id(manifest, v) for v in manifest.variants])
     if err:
         print(common.red(err))
         return
-    targets = [("shared", rel, spec) for rel, spec in manifest.shared_artifacts.items()]
-    for v in manifest.variants:
-        targets += [(v, rel, spec) for rel, spec in manifest.variant(v).artifacts.items()
-                    if spec.step]
-    for i, (scope, rel, _spec) in enumerate(targets, 1):
-        print(f"  {i}) {scope}/{rel}")
-    choice = common.select_number(len(targets), "Regenerate which artifact")
-    if choice is None:
-        return
-    scope, rel, spec = targets[int(choice) - 1]
-    root = (paths.shared_dir(status.snapshot) if scope == "shared"
-            else paths.variant_dir(status.snapshot, scope))
-    print(f"This deletes {scope}/{rel} and re-runs {spec.step}.")
-    if not common.confirm("Continue?", default=False):
-        return
-    target_path = os.path.join(root, rel.rstrip("/"))
-    if os.path.isdir(target_path) and not os.path.islink(target_path):
-        shutil.rmtree(target_path)
-    elif os.path.lexists(target_path):
-        os.unlink(target_path)
-    adir = ArtifactDir(root, manifest.id, scope if scope != "shared" else "shared")
-    adir.forget(rel)
-    for companion in spec.companions:
-        cpath = os.path.join(root, companion)
-        if os.path.lexists(cpath):
-            os.unlink(cpath)
-        adir.forget(companion)
-    adir.commit()
-    # The recipe planner sees the hole and heals it (plus any dependents).
-    variant_name = scope if scope != "shared" else manifest.default_variant
-    build.ensure_variant_built(registry, manifest, variant_name,
-                               assume_yes=False)
+    _rebuild_artifacts(registry, manifest, status, rebuild_targets, chosen)
 
 
 def _archive_originals(registry, manifest, status) -> None:
