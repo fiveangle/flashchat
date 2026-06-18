@@ -9999,6 +9999,15 @@ static void parsed_tool_call_free(ParsedToolCall *tool_call) {
     tool_call->arguments = NULL;
 }
 
+static int tool_call_tag_prefix_candidate(const char *buf) {
+    const char *lt = strrchr(buf, '<');
+    if (!lt) return 0;
+    const char *p = lt + 1;
+    size_t n = strlen(p);
+    if (n > strlen("tool_call") && n > strlen("function")) return 0;
+    return strncmp("tool_call", p, n) == 0 || strncmp("function", p, n) == 0;
+}
+
 static int append_bytes(char **buf, size_t *len, size_t *cap, const char *src, size_t src_len) {
     if (!buf || !len || !cap || !src) return -1;
     if (!*buf) {
@@ -10298,9 +10307,7 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
         // distribution and produces malformed XML — verified empirically.
     } else {
         [final appendString:user_sys_norm];
-        if (req->tool_choice_mode == TOOL_CHOICE_NONE) {
-            [final appendString:@"\n\nDo not call tools. Respond directly to the user."];
-        }
+        [final appendString:@"\n\nNo tools are available. Respond directly to the user without tool-call markup."];
     }
     if (info) info->final_system_chars = strlen([final UTF8String] ?: "");
     return dup_nsstring(final);
@@ -11214,12 +11221,17 @@ static id native_param_value_to_json_type(NSString *raw) {
 static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall *parsed) {
     memset(parsed, 0, sizeof(*parsed));
     const char *tc_start = strstr(tool_call_buf, "<tool_call>");
-    if (!tc_start) return 0;
+    const char *fn_fallback = NULL;
+    if (!tc_start) {
+        fn_fallback = strstr(tool_call_buf, "<function=");
+        if (!fn_fallback) return 0;
+        tc_start = fn_fallback;
+    }
     // qwen3_xml closes with </tool_call>; qwen3_coder may omit it and close on </function>.
     const char *tc_end = strstr(tc_start, "</tool_call>");
 
-    const char *body = tc_start + strlen("<tool_call>");
-    const char *fn_open = strstr(body, "<function=");
+    const char *body = fn_fallback ? tc_start : tc_start + strlen("<tool_call>");
+    const char *fn_open = fn_fallback ? fn_fallback : strstr(body, "<function=");
     if (!fn_open || (tc_end && fn_open >= tc_end)) return 0;
     fn_open += strlen("<function=");
     const char *fn_name_end = strchr(fn_open, '>');
@@ -13826,8 +13838,8 @@ static void serve_loop(
                 }
                 if (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE) {
                     if (append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, tok_str, (size_t)tlen) == 0 &&
-                        tool_call_buf && strstr(tool_call_buf, "<tool_call")) {
-                        if (!saw_tool_call_start) {
+                        tool_call_buf && (saw_tool_call_start || tool_call_tag_prefix_candidate(tool_call_buf))) {
+                        if (!saw_tool_call_start && (strstr(tool_call_buf, "<tool_call") || strstr(tool_call_buf, "<function"))) {
                             saw_tool_call_start = 1;
                             server_log_errorf("[serve] %s detected native tool_call start at generated=%d\n",
                                               request_id, gen_count);

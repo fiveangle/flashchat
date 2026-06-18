@@ -150,6 +150,25 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
+NO_TOOLS_JSON="${TMPDIR}/no_tools_request.json"
+NO_TOOLS_DIR="${TMPDIR}/no_tools_rendered"
+python3 - "$NO_TOOLS_JSON" <<'PY'
+import json
+import sys
+
+request = {
+    "stream": True,
+    "messages": [
+        {"role": "user", "content": "what are the main differences between c and c++ ?"}
+    ]
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$NO_TOOLS_JSON" --render-output "$NO_TOOLS_DIR" >/dev/null 2>&1
+assert_contains "no-tools chat prompt explicitly disables tool-call markup" "No tools are available" "${NO_TOOLS_DIR}/system_prompt.txt"
+
 # The native 35B-A3B entry appears before later non-thinking Instruct entries.
 # The C registry parser must not let a later `"thinking_capable": false` leak
 # into this selected model, or Qwen thinking prompts render as bare assistant
@@ -443,6 +462,29 @@ if [ $? -eq 0 ]; then
     assert_pass "native coder parser extracts <parameters>{json}</parameters> (no </tool_call>)"
 else
     assert_fail "native coder parser extracts <parameters>{json}</parameters> (no </tool_call>)"
+fi
+
+FUNCTION_ONLY_TOOL_CALL_TXT="${TMPDIR}/function_only_tool_call.txt"
+cat > "$FUNCTION_ONLY_TOOL_CALL_TXT" <<'EOF'
+<function=read>
+<parameter=filePath>
+/Users/speedster/dev/clamup
+</parameter>
+</function>
+</tool_call>
+EOF
+function_only_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$FUNCTION_ONLY_TOOL_CALL_TXT" | tail -1)
+python3 - "$function_only_parsed" <<'PY'
+import json, sys
+outer = json.loads(sys.argv[1])
+args = json.loads(outer["arguments"])
+assert outer["name"] == "read", outer
+assert args["filePath"] == "/Users/speedster/dev/clamup", args
+PY
+if [ $? -eq 0 ]; then
+    assert_pass "native parser extracts <function=...> without opening <tool_call>"
+else
+    assert_fail "native parser extracts <function=...> without opening <tool_call>"
 fi
 
 # coder nested-XML variant: <parameters><KEY>value</KEY>...</parameters> (seen from Qwen3.6
