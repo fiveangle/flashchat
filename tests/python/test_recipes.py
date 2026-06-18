@@ -22,7 +22,6 @@ class TestRecipePlanning(unittest.TestCase):
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")
         self.dense = registry.get("qwen3.6-27b")
-        self.mlx = registry.get("qwen3.6-35b-a3b-mlx")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -31,7 +30,7 @@ class TestRecipePlanning(unittest.TestCase):
         return [s.step for s in plan.steps]
 
     def test_valid_tree_plans_nothing(self):
-        for manifest in (self.moe, self.dense, self.mlx):
+        for manifest in (self.moe, self.dense):
             snapshot = make_snapshot(self.tmp.name, manifest)
             for vname in manifest.variants:
                 plan = recipes.plan(manifest, vname, snapshot)
@@ -76,15 +75,6 @@ class TestRecipePlanning(unittest.TestCase):
         self.assertNotIn("compile_native:experts", steps)
         self.assertNotIn("compile_native:mtp_experts", steps)
         self.assertIn("compile_native:non_experts", steps)
-
-    def test_mlx_recipe_includes_expert_index(self):
-        snapshot = make_snapshot(self.tmp.name, self.mlx, variants=[])
-        import shutil
-        shutil.rmtree(paths.flashchat_dir(snapshot))
-        steps = self.steps_of(recipes.plan(self.mlx, "q4", snapshot))
-        self.assertIn("generate_expert_index", steps)
-        self.assertIn("extract_weights", steps)
-        self.assertIn("repack_experts", steps)
 
     def test_deleted_weights_replans_only_that_step(self):
         snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])

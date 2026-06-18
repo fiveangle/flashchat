@@ -163,7 +163,7 @@ export HOME="$TMPDIR"
 mkdir -p "${TMPDIR}/.config/flashchat"
 
 REAL_HOME=$(eval echo ~$(whoami))
-ACTUAL_MODEL_SNAPSHOTS="${REAL_HOME}/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots"
+ACTUAL_MODEL_SNAPSHOTS="${REAL_HOME}/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots"
 ACTUAL_MODEL_PATH=""
 if [ -d "$ACTUAL_MODEL_SNAPSHOTS" ]; then
     ACTUAL_MODEL_PATH=$(find "$ACTUAL_MODEL_SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
@@ -181,7 +181,7 @@ fi
 
 TMP_CONFIG="${TMPDIR}/.config/flashchat/config"
 cat > "$TMP_CONFIG" <<EOF
-MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+MODEL="Qwen-Qwen36-35B-A3B"
 MAX_TOKENS="1"
 SAMPLING_PROFILE="custom"
 REASONING="0"
@@ -200,6 +200,7 @@ SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
 SYSTEM_PROMPT_CACHE="1"
 SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
+SYSTEM_PROMPT_CACHE_DIR="${TMPDIR}/sys-cache"
 SHOW_THINKING="0"
 COLOR_OUTPUT="0"
 EOF
@@ -221,7 +222,7 @@ run_test_contains "config file missing uses defaults" "Flashchat Show Status" "$
 run_test_contains "config file valid" "Flashchat Show Status" "$FLASHCHAT" status
 run_test_contains "verbose flag" "Usage:" "$FLASHCHAT" -v --help
 run_test "quiet flag" "$FLASHCHAT" -q --help
-run_test_contains "model override" "Usage:" "$FLASHCHAT" --model mlx-community-Qwen36-35B-A3B-4bit --help
+run_test_contains "model override" "Usage:" "$FLASHCHAT" --model Qwen-Qwen36-35B-A3B --help
 
 # ---------------------------------------------------------------------------
 # Status command
@@ -314,7 +315,7 @@ awk '/^main "\$@"/{exit} {print}' "$FLASHCHAT" > "$THINKING_GUARD_FUNCS"
 make_thinking_guard_config() {
     local path="$1"
     cat > "$path" <<EOF
-MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+MODEL="Qwen-Qwen36-35B-A3B"
 SAMPLING_PROFILE="thinking-general"
 REASONING="1"
 SHOW_THINKING="0"
@@ -473,6 +474,7 @@ SERVER_DEBUG="0"
 SERVER_HTTP_LOG="0"
 SYSTEM_PROMPT_CACHE="1"
 SYSTEM_PROMPT_CACHE_MAX_ENTRIES="2"
+SYSTEM_PROMPT_CACHE_DIR="${TMPDIR}/sys-cache"
 SHOW_THINKING="0"
 COLOR_OUTPUT="0"
 EOF
@@ -540,7 +542,7 @@ else
 
     # Test /v1/models endpoint
     output=$(curl -fsS "${BASE_URL}/v1/models" 2>/dev/null)
-    if echo "$output" | grep -q '"id":"mlx-community-Qwen36-35B-A3B-4bit"'; then
+    if echo "$output" | grep -q '"id":"Qwen-Qwen36-35B-A3B"'; then
         assert_pass "api models endpoint"
     else
         assert_fail "api models endpoint" "unexpected response: $output"
@@ -561,6 +563,7 @@ else
        grep -q "expert_size_per_token=" "$server_log" && \
        grep -q "sampling: temp=" "$server_log" && \
        grep -q "system_prompt_cache:" "$server_log" && \
+       grep -q "system_prompt_cache_dir: ${TMPDIR}/sys-cache" "$server_log" && \
        grep -q "custom_user_system_prompt: .*not present" "$server_log"; then
         assert_pass "server log shows resolved runtime config"
     else

@@ -122,6 +122,7 @@ static int g_server_http_log_enabled = 0;
 static int g_show_thinking_enabled = 0;
 static int g_system_prompt_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
+static char g_system_prompt_cache_dir[PATH_MAX] = {0};
 static int g_mtp_predictions = -1;
 static int g_mtp_active_experts = 1;
 // Draft-model expert acceleration (empirical probe + genuine speedup): keep the
@@ -11979,14 +11980,51 @@ static int mkdir_p_cstr(const char *path) {
     return 0;
 }
 
+static void sanitize_path_component(const char *src, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    size_t j = 0;
+    if (!src || !src[0]) src = "model";
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            dst[j++] = (char)c;
+        } else {
+            dst[j++] = '_';
+        }
+    }
+    dst[j] = '\0';
+}
+
+static void expand_config_path(const char *src, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+    if (src[0] == '~' && src[1] == '/') {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(dst, dst_sz, "%s/%s", home, src + 2);
+            return;
+        }
+    }
+    snprintf(dst, dst_sz, "%s", src);
+}
+
 static int system_prompt_cache_dir(const char *model_path, char *out, size_t out_sz) {
     if (!model_path || !model_path[0] || !out || out_sz == 0) return -1;
+    int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+    if (g_system_prompt_cache_dir[0]) {
+        char model_component[256];
+        sanitize_path_component(g_cfg.model_id, model_component, sizeof(model_component));
+        snprintf(out, out_sz, "%s/%s/q%d/system_prompt_cache",
+                 g_system_prompt_cache_dir, model_component, bits);
+        return 0;
+    }
     if (g_flashchat_model_path[0] && g_flashchat_weights_dir[0] &&
         strcmp(model_path, g_flashchat_model_path) == 0) {
         snprintf(out, out_sz, "%s/system_prompt_cache", g_flashchat_weights_dir);
         return 0;
     }
-    int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
     snprintf(out, out_sz, "%s/flashchat/q%d/system_prompt_cache", model_path, bits);
     return 0;
 }
@@ -12840,6 +12878,8 @@ static size_t first_byte_diff(const void *a, const void *b, size_t n) {
 static int cache_roundtrip_test(void) {
     int prev_enabled = g_system_prompt_cache_enabled;
     int prev_max = g_system_prompt_cache_max_entries;
+    char prev_dir[PATH_MAX];
+    snprintf(prev_dir, sizeof(prev_dir), "%s", g_system_prompt_cache_dir);
     g_system_prompt_cache_enabled = 1;
     if (g_system_prompt_cache_max_entries <= 0) g_system_prompt_cache_max_entries = 6;
 
@@ -12855,6 +12895,7 @@ static int cache_roundtrip_test(void) {
         fprintf(stderr, "[cache-roundtrip] FAIL mkdtemp: %s\n", strerror(errno));
         return 1;
     }
+    snprintf(g_system_prompt_cache_dir, sizeof(g_system_prompt_cache_dir), "%s/external-cache", tmp_dir);
 
     // Use a small token count so the test runs in milliseconds even though
     // realistic prefills are 7000+. Compression and roundtrip semantics are
@@ -12918,6 +12959,12 @@ static int cache_roundtrip_test(void) {
         system_prompt_cache_path(tmp_dir, hash_b, path_b, sizeof(path_b)) != 0 ||
         system_prompt_cache_path(tmp_dir, hash_c, path_c, sizeof(path_c)) != 0) {
         fprintf(stderr, "[cache-roundtrip] FAIL cache path generation\n");
+        failures++;
+        goto cleanup;
+    }
+    if (strncmp(path_a, g_system_prompt_cache_dir, strlen(g_system_prompt_cache_dir)) != 0) {
+        fprintf(stderr, "[cache-roundtrip] FAIL external cache dir ignored: %s not under %s\n",
+                path_a, g_system_prompt_cache_dir);
         failures++;
         goto cleanup;
     }
@@ -13100,6 +13147,15 @@ cleanup:
     if (system_prompt_cache_path(tmp_dir, hash_c, path, sizeof(path)) == 0) unlink(path);
     char dir[PATH_MAX];
     if (system_prompt_cache_dir(tmp_dir, dir, sizeof(dir)) == 0) rmdir(dir);
+    char model_cache_dir[PATH_MAX];
+    char model_component[256];
+    int cleanup_bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
+    sanitize_path_component(g_cfg.model_id, model_component, sizeof(model_component));
+    snprintf(model_cache_dir, sizeof(model_cache_dir), "%s/%s/q%d", g_system_prompt_cache_dir, model_component, cleanup_bits);
+    rmdir(model_cache_dir);
+    snprintf(model_cache_dir, sizeof(model_cache_dir), "%s/%s", g_system_prompt_cache_dir, model_component);
+    rmdir(model_cache_dir);
+    rmdir(g_system_prompt_cache_dir);
     char runtime_dir[PATH_MAX];
     int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
     snprintf(runtime_dir, sizeof(runtime_dir), "%s/flashchat/q%d", tmp_dir, bits);
@@ -13111,6 +13167,7 @@ cleanup:
 
     g_system_prompt_cache_enabled = prev_enabled;
     g_system_prompt_cache_max_entries = prev_max;
+    snprintf(g_system_prompt_cache_dir, sizeof(g_system_prompt_cache_dir), "%s", prev_dir);
 
     if (failures == 0) {
         fprintf(stderr, "[cache-roundtrip] PASS all chunks identical (token_count=%d, full=%d, linear=%d)\n",
@@ -13214,6 +13271,8 @@ static void serve_loop(
     server_logf("[serve]   system_prompt_cache: %s max_entries=%d\n",
                 g_system_prompt_cache_enabled ? "enabled" : "disabled",
                 g_system_prompt_cache_max_entries);
+    server_logf("[serve]   system_prompt_cache_dir: %s\n",
+                g_system_prompt_cache_dir[0] ? g_system_prompt_cache_dir : "(model directory)");
     server_logf("[serve]   server_debug: %s http_log: %s\n",
                 g_server_debug_enabled ? "enabled" : "disabled",
                 g_server_http_log_enabled ? "enabled" : "disabled");
@@ -14473,6 +14532,14 @@ int main(int argc, char **argv) {
                         if (quote) {
                             g_system_prompt_cache_max_entries = atoi(quote + 1);
                             if (g_system_prompt_cache_max_entries < 0) g_system_prompt_cache_max_entries = 0;
+                        }
+                    }
+                    if (strncmp(line, "SYSTEM_PROMPT_CACHE_DIR=", 24) == 0) {
+                        char *quote = strchr(line + 24, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            expand_config_path(quote + 1, g_system_prompt_cache_dir, sizeof(g_system_prompt_cache_dir));
                         }
                     }
                     // MTP from config; --mtp / --no-mtp (parsed below) override.

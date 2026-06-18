@@ -25,7 +25,6 @@ class MigrateBase(unittest.TestCase):
         os.environ["FLASHCHAT_CONFIG_DIR"] = self.config_dir
         self.registry = Registry.load()
         self.moe = self.registry.get("qwen3.6-35b-a3b")
-        self.mlx = self.registry.get("qwen3.6-35b-a3b-mlx")
 
     def tearDown(self):
         del os.environ["FLASHCHAT_CONFIG_DIR"]
@@ -62,15 +61,6 @@ class TestDedup(MigrateBase):
         self.assertTrue(snap_plan.conflicts)
         vocab = next(d for d in snap_plan.dedups if d.relpath == "vocab.bin")
         self.assertEqual(vocab.duplicates, [])  # nothing deleted
-
-    def test_single_variant_mlx_still_moves_to_shared(self):
-        snapshot = make_legacy_snapshot(self.cache, self.mlx)
-        plan = migrate.build_plan(self.registry, self.cache)
-        migrate.execute_snapshot(plan.snapshots[0])
-        self.assertTrue(os.path.isfile(
-            os.path.join(paths.shared_dir(snapshot), "vocab.bin")))
-        self.assertTrue(os.path.islink(
-            os.path.join(paths.variant_dir(snapshot, "q4"), "vocab.bin")))
 
     def test_idempotent_rerun_plans_nothing(self):
         make_legacy_snapshot(self.cache, self.moe, with_bf16=True)
@@ -120,7 +110,7 @@ class TestConfigAndState(MigrateBase):
         self.assertEqual(changes["MODEL_VARIANT"], "q8")
         values = configfile.load()
         self.assertEqual(values["MODEL"], "Qwen-Qwen36-35B-A3B-8bit")  # untouched
-        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "2")
+        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "3")
 
     def test_config_migration_is_idempotent(self):
         configfile.update({"MODEL": "Qwen-Qwen36-27B"})

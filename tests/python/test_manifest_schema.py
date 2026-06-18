@@ -23,7 +23,7 @@ def load_shipped():
 class TestShippedManifests(unittest.TestCase):
     def test_all_shipped_manifests_parse(self):
         shipped = load_shipped()
-        self.assertEqual(len(shipped), 6)
+        self.assertEqual(len(shipped), 5)
         ids = set()
         for path, data in shipped.items():
             m = parse_manifest(data, source_path=path)
@@ -38,7 +38,7 @@ class TestShippedManifests(unittest.TestCase):
                 for lid in variant.legacy_ids:
                     self.assertNotIn(lid, seen, f"legacy id {lid} duplicated in {path} and {seen.get(lid)}")
                     seen[lid] = path
-        # All nine legacy registry ids must be claimed somewhere.
+        # All shipped registry ids must be claimed somewhere.
         legacy = paths.read_json(
             os.path.join(os.path.dirname(__file__), "fixtures", "model_configs_legacy.json")
         )

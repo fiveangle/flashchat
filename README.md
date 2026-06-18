@@ -52,7 +52,7 @@ I've extended the original project from a reasearch project to usable system inc
 
 ## Model Support
 
-* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B) q4, q8 - 52GB (default)
+* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) q4, q8 - 52GB (default)
 * [Qwen/Qwen3.5-80B-A3B](https://huggingface.co/Qwen/Qwen3.5-80B-A3B) q4, q8 - 92GB
 * [mlx-community/Qwen3.5-397B-A17B-4bit](https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit) q4 - 417GB
 

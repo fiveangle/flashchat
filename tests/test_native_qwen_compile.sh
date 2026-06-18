@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MODEL="${FLASHCHAT_NATIVE_QWEN_SMOKE_MODEL:-/Volumes/usr/Users/speedster/dev/models/hf/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0}"
-MODEL_ID="${FLASHCHAT_NATIVE_QWEN_SMOKE_MODEL_ID:-mlx-community-Qwen36-35B-A3B-4bit}"
+MODEL_ID="${FLASHCHAT_NATIVE_QWEN_SMOKE_MODEL_ID:-Qwen-Qwen36-35B-A3B}"
 OUT="debug/native-qwen-compile-smoke"
 
 if [[ ! -f "$MODEL/model.safetensors.index.json" ]]; then

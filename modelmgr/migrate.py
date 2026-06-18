@@ -289,7 +289,7 @@ def migrate_user_config(registry: Registry) -> dict:
     changes = {
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
-        "CONFIG_SCHEMA_VERSION": "2",
+        "CONFIG_SCHEMA_VERSION": "3",
     }
     configfile.update(changes)
     return changes

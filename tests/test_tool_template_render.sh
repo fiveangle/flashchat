@@ -94,7 +94,7 @@ for i in range(1, 30):
         }
     })
 request = {
-    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "model": "Qwen-Qwen36-35B-A3B",
     "stream": False,
     "temperature": 0.6,
     "top_p": 0.95,
@@ -117,7 +117,7 @@ echo ""
 echo "=== Flashchat Tool Template Render Smoke ==="
 echo ""
 
-render_output=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$REQUEST_JSON" --render-output "$RENDER_DIR" 2>&1)
+render_output=$("$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$REQUEST_JSON" --render-output "$RENDER_DIR" 2>&1)
 if printf "%s" "$render_output" | grep -q "tools=30"; then
     assert_pass "render request reports thirty tools"
 else
@@ -166,7 +166,7 @@ with open(sys.argv[1], "w") as f:
     json.dump(request, f)
 PY
 
-"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$NO_TOOLS_JSON" --render-output "$NO_TOOLS_DIR" >/dev/null 2>&1
+"$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$NO_TOOLS_JSON" --render-output "$NO_TOOLS_DIR" >/dev/null 2>&1
 assert_contains "no-tools chat prompt explicitly disables tool-call markup" "No tools are available" "${NO_TOOLS_DIR}/system_prompt.txt"
 
 # The native 35B-A3B entry appears before later non-thinking Instruct entries.
@@ -212,7 +212,7 @@ V19_RENDER_DIR="${TMPDIR}/v19_rendered"
 python3 - "$V19_REQUEST_JSON" <<'PY'
 import json, sys
 request = {
-    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "model": "Qwen-Qwen36-35B-A3B",
     "stream": False,
     "messages": [
         {"role": "developer", "content": "Developer-supplied instructions: V19_DEV_MARKER"},
@@ -245,7 +245,7 @@ with open(sys.argv[1], "w") as f:
     json.dump(request, f)
 PY
 
-"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_REQUEST_JSON" --render-output "$V19_RENDER_DIR" >/dev/null 2>&1
+"$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$V19_REQUEST_JSON" --render-output "$V19_RENDER_DIR" >/dev/null 2>&1
 
 V19_SYS="${V19_RENDER_DIR}/system_prompt.txt"
 V19_CONV="${V19_RENDER_DIR}/conversation.txt"
@@ -316,7 +316,7 @@ V19_TIER1_DIR="${TMPDIR}/v19_tier1_rendered"
 python3 - "$V19_TIER1_JSON" <<'PY'
 import json, sys
 request = {
-    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "model": "Qwen-Qwen36-35B-A3B",
     "stream": False,
     "messages": [
         {"role": "user", "content": "Try the tool."},
@@ -340,7 +340,7 @@ with open(sys.argv[1], "w") as f:
     json.dump(request, f)
 PY
 
-"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_TIER1_JSON" --render-output "$V19_TIER1_DIR" >/dev/null 2>&1
+"$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$V19_TIER1_JSON" --render-output "$V19_TIER1_DIR" >/dev/null 2>&1
 
 V19_TIER1_FULL="${V19_TIER1_DIR}/assembled_prompt.txt"
 if grep -q "reconsider" "$V19_TIER1_FULL"; then
@@ -365,7 +365,7 @@ python3 - "$V19_OK_JSON" <<'PY'
 import json, sys
 ok_payload = json.dumps({"status": "ok", "error_rate": 0.0, "items": ["a", "b"]})
 request = {
-    "model": "mlx-community-Qwen36-35B-A3B-4bit",
+    "model": "Qwen-Qwen36-35B-A3B",
     "stream": False,
     "messages": [
         {"role": "user", "content": "Try the tool."},
@@ -389,7 +389,7 @@ with open(sys.argv[1], "w") as f:
     json.dump(request, f)
 PY
 
-"$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --render-request "$V19_OK_JSON" --render-output "$V19_OK_DIR" >/dev/null 2>&1
+"$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$V19_OK_JSON" --render-output "$V19_OK_DIR" >/dev/null 2>&1
 V19_OK_FULL="${V19_OK_DIR}/assembled_prompt.txt"
 if grep -q "reconsider\|twice in a row" "$V19_OK_FULL"; then
     assert_fail "successful response with 'error_rate' does not trigger escalation" \
@@ -419,7 +419,7 @@ true
 </tool_call>
 EOF
 
-parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$TOOL_CALL_TXT" | tail -1)
+parsed=$("$INFER" --model-id Qwen-Qwen36-35B-A3B --parse-tool-call "$TOOL_CALL_TXT" | tail -1)
 python3 - "$parsed" <<'PY'
 import json
 import sys
@@ -448,7 +448,7 @@ cat > "$CODER_TOOL_CALL_TXT" <<'EOF'
 <parameters>{"result": "done", "count": 3, "ok": true}</parameters>
 </function>
 EOF
-coder_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$CODER_TOOL_CALL_TXT" | tail -1)
+coder_parsed=$("$INFER" --model-id Qwen-Qwen36-35B-A3B --parse-tool-call "$CODER_TOOL_CALL_TXT" | tail -1)
 python3 - "$coder_parsed" <<'PY'
 import json, sys
 outer = json.loads(sys.argv[1])
@@ -473,7 +473,7 @@ cat > "$FUNCTION_ONLY_TOOL_CALL_TXT" <<'EOF'
 </function>
 </tool_call>
 EOF
-function_only_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$FUNCTION_ONLY_TOOL_CALL_TXT" | tail -1)
+function_only_parsed=$("$INFER" --model-id Qwen-Qwen36-35B-A3B --parse-tool-call "$FUNCTION_ONLY_TOOL_CALL_TXT" | tail -1)
 python3 - "$function_only_parsed" <<'PY'
 import json, sys
 outer = json.loads(sys.argv[1])
@@ -501,7 +501,7 @@ cat > "$NESTED_TOOL_CALL_TXT" <<'EOF'
 </function>
 </tool_call>
 EOF
-nested_parsed=$("$INFER" --model-id mlx-community-Qwen36-35B-A3B-4bit --parse-tool-call "$NESTED_TOOL_CALL_TXT" | tail -1)
+nested_parsed=$("$INFER" --model-id Qwen-Qwen36-35B-A3B --parse-tool-call "$NESTED_TOOL_CALL_TXT" | tail -1)
 python3 - "$nested_parsed" <<'PY'
 import json, sys
 outer = json.loads(sys.argv[1])

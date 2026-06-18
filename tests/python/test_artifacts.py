@@ -103,13 +103,12 @@ class TestVariantVerification(unittest.TestCase):
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")        # native MoE, q4+q8, MTP
         self.dense = registry.get("qwen3.6-27b")          # dense, no expert dirs
-        self.mlx = registry.get("qwen3.6-35b-a3b-mlx")    # single-variant mlx
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_complete_tree_verifies(self):
-        for manifest in (self.moe, self.dense, self.mlx):
+        for manifest in (self.moe, self.dense):
             snapshot = make_snapshot(self.tmp.name, manifest)
             for vname in manifest.variants:
                 self.assertTrue(

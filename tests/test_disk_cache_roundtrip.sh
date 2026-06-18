@@ -31,7 +31,9 @@ echo ""
 # the runtime validator (FLASHCHAT_CACHE_VALIDATE=1 during a live prefill).
 
 LOG=/tmp/flashchat_cache_roundtrip.log
-"$INFER" --cache-roundtrip-test >"$LOG" 2>&1
+TMP_HOME="$(mktemp -d /tmp/flashchat-cache-roundtrip-home.XXXXXX)"
+trap 'rm -rf "$TMP_HOME"' EXIT
+HOME="$TMP_HOME" FLASHCHAT_MODEL="Qwen-Qwen36-35B-A3B" "$INFER" --cache-roundtrip-test >"$LOG" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo -e "${RED}FAIL${NC}  infer --cache-roundtrip-test exit=$rc"

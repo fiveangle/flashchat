@@ -266,6 +266,8 @@ Environment variables:
                               content (e.g. for diversifying parameter values
                               across runs).
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
+  FLASHCHAT_SYSTEM_PROMPT_CACHE_DIR
+                                  Optional external cache root for system prompt caches
   FLASHCHAT_MTP                  Multi-token prediction (0=disabled, 1=automatic, 2+=predictor batch size; empty=registry default)
   FLASHCHAT_WEIGHTS_DIR    Path to extracted weights
   FLASHCHAT_EXPERTS_DIR   Path to expert weights
@@ -408,6 +410,7 @@ cmd_status() {
     fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
+    echo "System prompt cache dir: $(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
     echo "Multi-token prediction: $(mtp_label "$MTP")"
     echo "Color output: $(flashchat_get COLOR_OUTPUT)"
     echo "User state: $(flashchat_get CONFIG_DIR)"
@@ -843,6 +846,7 @@ server_runtime_signature() {
         echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
         echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
         echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
+        echo "SYSTEM_PROMPT_CACHE_DIR=$(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
         echo "MTP=$(flashchat_get MTP)"
         echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
         echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"

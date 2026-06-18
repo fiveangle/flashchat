@@ -52,7 +52,7 @@ def run(registry: Registry) -> None:
         "MODEL": resolved_id(manifest, variant_name),
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
-        "CONFIG_SCHEMA_VERSION": "2",
+        "CONFIG_SCHEMA_VERSION": "3",
     })
     registry.state.enabled[manifest.id] = True
     registry.state.save()
@@ -104,6 +104,7 @@ def _print_summary(registry: Registry) -> None:
     print(f"Offload dir: {configfile.get('OFFLOAD_DIR', '') or '(not configured)'}")
     print(f"System prompt cache: {configfile.get('SYSTEM_PROMPT_CACHE', '1')} "
           f"(max entries: {configfile.get('SYSTEM_PROMPT_CACHE_MAX_ENTRIES', '2')})")
+    print(f"System prompt cache dir: {configfile.get('SYSTEM_PROMPT_CACHE_DIR', '') or '(model directory)'}")
     print(f"MTP: {configfile.get('MTP', '') or '(registry default)'}"
           f" | Show thinking: {configfile.get('SHOW_THINKING', '0')}")
     active = configfile.get("ACTIVE_EXPERTS", "")
@@ -310,6 +311,7 @@ def _advanced_settings(manifest) -> dict:
             ("SERVER_HTTP_LOG", "HTTP traffic log (0/1)", "0"),
             ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1"),
             ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "Cache max entries", "2"),
+            ("SYSTEM_PROMPT_CACHE_DIR", "External system prompt cache root (- for model directory)", ""),
             ("MTP", "Multi-token prediction (0=off, auto=registry default, N=batch)", "0"),
             ("MTP_BF16", "Use BF16 MTP predictor weights (0/1)", "0"),
             ("SHOW_THINKING", "Show thinking tokens (0/1)", "0"),
@@ -319,6 +321,8 @@ def _advanced_settings(manifest) -> dict:
             mtp_raw = value
             if value.lower() == "auto":
                 value = ""  # empty = registry/profile default (legacy semantics)
+        if key == "SYSTEM_PROMPT_CACHE_DIR" and value == "-":
+            value = ""
         out[key] = value
     _warn_if_mtp_unsupported(manifest, mtp_raw, out)
     return out

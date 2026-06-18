@@ -22,7 +22,7 @@ src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
     data = json.load(f)
 
-model = data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]
+model = data["models"]["Qwen-Qwen36-35B-A3B"]
 model["mtp_default_predictions"] = 1
 model["sampling_profiles"]["instruct"]["mtp_default_predictions"] = 3
 data["server_defaults"] = {"mtp_default_predictions": 2}
@@ -42,7 +42,7 @@ if [ "$profile_value" != "3" ]; then
 fi
 
 cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
-MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+MODEL="Qwen-Qwen36-35B-A3B"
 SAMPLING_PROFILE="instruct"
 MTP="0"
 EOF
@@ -61,7 +61,7 @@ fi
 
 # Empty MTP in config falls back to the profile's default.
 cat > "$HOME_DIR/.config/flashchat/config" <<'EOF'
-MODEL="mlx-community-Qwen36-35B-A3B-4bit"
+MODEL="Qwen-Qwen36-35B-A3B"
 SAMPLING_PROFILE="instruct"
 MTP=""
 EOF
@@ -79,7 +79,7 @@ import sys
 
 with open(sys.argv[1]) as f:
     data = json.load(f)
-del data["models"]["mlx-community-Qwen36-35B-A3B-4bit"]["sampling_profiles"]["instruct"]["mtp_default_predictions"]
+del data["models"]["Qwen-Qwen36-35B-A3B"]["sampling_profiles"]["instruct"]["mtp_default_predictions"]
 with open(sys.argv[1], "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
