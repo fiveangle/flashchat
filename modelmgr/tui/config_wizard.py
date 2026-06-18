@@ -216,7 +216,7 @@ def _select_sampling_profile(manifest) -> dict:
         mark = " (current)" if name == current else ""
         note = ""
         if supports_thinking is False and _profile_enables_thinking(p):
-            note = common.yellow("  ⚠ non-thinking model — reasoning has no effect")
+            note = common.yellow("  ⚠ your selected model does not support reasoning mode!")
         print(f"  {i}) {p.get('label', name)}{mark}{note}")
         print(common.dim(f"     {p.get('description', '')} "
                          f"temp={p.get('temperature')} top_p={p.get('top_p')} "
