@@ -334,16 +334,48 @@ static void md_tbl_append(char c) {
         g_md.table_buf[g_md.table_len++] = c;
 }
 
-// Visible width of a cell: UTF-8 codepoints with inline markers (**, *, `, ~~)
-// removed. Wide glyphs (emoji/CJK) count as 1, so rows with them may be off by
-// a column — still far better than raw pipes.
+// Terminal column width of a Unicode codepoint: 0 (combining / variation
+// selector / ZWJ), 2 (emoji, CJK, fullwidth), or 1. Covers the common cases —
+// notably ✅/❌ and CJK — so table columns line up.
+static int md_wcwidth(unsigned int cp) {
+    if (cp == 0x200D ||                       // zero-width joiner
+        (cp >= 0x0300 && cp <= 0x036F) ||     // combining diacritics
+        (cp >= 0xFE00 && cp <= 0xFE0F)) return 0;  // variation selectors
+    if ((cp >= 0x1100 && cp <= 0x115F) ||     // Hangul Jamo
+        (cp >= 0x2300 && cp <= 0x23FF) ||     // misc technical (⌚ ⏰ …)
+        (cp >= 0x2600 && cp <= 0x27BF) ||     // misc symbols + dingbats (✅ ❌ ⭐ …)
+        (cp >= 0x2B00 && cp <= 0x2BFF) ||     // misc symbols & arrows
+        (cp >= 0x2E80 && cp <= 0xA4CF) ||     // CJK radicals … Yi
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||     // Hangul syllables
+        (cp >= 0xF900 && cp <= 0xFAFF) ||     // CJK compatibility ideographs
+        (cp >= 0xFE30 && cp <= 0xFE4F) ||     // CJK compatibility forms
+        (cp >= 0xFF00 && cp <= 0xFF60) ||     // fullwidth forms
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+        (cp >= 0x1F000 && cp <= 0x1FAFF) ||   // emoji
+        (cp >= 0x20000 && cp <= 0x3FFFD)) return 2;  // CJK ext B+
+    return 1;
+}
+
+// Visible terminal width of a cell: sum of codepoint widths with inline markers
+// (**, *, `, ~~) removed, so columns align even with emoji/CJK content.
 static int md_cell_width(const char *s) {
     int w = 0;
     for (int i = 0; s[i]; ) {
         if ((s[i] == '*' && s[i+1] == '*') || (s[i] == '~' && s[i+1] == '~')) { i += 2; continue; }
         if (s[i] == '*' || s[i] == '`') { i += 1; continue; }
-        if (((unsigned char)s[i] & 0xC0) != 0x80) w++;  // count ASCII / UTF-8 lead bytes
-        i++;
+        unsigned char c = (unsigned char)s[i];
+        unsigned int cp; int len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { i += 1; continue; }  // stray continuation/invalid byte
+        for (int k = 1; k < len; k++) {
+            if ((s[i+k] & 0xC0) != 0x80) { len = k; break; }  // truncated sequence
+            cp = (cp << 6) | (s[i+k] & 0x3F);
+        }
+        w += md_wcwidth(cp);
+        i += len;
     }
     return w;
 }
