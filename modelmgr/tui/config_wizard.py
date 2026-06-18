@@ -236,8 +236,9 @@ def _select_sampling_profile(manifest) -> dict:
         profile = manifest.sampling_profiles[name]
         if supports_thinking is False and _profile_enables_thinking(profile):
             print(common.yellow(
-                f"  note: {manifest.name} is non-thinking; '{profile.get('label', name)}' "
-                "enables reasoning, which can produce malformed output. Proceeding as selected."))
+                f"  CAUTION: {manifest.name} does not support thinking mode; your selected "
+                f"profile '{profile.get('label', name)}' enables reasoning, which can produce "
+                "malformed output."))
         out = {"SAMPLING_PROFILE": name}
         for key, cfg_key in _SAMPLING_KEYS:
             if key in profile:
