@@ -306,7 +306,7 @@ typedef struct {
     int table_line_start;  // at the start of a line while buffering a table
     int table_len;         // bytes used in table_buf
     char table_buf[8192];  // raw table rows, accumulated until the table ends
-    char pending[8]; // buffered chars for lookahead (e.g., partial "**")
+    char pending[64]; // bytes held for cross-chunk lookahead (split ``` ### --- **)
     int pending_len;
 } MdState;
 
@@ -491,6 +491,10 @@ static void md_flush_table(void) {
 }
 
 static void md_flush(void) {
+    // Emit any trailing marker bytes held for lookahead — at end of stream they
+    // are just literal text with no completion coming.
+    for (int k = 0; k < g_md.pending_len; k++) putchar(g_md.pending[k]);
+    g_md.pending_len = 0;
     if (!g_md.in_table) return;
     if (g_md.table_line_start) {
         while (g_md.table_len > 0 &&
@@ -500,8 +504,61 @@ static void md_flush(void) {
     md_flush_table();
 }
 
-static void md_print(const char *text) {
-    for (int i = 0; text[i]; i++) {
+static void md_print(const char *text_in) {
+    // Combine bytes held from the previous chunk for cross-chunk lookahead, so a
+    // multi-char marker (``` ** ~~) split across SSE tokens is still recognized.
+    int plen = g_md.pending_len;
+    int tlen = (int)strlen(text_in);
+    int total = plen + tlen;
+    if (total == 0) return;
+    char *combined = malloc((size_t)total + 1);
+    if (!combined) { fputs(text_in, stdout); return; }  // best effort on OOM
+    memcpy(combined, g_md.pending, (size_t)plen);
+    memcpy(combined + plen, text_in, (size_t)tlen);
+    combined[total] = '\0';
+    g_md.pending_len = 0;
+
+    // Hold back trailing bytes that could be the start of a longer marker:
+    // 1-2 backticks (a 3rd would make a ``` fence), or a lone * / ~ (vs ** / ~~).
+    int hold = 0;
+    char last = combined[total - 1];
+    if (last == '`') {                       // 1-2 backticks: a 3rd makes a ``` fence
+        int k = 0;
+        while (k < total && combined[total - 1 - k] == '`') k++;
+        if (k < 3) hold = k;
+    } else if (last == '*' && !(total >= 2 && combined[total - 2] == '*')) {
+        hold = 1;                            // lone * (vs **)
+    } else if (last == '~' && !(total >= 2 && combined[total - 2] == '~')) {
+        hold = 1;                            // lone ~ (vs ~~)
+    }
+    // The header and rule handlers consume a whole line at once. If the trailing
+    // line is unterminated (no \n yet) and looks like a header (#…) or a rule
+    // (only -, *, _ and spaces), hold the whole line so its handler sees it
+    // complete next chunk instead of emitting a broken partial.
+    if (!g_md.code_block) {
+        int ls = total;
+        while (ls > 0 && combined[ls - 1] != '\n') ls--;
+        int at_line_start = (ls == 0) ? g_md.line_start : 1;
+        if (at_line_start) {
+            int q = ls;
+            while (q < total && (combined[q] == ' ' || combined[q] == '\t')) q++;
+            char m = (q < total) ? combined[q] : 0;
+            int hold_line = 0;
+            if (m == '#') {
+                hold_line = 1;                       // header
+            } else if (m == '-' || m == '*' || m == '_') {
+                hold_line = 1;                       // possible horizontal rule
+                for (int t = q; t < total; t++)
+                    if (combined[t] != m && combined[t] != ' ' && combined[t] != '\t') { hold_line = 0; break; }
+            }
+            int n = total - ls;
+            if (hold_line && n <= (int)sizeof(g_md.pending) - 1 && n > hold) hold = n;
+        }
+    }
+    int proc_len = total - hold;
+
+    const char *text = combined;
+    for (int i = 0; i < proc_len; i++) {
         char c = text[i];
 
         // Markdown table: buffer rows until the table ends, then render aligned.
@@ -732,6 +789,18 @@ static void md_print(const char *text) {
 
         putchar(c);
     }
+
+    // Stash the held trailing bytes for the next chunk. Inside a table they're
+    // raw buffer content (rendered on flush), so append them there instead.
+    if (hold > 0) {
+        if (g_md.in_table) {
+            for (int k = proc_len; k < total; k++) md_tbl_append(combined[k]);
+        } else {
+            memcpy(g_md.pending, combined + proc_len, (size_t)hold);
+            g_md.pending_len = hold;
+        }
+    }
+    free(combined);
 }
 
 static int json_int_field(const char *json, const char *field, int fallback) {
