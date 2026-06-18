@@ -10,7 +10,7 @@ import os
 import re
 
 from .. import configfile, paths, resolved
-from ..artifacts import source_mtp_tensors_present
+from ..artifacts import source_mtp_tensors_present, template_supports_thinking
 from ..registry import Registry, resolved_id
 from ..status import all_statuses, hf_cache_dir, selected_model
 from . import build, common, status_view
@@ -199,14 +199,25 @@ def _add_model(registry: Registry) -> bool:
     return True
 
 
+def _profile_enables_thinking(profile) -> bool:
+    return str(profile.get("reasoning", "")).strip().lower() in ("1", "true", "on", "yes")
+
+
 def _select_sampling_profile(manifest) -> dict:
     common.heading("Sampling profile")
     names = list(manifest.sampling_profiles)
     current = configfile.get("SAMPLING_PROFILE", manifest.default_sampling_profile)
+    # Authoritative source-side check: does this model's chat template emit
+    # <think> blocks? None = undeterminable (not downloaded) → stay quiet.
+    supports_thinking = template_supports_thinking(
+        paths.snapshot_dir(hf_cache_dir(), manifest.hf_repo))
     for i, name in enumerate(names, 1):
         p = manifest.sampling_profiles[name]
         mark = " (current)" if name == current else ""
-        print(f"  {i}) {p.get('label', name)}{mark}")
+        note = ""
+        if supports_thinking is False and _profile_enables_thinking(p):
+            note = common.yellow("  ⚠ non-thinking model — reasoning has no effect")
+        print(f"  {i}) {p.get('label', name)}{mark}{note}")
         print(common.dim(f"     {p.get('description', '')} "
                          f"temp={p.get('temperature')} top_p={p.get('top_p')} "
                          f"reasoning={p.get('reasoning')}"))
@@ -223,6 +234,10 @@ def _select_sampling_profile(manifest) -> dict:
     if int(choice) <= len(names):
         name = names[int(choice) - 1]
         profile = manifest.sampling_profiles[name]
+        if supports_thinking is False and _profile_enables_thinking(profile):
+            print(common.yellow(
+                f"  note: {manifest.name} is non-thinking; '{profile.get('label', name)}' "
+                "enables reasoning, which can produce malformed output. Proceeding as selected."))
         out = {"SAMPLING_PROFILE": name}
         for key, cfg_key in _SAMPLING_KEYS:
             if key in profile:

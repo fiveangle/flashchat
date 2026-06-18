@@ -334,6 +334,28 @@ def source_mtp_tensors_present(model_path: str) -> bool | None:
     return any("mtp" in k.lower() or "nextn" in k.lower() for k in weight_map)
 
 
+def template_supports_thinking(model_path: str) -> bool | None:
+    """Whether the model's chat template emits <think> reasoning blocks. Reads
+    tokenizer_config.json's chat_template and checks for the <think> marker:
+    Qwen3 thinking models have it; non-thinking variants (e.g. Qwen3-Coder)
+    do not and have dropped the enable_thinking flag entirely. Returns None when
+    undeterminable (no tokenizer_config / template — e.g. the model isn't
+    downloaded) so callers can stay conservative and not warn."""
+    if not model_path:
+        return None
+    tcp = os.path.join(model_path, "tokenizer_config.json")
+    try:
+        with open(tcp) as f:
+            ct = json.load(f).get("chat_template")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(ct, list):  # some repos ship a list of named templates
+        ct = " ".join((d or {}).get("template", "") for d in ct)
+    if not ct:
+        return None
+    return "<think>" in ct
+
+
 def packed_layer_files(packed_dir: str, num_layers: int) -> list:
     """Missing layer_NN.bin files (empty list when complete)."""
     missing = []
