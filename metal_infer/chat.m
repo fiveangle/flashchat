@@ -296,15 +296,21 @@ static int send_chat_request(const char *host, int port, const char *user_messag
 typedef struct {
     int bold;        // inside **...**
     int italic;      // inside *...*
+    int strike;      // inside ~~...~~
     int code_inline; // inside `...`
     int code_block;  // inside ```...```
     int skip_lang;   // eating language tag after opening ```
     int line_start;  // at start of a new line
+    int quote;       // inside a > blockquote line
+    int in_table;          // buffering a markdown table (rendered on flush)
+    int table_line_start;  // at the start of a line while buffering a table
+    int table_len;         // bytes used in table_buf
+    char table_buf[8192];  // raw table rows, accumulated until the table ends
     char pending[8]; // buffered chars for lookahead (e.g., partial "**")
     int pending_len;
 } MdState;
 
-static MdState g_md = {0, 0, 0, 0, 0, 1, {0}, 0};
+static MdState g_md = { .line_start = 1 };
 
 static void md_reset(void) {
     memset(&g_md, 0, sizeof(g_md));
@@ -318,9 +324,172 @@ static int md_lang_char(char c) {
            c == '_' || c == '-' || c == '+' || c == '#' || c == '.';
 }
 
+// --- Markdown tables -------------------------------------------------------
+// Tables can't be rendered while streaming (column widths need every row), so
+// md_print buffers the raw rows and md_flush_table() renders an aligned box
+// once the table ends (a non-"|" line, or end of response via md_flush()).
+
+static void md_tbl_append(char c) {
+    if (g_md.table_len < (int)sizeof(g_md.table_buf) - 1)
+        g_md.table_buf[g_md.table_len++] = c;
+}
+
+// Visible width of a cell: UTF-8 codepoints with inline markers (**, *, `, ~~)
+// removed. Wide glyphs (emoji/CJK) count as 1, so rows with them may be off by
+// a column — still far better than raw pipes.
+static int md_cell_width(const char *s) {
+    int w = 0;
+    for (int i = 0; s[i]; ) {
+        if ((s[i] == '*' && s[i+1] == '*') || (s[i] == '~' && s[i+1] == '~')) { i += 2; continue; }
+        if (s[i] == '*' || s[i] == '`') { i += 1; continue; }
+        if (((unsigned char)s[i] & 0xC0) != 0x80) w++;  // count ASCII / UTF-8 lead bytes
+        i++;
+    }
+    return w;
+}
+
+// Emit a cell's text honoring inline bold/italic/code/strikethrough.
+static void md_emit_cell(const char *s) {
+    int bold = 0, ital = 0, code = 0, strike = 0;
+    for (int i = 0; s[i]; ) {
+        if (s[i] == '*' && s[i+1] == '*') { printf(bold ? ANSI_RESET : ANSI_BOLD); bold = !bold; i += 2; continue; }
+        if (s[i] == '~' && s[i+1] == '~') { printf(strike ? ANSI_RESET : "\033[9m"); strike = !strike; i += 2; continue; }
+        if (s[i] == '*') { printf(ital ? ANSI_RESET : ANSI_ITALIC); ital = !ital; i++; continue; }
+        if (s[i] == '`') { printf(code ? ANSI_RESET : ANSI_CODE); code = !code; i++; continue; }
+        putchar(s[i]); i++;
+    }
+    if (bold || ital || code || strike) printf(ANSI_RESET);
+}
+
+static int md_is_separator_cell(const char *s) {
+    int sawdash = 0;
+    for (const char *q = s; *q; q++) {
+        if (*q == '-') sawdash = 1;
+        else if (*q != ':' && *q != ' ') return 0;
+    }
+    return sawdash;
+}
+
+static void md_flush_table(void) {
+    g_md.in_table = 0;
+    g_md.table_line_start = 0;
+    int len = g_md.table_len;
+    g_md.table_len = 0;
+    if (len <= 0) return;
+    g_md.table_buf[len] = '\0';
+
+    enum { MD_MAXR = 128, MD_MAXC = 24 };
+    static char *cells[MD_MAXR][MD_MAXC];
+    static int ncol[MD_MAXR];
+    int nrows = 0, sep_row = -1;
+
+    char *line = g_md.table_buf;
+    while (line && *line && nrows < MD_MAXR) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '|') p++;
+        int nc = 0;
+        char *cs = p;
+        for (;; p++) {
+            if (*p == '|' || *p == '\0') {
+                char *a = cs, *b = p;
+                while (a < b && (*a == ' ' || *a == '\t')) a++;
+                while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+                if (!(*p == '\0' && a == b && cs == p)) {  // skip empty cell after trailing '|'
+                    if (nc < MD_MAXC) { *b = '\0'; cells[nrows][nc++] = a; }
+                }
+                if (*p == '\0') break;
+                cs = p + 1;
+            }
+        }
+        if (nc > 0) {
+            int issep = 1;
+            for (int c = 0; c < nc; c++) if (!md_is_separator_cell(cells[nrows][c])) { issep = 0; break; }
+            if (issep && sep_row < 0) sep_row = nrows;
+            ncol[nrows++] = nc;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (nrows == 0) return;
+
+    int ncols = 0;
+    for (int r = 0; r < nrows; r++) if (ncol[r] > ncols) ncols = ncol[r];
+    int width[MD_MAXC];
+    for (int c = 0; c < ncols; c++) width[c] = 1;
+    for (int r = 0; r < nrows; r++) {
+        if (r == sep_row) continue;
+        for (int c = 0; c < ncol[r] && c < ncols; c++) {
+            int w = md_cell_width(cells[r][c]);
+            if (w > width[c]) width[c] = w;
+        }
+    }
+
+    // Each column between pipes spans width+2 cells (a space on each side).
+    #define MD_BORDER(L, M, R) do { \
+        printf(ANSI_DIM L); \
+        for (int c = 0; c < ncols; c++) { \
+            for (int k = 0; k < width[c] + 2; k++) printf("─"); \
+            printf(c < ncols - 1 ? M : R); \
+        } \
+        printf(ANSI_RESET "\n"); \
+    } while (0)
+
+    printf("\n");
+    MD_BORDER("┌", "┬", "┐");
+    int header_done = 0;
+    for (int r = 0; r < nrows; r++) {
+        if (r == sep_row) continue;
+        printf(ANSI_DIM "│" ANSI_RESET);
+        for (int c = 0; c < ncols; c++) {
+            const char *txt = (c < ncol[r]) ? cells[r][c] : "";
+            printf(" ");
+            if (!header_done) printf(ANSI_BOLD);
+            md_emit_cell(txt);
+            if (!header_done) printf(ANSI_RESET);
+            for (int k = md_cell_width(txt); k < width[c]; k++) printf(" ");
+            printf(" " ANSI_DIM "│" ANSI_RESET);
+        }
+        printf("\n");
+        if (!header_done) { header_done = 1; MD_BORDER("├", "┼", "┤"); }
+    }
+    MD_BORDER("└", "┴", "┘");
+    #undef MD_BORDER
+}
+
+static void md_flush(void) {
+    if (!g_md.in_table) return;
+    if (g_md.table_line_start) {
+        while (g_md.table_len > 0 &&
+               (g_md.table_buf[g_md.table_len-1] == ' ' || g_md.table_buf[g_md.table_len-1] == '\t'))
+            g_md.table_len--;
+    }
+    md_flush_table();
+}
+
 static void md_print(const char *text) {
     for (int i = 0; text[i]; i++) {
         char c = text[i];
+
+        // Markdown table: buffer rows until the table ends, then render aligned.
+        if (g_md.in_table) {
+            if (g_md.table_line_start) {
+                if (c == ' ' || c == '\t') { md_tbl_append(c); continue; }
+                if (c == '|') { g_md.table_line_start = 0; md_tbl_append(c); continue; }
+                // Line does not continue the table: drop the tentative leading
+                // whitespace, render the table, then fall through to handle c.
+                while (g_md.table_len > 0 &&
+                       (g_md.table_buf[g_md.table_len-1] == ' ' || g_md.table_buf[g_md.table_len-1] == '\t'))
+                    g_md.table_len--;
+                md_flush_table();
+                g_md.line_start = 1;
+            } else {
+                md_tbl_append(c);
+                if (c == '\n') g_md.table_line_start = 1;
+                continue;
+            }
+        }
 
         // Skip language tag after opening ``` (may span tokens)
         if (g_md.skip_lang) {
@@ -378,6 +547,49 @@ static void md_print(const char *text) {
         // Inside inline code: print verbatim
         if (g_md.code_inline) {
             putchar(c);
+            continue;
+        }
+
+        // Table start: line begins with optional spaces then '|' → buffer it
+        if (g_md.line_start) {
+            int p = i;
+            while (text[p] == ' ' || text[p] == '\t') p++;
+            if (text[p] == '|') {
+                g_md.in_table = 1;
+                g_md.table_line_start = 0;
+                g_md.table_len = 0;
+                md_tbl_append(c);
+                continue;
+            }
+        }
+
+        // Horizontal rule: a whole line of only -, *, or _ (3+), optional spaces
+        if (g_md.line_start && (c == '-' || c == '*' || c == '_')) {
+            int p = i, cnt = 0, only = 1;
+            char hc = c;
+            while (text[p] && text[p] != '\n') {
+                if (text[p] == hc) cnt++;
+                else if (text[p] != ' ' && text[p] != '\t') { only = 0; break; }
+                p++;
+            }
+            if (only && cnt >= 3 && text[p] == '\n') {
+                printf(ANSI_DIM);
+                for (int k = 0; k < 48; k++) printf("─");
+                printf(ANSI_RESET "\n");
+                i = p;  // consume through the newline (loop's i++ steps past it)
+                g_md.line_start = 1;
+                continue;
+            }
+        }
+
+        // Blockquote: > (or >>) at line start → colored gutter + dim text
+        if (g_md.line_start && c == '>') {
+            while (text[i] == '>') i++;
+            while (text[i] == ' ') i++;
+            printf("\033[2m\033[36m│\033[0m " ANSI_DIM);
+            g_md.quote = 1;
+            g_md.line_start = 0;
+            i--;  // loop's i++ lands on the first content char
             continue;
         }
 
@@ -470,8 +682,17 @@ static void md_print(const char *text) {
             continue;
         }
 
+        // Strikethrough: ~~text~~
+        if (c == '~' && text[i+1] == '~') {
+            if (g_md.strike) { printf(ANSI_RESET); g_md.strike = 0; }
+            else { printf("\033[9m"); g_md.strike = 1; }
+            i++;
+            continue;
+        }
+
         // Track line starts
         if (c == '\n') {
+            if (g_md.quote) { printf(ANSI_RESET); g_md.quote = 0; }
             g_md.line_start = 1;
         } else {
             g_md.line_start = 0;
@@ -592,6 +813,7 @@ static char *stream_response(int sock, int show_thinking) {
     }
     fclose(stream);
 
+    md_flush();           // render a table left buffered at end of response
     printf(ANSI_RESET);  // ensure no style leaks
     double t_end = now_ms();
     double ttft_ms = t_first > 0 ? t_first - t_start : 0;
