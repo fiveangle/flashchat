@@ -305,6 +305,9 @@ typedef struct {
     int in_table;          // buffering a markdown table (rendered on flush)
     int table_line_start;  // at the start of a line while buffering a table
     int table_len;         // bytes used in table_buf
+    int table_rows;        // rows buffered so far (for the progress spinner)
+    unsigned spin;         // spinner frame counter
+    int spin_active;       // a spinner line is currently drawn (needs clearing)
     char table_buf[8192];  // raw table rows, accumulated until the table ends
     char pending[64]; // bytes held for cross-chunk lookahead (split ``` ### --- **)
     int pending_len;
@@ -403,8 +406,10 @@ static int md_is_separator_cell(const char *s) {
 }
 
 static void md_flush_table(void) {
+    if (g_md.spin_active) { printf("\r\033[K"); g_md.spin_active = 0; }  // erase spinner line
     g_md.in_table = 0;
     g_md.table_line_start = 0;
+    g_md.table_rows = 0;
     int len = g_md.table_len;
     g_md.table_len = 0;
     if (len <= 0) return;
@@ -575,7 +580,7 @@ static void md_print(const char *text_in) {
                 g_md.line_start = 1;
             } else {
                 md_tbl_append(c);
-                if (c == '\n') g_md.table_line_start = 1;
+                if (c == '\n') { g_md.table_line_start = 1; g_md.table_rows++; }
                 continue;
             }
         }
@@ -801,6 +806,16 @@ static void md_print(const char *text_in) {
         }
     }
     free(combined);
+
+    // A table is buffered silently until it ends, so show a progress spinner
+    // (interactive terminals only) so the UI doesn't look hung on a big table.
+    if (g_md.in_table && isatty(STDOUT_FILENO)) {
+        static const char *frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+        printf("\r\033[2m%s assembling table… (%d rows)\033[0m\033[K",
+               frames[g_md.spin++ % 10], g_md.table_rows);
+        fflush(stdout);
+        g_md.spin_active = 1;
+    }
 }
 
 static int json_int_field(const char *json, const char *field, int fallback) {
