@@ -7,6 +7,7 @@ artifacts each variant needs, with the step that produces each artifact.
 Adding a model means writing one of these files; code is only needed for
 architecturally novel models (hooks).
 """
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field

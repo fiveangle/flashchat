@@ -11,6 +11,7 @@ Updates edit a key's line in place when present and append otherwise —
 never reorder, never rewrite untouched lines (preserves user comments and
 the append-only migration contract).
 """
+from __future__ import annotations
 
 import os
 import re

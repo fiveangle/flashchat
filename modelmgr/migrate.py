@@ -12,6 +12,7 @@ After migration nothing reads the old layout — there is no dual-layout
 support. The pass covers the HF cache and the offload dir in one run and
 is idempotent per snapshot.
 """
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field

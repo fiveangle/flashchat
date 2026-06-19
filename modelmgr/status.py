@@ -3,6 +3,7 @@
 Single source for the status views in `flashchat models`, the config
 wizard, the manage TUI, and the launch-time `ensure` checks.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 

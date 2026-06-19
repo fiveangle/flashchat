@@ -12,6 +12,7 @@ Verification levels:
   and small JSON reads; safe to run on every status render)
 - deep: full sha256 re-hash against the manifest
 """
+from __future__ import annotations
 
 import hashlib
 import json

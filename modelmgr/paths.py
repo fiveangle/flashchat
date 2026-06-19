@@ -1,4 +1,5 @@
 """Filesystem locations: repo root, user config dir, HF cache, snapshots."""
+from __future__ import annotations
 
 import json
 import os

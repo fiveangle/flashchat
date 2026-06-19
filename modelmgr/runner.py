@@ -1,4 +1,5 @@
 """Recipe execution: run a planned step list with progress and estimates."""
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass

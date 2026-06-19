@@ -3,6 +3,7 @@
 Plain stdin/stdout (works under the existing piped-input test harness),
 ANSI color gated on COLOR_OUTPUT + isatty.
 """
+from __future__ import annotations
 
 import sys
 

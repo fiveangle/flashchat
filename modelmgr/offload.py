@@ -18,6 +18,7 @@ Design rules learned from the failures of the old `mv`-based implementation:
   symlink support the *local* restore side still gets real links because
   restores always target the local APFS cache.
 """
+from __future__ import annotations
 
 import json
 import os

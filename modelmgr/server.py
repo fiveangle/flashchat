@@ -4,6 +4,7 @@ Destructive/manage operations must refuse to touch a model the running
 server is serving. Mirrors the bash guards: pid file liveness plus a
 port-listening fallback.
 """
+from __future__ import annotations
 
 import os
 import socket

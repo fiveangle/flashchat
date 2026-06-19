@@ -7,6 +7,7 @@ Order matters:
 4. consolidated offload offer (quiet when the volume is unreachable)
 5. resolved registry view refresh (the engine reads it)
 """
+from __future__ import annotations
 
 import os
 

@@ -4,6 +4,7 @@ Replaces the old add_model_to_registry which mutated the shipped registry
 JSON. The shipped files stay read-only; user-added models live in
 ~/.config/flashchat/models.d/ and shadow shipped ids.
 """
+from __future__ import annotations
 
 import json
 import os

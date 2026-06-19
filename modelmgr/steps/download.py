@@ -4,6 +4,7 @@ Uses huggingface_hub (resumable, hash-verified, populates the standard
 hub cache layout) with the `hf` CLI as fallback. Replaces the old
 throwaway-venv download hack in the bash launcher.
 """
+from __future__ import annotations
 
 import os
 import shutil

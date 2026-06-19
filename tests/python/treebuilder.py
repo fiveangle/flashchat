@@ -6,6 +6,7 @@ architecture, packed layout.json carries the real computed expert sizes,
 and integrity manifests are written through the same hash-on-write path
 production uses.
 """
+from __future__ import annotations
 
 import json
 import os

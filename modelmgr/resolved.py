@@ -11,6 +11,7 @@ needs zero changes. Constraints imposed by the C strstr-based parser:
 - per-entry keys are scoped to the entry object, names must match the
   legacy schema exactly.
 """
+from __future__ import annotations
 
 import json
 

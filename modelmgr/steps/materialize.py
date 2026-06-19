@@ -8,6 +8,7 @@ SMB servers) fall back to real copies with a warning — the only case
 where dedup costs disk space, and only when running directly from such a
 volume.
 """
+from __future__ import annotations
 
 import os
 import shutil

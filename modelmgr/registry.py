@@ -6,6 +6,7 @@ state (which models are enabled, the default model, migration progress)
 lives in ~/.config/flashchat/models.state.json — never in the shipped
 files.
 """
+from __future__ import annotations
 
 import glob
 import os

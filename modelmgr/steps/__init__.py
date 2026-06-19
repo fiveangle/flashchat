@@ -10,6 +10,7 @@ recipe *planning* must work with stdlib only.
 Bump a step's version to invalidate previously-built outputs after a step
 bugfix: recipes re-plan any artifact whose recorded step_version differs.
 """
+from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
