@@ -5,6 +5,7 @@
   "hf_repo": "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
   "source_format": "mlx_quantized",
   "default_variant": "q4",
+  "thinking_capable": true,
   "architecture": {
     "hidden_size": 2048,
     "num_hidden_layers": 40,

@@ -5,6 +5,7 @@
   "hf_repo": "Qwen/Qwen3.6-35B-A3B",
   "source_format": "native_bf16",
   "default_variant": "q4",
+  "thinking_capable": true,
   "architecture": {
     "hidden_size": 2048,
     "num_hidden_layers": 40,

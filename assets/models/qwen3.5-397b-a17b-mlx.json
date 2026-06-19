@@ -5,6 +5,7 @@
   "hf_repo": "mlx-community/Qwen3.5-397B-A17B-4bit",
   "source_format": "mlx_quantized",
   "default_variant": "q4",
+  "thinking_capable": true,
   "architecture": {
     "hidden_size": 4096,
     "num_hidden_layers": 60,

@@ -10,6 +10,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, REPO_ROOT)
 
 from modelmgr import paths
+from modelmgr.artifacts import template_supports_thinking
 from modelmgr.manifest import ManifestError, parse_manifest
 
 
@@ -57,6 +58,23 @@ class TestShippedManifests(unittest.TestCase):
             m = parse_manifest(data, source_path=path)
             if m.mtp_artifacts_required:
                 self.assertEqual(m.source_format, "native_bf16", path)
+
+    def test_thinking_capability_is_explicit(self):
+        for path, data in load_shipped().items():
+            self.assertIn("thinking_capable", data, path)
+
+    def test_thinking_capability_matches_available_tokenizer_templates(self):
+        for path, data in load_shipped().items():
+            m = parse_manifest(data, source_path=path)
+            snapshot = paths.snapshot_dir(paths.DEFAULT_HF_CACHE, m.hf_repo)
+            template_capability = template_supports_thinking(snapshot)
+            if template_capability is None:
+                continue
+            self.assertEqual(
+                m.thinking_capable,
+                template_capability,
+                f"{path}: thinking_capable disagrees with tokenizer_config.json",
+            )
 
 
 class TestManifestValidation(unittest.TestCase):
