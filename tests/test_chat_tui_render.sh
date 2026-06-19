@@ -43,7 +43,7 @@ with socket.socket() as server:
     with open(port_file, "w") as f:
         f.write(str(server.getsockname()[1]))
 
-    for request_index, request_path in enumerate([body_file, body_file + ".show"]):
+    for request_index, request_path in enumerate([body_file, body_file + ".show", body_file + ".plain"]):
         conn, _ = server.accept()
         conn.close()
 
@@ -58,7 +58,8 @@ with socket.socket() as server:
                 b"Connection: close\r\n"
                 b"\r\n"
             )
-            for chunk in chunks:
+            response_chunks = chunks if request_index < 2 else [chunk for chunk in chunks if not isinstance(chunk, tuple)]
+            for chunk in response_chunks:
                 if isinstance(chunk, tuple):
                     key, text = chunk
                 else:
@@ -67,9 +68,8 @@ with socket.socket() as server:
                 line = "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n\n"
                 conn.sendall(line.encode("utf-8"))
                 time.sleep(0.01)
-            usage = {
-                "choices": [{"delta": {}, "finish_reason": "stop"}],
-                "usage": {
+            if request_index < 2:
+                usage_stats = {
                     "completion_tokens": 2559,
                     "thinking_tokens": 1249,
                     "response_tokens": 1120,
@@ -79,7 +79,22 @@ with socket.socket() as server:
                     "response_ms": 70000,
                     "experts_mib_per_sec": 432.1,
                     "experts_mib_per_sec_per_expert": 54.0,
-                },
+                }
+            else:
+                usage_stats = {
+                    "completion_tokens": 1126,
+                    "thinking_tokens": 0,
+                    "response_tokens": 1126,
+                    "ttft_ms": 2000,
+                    "generation_ms": 93058,
+                    "thinking_ms": 0,
+                    "response_ms": 93058,
+                    "experts_mib_per_sec": 199.2,
+                    "experts_mib_per_sec_per_expert": 19.9,
+                }
+            usage = {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": usage_stats,
             }
             line = "data: " + json.dumps(usage, separators=(",", ":")) + "\n\n"
             conn.sendall(line.encode("utf-8"))
@@ -140,6 +155,28 @@ fi
 if ! grep -q '"reasoning":true' "${body_file}.show"; then
     echo "FAIL: show-thinking chat request did not preserve configured reasoning mode" >&2
     cat "${body_file}.show" >&2
+    exit 1
+fi
+
+raw_plain_output="$(
+    printf 'hello without thinking\n/quit\n' |
+        HOME="${TMPDIR}/home-plain" FLASHCHAT_MODEL=Mock FLASHCHAT_REASONING=0 FLASHCHAT_SHOW_THINKING=0 \
+            "$CHAT" --host 127.0.0.1 --port "$port" --max-tokens 200 2>&1
+)"
+clean_plain_output="$(printf '%s\n' "$raw_plain_output" | perl -pe 's/\e\[[0-9;]*[A-Za-z]//g')"
+if [[ "$clean_plain_output" != *'1126 tokens, 12.1 tok/s, TTFT 2.0s, experts 199.2 MiB/s, 19.9 MiB/s/expert'* ]]; then
+    echo "FAIL: non-thinking chat footer did not render aggregate timing" >&2
+    printf '%s\n' "$clean_plain_output" >&2
+    exit 1
+fi
+if [[ "$clean_plain_output" == *'1126@12.1tok/s response'* ]]; then
+    echo "FAIL: non-thinking chat footer rendered redundant response breakdown" >&2
+    printf '%s\n' "$clean_plain_output" >&2
+    exit 1
+fi
+if ! grep -q '"reasoning":false' "${body_file}.plain"; then
+    echo "FAIL: non-thinking chat request did not preserve disabled reasoning mode" >&2
+    cat "${body_file}.plain" >&2
     exit 1
 fi
 

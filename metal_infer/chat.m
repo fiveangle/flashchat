@@ -946,7 +946,7 @@ static char *stream_response(int sock, int show_thinking) {
                              usage_think_ms > 0 ? usage_think_tokens * 1000.0 / usage_think_ms : 0.0);
             w += n; rem = (n > 0 && (size_t)n < rem) ? rem - (size_t)n : 0;
         }
-        if (usage_response_tokens > 0 && rem > 0) {
+        if (usage_think_tokens > 0 && usage_response_tokens > 0 && rem > 0) {
             snprintf(w, rem, "%s%d@%.1ftok/s response",
                      detail[0] ? ", " : "",
                      usage_response_tokens,
