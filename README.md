@@ -2,7 +2,7 @@
 
 ## History
 
-Back when Apple began its quest to free itself from reliance on CPU makers Motorola (68k), IBM (PowerPC), and Intel (x86) for the beating heart of its microcomputer offerings, it bet hard on the fledgling ARM ecosystem and its flexible licensing model — and the bet paid off. Beyond the obvious gains in raw compute and efficiency, the move quietly opened the door for Apple to enter the then-anemic handset market. With that came the freedom to pull functions historically off-loaded to 3rd-party vendors back in-house, including the dedicated SSD processors it had been buying from the likes of Samsung and Toshiba — now folded onto the die alongside the rest of the "A" series, and later the "M" series processors. A huge undertaking, but Apple was no stranger to ripping out the heart of its computers and replacing it: it had already done so 3 times in the previous 2 decades.
+Back when Apple began its quest to free itself from reliance on CPU makers Motorola (68k), IBM (PowerPC), and Intel (x86) for the beating heart of its microcomputer offerings, it bet hard on the fledgling ARM ecosystem and its flexible licensing model — and the bet paid off. Beyond the obvious gains in raw compute and efficiency, the move quietly opened the door for Apple to enter the then-anemic truly smart handset market. With that came the freedom to pull functions historically off-loaded to 3rd-party vendors back in-house, including the dedicated SSD processors it had been buying from the likes of Samsung and Toshiba — now folded onto the die alongside the rest of the "A" series, and later the "M" series processors. A huge undertaking, but Apple was no stranger to ripping out the heart of its computers and replacing it: it had already done so 3 times in the previous 2 decades.
 
 A major benefit of this consolidation was bringing ancillary subsystems under hardware control Apple now owned end-to-end. Driven primarily by cost reduction, pulling NAND die managment directly onto the main CPU was one of those moves. It came at the price of modular storage upgrades, but offered something else besides not paying a 3rd party for their SSD management processor: S P E E D
 
@@ -36,7 +36,7 @@ cd flashchat
 …and follow the prompts to set up and run.
 
 ## Features
-I've extended the original project from a reasearch project to usable system including:
+I've extended the original project from a research project to usable system including:
 * TUI driven setup wizard
 * Menu-driven configuration system
 * OpenAI-compatible v1 API endpoints with true tool calling support:
@@ -52,14 +52,14 @@ I've extended the original project from a reasearch project to usable system inc
 
 ## Model Support
 
-* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) q4, q8 - 52GB (default)
-* [Qwen/Qwen3.5-80B-A3B](https://huggingface.co/Qwen/Qwen3.5-80B-A3B) q4, q8 - 92GB
-* [mlx-community/Qwen3.5-397B-A17B-4bit](https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit) q4 - 417GB
+* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) q4, q8 - 52GB (default - 17 tok/s)
+* [Qwen/Qwen3.5-80B-A3B](https://huggingface.co/Qwen/Qwen3.5-80B-A3B) q4, q8 - 92GB (12 tok/s)
+* [Qwen/Qwen3-Coder-Next (80B-A3B)](https://huggingface.co/Qwen/Qwen3-Coder-Next) q4, q8 - 92GB (12 tok/s)
+* [mlx-community/Qwen3.5-397B-A17B-4bit](https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit) q4 - 417GB (3.5 tok/s)
 
 ## Requirements
-* Apple Silicon computer with at least 24GB of RAM (for Qwen 397B MoE model with 4 active experts, 8=default) or 12GB of RAM (Qwen 35B MoE model, 8 active experts)
-* Enough free space on the internal Apple Fabric SSD built into your Mac to hold the entire original model + experts extractions for the model you wish to use
-* Xcode Command Line Tools
+* Apple Silicon computer with at least 24GB of RAM for Qwen 397B MoE model with 4 active experts (32GB for the default 8 experts), 16GB of RAM for the 80B-A3B models (10 active experts), and 12GB of RAM for the Qwen 35B MoE model, 8 active experts)
+* Enough free space on the internal Apple Fabric SSD built into your Mac to hold the entire original model + experts extractions for the model you wish to use (you can offload the original weights after extraction).
 
 ## Dan Woods' Original FLASH-MoE Project Info
 
