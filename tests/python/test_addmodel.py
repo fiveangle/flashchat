@@ -10,6 +10,7 @@ sys.path.insert(0, REPO_ROOT)
 from modelmgr.addmodel import derive_manifest
 from modelmgr.manifest import parse_manifest
 from modelmgr.registry import Registry
+from modelmgr.resolved import flat_entry
 
 
 class TestAddModelDerivation(unittest.TestCase):
@@ -37,7 +38,8 @@ class TestAddModelDerivation(unittest.TestCase):
             "rope_theta": 5000000,
         }
 
-        manifest = derive_manifest("Qwen/Qwen3-Coder-Next", hf_config, Registry.load())
+        manifest = derive_manifest("Qwen/Qwen3-Coder-Next", hf_config, Registry.load(),
+                                   thinking_capable=False)
         parsed = parse_manifest(manifest, user_defined=True)
 
         self.assertEqual(parsed.id, "qwen-qwen3-coder-next")
@@ -48,6 +50,21 @@ class TestAddModelDerivation(unittest.TestCase):
         self.assertEqual(set(parsed.variants), {"q4", "q8"})
         self.assertIn("packed_experts/", parsed.variants["q4"].artifacts)
         self.assertEqual(parsed.special_tokens["eos_1"], 151645)
+        self.assertFalse(parsed.thinking_capable)
+        self.assertFalse(flat_entry(parsed, "q4")["thinking_capable"])
+
+    def test_manifest_derivation_defaults_to_thinking_capable_when_unknown(self):
+        hf_config = {
+            "model_type": "qwen3_next",
+            "vocab_size": 151936,
+            "num_experts": 512,
+        }
+
+        manifest = derive_manifest("Qwen/Qwen3-Next-Unknown", hf_config, Registry.load())
+        parsed = parse_manifest(manifest, user_defined=True)
+
+        self.assertTrue(parsed.thinking_capable)
+        self.assertNotIn("thinking_capable", flat_entry(parsed, "q4"))
 
 
 if __name__ == "__main__":

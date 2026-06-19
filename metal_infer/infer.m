@@ -8472,7 +8472,7 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
         // distribution and produces malformed XML — verified empirically.
     } else {
         [final appendString:user_sys_norm];
-        [final appendString:@"\n\nNo tools are available. Respond directly to the user without tool-call markup."];
+        [final appendString:@"\n\nNo tools are available. Respond directly to the user without role labels or tool-call markup."];
     }
     if (info) info->final_system_chars = strlen([final UTF8String] ?: "");
     return dup_nsstring(final);

@@ -168,6 +168,7 @@ PY
 
 "$INFER" --model-id Qwen-Qwen36-35B-A3B --render-request "$NO_TOOLS_JSON" --render-output "$NO_TOOLS_DIR" >/dev/null 2>&1
 assert_contains "no-tools chat prompt explicitly disables tool-call markup" "No tools are available" "${NO_TOOLS_DIR}/system_prompt.txt"
+assert_contains "no-tools chat prompt disables role-label prefaces" "without role labels" "${NO_TOOLS_DIR}/system_prompt.txt"
 
 # The native 35B-A3B entry appears before later non-thinking Instruct entries.
 # The C registry parser must not let a later `"thinking_capable": false` leak

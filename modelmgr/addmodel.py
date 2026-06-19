@@ -40,7 +40,8 @@ class AddModelError(RuntimeError):
 
 
 def derive_manifest(hf_repo: str, hf_config: dict, registry: Registry,
-                    variants: list | None = None) -> dict:
+                    variants: list | None = None,
+                    thinking_capable: bool | None = None) -> dict:
     """Build a manifest dict from a HuggingFace config.json."""
     model_type = hf_config.get("model_type", "")
     if model_type not in SUPPORTED_MODEL_TYPES:
@@ -131,6 +132,7 @@ def derive_manifest(hf_repo: str, hf_config: dict, registry: Registry,
         "special_tokens": dict(template.special_tokens),
         "default_sampling_profile": template.default_sampling_profile,
         "sampling_profiles": json.loads(json.dumps(template.sampling_profiles)),
+        "thinking_capable": bool(thinking_capable) if thinking_capable is not None else True,
         "shared_artifacts": shared,
         "variants": {},
     }

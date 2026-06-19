@@ -160,15 +160,22 @@ def cmd_add_model(args) -> int:
     import json
 
     from .addmodel import AddModelError, derive_manifest, save_user_manifest
+    from .artifacts import template_supports_thinking
     from .steps.download import DownloadError, download_file
 
     registry = Registry.load()
     try:
         config_path = download_file(args.repo, "config.json", hf_cache_dir())
+        try:
+            download_file(args.repo, "tokenizer_config.json", hf_cache_dir())
+        except DownloadError:
+            pass
         with open(config_path) as f:
             hf_config = json.load(f)
+        thinking_capable = template_supports_thinking(paths.snapshot_dir(hf_cache_dir(), args.repo))
         manifest_dict = derive_manifest(args.repo, hf_config, registry,
-                                        variants=args.variants.split(",") if args.variants else None)
+                                        variants=args.variants.split(",") if args.variants else None,
+                                        thinking_capable=thinking_capable)
         path = save_user_manifest(manifest_dict)
     except (AddModelError, DownloadError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

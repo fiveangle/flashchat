@@ -180,6 +180,10 @@ def _add_model(registry: Registry) -> bool:
     print("Fetching config.json from HuggingFace...")
     try:
         config_path = download_file(repo, "config.json", hf_cache_dir())
+        try:
+            download_file(repo, "tokenizer_config.json", hf_cache_dir())
+        except DownloadError:
+            pass
     except DownloadError as e:
         print(common.red(f"download failed: {e}"))
         return False
@@ -187,7 +191,9 @@ def _add_model(registry: Registry) -> bool:
     with open(config_path) as f:
         hf_config = json.load(f)
     try:
-        manifest_dict = derive_manifest(repo, hf_config, registry)
+        thinking_capable = template_supports_thinking(paths.snapshot_dir(hf_cache_dir(), repo))
+        manifest_dict = derive_manifest(repo, hf_config, registry,
+                                        thinking_capable=thinking_capable)
         path = save_user_manifest(manifest_dict)
     except AddModelError as e:
         print(common.red(str(e)))
