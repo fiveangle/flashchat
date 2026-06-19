@@ -130,7 +130,7 @@ resolve_model() {
         done
     fi
     [[ -f "${WD}/model_weights.bin" ]] || return 1
-    # Experts dir (MoE only). The engine uses FLASHCHAT_EXPERTS_DIR *directly* as the dir
+    # Experts dir. The engine uses FLASHCHAT_EXPERTS_DIR *directly* as the dir
     # holding layer_XX.bin (it does NOT append packed_experts) — so it must point AT
     # packed_experts, not its parent. Earlier this set ED to the parent, so layer files were
     # never found, experts didn't load, and generation was garbage (which is what made MoE

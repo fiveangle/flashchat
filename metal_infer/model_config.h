@@ -11,7 +11,7 @@
 // Compile-time maximums
 // ============================================================================
 
-#define MAX_HIDDEN_DIM              6144   // Qwen3.6-27B dense: hidden 5120 (q_dim 6144); was 4096
+#define MAX_HIDDEN_DIM              4096   // upper bound for hidden_dim across supported models
 #define MAX_NUM_LAYERS              64
 #define MAX_NUM_EXPERTS             512
 #define MAX_NUM_ATTN_HEADS          64
@@ -49,7 +49,6 @@ typedef struct {
     int num_experts_per_tok;
     int moe_intermediate;
     int shared_intermediate;
-    int dense_intermediate;   // dense FFN intermediate size (num_experts==0 => dense model)
     int full_attn_interval;
     int num_full_attn_layers;
     int num_linear_layers;
@@ -321,7 +320,6 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_INT(mtp_default_predictions, "mtp_default_predictions");
     CFG_INT(moe_intermediate, "moe_intermediate_size");
     CFG_INT(shared_intermediate, "shared_expert_intermediate_size");
-    CFG_INT(dense_intermediate, "intermediate_size");
     CFG_INT(full_attn_interval, "full_attention_interval");
 
     p = json_find_key_until(model_object, model_end, "quantization");

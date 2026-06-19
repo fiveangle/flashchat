@@ -102,19 +102,18 @@ class TestVariantVerification(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")        # native MoE, q4+q8, MTP
-        self.dense = registry.get("qwen3.6-27b")          # dense, no expert dirs
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_complete_tree_verifies(self):
-        for manifest in (self.moe, self.dense):
-            snapshot = make_snapshot(self.tmp.name, manifest)
-            for vname in manifest.variants:
-                self.assertTrue(
-                    variant_ready(manifest, vname, snapshot),
-                    f"{manifest.id}:{vname} should verify",
-                )
+        manifest = self.moe
+        snapshot = make_snapshot(self.tmp.name, manifest)
+        for vname in manifest.variants:
+            self.assertTrue(
+                variant_ready(manifest, vname, snapshot),
+                f"{manifest.id}:{vname} should verify",
+            )
 
     def test_symlinked_shared_artifact_passes(self):
         snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])
@@ -152,14 +151,14 @@ class TestVariantVerification(unittest.TestCase):
     def test_missing_mtp_tensors_detected_for_native(self):
         import json
 
-        snapshot = make_snapshot(self.tmp.name, self.dense, variants=["q4"])
+        snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])
         weights_json = os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.json")
         with open(weights_json) as f:
             data = json.load(f)
         data["tensors"] = {"embed_tokens.weight": {"offset": 0, "size": 16}}
         with open(weights_json, "w") as f:
             json.dump(data, f)
-        states = {s.relpath: s for s in variant_status(self.dense, "q4", snapshot)}
+        states = {s.relpath: s for s in variant_status(self.moe, "q4", snapshot)}
         self.assertEqual(states["model_weights.bin"].state, "incomplete")
         self.assertIn("MTP", states["model_weights.bin"].detail)
         self.assertFalse(states["model_weights.bin"].satisfied)

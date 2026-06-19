@@ -243,7 +243,6 @@ def build_manifest_config(entry, native_config=None):
         "num_experts_per_tok": entry["num_experts_per_tok"],
         "moe_intermediate_size": entry["moe_intermediate_size"],
         "shared_expert_intermediate_size": entry["shared_expert_intermediate_size"],
-        "intermediate_size": entry.get("intermediate_size", 0),  # dense FFN (num_experts==0 => dense)
         "full_attention_interval": entry["full_attention_interval"],
         "linear_num_value_heads": entry["linear_num_value_heads"],
         "linear_num_key_heads": entry["linear_num_key_heads"],

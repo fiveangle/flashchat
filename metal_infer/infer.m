@@ -434,12 +434,9 @@ typedef struct {
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
-// Dense MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
+// MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
-static double g_prof_dense_chunk_attn = 0, g_prof_dense_chunk_mlp = 0;
-static int g_prof_dense_chunk_layers = 0;
 // Per-layer production reference (token a) for MTP_VF2_DBG divergence probe.
-static float *g_vf2_ref[64] = {0}; static int g_vf2_ref_on = 0;
 // matmulN kernel select. 0 = v3 (one row/simdgroup), 1 = tiled-X v4, 2 = v5 (multi-row
 // per simdgroup for load-latency hiding). v4 staged X in threadgroup memory but measured
 // SLOWER (L2 already absorbs the X re-reads); kept as a documented negative. v5 gives each
@@ -452,77 +449,37 @@ static inline int matmuln_mode(void) {
                          getenv("FLASHCHAT_MATMULN_V3") ? 0 : 2; // default v5
     return g_matmuln_mode;
 }
-// Dense batched (chunked) prefill toggle. Default on; FLASHCHAT_NO_BATCHED_PREFILL=1 to A/B.
-static int g_batched_prefill = -1;
-static inline int batched_prefill_enabled(void) {
-    if (g_batched_prefill < 0) g_batched_prefill = getenv("FLASHCHAT_NO_BATCHED_PREFILL") ? 0 : 1;
-    return g_batched_prefill;
-}
 static int g_delta_dispatch_batch = -1;
 static inline int delta_dispatch_batch_enabled(void) {
     if (g_delta_dispatch_batch < 0) g_delta_dispatch_batch = getenv("FLASHCHAT_NO_DELTA_DISPATCH_BATCH") ? 0 : 1;
     return g_delta_dispatch_batch;
 }
-// GPU full-attention for DENSE (default OFF; FLASHCHAT_DENSE_GPU_ATTN=1 to enable).
-// DOCUMENTED NEGATIVE for prefill: dense prefill is bound by the COUNT of synchronous
-// per-token GPU commit+waits (delta-net across the linear layers + attention), not by
-// attention compute. Swapping CPU->GPU attention doesn't cut that count (it adds round-
-// trips), so a 2111-token prefill stayed >250s either way. Kept gated for the decode path
-// / future commit+wait-batched prefill. The real lever is batching the per-token
-// delta-net + attention dispatches into one command buffer per chunk.
-static int g_dense_gpu_attn = -1;
-static inline int dense_gpu_attn_enabled(void) {
-    if (g_dense_gpu_attn < 0) g_dense_gpu_attn = getenv("FLASHCHAT_DENSE_GPU_ATTN") ? 1 : 0;
-    return g_dense_gpu_attn;
-}
-static int g_dense_gpu_swiglu = -1;
-static inline int dense_gpu_swiglu_enabled(void) {
-    if (g_dense_gpu_swiglu < 0) {
-        const char *v = getenv("FLASHCHAT_DENSE_GPU_SWIGLU");
-        g_dense_gpu_swiglu = server_flag_enabled(v) ? 1 : 0;
-    }
-    return g_dense_gpu_swiglu;
-}
-static int g_dense_fused_mlp = -1;
-static inline int dense_fused_mlp_enabled(void) {
-    if (g_dense_fused_mlp < 0) {
-        const char *v = getenv("FLASHCHAT_DENSE_FUSED_MLP");
-        g_dense_fused_mlp = server_flag_enabled(v) ? 1 : 0;
-    }
-    return g_dense_fused_mlp;
+// GPU full-attention in the batched MTP verify path (default OFF; FLASHCHAT_VERIFY_GPU_ATTN=1).
+// When off, the full-attention layers of the batched verify run on CPU.
+static int g_verify_gpu_attn = -1;
+static inline int verify_gpu_attn_enabled(void) {
+    if (g_verify_gpu_attn < 0) g_verify_gpu_attn = getenv("FLASHCHAT_VERIFY_GPU_ATTN") ? 1 : 0;
+    return g_verify_gpu_attn;
 }
 
 // Architecture-aware performance defaults. Derives the fastest CORRECT runtime config from
-// the loaded model's architecture (dense vs MoE) so each model auto-gets its best settings
+// the loaded model so each model auto-gets its best settings
 // without hand-tuning env vars. Explicit env vars still override. Call once after the model
 // config is loaded (g_cfg populated). Resolves the toggle globals up-front so the per-call
 // helpers return these values instead of their generic env defaults.
 static void configure_arch_perf(void) {
-    int dense = (g_cfg.num_experts == 0);
-    // Batched chunked prefill: faithful only for dense (the chunked MoE forward diverges).
-    g_batched_prefill = getenv("FLASHCHAT_NO_BATCHED_PREFILL") ? 0 : (dense ? 1 : 0);
-    // Delta-net dispatch batching: both architectures have linear-attn layers -> always on.
+    // Delta-net dispatch batching: linear-attn layers -> always on.
     g_delta_dispatch_batch = getenv("FLASHCHAT_NO_DELTA_DISPATCH_BATCH") ? 0 : 1;
-    // GPU full-attention: MoE already runs GPU attention via the fused CMD2 path; for dense
-    // it's the standalone gpu_full_attention[_batch] path -> AUTO-ON for dense. It never
-    // degrades (faster at long context, equal at short) and stays coherent. Dense attention is
-    // unified on GPU across baseline (fused_layer_forward), depth-2 verify (attn_block_2) and
-    // depth-N verify (dense_layer_forward_N) — all use the same kernels at every position — so
-    // the MTP verify bit-matches the baseline (lossless) AND the verify also runs on GPU.
-    if (getenv("FLASHCHAT_NO_DENSE_GPU_ATTN"))    g_dense_gpu_attn = 0;
-    else if (getenv("FLASHCHAT_DENSE_GPU_ATTN"))  g_dense_gpu_attn = 1;
-    else                                          g_dense_gpu_attn = dense ? 1 : 0;
-    g_dense_gpu_swiglu = (dense && server_flag_enabled(getenv("FLASHCHAT_DENSE_GPU_SWIGLU"))) ? 1 : 0;
-    g_dense_fused_mlp = (dense && server_flag_enabled(getenv("FLASHCHAT_DENSE_FUSED_MLP"))) ? 1 : 0;
+    // GPU full-attention in the batched MTP verify path (default off).
+    if (getenv("FLASHCHAT_NO_VERIFY_GPU_ATTN"))    g_verify_gpu_attn = 0;
+    else if (getenv("FLASHCHAT_VERIFY_GPU_ATTN"))  g_verify_gpu_attn = 1;
+    else                                          g_verify_gpu_attn = 0;
     (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
     fprintf(stderr,
-        "[perf] arch=%s experts=%d | batched_prefill=%d delta_batch=%d dense_gpu_attn=%d dense_gpu_swiglu=%d dense_fused_mlp=%d matmulN=v%d | "
-        "mtp=%s\n",
-        dense ? "dense" : "moe", g_cfg.num_experts,
-        g_batched_prefill, g_delta_dispatch_batch, g_dense_gpu_attn,
-        dense_gpu_swiglu_enabled(), dense_fused_mlp_enabled(),
-        matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
-        dense ? "faithful (dense)" : "shadow-only (MoE speculative is not faithful)");
+        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d | "
+        "mtp=lossless draft/verify when MTP artifacts present\n",
+        g_cfg.num_experts, g_delta_dispatch_batch, g_verify_gpu_attn,
+        matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3));
 }
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
@@ -890,12 +847,7 @@ typedef struct {
     uint32_t *su_w;   uint16_t *su_s, *su_b;
     uint32_t *sd_w;   uint16_t *sd_s, *sd_b;
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b;
-    // Dense head feed-forward: plain gate/up/down swiglu (no router, no experts).
-    uint32_t *dgate_w; uint16_t *dgate_s, *dgate_b;
-    uint32_t *dup_w;   uint16_t *dup_s, *dup_b;
-    uint32_t *ddown_w; uint16_t *ddown_s, *ddown_b;
     uint16_t *norm_w;
-    int is_dense;   // resolved once at load: 1 = dense MLP head, 0 = MoE head
     int bf16_mode;  // 1 = MTP weights kept in native BF16 (no quantization)
     int ready;
 } MTPWeightCache;
@@ -1082,46 +1034,12 @@ static void build_mtp_cache(WeightFile *wf, WeightFile *bf16_wf) {
     g_mtp_cache.seg_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.weight");
     g_mtp_cache.seg_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.scales");
     g_mtp_cache.seg_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
-    // Dense MLP head tensors (mutually exclusive with the MoE set above).
-    g_mtp_cache.dgate_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.weight");
-    g_mtp_cache.dgate_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.scales");
-    g_mtp_cache.dgate_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.gate_proj.biases");
-    g_mtp_cache.dup_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.weight");
-    g_mtp_cache.dup_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.scales");
-    g_mtp_cache.dup_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.up_proj.biases");
-    g_mtp_cache.ddown_w = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.weight");
-    g_mtp_cache.ddown_s = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.scales");
-    g_mtp_cache.ddown_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.down_proj.biases");
     g_mtp_cache.norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.norm.weight");
 
     // Detect BF16 mode: if the MTP fc.weight exists but its companion scales/biases
     // do not, the extraction script kept MTP weights in native BF16.
     g_mtp_cache.bf16_mode = (g_mtp_cache.fc_w != NULL &&
                               (g_mtp_cache.fc_s == NULL || g_mtp_cache.fc_b == NULL));
-
-    // Head type is fixed for the life of the process: resolve it once here so the
-    // per-draft hot path only reads g_mtp_cache.is_dense (never re-derives it).
-    int moe_ff_present, dense_ff_present;
-    if (g_mtp_cache.bf16_mode) {
-        moe_ff_present =
-            g_mtp_cache.gate_w &&
-            g_mtp_cache.sg_w && g_mtp_cache.su_w && g_mtp_cache.sd_w &&
-            g_mtp_cache.seg_w;
-        dense_ff_present =
-            g_mtp_cache.dgate_w && g_mtp_cache.dup_w && g_mtp_cache.ddown_w;
-    } else {
-        moe_ff_present =
-            g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
-            g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
-            g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
-            g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
-            g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b;
-        dense_ff_present =
-            g_mtp_cache.dgate_w && g_mtp_cache.dgate_s && g_mtp_cache.dgate_b &&
-            g_mtp_cache.dup_w && g_mtp_cache.dup_s && g_mtp_cache.dup_b &&
-            g_mtp_cache.ddown_w && g_mtp_cache.ddown_s && g_mtp_cache.ddown_b;
-    }
-    g_mtp_cache.is_dense = (!moe_ff_present && dense_ff_present);
 
     int common_ready;
     if (g_mtp_cache.bf16_mode) {
@@ -1161,7 +1079,21 @@ static void build_mtp_cache(WeightFile *wf, WeightFile *bf16_wf) {
         manifest_has_tensor(wf, "lm_head.weight") &&
         manifest_has_tensor(wf, "lm_head.scales") &&
         manifest_has_tensor(wf, "lm_head.biases");
-    g_mtp_cache.ready = common_ready && head_io_present && (moe_ff_present || dense_ff_present);
+    int moe_ff_present;
+    if (g_mtp_cache.bf16_mode) {
+        moe_ff_present =
+            g_mtp_cache.gate_w &&
+            g_mtp_cache.sg_w && g_mtp_cache.su_w && g_mtp_cache.sd_w &&
+            g_mtp_cache.seg_w;
+    } else {
+        moe_ff_present =
+            g_mtp_cache.gate_w && g_mtp_cache.gate_s && g_mtp_cache.gate_b &&
+            g_mtp_cache.sg_w && g_mtp_cache.sg_s && g_mtp_cache.sg_b &&
+            g_mtp_cache.su_w && g_mtp_cache.su_s && g_mtp_cache.su_b &&
+            g_mtp_cache.sd_w && g_mtp_cache.sd_s && g_mtp_cache.sd_b &&
+            g_mtp_cache.seg_w && g_mtp_cache.seg_s && g_mtp_cache.seg_b;
+    }
+    g_mtp_cache.ready = common_ready && head_io_present && moe_ff_present;
 
     if (g_mtp_cache.ready && !g_mtp_k_cache) {
         int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
@@ -1492,13 +1424,11 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     cpu_rms_norm(x, g_mtp_cache.post_attn_norm_w, h_post, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "post_attn_norm", h_post, g_cfg.hidden_dim);
 
-    // Feed-forward block — the only part of the drafter that differs between head
-    // types. Head type was resolved once at load (g_mtp_cache.is_dense); this is a
-    // single, perfectly-predicted branch around a multi-ms matvec block, not a
-    // per-element decision. Both branches leave the FFN contribution accumulated
-    // into x[], then fall through to the shared final norm below.
+    // Feed-forward block — MoE head: router + top-K experts + shared expert. Leaves
+    // the FFN contribution accumulated into x[], then falls through to the shared
+    // final norm below.
     int expert_index = -1;
-    if (!g_mtp_cache.is_dense) {
+    {
     mtp_matvec(g_mtp_cache.gate_w, g_mtp_cache.gate_s, g_mtp_cache.gate_b,
                h_post, gate_scores, g_cfg.num_experts, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
     mtp_matvec(g_mtp_cache.sg_w, g_mtp_cache.sg_s, g_mtp_cache.sg_b,
@@ -1639,29 +1569,6 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     for (int i = 0; i < g_cfg.hidden_dim; i++) {
         x[i] = x[i] + moe_out[i] + shared_out[i] * shared_weight;
     }
-    } else {
-        // Dense head: plain gate/up swiglu over dense_intermediate, then down_proj,
-        // added straight onto the residual (no router, no experts, no shared expert).
-        int inter = g_cfg.dense_intermediate;
-        float *dg = calloc(inter, sizeof(float));
-        float *du = calloc(inter, sizeof(float));
-        float *da = calloc(inter, sizeof(float));
-        float *dmlp_out = calloc(g_cfg.hidden_dim, sizeof(float));
-        if (!dg || !du || !da || !dmlp_out) {
-            free(dg); free(du); free(da); free(dmlp_out);
-            fprintf(stderr, "[mtp] forward failed: dense MLP allocation failure\n");
-            goto cleanup;
-        }
-        mtp_matvec(g_mtp_cache.dgate_w, g_mtp_cache.dgate_s, g_mtp_cache.dgate_b,
-                   h_post, dg, inter, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
-        mtp_matvec(g_mtp_cache.dup_w, g_mtp_cache.dup_s, g_mtp_cache.dup_b,
-                   h_post, du, inter, g_cfg.hidden_dim, g_cfg.group_size, g_mtp_cache.bf16_mode);
-        cpu_swiglu(dg, du, da, inter);
-        mtp_matvec(g_mtp_cache.ddown_w, g_mtp_cache.ddown_s, g_mtp_cache.ddown_b,
-                   da, dmlp_out, g_cfg.hidden_dim, inter, g_cfg.group_size, g_mtp_cache.bf16_mode);
-        mtp_trace_vector(trace_call, "dense_mlp_out", dmlp_out, g_cfg.hidden_dim);
-        for (int i = 0; i < g_cfg.hidden_dim; i++) x[i] = x[i] + dmlp_out[i];
-        free(dg); free(du); free(da); free(dmlp_out);
     }
     cpu_rms_norm(x, g_mtp_cache.norm_w, final_normed, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "final_residual", x, g_cfg.hidden_dim);
@@ -1679,7 +1586,6 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         // seed is the backbone's pre-final-norm hidden and each step re-applies
         // pre_fc_norm_hidden internally; handing back the post-norm vector would
         // double-normalize. final_normed exists only to feed lm_head just below.
-        // Matches the validated dense_mtp_draft convention.
         memcpy(out_hidden, x, g_cfg.hidden_dim * sizeof(float));
     }
     if (out_draft_token) {
@@ -2496,7 +2402,7 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;  // [g_cfg.num_attn_heads * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [g_cfg.num_attn_heads * g_cfg.head_dim floats] full attention output
     id<MTLBuffer> buf_attn_gate;    // [g_cfg.num_attn_heads * g_cfg.head_dim floats] sigmoid gate
-    // Batched full-attention (dense chunked prefill): N queries/gates/outputs per chunk.
+    // Batched full-attention (batched MTP verify): N queries/gates/outputs per chunk.
     id<MTLBuffer> buf_attn_q_batch;     // [MAX_DELTA_BATCH_SLOTS * q_dim]
     id<MTLBuffer> buf_attn_gate_batch;  // [MAX_DELTA_BATCH_SLOTS * q_dim]
     id<MTLBuffer> buf_attn_out_batch;   // [MAX_DELTA_BATCH_SLOTS * q_dim]
@@ -2569,7 +2475,7 @@ static void mtp_gpu_8bit_dispatch(const uint32_t *W, const uint16_t *scales, con
 static void gpu_mtp_attention(int seq_len, const float *q, const float *q_gate, float *out);
 
 static int mtp_try_gpu_attention(int ctx_len, const float *q, const float *q_gate, float *out) {
-    if (!dense_gpu_attn_enabled() || !g_metal || !g_metal->attn_scores_pipe ||
+    if (!verify_gpu_attn_enabled() || !g_metal || !g_metal->attn_scores_pipe ||
         !g_metal->buf_mtp_kv_k || !g_metal->buf_mtp_kv_v ||
         ctx_len > GPU_KV_SEQ) {
         return 0;
@@ -2694,9 +2600,6 @@ static MetalCtx *metal_setup(void) {
     if (max_in < (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim) * sizeof(float)) {
         max_in = (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim) * sizeof(float);  // o_proj input = 8192
     }
-    if (max_in < (size_t)g_cfg.dense_intermediate * sizeof(float)) {
-        max_in = (size_t)g_cfg.dense_intermediate * sizeof(float);  // dense down_proj input = 17408
-    }
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
 
@@ -2707,9 +2610,6 @@ static MetalCtx *metal_setup(void) {
         size_t slot_size = (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim * 2) * sizeof(float);  // 16384 floats
         if (slot_size < (size_t)g_cfg.linear_conv_dim * sizeof(float))
             slot_size = (size_t)g_cfg.linear_conv_dim * sizeof(float);  // 12288 floats
-        // Dense MLP batches gate+up (out_dim = dense_intermediate) through batch_out slots.
-        if (slot_size < (size_t)g_cfg.dense_intermediate * sizeof(float))
-            slot_size = (size_t)g_cfg.dense_intermediate * sizeof(float);
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
             ctx->batch_out[i] = [ctx->device newBufferWithLength:slot_size
                                                          options:MTLResourceStorageModeShared];
@@ -3198,7 +3098,7 @@ static void gpu_dequant_matvec(
     // #1: the in_dim>4096 single-token matvec used matvec_fast (1 row/TG, X re-read from device),
     // which is load-latency bound. matmulN with N=1 is the v5 multi-row-per-simdgroup kernel
     // (independent per-row weight loads overlap -> ILP latency hiding). Routing the big matvecs
-    // (down_proj/o_proj/lm_head) through it measured +14% on dense decode -> DEFAULT ON.
+    // (down_proj/o_proj/lm_head) through it measured +14% on decode -> DEFAULT ON.
     static int s_matvec_mm = -1;
     if (s_matvec_mm < 0) s_matvec_mm = getenv("FLASHCHAT_NO_MATVEC_MM") ? 0 : 1;
     if (s_matvec_mm && metal_weights_ready(ctx) && in_dim > 4096) {
@@ -3281,7 +3181,7 @@ static void gpu_dequant_matmul2(
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
     // The matmul2 v3 kernel caches the input in x_shared[4096], so it only handles
-    // in_dim <= 4096. For larger inputs (e.g. dense-27B hidden=5120, down_proj=17408)
+    // in_dim <= 4096. For larger contraction dims (in_dim > 4096)
     // route to matmulN, which reads X from device and handles any in_dim.
     if (in_dim > 4096) {
         float *X = malloc((size_t)2 * in_dim * sizeof(float));
@@ -3447,7 +3347,7 @@ typedef struct {
 // (one encoder, one commit, one waitUntilCompleted) instead of paying a synchronous
 // CPU<->GPU round-trip per matmul. Used for the projection groups whose inputs are
 // already in hand and whose outputs are independent (QKV, linear in_proj_*, gate+up).
-// Profiling showed ~80% of the dense MTP forward sat in matmulN, running at ~50 GB/s
+// Profiling showed ~80% of the MTP forward sat in matmulN, running at ~50 GB/s
 // (1/8 of bandwidth) — the cost was dispatch/commit latency across ~480 round-trips
 // per forward, not compute. Batching the independent groups roughly halves that count.
 static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
@@ -3518,79 +3418,6 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
     g_prof_matmulN += now_ms() - _t_mm;
 }
 
-static int gpu_dense_mlp_N(
-    MetalCtx *ctx,
-    const void *gate_W, const void *gate_S, const void *gate_B,
-    const void *up_W, const void *up_S, const void *up_B,
-    const void *down_W, const void *down_S, const void *down_B,
-    const float *X, float *OUT,
-    uint32_t hidden_dim, uint32_t intermediate_dim, uint32_t group_size, uint32_t N
-) {
-    if (!ctx || !metal_weights_ready(ctx) || !ctx->swiglu || N == 0) return 0;
-    double t0 = now_ms();
-    static id<MTLBuffer> xbuf = nil, gatebuf = nil, upbuf = nil, actbuf = nil, outbuf = nil;
-    size_t xs = (size_t)N * hidden_dim * sizeof(float);
-    size_t inters = (size_t)N * intermediate_dim * sizeof(float);
-    size_t outs = (size_t)N * hidden_dim * sizeof(float);
-    if (!xbuf || (size_t)[xbuf length] < xs) xbuf = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
-    if (!gatebuf || (size_t)[gatebuf length] < inters) gatebuf = [ctx->device newBufferWithLength:inters options:MTLResourceStorageModeShared];
-    if (!upbuf || (size_t)[upbuf length] < inters) upbuf = [ctx->device newBufferWithLength:inters options:MTLResourceStorageModeShared];
-    if (!actbuf || (size_t)[actbuf length] < inters) actbuf = [ctx->device newBufferWithLength:inters options:MTLResourceStorageModeShared];
-    if (!outbuf || (size_t)[outbuf length] < outs) outbuf = [ctx->device newBufferWithLength:outs options:MTLResourceStorageModeShared];
-    memcpy([xbuf contents], X, xs);
-
-    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
-    id<MTLComputePipelineState> pipe = matmuln_pipe(ctx);
-    uint32_t rpt = matmuln_rows_per_tg();
-    void (^encode_mm)(const void *, const void *, const void *, id<MTLBuffer>, id<MTLBuffer>, uint32_t, uint32_t) =
-        ^(const void *W, const void *S, const void *B, id<MTLBuffer> inbuf, id<MTLBuffer> obuf, uint32_t out_dim, uint32_t in_dim) {
-            int values_per_word = (g_cfg.bits == 8) ? 4 : 8;
-            size_t w_bytes = (size_t)out_dim * (in_dim / values_per_word) * sizeof(uint32_t);
-            size_t sb_bytes = (size_t)out_dim * (in_dim / group_size) * sizeof(uint16_t);
-            id<MTLBuffer> w_buf = nil, s_buf = nil, b_buf = nil;
-            NSUInteger w_off = 0, s_off = 0, b_off = 0;
-            if (!metal_weight_arg(ctx, W, w_bytes, &w_buf, &w_off) ||
-                !metal_weight_arg(ctx, S, sb_bytes, &s_buf, &s_off) ||
-                !metal_weight_arg(ctx, B, sb_bytes, &b_buf, &b_off)) {
-                return;
-            }
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:pipe];
-            [enc setBuffer:w_buf offset:w_off atIndex:0];
-            [enc setBuffer:s_buf offset:s_off atIndex:1];
-            [enc setBuffer:b_buf offset:b_off atIndex:2];
-            [enc setBuffer:inbuf offset:0 atIndex:3];
-            [enc setBuffer:obuf offset:0 atIndex:4];
-            [enc setBytes:&out_dim length:4 atIndex:5];
-            [enc setBytes:&in_dim length:4 atIndex:6];
-            [enc setBytes:&group_size length:4 atIndex:7];
-            [enc setBytes:&N length:4 atIndex:8];
-            [enc dispatchThreadgroups:MTLSizeMake((out_dim + rpt - 1) / rpt, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        };
-
-    encode_mm(gate_W, gate_S, gate_B, xbuf, gatebuf, intermediate_dim, hidden_dim);
-    encode_mm(up_W, up_S, up_B, xbuf, upbuf, intermediate_dim, hidden_dim);
-    {
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:gatebuf offset:0 atIndex:0];
-        [enc setBuffer:upbuf offset:0 atIndex:1];
-        [enc setBuffer:actbuf offset:0 atIndex:2];
-        uint32_t total = N * intermediate_dim;
-        [enc setBytes:&total length:4 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((total + 255) / 256, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
-    }
-    encode_mm(down_W, down_S, down_B, actbuf, outbuf, hidden_dim, intermediate_dim);
-    [cmdbuf commit];
-    [cmdbuf waitUntilCompleted];
-    memcpy(OUT, [outbuf contents], outs);
-    g_prof_matmulN += now_ms() - t0;
-    return 1;
-}
 
 // matmul2 form of a job: two separate input/output columns (the depth-2 verify blocks
 // carry token a / token b as distinct host buffers).
@@ -3601,40 +3428,6 @@ typedef struct {
     uint32_t out_dim, in_dim, group_size;
 } MM2Job;
 
-// Batched matmul2: same single-command-buffer win as gpu_dequant_matmulN_batch, for the
-// depth-2 verify blocks (attn_block_2 / linear_block_2 / dense_mlp_block_2). When every
-// job's in_dim>4096 (the dense-27B case: hidden 5120, intermediate 17408) each pair packs
-// into a contiguous [2][in_dim] and the group goes through one matmulN command buffer.
-// If any job is in_dim<=4096 it falls back to per-job matmul2 so the small-model x_shared
-// kernel path stays bit-exact.
-static void gpu_dequant_matmul2_batch(MetalCtx *ctx, MM2Job *jobs, int nj) {
-    if (nj <= 0) return;
-    int all_large = 1;
-    for (int j = 0; j < nj; j++) if (jobs[j].in_dim <= 4096) all_large = 0;
-    if (!all_large || nj == 1) {
-        for (int j = 0; j < nj; j++)
-            gpu_dequant_matmul2(ctx, jobs[j].W, jobs[j].S, jobs[j].B, jobs[j].x0, jobs[j].x1,
-                                jobs[j].out0, jobs[j].out1, jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size);
-        return;
-    }
-    enum { MAX_B2 = 8 };
-    if (nj > MAX_B2) nj = MAX_B2;
-    MMJob mj[MAX_B2]; float *Xs[MAX_B2], *Os[MAX_B2];
-    for (int j = 0; j < nj; j++) {
-        Xs[j] = malloc((size_t)2 * jobs[j].in_dim * sizeof(float));
-        Os[j] = malloc((size_t)2 * jobs[j].out_dim * sizeof(float));
-        memcpy(Xs[j], jobs[j].x0, jobs[j].in_dim * sizeof(float));
-        memcpy(Xs[j] + jobs[j].in_dim, jobs[j].x1, jobs[j].in_dim * sizeof(float));
-        mj[j] = (MMJob){ jobs[j].W, jobs[j].S, jobs[j].B, Xs[j], Os[j],
-                         jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size, 2 };
-    }
-    gpu_dequant_matmulN_batch(ctx, mj, nj);
-    for (int j = 0; j < nj; j++) {
-        memcpy(jobs[j].out0, Os[j], jobs[j].out_dim * sizeof(float));
-        memcpy(jobs[j].out1, Os[j] + jobs[j].out_dim, jobs[j].out_dim * sizeof(float));
-        free(Xs[j]); free(Os[j]);
-    }
-}
 
 // Stage 1 microbench: does one weight read serve two tokens? Times two separate
 // single-token matvecs vs one batched N=2 matmul on real weight matrices, and
@@ -3751,9 +3544,9 @@ static void fast_dequant_matvec(
 
 // SwiGLU via the production swiglu_fused GPU kernel (Metal exp), so the MoE batched
 // verify block is bit-faithful to production. Production computes expert/shared SwiGLU
-// on GPU; cpu_swiglu (libm expf) differs by a few ulp, which is harmless for dense but
-// — through the top-K routing threshold — flips expert selection on MoE and cascades to
-// garbage over 40 layers. Dense stays on cpu_swiglu (its production path is CPU too).
+// on GPU; cpu_swiglu (libm expf) differs by a few ulp, which — through the top-K routing
+// threshold — flips expert selection and cascades to garbage over 40 layers, so the
+// verify must use the same GPU swiglu kernel to stay bit-faithful.
 static void gpu_swiglu(MetalCtx *ctx, const float *gate, const float *up, float *out, int dim) {
     static id<MTLBuffer> gbuf = nil, ubuf = nil, obuf = nil;
     size_t sz = (size_t)dim * sizeof(float);
@@ -3777,33 +3570,6 @@ static void gpu_swiglu(MetalCtx *ctx, const float *gate, const float *up, float 
     memcpy(out, [obuf contents], sz);
 }
 
-// Two independent swiglus (one per batched token) in ONE command buffer.
-// Same kernel and per-element math as gpu_swiglu — faithful, half the round-trips.
-static void gpu_swiglu_2(MetalCtx *ctx, const float *g1, const float *u1, float *o1,
-                         const float *g2, const float *u2, float *o2, int dim) {
-    static id<MTLBuffer> gbuf = nil, ubuf = nil, obuf = nil;
-    size_t sz = (size_t)dim * sizeof(float);
-    if (!gbuf || (size_t)[gbuf length] < 2*sz) gbuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
-    if (!ubuf || (size_t)[ubuf length] < 2*sz) ubuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
-    if (!obuf || (size_t)[obuf length] < 2*sz) obuf = [ctx->device newBufferWithLength:2*sz options:MTLResourceStorageModeShared];
-    memcpy([gbuf contents], g1, sz); memcpy((char *)[gbuf contents] + sz, g2, sz);
-    memcpy([ubuf contents], u1, sz); memcpy((char *)[ubuf contents] + sz, u2, sz);
-    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
-    [e setComputePipelineState:ctx->swiglu];
-    uint32_t d = (uint32_t)dim;
-    for (int t = 0; t < 2; t++) {
-        [e setBuffer:gbuf offset:t*sz atIndex:0];
-        [e setBuffer:ubuf offset:t*sz atIndex:1];
-        [e setBuffer:obuf offset:t*sz atIndex:2];
-        [e setBytes:&d length:4 atIndex:3];
-        [e dispatchThreadgroups:MTLSizeMake((d + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    }
-    [e endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    memcpy(o1, [obuf contents], sz); memcpy(o2, (char *)[obuf contents] + sz, sz);
-}
 
 // ============================================================================
 // Batched GPU matmul: encode N independent matmuls sharing the same input
@@ -3928,7 +3694,7 @@ static void gpu_encode_batch_matvec(
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        // in_dim>4096 (e.g. dense QKV at hidden=5120): v5 multi-row matmulN (N=1) instead of
+        // in_dim>4096: v5 multi-row matmulN (N=1) instead of
         // matvec_fast for ILP latency hiding. (FLASHCHAT_NO_MATVEC_MM forces matvec_fast.)
         static int s_em_mm = -1;
         if (s_em_mm < 0) s_em_mm = getenv("FLASHCHAT_NO_MATVEC_MM") ? 0 : 1;
@@ -4873,358 +4639,17 @@ static void full_attention_forward(
 // (at pos_b = pos_a+1) attends to token a's freshly-appended K/V. o_proj uses
 // two single matvecs (its in_dim=q_dim>4096 exceeds the matmul2 kernel limit).
 // ============================================================================
-static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const float *q_gate, float *out);
-static void attn_block_2(
-    WeightFile *wf, int layer_idx,
-    float *ha, float *hb,     // [hidden_dim] in/out for the two tokens
-    KVCache *kv, int pos_a, int pos_b
-) {
-    char name[256];
-    int q_proj_dim = g_cfg.num_attn_heads * g_cfg.head_dim * 2;
-    int q_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
-    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
-    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
-    // Dense GPU attention (unified with fused_layer_forward / dense_layer_forward_N): when on,
-    // this verify block uses the SAME GPU kernels as the baseline so argmax matches losslessly.
-    int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
-    int gpu_attn = (g_dense_gpu_attn && g_metal && g_metal->attn_scores_pipe &&
-                    fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers);
-
-    float *res_a = malloc(g_cfg.hidden_dim * sizeof(float));
-    float *res_b = malloc(g_cfg.hidden_dim * sizeof(float));
-    memcpy(res_a, ha, g_cfg.hidden_dim * sizeof(float));
-    memcpy(res_b, hb, g_cfg.hidden_dim * sizeof(float));
-
-    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
-    uint16_t *norm_w = get_tensor_ptr(wf, name);
-    float *na = malloc(g_cfg.hidden_dim * sizeof(float));
-    float *nb = malloc(g_cfg.hidden_dim * sizeof(float));
-    cpu_rms_norm(ha, norm_w, na, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, norm_w, nb, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
-
-    // ---- Batched Q/K/V projections (shared weight read across both tokens) ----
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
-    uint32_t *qw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", layer_idx);
-    uint16_t *qs = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", layer_idx);
-    uint16_t *qb_ = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
-    uint32_t *kw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", layer_idx);
-    uint16_t *ks = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", layer_idx);
-    uint16_t *kb = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
-    uint32_t *vw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", layer_idx);
-    uint16_t *vs = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", layer_idx);
-    uint16_t *vb = get_tensor_ptr(wf, name);
-
-    float *qp_a = calloc(q_proj_dim, sizeof(float)), *qp_b = calloc(q_proj_dim, sizeof(float));
-    float *k_a = calloc(kv_dim, sizeof(float)), *k_b = calloc(kv_dim, sizeof(float));
-    float *v_a = calloc(kv_dim, sizeof(float)), *v_b = calloc(kv_dim, sizeof(float));
-    { MM2Job qkv_jobs[3] = {
-        {qw,qs,qb_,na,nb,qp_a,qp_b,(uint32_t)q_proj_dim,(uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size},
-        {kw,ks,kb, na,nb,k_a,k_b,  (uint32_t)kv_dim,    (uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size},
-        {vw,vs,vb, na,nb,v_a,v_b,  (uint32_t)kv_dim,    (uint32_t)g_cfg.hidden_dim,(uint32_t)g_cfg.group_size} };
-      gpu_dequant_matmul2_batch(g_metal, qkv_jobs, 3); }
-
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
-    uint16_t *qnorm_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
-    uint16_t *knorm_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
-    uint32_t *ow = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", layer_idx);
-    uint16_t *os_ptr = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
-    uint16_t *ob = get_tensor_ptr(wf, name);
-
-    // Per-token tail. Token a appended first (pos_a), so b (pos_b) attends to it.
-    float *qp[2] = { qp_a, qp_b }; float *kk[2] = { k_a, k_b }; float *vv[2] = { v_a, v_b };
-    float *out_h[2] = { ha, hb }; float *res[2] = { res_a, res_b };
-    int pos[2] = { pos_a, pos_b };
-    for (int t = 0; t < 2; t++) {
-        float *q = calloc(q_dim, sizeof(float));
-        float *q_gate = calloc(q_dim, sizeof(float));
-        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
-            float *src = qp[t] + h * (2 * g_cfg.head_dim);
-            memcpy(q + h * g_cfg.head_dim, src, g_cfg.head_dim * sizeof(float));
-            memcpy(q_gate + h * g_cfg.head_dim, src + g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
-        }
-        if (qnorm_w) {
-            for (int h = 0; h < g_cfg.num_attn_heads; h++) {
-                float *qh = q + h * g_cfg.head_dim; float ss = 0.0f;
-                for (int i = 0; i < g_cfg.head_dim; i++) ss += qh[i] * qh[i];
-                float inv = 1.0f / sqrtf(ss / g_cfg.head_dim + g_cfg.rms_norm_eps);
-                for (int i = 0; i < g_cfg.head_dim; i++) qh[i] = qh[i] * inv * bf16_to_f32(qnorm_w[i]);
-            }
-        }
-        if (knorm_w) {
-            for (int h = 0; h < g_cfg.num_kv_heads; h++) {
-                float *kh = kk[t] + h * g_cfg.head_dim; float ss = 0.0f;
-                for (int i = 0; i < g_cfg.head_dim; i++) ss += kh[i] * kh[i];
-                float inv = 1.0f / sqrtf(ss / g_cfg.head_dim + g_cfg.rms_norm_eps);
-                for (int i = 0; i < g_cfg.head_dim; i++) kh[i] = kh[i] * inv * bf16_to_f32(knorm_w[i]);
-            }
-        }
-        apply_rotary_emb(q, kk[t], pos[t], g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
-
-        int cache_pos = kv->len;
-        memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, kk[t], kv_dim * sizeof(float));
-        memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, vv[t], kv_dim * sizeof(float));
-        // Mirror this position into the GPU KV cache UNCONDITIONALLY (independent of whether
-        // this token attends on GPU): a later position's GPU attention reads back through it.
-        if (gpu_attn && cache_pos < GPU_KV_SEQ) {
-            memcpy((float*)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos*kv_dim, kk[t], (size_t)kv_dim*4);
-            memcpy((float*)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos*kv_dim, vv[t], (size_t)kv_dim*4);
-        }
-        kv->len++;
-
-        float *attn_out = calloc(q_dim, sizeof(float));
-        double _t_at = now_ms();
-        if (gpu_attn && kv->len <= GPU_KV_SEQ) {
-            // Same standalone GPU full-attention helper used by the dense baseline (fused_layer_forward).
-            gpu_full_attention(fa_idx, kv->len, q, q_gate, attn_out);
-        } else {
-        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
-            int kv_h = h / heads_per_kv;
-            float *qh = q + h * g_cfg.head_dim;
-            float *scores = malloc(kv->len * sizeof(float));
-            for (int p = 0; p < kv->len; p++) {
-                float *kp = kv->k_cache + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
-                float dot = 0.0f;
-                for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
-                scores[p] = dot * scale;
-            }
-            cpu_softmax(scores, kv->len);
-            float *oh = attn_out + h * g_cfg.head_dim;
-            for (int p = 0; p < kv->len; p++) {
-                float *vp = kv->v_cache + (size_t)p * kv_dim + kv_h * g_cfg.head_dim;
-                for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
-            }
-            free(scores);
-        }
-        for (int i = 0; i < q_dim; i++) attn_out[i] *= 1.0f / (1.0f + expf(-q_gate[i]));
-        }
-        g_prof_attncpu += now_ms() - _t_at;
-
-        float *attn_proj = calloc(g_cfg.hidden_dim, sizeof(float));
-        if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_proj, g_cfg.hidden_dim, q_dim, g_cfg.group_size);
-        for (int i = 0; i < g_cfg.hidden_dim; i++) out_h[t][i] = res[t][i] + attn_proj[i];
-        free(q); free(q_gate); free(attn_out); free(attn_proj);
-    }
-
-    free(res_a); free(res_b); free(na); free(nb);
-    free(qp_a); free(qp_b); free(k_a); free(k_b); free(v_a); free(v_b);
-}
 
 // Stage 4d-ii: batched (N=2) GPU linear-attention block for MTP verify.
 // in_proj amortized via matmul2; the production 5-encoder delta-net recurrence is
 // driven per-token (a updates buf_conv_state/buf_delta_state[li], then b reads them
 // — faithful to production, recurrence is sequential anyway); out_proj amortized.
-// hidden = residual + out_proj(gated_delta_output). Mirrors attn_block_2's contract.
+// hidden = residual + out_proj(gated_delta_output). 
 // Snapshot of recurrent GPU state + KV lens for batched-verify reject-rollback.
 typedef struct { float **delta; float **conv; int *kvlen; } GpuStateSnap;
 __attribute__((unused))
-static void linear_block_2(WeightFile *wf, int layer, float *ha, float *hb, GpuStateSnap *rb) {
-    int Hd = g_cfg.hidden_dim, gsz = g_cfg.group_size;
-    int li = layer - (layer + 1) / g_cfg.full_attn_interval;   // linear_layer_idx
-    int qkv_dim = g_cfg.linear_conv_dim;
-    int z_dim = g_cfg.linear_total_value;
-    int nvh = g_cfg.linear_num_v_heads, nkh = g_cfg.linear_num_k_heads;
-    char nm[256];
-    #define LN(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn." suf,layer), get_tensor_ptr(wf,nm))
-    uint16_t *innorm = (snprintf(nm,sizeof(nm),"model.layers.%d.input_layernorm.weight",layer), get_tensor_ptr(wf,nm));
-    uint32_t *qkvw=LN("in_proj_qkv.weight"); uint16_t *qkvs=LN("in_proj_qkv.scales"),*qkvb=LN("in_proj_qkv.biases");
-    uint32_t *zw=LN("in_proj_z.weight");     uint16_t *zs=LN("in_proj_z.scales"),*zb=LN("in_proj_z.biases");
-    uint32_t *bw=LN("in_proj_b.weight");     uint16_t *bs=LN("in_proj_b.scales"),*bb_=LN("in_proj_b.biases");
-    uint32_t *aw=LN("in_proj_a.weight");     uint16_t *as_=LN("in_proj_a.scales"),*ab=LN("in_proj_a.biases");
-    uint32_t *ow=LN("out_proj.weight");      uint16_t *os=LN("out_proj.scales"),*ob_=LN("out_proj.biases");
-    uint16_t *conv1d_w = LN("conv1d.weight");
-    float    *A_log    = (float *)LN("A_log");
-    uint16_t *dt_bias  = LN("dt_bias");
-    uint16_t *gnorm_w  = LN("norm.weight");
-    #undef LN
 
-    float *res_a = malloc(Hd*sizeof(float)), *res_b = malloc(Hd*sizeof(float));
-    memcpy(res_a, ha, Hd*sizeof(float)); memcpy(res_b, hb, Hd*sizeof(float));
-    float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
-    cpu_rms_norm(ha, innorm, na, Hd, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, innorm, nb, Hd, g_cfg.rms_norm_eps);
 
-    // in_proj (amortized, in_dim=hidden<=4096)
-    float *qkv_a=malloc(qkv_dim*sizeof(float)),*qkv_b=malloc(qkv_dim*sizeof(float));
-    float *z_a=malloc(z_dim*sizeof(float)),*z_b=malloc(z_dim*sizeof(float));
-    float *be_a=malloc(nvh*sizeof(float)),*be_b=malloc(nvh*sizeof(float));
-    float *al_a=malloc(nvh*sizeof(float)),*al_b=malloc(nvh*sizeof(float));
-    { MM2Job in_jobs[4] = {
-        {qkvw,qkvs,qkvb,na,nb,qkv_a,qkv_b,(uint32_t)qkv_dim,(uint32_t)Hd,(uint32_t)gsz},
-        {zw,zs,zb,      na,nb,z_a,z_b,    (uint32_t)z_dim,  (uint32_t)Hd,(uint32_t)gsz},
-        {bw,bs,bb_,     na,nb,be_a,be_b,  (uint32_t)nvh,    (uint32_t)Hd,(uint32_t)gsz},
-        {aw,as_,ab,     na,nb,al_a,al_b,  (uint32_t)nvh,    (uint32_t)Hd,(uint32_t)gsz} };
-      gpu_dequant_matmul2_batch(g_metal, in_jobs, 4); }
-
-    NSUInteger conv_off = (NSUInteger)((const char*)conv1d_w - (const char*)[g_metal->wf_buf contents]);
-    NSUInteger alog_off = (NSUInteger)((const char*)A_log   - (const char*)[g_metal->wf_buf contents]);
-    NSUInteger dtb_off  = (NSUInteger)((const char*)dt_bias - (const char*)[g_metal->wf_buf contents]);
-    NSUInteger gn_off   = (NSUInteger)((const char*)gnorm_w - (const char*)[g_metal->wf_buf contents]);
-    uint32_t conv_dim = g_cfg.linear_conv_dim, key_dim = g_cfg.linear_key_dim, value_dim = g_cfg.linear_value_dim;
-    float inv_scale = 1.0f / sqrtf((float)g_cfg.linear_key_dim), eps = g_cfg.rms_norm_eps;
-    uint32_t khpv = (uint32_t)(nvh / nkh);
-
-    float *qkv_t[2] = { qkv_a, qkv_b }; float *z_t[2] = { z_a, z_b };
-    float *be_t[2] = { be_a, be_b }; float *al_t[2] = { al_a, al_b };
-    float *gated_a = malloc(z_dim*sizeof(float)), *gated_b = malloc(z_dim*sizeof(float));
-    float *gated_t[2] = { gated_a, gated_b };
-
-    for (int t = 0; t < 2; t++) {
-        memcpy([g_metal->batch_out[0] contents], qkv_t[t], qkv_dim*sizeof(float));
-        memcpy([g_metal->batch_out[1] contents], z_t[t],   z_dim*sizeof(float));
-        memcpy([g_metal->batch_out[2] contents], be_t[t],  nvh*sizeof(float));
-        memcpy([g_metal->batch_out[3] contents], al_t[t],  nvh*sizeof(float));
-        id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
-        // L1: conv1d_step
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
-          [e setComputePipelineState:g_metal->conv1d_step];
-          [e setBuffer:g_metal->buf_conv_state[li] offset:0 atIndex:0];
-          [e setBuffer:g_metal->batch_out[0] offset:0 atIndex:1];
-          [e setBuffer:g_metal->wf_buf offset:conv_off atIndex:2];
-          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:3];
-          [e setBytes:&conv_dim length:4 atIndex:4];
-          [e dispatchThreadgroups:MTLSizeMake((conv_dim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-          [e endEncoding]; }
-        // L2: rms_norm_qk
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
-          [e setComputePipelineState:g_metal->rms_norm_qk];
-          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];
-          [e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*sizeof(float) atIndex:1];
-          [e setBytes:&key_dim length:4 atIndex:2]; [e setBytes:&inv_scale length:4 atIndex:3];
-          [e dispatchThreadgroups:MTLSizeMake(nkh,1,1) threadsPerThreadgroup:MTLSizeMake(key_dim,1,1)];
-          [e endEncoding]; }
-        // L3: compute_decay_beta
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
-          [e setComputePipelineState:g_metal->compute_decay_beta];
-          [e setBuffer:g_metal->batch_out[3] offset:0 atIndex:0];
-          [e setBuffer:g_metal->batch_out[2] offset:0 atIndex:1];
-          [e setBuffer:g_metal->wf_buf offset:alog_off atIndex:2];
-          [e setBuffer:g_metal->wf_buf offset:dtb_off atIndex:3];
-          [e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
-          [e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];
-          [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(nvh,1,1)];
-          [e endEncoding]; }
-        // L4: gated_delta_net_step
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
-          [e setComputePipelineState:g_metal->delta_net_step];
-          [e setBuffer:g_metal->buf_delta_state[li] offset:0 atIndex:0];
-          [e setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];
-          [e setBuffer:g_metal->buf_conv_output offset:g_cfg.linear_total_key*sizeof(float) atIndex:2];
-          [e setBuffer:g_metal->buf_conv_output offset:2*g_cfg.linear_total_key*sizeof(float) atIndex:3];
-          [e setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
-          [e setBuffer:g_metal->buf_delta_beta offset:0 atIndex:5];
-          [e setBuffer:g_metal->buf_delta_output offset:0 atIndex:6];
-          [e setBytes:&khpv length:sizeof(khpv) atIndex:7];
-          [e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-          [e endEncoding]; }
-        // L5: gated_rms_norm -> batch_out[6]
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
-          [e setComputePipelineState:g_metal->gated_rms_norm];
-          [e setBuffer:g_metal->buf_delta_output offset:0 atIndex:0];
-          [e setBuffer:g_metal->batch_out[1] offset:0 atIndex:1];
-          [e setBuffer:g_metal->wf_buf offset:gn_off atIndex:2];
-          [e setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];
-          [e setBytes:&value_dim length:4 atIndex:4]; [e setBytes:&eps length:4 atIndex:5];
-          [e dispatchThreadgroups:MTLSizeMake(nvh,1,1) threadsPerThreadgroup:MTLSizeMake(value_dim,1,1)];
-          [e endEncoding]; }
-        double _t_dl = now_ms();
-        [cmd commit]; [cmd waitUntilCompleted];
-        g_prof_delta += now_ms() - _t_dl;
-        memcpy(gated_t[t], [g_metal->batch_out[6] contents], z_dim*sizeof(float));
-        // Capture post-token-a recurrent state (before token b) for reject-rollback.
-        if (rb && t == 0) {
-            memcpy(rb->delta[li], [g_metal->buf_delta_state[li] contents], 64*128*128*sizeof(float));
-            memcpy(rb->conv[li],  [g_metal->buf_conv_state[li] contents],  3*12288*sizeof(float));
-        }
-    }
-
-    // out_proj (amortized, in_dim=linear_total_value=4096 fits matmul2)
-    float *oa = malloc(Hd*sizeof(float)), *ob_out = malloc(Hd*sizeof(float));
-    gpu_dequant_matmul2(g_metal, ow,os,ob_, gated_a,gated_b, oa,ob_out, Hd, z_dim, gsz);
-    for (int i = 0; i < Hd; i++) { ha[i] = res_a[i] + oa[i]; hb[i] = res_b[i] + ob_out[i]; }
-
-    free(res_a); free(res_b); free(na); free(nb);
-    free(qkv_a); free(qkv_b); free(z_a); free(z_b); free(be_a); free(be_b); free(al_a); free(al_b);
-    free(gated_a); free(gated_b); free(oa); free(ob_out);
-}
-
-// Dense-27B batched (N=2) MLP block: hidden += down(swiglu(gate(h_post), up(h_post)))
-// for both tokens. Uses matmulN (not matmul2) since dense in_dims 5120/17408 exceed
-// the matmul2 x_shared 4096 limit. No routing/experts/shared → no drift amplification.
-static void dense_mlp_block_2(WeightFile *wf, int layer, float *ha, float *hb) {
-    int H = g_cfg.hidden_dim, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
-    char nm[256];
-    #define DW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
-    uint16_t *post_w = (snprintf(nm,sizeof(nm),"model.layers.%d.post_attention_layernorm.weight",layer), get_tensor_ptr(wf,nm));
-    uint32_t *gw=DW("gate_proj.weight"); uint16_t *gs=DW("gate_proj.scales"),*gb=DW("gate_proj.biases");
-    uint32_t *uw=DW("up_proj.weight");   uint16_t *us=DW("up_proj.scales"),  *ub=DW("up_proj.biases");
-    uint32_t *dw=DW("down_proj.weight"); uint16_t *ds=DW("down_proj.scales"),*db=DW("down_proj.biases");
-    #undef DW
-    float *hp = malloc((size_t)2*H*sizeof(float));   // [2][hidden] packed h_post
-    cpu_rms_norm(ha, post_w, hp,     H, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, post_w, hp + H, H, g_cfg.rms_norm_eps);
-    float *g2 = malloc((size_t)2*inter*sizeof(float)), *u2 = malloc((size_t)2*inter*sizeof(float)), *a2 = malloc((size_t)2*inter*sizeof(float));
-    { MMJob gu_jobs[2] = {
-        {gw,gs,gb,hp,g2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2},
-        {uw,us,ub,hp,u2,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,2} };
-      gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
-    cpu_swiglu(g2,         u2,         a2,         inter);
-    cpu_swiglu(g2 + inter, u2 + inter, a2 + inter, inter);
-    float *o2 = malloc((size_t)2*H*sizeof(float));
-    gpu_dequant_matmulN(g_metal, dw, ds, db, a2, o2, H, inter, gsz, 2);
-    for (int i = 0; i < H; i++) { ha[i] += o2[i]; hb[i] += o2[H + i]; }
-    free(hp); free(g2); free(u2); free(a2); free(o2);
-}
-
-// Depth-N dense layer forward: process N positions (hs = [N][H]) through one dense
-// layer (attention + dense MLP). All weight-bound matmuls amortized via matmulN;
-// attention/delta-net run per-position (sequential, so position i sees earlier ones).
-// pos[i] = absolute sequence position of token i. Dense models only (num_experts==0).
-// Standalone GPU full-attention for ONE query position over buf_kv_k/v[fa_idx] (seq_len
-// positions in the GPU KV mirror): scores -> softmax -> values -> sigmoid-gate, producing
-// the gated attention output (q_dim floats) in `out`. Mirrors the production fused-CMD2
-// attention encoders (Enc A1-A4) as a self-contained commit+wait, so the DENSE path (which
-// never takes the MoE CMD2) can use GPU attention instead of O(seq^2) CPU attention. The
-// caller must have written this position's K/V into buf_kv_k/v[fa_idx] first.
-static void gpu_full_attention(int fa_idx, int seq_len, const float *q, const float *q_gate, float *out) {
-    MetalCtx *ctx = g_metal;
-    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    uint32_t hd = (uint32_t)g_cfg.head_dim, kvd = (uint32_t)kv_dim, sl = (uint32_t)seq_len;
-    uint32_t seq_stride = GPU_KV_SEQ, hpkv = (uint32_t)(g_cfg.num_attn_heads / g_cfg.num_kv_heads);
-    uint32_t qdim = (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim);
-    float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
-    memcpy([ctx->buf_attn_q contents], q, qdim * sizeof(float));
-    memcpy([ctx->buf_attn_gate contents], q_gate, qdim * sizeof(float));
-    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_scores_pipe];
-      [e setBuffer:ctx->buf_attn_q offset:0 atIndex:0]; [e setBuffer:ctx->buf_kv_k[fa_idx] offset:0 atIndex:1]; [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
-      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&scale length:4 atIndex:7];[e setBytes:&hpkv length:4 atIndex:8];[e setBytes:&sl length:4 atIndex:9];
-      [e dispatchThreadgroups:MTLSizeMake(sl*g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_softmax_pipe];
-      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBytes:&sl length:4 atIndex:1];[e setBytes:&seq_stride length:4 atIndex:2];
-      [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
-      [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out offset:0 atIndex:2];
-      [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
-      uint32_t tt=(uint32_t)(g_cfg.head_dim*g_cfg.num_attn_heads); [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-    { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
-      [e setBuffer:ctx->buf_attn_out offset:0 atIndex:0];[e setBuffer:ctx->buf_attn_gate offset:0 atIndex:1];[e setBytes:&qdim length:4 atIndex:2];
-      [e dispatchThreadgroups:MTLSizeMake((qdim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-    [cmd commit]; [cmd waitUntilCompleted];
-    memcpy(out, [ctx->buf_attn_out contents], qdim * sizeof(float));
-}
 
 // GPU full-attention for the MTP head, using dedicated MTP KV buffers.
 // Caller must have copied the MTP KV cache into buf_mtp_kv_k/v first.
@@ -5296,14 +4721,13 @@ static void gpu_full_attention_batch(int fa_idx, int n, int base_len,
 }
 
 static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_fd);  // defined below
-static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos, int packed_fd) {
-    double t_dense_layer = g_timing_enabled ? now_ms() : 0.0;
-    int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, inter=g_cfg.dense_intermediate, eps_layer=0; (void)eps_layer;
+static void batched_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, KVCache *kv, int *pos, int packed_fd) {
+    int H=g_cfg.hidden_dim, gsz=g_cfg.group_size;
     float eps=g_cfg.rms_norm_eps;
     int is_full = ((layer+1)%g_cfg.full_attn_interval)==0;
     char nm[256];
     #define LW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d." suf,layer), get_tensor_ptr(wf,nm))
-    uint16_t *iln=LW("input_layernorm.weight"), *paln=LW("post_attention_layernorm.weight");
+    uint16_t *iln=LW("input_layernorm.weight");
     float *res=malloc((size_t)N*H*4), *nmd=malloc((size_t)N*H*4);
     memcpy(res, hs, (size_t)N*H*4);
     for (int i=0;i<N;i++) cpu_rms_norm(hs+(size_t)i*H, iln, nmd+(size_t)i*H, H, eps);
@@ -5311,7 +4735,7 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
     if (is_full) {
         int qpd=g_cfg.num_attn_heads*g_cfg.head_dim*2, qd=g_cfg.num_attn_heads*g_cfg.head_dim, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, hpk=g_cfg.num_attn_heads/g_cfg.num_kv_heads;
         int fa_idx=(layer+1)/g_cfg.full_attn_interval-1;   // GPU KV mirror slot for this full-attn layer
-        int dgpu = dense_gpu_attn_enabled() && g_metal && g_metal->attn_scores_pipe && fa_idx>=0 && fa_idx<g_cfg.num_full_attn_layers;
+        int dgpu = verify_gpu_attn_enabled() && g_metal && g_metal->attn_scores_pipe && fa_idx>=0 && fa_idx<g_cfg.num_full_attn_layers;
         uint32_t *qw=LW("self_attn.q_proj.weight");uint16_t *qs=LW("self_attn.q_proj.scales"),*qb=LW("self_attn.q_proj.biases");
         uint32_t *kw=LW("self_attn.k_proj.weight");uint16_t *ks=LW("self_attn.k_proj.scales"),*kb=LW("self_attn.k_proj.biases");
         uint32_t *vw=LW("self_attn.v_proj.weight");uint16_t *vs=LW("self_attn.v_proj.scales"),*vb=LW("self_attn.v_proj.biases");
@@ -5343,7 +4767,7 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         if (dgpu && (base_len+N)<=GPU_KV_SEQ) {
             // One command buffer for the whole chunk's attention (token t -> base_len+t+1 keys).
             // No len>=32 threshold: matches the per-position GPU rule in fused_layer_forward
-            // (baseline) and attn_block_2 (depth-2 verify), so all paths agree bit-for-bit.
+            // (baseline) and the batched verify, so all paths agree bit-for-bit.
             gpu_full_attention_batch(fa_idx, N, base_len, q_all, qg_all, ao);
         } else {
             for (int t=0;t<N;t++){
@@ -5402,148 +4826,13 @@ static void dense_layer_forward_N(WeightFile *wf, int layer, float *hs, int N, K
         for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]=res[(size_t)t*H+i]+ap[(size_t)t*H+i];
         free(qkv);free(z);free(be);free(al);free(gated);free(ap);
     }
-    if (g_timing_enabled) {
-        g_prof_dense_chunk_attn += now_ms() - t_dense_layer;
-    }
-    // ---- MLP sublayer: the ONLY architecture-specific branch (dense vs MoE) ----
-    if (g_cfg.num_experts == 0) {
-        double t_dense_mlp = g_timing_enabled ? now_ms() : 0.0;
-        // dense MLP (N positions)
-        uint32_t *gw=LW("mlp.gate_proj.weight");uint16_t *gs=LW("mlp.gate_proj.scales"),*gb=LW("mlp.gate_proj.biases");
-        uint32_t *uw=LW("mlp.up_proj.weight");uint16_t *us=LW("mlp.up_proj.scales"),*ub=LW("mlp.up_proj.biases");
-        uint32_t *dw=LW("mlp.down_proj.weight");uint16_t *ds=LW("mlp.down_proj.scales"),*db=LW("mlp.down_proj.biases");
-        float *hp=malloc((size_t)N*H*4); for(int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H,paln,hp+(size_t)t*H,H,eps);
-        float *oN=malloc((size_t)N*H*4);
-        if (!dense_fused_mlp_enabled() ||
-                !gpu_dense_mlp_N(g_metal, gw, gs, gb, uw, us, ub, dw, ds, db,
-                                 hp, oN, (uint32_t)H, (uint32_t)inter, (uint32_t)gsz, (uint32_t)N)) {
-                float *gN=malloc((size_t)N*inter*4),*uN=malloc((size_t)N*inter*4),*aN=malloc((size_t)N*inter*4);
-                { MMJob gu_jobs[2] = {
-                    {gw,gs,gb,hp,gN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
-                    {uw,us,ub,hp,uN,(uint32_t)inter,(uint32_t)H,(uint32_t)gsz,(uint32_t)N} };
-                  gpu_dequant_matmulN_batch(g_metal, gu_jobs, 2); }
-                if (dense_gpu_swiglu_enabled() && g_metal && g_metal->swiglu) {
-                    gpu_swiglu(g_metal, gN, uN, aN, (int)((size_t)N * inter));
-                } else {
-                    for(int t=0;t<N;t++) cpu_swiglu(gN+(size_t)t*inter,uN+(size_t)t*inter,aN+(size_t)t*inter,inter);
-                }
-                { MMJob down_job = {dw,ds,db,aN,oN,(uint32_t)H,(uint32_t)inter,(uint32_t)gsz,(uint32_t)N};
-                  gpu_dequant_matmulN_batch(g_metal, &down_job, 1); }
-                free(gN);free(uN);free(aN);
-            }
-        for(int t=0;t<N;t++) for(int i=0;i<H;i++) hs[(size_t)t*H+i]+=oN[(size_t)t*H+i];
-        if (g_timing_enabled) {
-            g_prof_dense_chunk_mlp += now_ms() - t_dense_mlp;
-            g_prof_dense_chunk_layers++;
-        }
-        free(hp);free(oN);
-    } else {
-        // MoE experts (N positions) — reuses the faithful production expert kernel.
-        moe_block_N(wf, layer, hs, N, packed_fd);
-    }
+    // ---- MLP sublayer: MoE experts (N positions), reusing the faithful production kernel ----
+    moe_block_N(wf, layer, hs, N, packed_fd);
     #undef LW
     free(res);free(nmd);
 }
 
-// Batched (chunked) prefill for DENSE models: run [start,end) prompt tokens N-at-a-time
-// through dense_layer_forward_N, which is bit-exact to token-by-token production but does
-// ~N fewer weight-read passes (the win for the weight-bound dense path). kv + GPU delta
-// state end up identical, so decode continues correctly. *pos is advanced; if
-// out_last_hidden != NULL it receives the final token's post-forward hidden (for the
-// first decode logits). DENSE ONLY (num_experts==0; the batched MoE forward is not faithful).
-static void serve_prefill_dense_batched(WeightFile *wf, const float *embed_batch,
-                                        PromptTokens *pt, int start, int end,
-                                        KVCache **kv, int *pos, float *out_last_hidden) {
-    int H = g_cfg.hidden_dim;
-    enum { PREFILL_CHUNK = 8 };   // matmulN supports up to MATMULN_MAXN=8 columns
-    float *hs = malloc((size_t)PREFILL_CHUNK * H * sizeof(float));
-    int posv[PREFILL_CHUNK];
-    for (int i = start; i < end; i += PREFILL_CHUNK) {
-        int n = (end - i < PREFILL_CHUNK) ? (end - i) : PREFILL_CHUNK;
-        for (int j = 0; j < n; j++) {
-            if (embed_batch) memcpy(hs + (size_t)j * H, embed_batch + (size_t)(i + j) * H, H * sizeof(float));
-            else embed_lookup(wf, pt->ids[i + j], hs + (size_t)j * H);
-            posv[j] = *pos + j;
-        }
-        for (int layer = 0; layer < g_cfg.num_layers; layer++)
-            dense_layer_forward_N(wf, layer, hs, n, kv[layer], posv, -1);  // dense prefill: no experts
-        if (out_last_hidden && (i + n >= end))
-            memcpy(out_last_hidden, hs + (size_t)(n - 1) * H, H * sizeof(float));
-        *pos += n;
-    }
-    free(hs);
-}
 
-// Stage 2 unit test: attn_block_2 must match two sequential full_attention_forward
-// calls (the oracle) on an identical pre-seeded KV cache, and should be faster
-// (q/k/v projections amortized). Gated by --mtp-bench-attn.
-static int mtp_bench_attn(WeightFile *wf) {
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-attn] requires GPU\n"); return 1; }
-    int layer = g_cfg.full_attn_interval - 1;   // first full-attention layer (0-indexed)
-    int H = g_cfg.hidden_dim;
-    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    int cap = 64, P = 5;
-
-    KVCache kv_o = {0}, kv_b = {0};
-    kv_o.k_cache = calloc((size_t)cap * kv_dim, sizeof(float)); kv_o.v_cache = calloc((size_t)cap * kv_dim, sizeof(float));
-    kv_b.k_cache = calloc((size_t)cap * kv_dim, sizeof(float)); kv_b.v_cache = calloc((size_t)cap * kv_dim, sizeof(float));
-
-    for (int p = 0; p < P; p++) {
-        float *h = malloc(H * sizeof(float));
-        for (int i = 0; i < H; i++) h[i] = sinf((i + p * 13) * 0.01f);
-        full_attention_forward(wf, layer, h, &kv_o, p);
-        free(h);
-    }
-    memcpy(kv_b.k_cache, kv_o.k_cache, (size_t)cap * kv_dim * sizeof(float));
-    memcpy(kv_b.v_cache, kv_o.v_cache, (size_t)cap * kv_dim * sizeof(float));
-    kv_b.len = kv_o.len;
-    // Seed the GPU KV mirror so attn_block_2's GPU attention path (if enabled) sees this
-    // synthetic history — production keeps the mirror in sync incrementally, this test doesn't.
-    { int fb = (layer + 1) / g_cfg.full_attn_interval - 1;
-      if (g_metal && g_metal->attn_scores_pipe && fb >= 0 && fb < g_cfg.num_full_attn_layers) {
-        memcpy([g_metal->buf_kv_k[fb] contents], kv_b.k_cache, (size_t)kv_b.len * kv_dim * sizeof(float));
-        memcpy([g_metal->buf_kv_v[fb] contents], kv_b.v_cache, (size_t)kv_b.len * kv_dim * sizeof(float)); } }
-
-    float *ha = malloc(H * sizeof(float)), *hb = malloc(H * sizeof(float));
-    for (int i = 0; i < H; i++) { ha[i] = cosf(i * 0.013f); hb[i] = sinf(i * 0.019f + 1.0f); }
-    int pa = kv_o.len, pb = kv_o.len + 1;
-
-    float *ha_o = malloc(H * sizeof(float)), *hb_o = malloc(H * sizeof(float));
-    float *ha_b = malloc(H * sizeof(float)), *hb_b = malloc(H * sizeof(float));
-    memcpy(ha_o, ha, H * sizeof(float)); memcpy(hb_o, hb, H * sizeof(float));
-    memcpy(ha_b, ha, H * sizeof(float)); memcpy(hb_b, hb, H * sizeof(float));
-
-    full_attention_forward(wf, layer, ha_o, &kv_o, pa);
-    full_attention_forward(wf, layer, hb_o, &kv_o, pb);
-    attn_block_2(wf, layer, ha_b, hb_b, &kv_b, pa, pb);
-
-    double err = 0.0;
-    for (int i = 0; i < H; i++) { err = fmax(err, fabs(ha_o[i] - ha_b[i])); err = fmax(err, fabs(hb_o[i] - hb_b[i])); }
-
-    const int M = 100;
-    double t = now_ms();
-    for (int m = 0; m < M; m++) {
-        kv_o.len = P; memcpy(ha_o, ha, H * sizeof(float)); memcpy(hb_o, hb, H * sizeof(float));
-        full_attention_forward(wf, layer, ha_o, &kv_o, pa);
-        full_attention_forward(wf, layer, hb_o, &kv_o, pb);
-    }
-    double t_single = (now_ms() - t) / M;
-    t = now_ms();
-    for (int m = 0; m < M; m++) {
-        kv_b.len = P; memcpy(ha_b, ha, H * sizeof(float)); memcpy(hb_b, hb, H * sizeof(float));
-        attn_block_2(wf, layer, ha_b, hb_b, &kv_b, pa, pb);
-    }
-    double t_batched = (now_ms() - t) / M;
-
-    fprintf(stderr, "[mtp-attn] layer=%d | 2x single=%.4f ms | batched=%.4f ms | ratio=%.3f | max_err=%.2e\n",
-            layer, t_single, t_batched, t_batched / t_single, err);
-    fprintf(stderr, "[mtp-attn] %s (tolerance ~1e-3 for fp reduction-order differences)\n",
-            err < 1e-2 ? "PASS: batched matches oracle" : "FAIL: outputs diverge");
-
-    free(kv_o.k_cache); free(kv_o.v_cache); free(kv_b.k_cache); free(kv_b.v_cache);
-    free(ha); free(hb); free(ha_o); free(hb_o); free(ha_b); free(hb_b);
-    return err < 1e-2 ? 0 : 1;
-}
 
 // ============================================================================
 // Stage 3: batched (N=2) MoE block for MTP draft/verify.
@@ -5570,13 +4859,6 @@ static void routed_ffn_1(void *buf, const float *x, float *out) {
     memcpy(out, [g_metal->buf_multi_expert_out[0] contents], g_cfg.hidden_dim * sizeof(float));
 }
 
-// Two tokens through the SAME expert. Run the faithful per-token expert kernel
-// twice (the weight stays resident in buf_multi_expert_data[0] across both, so the
-// second call only re-copies the input). Speed is irrelevant here; faithfulness is.
-static void routed_ffn_2(void *buf, const float *xa, const float *xb, float *oa, float *ob) {
-    routed_ffn_1(buf, xa, oa);
-    routed_ffn_1(buf, xb, ob);
-}
 
 // Compute post-attn norm + routing (softmax/topk/normalize) for one token.
 static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_post, int *idx, float *wt) {
@@ -5597,27 +4879,6 @@ static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_p
     free(scores);
 }
 
-// Batched routing for two tokens: post-attn norm on CPU (same as moe_route), then
-// ONE matmul2 for both tokens' router logits (bit-exact per Stage 1, replaces two
-// matvec round-trips), then per-token softmax/topk/normalize identical to moe_route.
-static void moe_route_2(WeightFile *wf, int layer, const float *ha, const float *hb,
-                        float *hpa, float *hpb, int *ia, float *wa, int *ib, float *wb) {
-    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, gsz = g_cfg.group_size;
-    char nm[256];
-    snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", layer);
-    uint16_t *post_w = get_tensor_ptr(wf, nm);
-    cpu_rms_norm(ha, post_w, hpa, H, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, post_w, hpb, H, g_cfg.rms_norm_eps);
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", layer);   uint32_t *gw = get_tensor_ptr(wf, nm);
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.scales", layer);   uint16_t *gs = get_tensor_ptr(wf, nm);
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.biases", layer);   uint16_t *gb = get_tensor_ptr(wf, nm);
-    float *sa = malloc(g_cfg.num_experts * sizeof(float));
-    float *sb = malloc(g_cfg.num_experts * sizeof(float));
-    gpu_dequant_matmul2(g_metal, gw, gs, gb, hpa, hpb, sa, sb, g_cfg.num_experts, H, gsz);
-    cpu_softmax(sa, g_cfg.num_experts); cpu_topk(sa, g_cfg.num_experts, K, ia, wa); cpu_normalize_weights(wa, K);
-    cpu_softmax(sb, g_cfg.num_experts); cpu_topk(sb, g_cfg.num_experts, K, ib, wb); cpu_normalize_weights(wb, K);
-    free(sa); free(sb);
-}
 
 // Shared expert + gate for one token: returns shared_out (gated), needs h_post.
 static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, float *shared_out) {
@@ -5640,151 +4901,11 @@ static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, floa
     free(sg); free(su); free(sa);
 }
 
-// Batched shared expert: always used by both tokens (guaranteed 100% overlap),
-// so every matmul amortizes via matmul2.
-static void shared_expert_2(WeightFile *wf, int layer, const float *hpa, const float *hpb,
-                            float *out_a, float *out_b) {
-    int H = g_cfg.hidden_dim, SI = g_cfg.shared_intermediate, gsz = g_cfg.group_size;
-    char nm[256];
-    #define SW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
-    uint32_t *sgw = SW("shared_expert.gate_proj.weight"); uint16_t *sgs = SW("shared_expert.gate_proj.scales"), *sgb = SW("shared_expert.gate_proj.biases");
-    uint32_t *suw = SW("shared_expert.up_proj.weight");   uint16_t *sus = SW("shared_expert.up_proj.scales"),   *sub = SW("shared_expert.up_proj.biases");
-    uint32_t *sdw = SW("shared_expert.down_proj.weight"); uint16_t *sds = SW("shared_expert.down_proj.scales"), *sdb = SW("shared_expert.down_proj.biases");
-    uint32_t *segw = SW("shared_expert_gate.weight");     uint16_t *segs = SW("shared_expert_gate.scales"),     *segb = SW("shared_expert_gate.biases");
-    #undef SW
-    float *sga = malloc(SI*sizeof(float)), *sgb_ = malloc(SI*sizeof(float));
-    float *sua = malloc(SI*sizeof(float)), *sub_ = malloc(SI*sizeof(float));
-    float *saa = malloc(SI*sizeof(float)), *sab = malloc(SI*sizeof(float));
-    float scorea = 0, scoreb = 0;
-    // gate/up/gate-score all read hpa/hpb: one command buffer (3 round-trips -> 1).
-    { MM2Job se_jobs[3] = {
-        {sgw,sgs,sgb,  hpa,hpb, sga,sgb_,        (uint32_t)SI,(uint32_t)H,(uint32_t)gsz},
-        {suw,sus,sub,  hpa,hpb, sua,sub_,        (uint32_t)SI,(uint32_t)H,(uint32_t)gsz},
-        {segw,segs,segb,hpa,hpb,&scorea,&scoreb, 1u,          (uint32_t)H,(uint32_t)gsz} };
-      gpu_dequant_matmul2_batch(g_metal, se_jobs, 3); }
-    gpu_swiglu_2(g_metal, sga, sua, saa, sgb_, sub_, sab, SI);  // GPU swiglu => bit-faithful to production MoE
-    gpu_dequant_matmul2(g_metal, sdw, sds, sdb, saa, sab, out_a, out_b, H, SI, gsz);
-    float wa = cpu_sigmoid(scorea), wb = cpu_sigmoid(scoreb);
-    for (int i = 0; i < H; i++) { out_a[i] *= wa; out_b[i] *= wb; }
-    free(sga); free(sgb_); free(sua); free(sub_); free(saa); free(sab);
-}
 
-static void moe_block_1(WeightFile *wf, int layer, float *hidden, int packed_fd) {
-    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
-    float *h_post = malloc(H * sizeof(float));
-    int idx[64]; float wt[64];
-    moe_route(wf, layer, hidden, h_post, idx, wt);
-    float *moe_out = calloc(H, sizeof(float));
-    void *buf = malloc(active_expert_size());
-    float *eo = malloc(H * sizeof(float));
-    for (int k = 0; k < K; k++) {
-        if (pread(packed_fd, buf, active_expert_size(), (off_t)idx[k] * active_expert_size()) != (ssize_t)active_expert_size()) continue;
-        routed_ffn_1(buf, h_post, eo);
-        cpu_vec_madd(moe_out, eo, wt[k], H);
-    }
-    float *shared_out = malloc(H * sizeof(float));
-    shared_expert_1(wf, layer, h_post, shared_out);
-    for (int i = 0; i < H; i++) hidden[i] = hidden[i] + moe_out[i] + shared_out[i];
-    free(h_post); free(moe_out); free(buf); free(eo); free(shared_out);
-}
 
-static double g_mb2_route, g_mb2_load, g_mb2_gpu, g_mb2_shared;
 
-static void moe_block_2(WeightFile *wf, int layer, float *ha, float *hb, int packed_fd) {
-    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
-    double _t = now_ms();
-    float *hpa = malloc(H*sizeof(float)), *hpb = malloc(H*sizeof(float));
-    int ia[64], ib[64]; float wa[64], wb[64];
-    if (g_metal) {
-        moe_route_2(wf, layer, ha, hb, hpa, hpb, ia, wa, ib, wb);
-    } else {
-        moe_route(wf, layer, ha, hpa, ia, wa);
-        moe_route(wf, layer, hb, hpb, ib, wb);
-    }
-    g_mb2_route += now_ms() - _t;
-    float *moe_a = calloc(H, sizeof(float)), *moe_b = calloc(H, sizeof(float));
 
-    // Union size for the overlap instrumentation (the fast path below loads
-    // per-token rather than per-union; page cache makes the duplicate preads free).
-    int seen[1024]; int n_union = 0; int uni[128];
-    for (int e = 0; e < g_cfg.num_experts && e < 1024; e++) seen[e] = 0;
-    for (int k = 0; k < K; k++) { if (!seen[ia[k]]) { seen[ia[k]] = 1; uni[n_union++] = ia[k]; } }
-    for (int k = 0; k < K; k++) { if (!seen[ib[k]]) { seen[ib[k]] = 1; uni[n_union++] = ib[k]; } }
-    g_moe_last_union = n_union;
-
-    size_t esz = active_expert_size();
-    if (g_metal && K <= MAX_K) {
-        // Fast faithful path: per token, pread its K experts straight into the
-        // production multi-expert slots and encode all of them into ONE command
-        // buffer via gpu_encode_experts_batched — the same per-expert kernels and
-        // buffers as production CMD3 (and as routed_ffn_1), so per-expert math is
-        // unchanged. This replaces one commit+wait per (expert, token) pair with
-        // 2 commits per layer, which is what the batched-2 cost_ratio lives on.
-        const int *idxs[2] = { ia, ib }; const float *wts[2] = { wa, wb };
-        const float *hps[2] = { hpa, hpb }; float *outs[2] = { moe_a, moe_b };
-        for (int t = 0; t < 2; t++) {
-            int valid[MAX_K] = {0};
-            id<MTLBuffer> __strong expert_bufs[MAX_K] = {nil};
-            _t = now_ms();
-            // Parallel preads (same pattern as the production expert loader):
-            // each slot is independent, page-cache reads scale across cores.
-            {
-                const int *t_idx = idxs[t];
-                int *valid_p = valid;
-                id<MTLBuffer> __strong *bufs_p = expert_bufs;
-                dispatch_apply((size_t)K, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
-                    int e = t_idx[k];
-                    if (pread(packed_fd, [g_metal->buf_multi_expert_data[k] contents], esz,
-                              (off_t)e * (off_t)esz) == (ssize_t)esz) {
-                        valid_p[k] = 1;
-                        bufs_p[k] = g_metal->buf_multi_expert_data[k];
-                    }
-                });
-            }
-            g_mb2_load += now_ms() - _t; _t = now_ms();
-            memcpy([g_metal->buf_multi_expert_input contents], hps[t], (size_t)H * sizeof(float));
-            id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
-            gpu_encode_experts_batched(g_metal, cmd, K, valid, expert_bufs);
-            [cmd commit]; [cmd waitUntilCompleted];
-            for (int k = 0; k < K; k++) {
-                if (!valid[k]) continue;
-                cpu_vec_madd(outs[t], (float *)[g_metal->buf_multi_expert_out[k] contents],
-                             wts[t][k], H);
-            }
-            g_mb2_gpu += now_ms() - _t;
-        }
-    } else {
-        // Slow faithful fallback (K > MAX_K slots): one round-trip per expert.
-        void *buf = malloc(esz);
-        float *oa = malloc(H*sizeof(float)), *ob = malloc(H*sizeof(float));
-        for (int u = 0; u < n_union; u++) {
-            int e = uni[u];
-            if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
-            int ka = -1, kb = -1;
-            for (int k = 0; k < K; k++) { if (ia[k] == e) ka = k; if (ib[k] == e) kb = k; }
-            if (ka >= 0 && kb >= 0) {
-                routed_ffn_2(buf, hpa, hpb, oa, ob);
-                cpu_vec_madd(moe_a, oa, wa[ka], H);
-                cpu_vec_madd(moe_b, ob, wb[kb], H);
-            } else if (ka >= 0) {
-                routed_ffn_1(buf, hpa, oa);
-                cpu_vec_madd(moe_a, oa, wa[ka], H);
-            } else if (kb >= 0) {
-                routed_ffn_1(buf, hpb, ob);
-                cpu_vec_madd(moe_b, ob, wb[kb], H);
-            }
-        }
-        free(buf); free(oa); free(ob);
-    }
-    _t = now_ms();
-    float *sa = malloc(H*sizeof(float)), *sb = malloc(H*sizeof(float));
-    shared_expert_2(wf, layer, hpa, hpb, sa, sb);
-    g_mb2_shared += now_ms() - _t;
-    for (int i = 0; i < H; i++) { ha[i] = ha[i] + moe_a[i] + sa[i]; hb[i] = hb[i] + moe_b[i] + sb[i]; }
-    free(hpa); free(hpb); free(moe_a); free(moe_b); free(sa); free(sb);
-}
-
-// N-position MoE block: faithful generalization of moe_block_2 for the depth-N
+// N-position MoE block: the per-token MoE FFN applied across the depth-N
 // verify. hs is N*H (post-attention residual stream, in/out). Routes all N
 // positions, loads the union of their experts once each, and runs the faithful
 // per-token production expert kernel (routed_ffn_1) for whichever positions use
@@ -5880,48 +5001,6 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
     free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared);
 }
 
-// Stage 3 unit test: moe_block_2 must match two independent moe_block_1 calls.
-static int mtp_bench_moe(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-moe] requires GPU\n"); return 1; }
-    int layer = 0, H = g_cfg.hidden_dim;
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "[mtp-moe] cannot open %s\n", path); return 1; }
-
-    float *ha = malloc(H*sizeof(float)), *hb = malloc(H*sizeof(float));
-    for (int i = 0; i < H; i++) { ha[i] = sinf(i*0.011f); hb[i] = cosf(i*0.017f + 0.5f); }
-    float *ha_o = malloc(H*sizeof(float)), *hb_o = malloc(H*sizeof(float));
-    float *ha_b = malloc(H*sizeof(float)), *hb_b = malloc(H*sizeof(float));
-    memcpy(ha_o, ha, H*sizeof(float)); memcpy(hb_o, hb, H*sizeof(float));
-    memcpy(ha_b, ha, H*sizeof(float)); memcpy(hb_b, hb, H*sizeof(float));
-
-    moe_block_1(wf, layer, ha_o, fd);
-    moe_block_1(wf, layer, hb_o, fd);
-    moe_block_2(wf, layer, ha_b, hb_b, fd);
-    double err = 0.0;
-    for (int i = 0; i < H; i++) { err = fmax(err, fabs(ha_o[i]-ha_b[i])); err = fmax(err, fabs(hb_o[i]-hb_b[i])); }
-
-    const int M = 50;
-    for (int w = 0; w < 3; w++) { memcpy(ha_o,ha,H*4); memcpy(hb_o,hb,H*4); moe_block_1(wf,layer,ha_o,fd); moe_block_1(wf,layer,hb_o,fd);
-                                  memcpy(ha_b,ha,H*4); memcpy(hb_b,hb,H*4); moe_block_2(wf,layer,ha_b,hb_b,fd); }
-    double t = now_ms();
-    for (int m = 0; m < M; m++) { memcpy(ha_o,ha,H*sizeof(float)); memcpy(hb_o,hb,H*sizeof(float)); moe_block_1(wf,layer,ha_o,fd); moe_block_1(wf,layer,hb_o,fd); }
-    double t_single = (now_ms()-t)/M;
-    t = now_ms();
-    for (int m = 0; m < M; m++) { memcpy(ha_b,ha,H*sizeof(float)); memcpy(hb_b,hb,H*sizeof(float)); moe_block_2(wf,layer,ha_b,hb_b,fd); }
-    double t_batched = (now_ms()-t)/M;
-
-    fprintf(stderr, "[mtp-moe] layer=%d K=%d union=%d/%d | 2x single=%.4f ms | batched=%.4f ms | ratio=%.3f | max_err=%.2e\n",
-            layer, g_cfg.num_experts_per_tok, g_moe_last_union, 2 * g_cfg.num_experts_per_tok,
-            t_single, t_batched, t_batched/t_single, err);
-    fprintf(stderr, "[mtp-moe] %s (lower ratio = more expert overlap amortized)\n",
-            err < 1e-2 ? "PASS: batched matches oracle" : "FAIL: outputs diverge");
-    close(fd);
-    free(ha); free(hb); free(ha_o); free(hb_o); free(ha_b); free(hb_b);
-    return err < 1e-2 ? 0 : 1;
-}
 
 static void fused_layer_forward(WeightFile *wf, int layer_idx, float *hidden, KVCache *kv,
                                 LinearAttnState *la_state, int pos, const void *mmap_base,
@@ -5929,186 +5008,9 @@ static void fused_layer_forward(WeightFile *wf, int layer_idx, float *hidden, KV
 static void complete_deferred_experts(void);
 static void linear_attention_forward(WeightFile *wf, int layer_idx, float *hidden, LinearAttnState *state);
 
-// 4b prerequisite: confirm the CPU-reference blocks (full_attention_forward /
-// linear_attention_forward + moe_block_1) match the PRODUCTION fused_layer_forward
-// for one layer on identical input. If they diverge, a batched forward built from
-// the reference blocks would produce different tokens than normal decode.
-static int mtp_verify_layer(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vlayer] requires GPU\n"); return 1; }
-    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
-    int kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    int full_layer = g_cfg.full_attn_interval - 1;   // first full-attention layer
-    int lin_layer  = 0;                              // layer 0 is linear attention
-    int layers[2] = { full_layer, lin_layer };
-    const char *labels[2] = { "full-attn", "linear-attn" };
-    int rc = 0;
 
-    for (int t = 0; t < 2; t++) {
-        int layer = layers[t]; int is_full = (t == 0);
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) { fprintf(stderr, "[mtp-vlayer] cannot open %s\n", path); rc = 1; continue; }
-        struct stat st; void *mm = MAP_FAILED;
-        if (fstat(fd, &st) == 0 && st.st_size > 0) mm = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 
-        float *H0 = malloc(H*sizeof(float));
-        for (int i = 0; i < H; i++) H0[i] = sinf((i + layer*3) * 0.01f) * 0.5f;
-        float *Hp = malloc(H*sizeof(float)), *Hc = malloc(H*sizeof(float));
-        memcpy(Hp, H0, H*sizeof(float)); memcpy(Hc, H0, H*sizeof(float));
 
-        // Production path: one fused layer + deferred-expert finalize.
-        KVCache kvp = {0}; LinearAttnState *lsp = NULL;
-        if (is_full) { kvp.k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvp.v_cache = calloc((size_t)64*kv_dim, sizeof(float)); }
-        else lsp = linear_attn_state_new();
-        fused_layer_forward(wf, layer, Hp, is_full ? &kvp : NULL, is_full ? NULL : lsp, 0,
-                            mm != MAP_FAILED ? mm : NULL, K, fd);
-        complete_deferred_experts();
-
-        // Reference path: CPU attention block + moe_block_1.
-        KVCache kvc = {0}; LinearAttnState *lsc = NULL;
-        if (is_full) { kvc.k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvc.v_cache = calloc((size_t)64*kv_dim, sizeof(float));
-                       full_attention_forward(wf, layer, Hc, &kvc, 0); }
-        else { lsc = linear_attn_state_new(); linear_attention_forward(wf, layer, Hc, lsc); }
-        moe_block_1(wf, layer, Hc, fd);
-
-        double err = 0.0, ref = 0.0;
-        for (int i = 0; i < H; i++) { err = fmax(err, fabs(Hp[i]-Hc[i])); ref = fmax(ref, fabs(Hp[i])); }
-        double rel = ref > 0 ? err/ref : err;
-        fprintf(stderr, "[mtp-vlayer] %-11s layer=%d | max_abs_err=%.3e | rel=%.3e | %s\n",
-                labels[t], layer, err, rel, rel < 5e-2 ? "MATCH" : "DIVERGE");
-        if (rel >= 5e-2) rc = 1;
-
-        if (is_full) { free(kvp.k_cache); free(kvp.v_cache); free(kvc.k_cache); free(kvc.v_cache); }
-        else { linear_attn_state_free(lsp); linear_attn_state_free(lsc); }
-        if (mm != MAP_FAILED) munmap(mm, st.st_size);
-        close(fd); free(H0); free(Hp); free(Hc);
-    }
-    fprintf(stderr, "[mtp-vlayer] MATCH => CPU reference blocks are faithful to production (safe to assemble batched forward)\n");
-    return rc;
-}
-
-// 4d-ii scoping: is the CPU reference (full_attention_forward + moe_block_1) faithful
-// to production fused_layer_forward at a DECODE position (len>=32, where production
-// switches to GPU attention)? Prefill a full-attn layer's KV to len=40 via production,
-// copy that KV to the reference, then compare both at pos 40. Same prefix K/V, so this
-// isolates GPU-attention vs CPU-attention numerics. If MATCH, 4d-ii's full-attn layers
-// can reuse attn_block_2 + moe_block_2.
-static int mtp_verify_deep(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-deep] requires GPU\n"); return 1; }
-    int Hd = g_cfg.hidden_dim, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, K = g_cfg.num_experts_per_tok;
-    int layer = g_cfg.full_attn_interval - 1;   // first full-attention layer (uses GPU attn at len>=32)
-    int P = 40, cap = 128;
-    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
-    int fd = open(path, O_RDONLY);
-    void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-
-    KVCache kvp = {0}; kvp.k_cache = calloc((size_t)cap*kv_dim,sizeof(float)); kvp.v_cache = calloc((size_t)cap*kv_dim,sizeof(float));
-    float *H = malloc(Hd*sizeof(float));
-    for (int p = 0; p < P; p++) {
-        for (int i = 0; i < Hd; i++) H[i] = sinf((i + p*7) * 0.01f) * 0.4f;
-        fused_layer_forward(wf, layer, H, &kvp, NULL, p, mm!=MAP_FAILED?mm:NULL, K, fd);
-        complete_deferred_experts();
-    }
-    // Reference KV = exact copy of the production-built K/V (no prefix drift).
-    KVCache kvc = {0}; kvc.k_cache = malloc((size_t)cap*kv_dim*sizeof(float)); kvc.v_cache = malloc((size_t)cap*kv_dim*sizeof(float));
-    memcpy(kvc.k_cache, kvp.k_cache, (size_t)cap*kv_dim*sizeof(float));
-    memcpy(kvc.v_cache, kvp.v_cache, (size_t)cap*kv_dim*sizeof(float));
-    kvc.len = kvp.len;
-
-    float *Hp = malloc(Hd*sizeof(float)), *Hc = malloc(Hd*sizeof(float));
-    for (int i = 0; i < Hd; i++) { Hp[i] = cosf(i*0.011f)*0.4f; Hc[i] = Hp[i]; }
-    fused_layer_forward(wf, layer, Hp, &kvp, NULL, P, mm!=MAP_FAILED?mm:NULL, K, fd);
-    complete_deferred_experts();
-    full_attention_forward(wf, layer, Hc, &kvc, P);
-    moe_block_1(wf, layer, Hc, fd);
-
-    double err = 0, ref = 0;
-    for (int i = 0; i < Hd; i++) { err = fmax(err, fabs(Hp[i]-Hc[i])); ref = fmax(ref, fabs(Hp[i])); }
-    double rel = ref>0 ? err/ref : err;
-    fprintf(stderr, "[mtp-deep] full-attn layer=%d at pos=%d (len=%d, GPU-attn regime) | max_err=%.3e rel=%.3e | %s\n",
-            layer, P, kvc.len, err, rel, rel < 5e-2 ? "MATCH (reuse attn_block_2+moe_block_2)" : "DIVERGE (need GPU 2-query attn)");
-
-    if (mm!=MAP_FAILED) munmap(mm, st.st_size); if (fd>=0) close(fd);
-    free(kvp.k_cache); free(kvp.v_cache); free(kvc.k_cache); free(kvc.v_cache); free(H); free(Hp); free(Hc);
-    return rel < 5e-2 ? 0 : 1;
-}
-
-// 4d-ii validation: linear_block_2 (+ moe_block_1) must match production
-// fused_layer_forward for a LINEAR layer. Both share the GPU delta state
-// (buf_delta_state[li]/buf_conv_state[li]); snapshot after prefix, run oracle
-// (2 sequential production forwards), restore, run linear_block_2 (a->b) + MoE.
-static int mtp_verify_linear(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vlin] requires GPU delta-net\n"); return 1; }
-    int Hd = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
-    int layer = 0, li = layer - (layer + 1) / g_cfg.full_attn_interval;  // layer 0 is linear, li=0
-    size_t dsz = 64*128*128*sizeof(float), csz = 3*12288*sizeof(float);
-    char path[PATH_MAX]; snprintf(path, sizeof(path), "%s/layer_%02d.bin", g_flashchat_experts_dir, layer);
-    int fd = open(path, O_RDONLY);
-    void *mm = MAP_FAILED; struct stat st; if (fd>=0 && fstat(fd,&st)==0 && st.st_size>0) mm = mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
-    LinearAttnState *dummy = linear_attn_state_new();
-
-    reset_delta_net_state();
-    float *h = malloc(Hd*sizeof(float)); int P = 5;
-    for (int p = 0; p < P; p++) {
-        for (int i = 0; i < Hd; i++) h[i] = sinf((i + p*5) * 0.01f) * 0.4f;
-        fused_layer_forward(wf, layer, h, NULL, dummy, p, mm!=MAP_FAILED?mm:NULL, K, fd);
-        complete_deferred_experts();
-    }
-    // Snapshot post-prefix GPU state S.
-    float *Sd = malloc(dsz), *Sc = malloc(csz);
-    memcpy(Sd, [g_metal->buf_delta_state[li] contents], dsz);
-    memcpy(Sc, [g_metal->buf_conv_state[li] contents], csz);
-
-    float *Ha = malloc(Hd*sizeof(float)), *Hb = malloc(Hd*sizeof(float));
-    for (int i = 0; i < Hd; i++) { Ha[i] = cosf(i*0.011f)*0.4f; Hb[i] = sinf(i*0.017f+0.7f)*0.4f; }
-
-    // Oracle: two sequential production forwards from S.
-    float *Hao = malloc(Hd*sizeof(float)), *Hbo = malloc(Hd*sizeof(float));
-    memcpy(Hao, Ha, Hd*sizeof(float)); memcpy(Hbo, Hb, Hd*sizeof(float));
-    fused_layer_forward(wf, layer, Hao, NULL, dummy, P,   mm!=MAP_FAILED?mm:NULL, K, fd); complete_deferred_experts();
-    fused_layer_forward(wf, layer, Hbo, NULL, dummy, P+1, mm!=MAP_FAILED?mm:NULL, K, fd); complete_deferred_experts();
-
-    // Restore S, run linear_block_2 (a->b) + per-token MoE.
-    memcpy([g_metal->buf_delta_state[li] contents], Sd, dsz);
-    memcpy([g_metal->buf_conv_state[li] contents], Sc, csz);
-    float *Hat = malloc(Hd*sizeof(float)), *Hbt = malloc(Hd*sizeof(float));
-    memcpy(Hat, Ha, Hd*sizeof(float)); memcpy(Hbt, Hb, Hd*sizeof(float));
-    linear_block_2(wf, layer, Hat, Hbt, NULL);
-    moe_block_1(wf, layer, Hat, fd);
-    moe_block_1(wf, layer, Hbt, fd);
-
-    double ea=0, eb=0, ref=0;
-    for (int i = 0; i < Hd; i++) { ea=fmax(ea,fabs(Hao[i]-Hat[i])); eb=fmax(eb,fabs(Hbo[i]-Hbt[i])); ref=fmax(ref,fabs(Hao[i])); }
-    double ra = ref>0?ea/ref:ea, rb = ref>0?eb/ref:eb;
-    fprintf(stderr, "[mtp-vlin] linear layer=%d li=%d | tokenA rel=%.3e tokenB rel=%.3e | %s\n",
-            layer, li, ra, rb, (ra<5e-2 && rb<5e-2) ? "MATCH (linear_block_2 faithful)" : "DIVERGE");
-
-    if (mm!=MAP_FAILED) munmap(mm, st.st_size); if (fd>=0) close(fd);
-    linear_attn_state_free(dummy);
-    free(h); free(Sd); free(Sc); free(Ha); free(Hb); free(Hao); free(Hbo); free(Hat); free(Hbt);
-    return (ra<5e-2 && rb<5e-2) ? 0 : 1;
-}
-
-// Reference single-token forward through all layers + norm + lm_head (CPU blocks).
-static void ref_forward_1(WeightFile *wf, float *h, KVCache **kv, LinearAttnState **ls,
-                          int *fds, int pos, float *logits) {
-    int Hd = g_cfg.hidden_dim;
-    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-        int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-        if (is_full) full_attention_forward(wf, layer, h, kv[layer], pos);
-        else         linear_attention_forward(wf, layer, h, ls[layer]);
-        moe_block_1(wf, layer, h, fds[layer]);
-    }
-    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
-    float *n = malloc(Hd * sizeof(float));
-    cpu_rms_norm(h, norm_w, n, Hd, g_cfg.rms_norm_eps);
-    lm_head_forward(wf, n, logits);
-    free(n);
-}
 
 // Rollback state for a rejected draft: undo token b's contributions, leaving the
 // state as if only token a (the accepted token) had been processed.
@@ -6118,291 +5020,13 @@ typedef struct {
     float *ssm[MAX_NUM_LAYERS];      // linear: ssm_state snapshot after a, before b
 } VerifyRollback;
 
-static int verify_conv_sz(void) { return (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim; }
-static int verify_ssm_sz(void)  { return g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim; }
 
-static void verify_rollback_init(VerifyRollback *rb) {
-    memset(rb, 0, sizeof(*rb));
-    for (int i = 0; i < g_cfg.num_layers; i++) {
-        if (((i + 1) % g_cfg.full_attn_interval) != 0) {
-            rb->conv[i] = malloc(verify_conv_sz() * sizeof(float));
-            rb->ssm[i]  = malloc(verify_ssm_sz()  * sizeof(float));
-        }
-    }
-}
-static void verify_rollback_free(VerifyRollback *rb) {
-    for (int i = 0; i < g_cfg.num_layers; i++) { free(rb->conv[i]); free(rb->ssm[i]); }
-}
-// Undo token b: truncate KV (drop b's appended K/V) and restore linear states.
-static void verify_rollback_apply(VerifyRollback *rb, KVCache **kv, LinearAttnState **ls) {
-    for (int i = 0; i < g_cfg.num_layers; i++) {
-        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
-            kv[i]->len = rb->kv_pre_len[i] + 1;  // keep a (appended first), drop b
-        } else {
-            memcpy(ls[i]->conv_state, rb->conv[i], verify_conv_sz() * sizeof(float));
-            memcpy(ls[i]->ssm_state,  rb->ssm[i],  verify_ssm_sz()  * sizeof(float));
-        }
-    }
-}
 
-// 4b: full batched 2-position backbone forward. Layer-by-layer so token b sees
-// token a's freshly-written KV (full attn) and a-updated recurrent state (linear).
-// If rb != NULL, capture per-layer rollback state (post-a) so a rejected draft
-// can be undone via verify_rollback_apply.
-static void backbone_forward_2(WeightFile *wf, float *ha, float *hb,
-                               KVCache **kv, LinearAttnState **ls, int *fds,
-                               int pos_a, int pos_b, float *log_a, float *log_b,
-                               VerifyRollback *rb) {
-    int Hd = g_cfg.hidden_dim;
-    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-        int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-        if (is_full) {
-            if (rb) rb->kv_pre_len[layer] = kv[layer]->len;
-            attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
-        } else {
-            // Linear recurrence is sequential: a updates the state, then b reads it.
-            linear_attention_forward(wf, layer, ha, ls[layer]);
-            if (rb) {
-                memcpy(rb->conv[layer], ls[layer]->conv_state, verify_conv_sz() * sizeof(float));
-                memcpy(rb->ssm[layer],  ls[layer]->ssm_state,  verify_ssm_sz()  * sizeof(float));
-            }
-            linear_attention_forward(wf, layer, hb, ls[layer]);
-        }
-        moe_block_2(wf, layer, ha, hb, fds[layer]);
-    }
-    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
-    float *na = malloc(Hd * sizeof(float)), *nb = malloc(Hd * sizeof(float));
-    cpu_rms_norm(ha, norm_w, na, Hd, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, norm_w, nb, Hd, g_cfg.rms_norm_eps);
-    TensorInfo *wi = get_tensor_info(wf, "lm_head.weight");
-    TensorInfo *si = get_tensor_info(wf, "lm_head.scales");
-    TensorInfo *bi = get_tensor_info(wf, "lm_head.biases");
-    uint32_t *W = (uint32_t *)((char *)wf->data + wi->offset);
-    uint16_t *S = (uint16_t *)((char *)wf->data + si->offset);
-    uint16_t *B = (uint16_t *)((char *)wf->data + bi->offset);
-    gpu_dequant_matmul2(g_metal, W, S, B, na, nb, log_a, log_b, g_cfg.vocab_size, Hd, g_cfg.group_size);
-    free(na); free(nb);
-}
 
-// 4b validation: backbone_forward_2 must equal two reference single forwards
-// (same CPU blocks, just batched), on fresh caches at positions 0 and 1.
-static int mtp_verify_forward(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vfwd] requires GPU\n"); return 1; }
-    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    int L = g_cfg.num_layers;
 
-    int *fds = malloc(L * sizeof(int));
-    KVCache **kvr = calloc(L, sizeof(KVCache*)), **kvb = calloc(L, sizeof(KVCache*));
-    LinearAttnState **lsr = calloc(L, sizeof(LinearAttnState*)), **lsb = calloc(L, sizeof(LinearAttnState*));
-    for (int i = 0; i < L; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
-        fds[i] = open(p, O_RDONLY);
-        int is_full = ((i + 1) % g_cfg.full_attn_interval == 0);
-        if (is_full) {
-            kvr[i] = calloc(1, sizeof(KVCache)); kvr[i]->k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvr[i]->v_cache = calloc((size_t)64*kv_dim, sizeof(float));
-            kvb[i] = calloc(1, sizeof(KVCache)); kvb[i]->k_cache = calloc((size_t)64*kv_dim, sizeof(float)); kvb[i]->v_cache = calloc((size_t)64*kv_dim, sizeof(float));
-        } else { lsr[i] = linear_attn_state_new(); lsb[i] = linear_attn_state_new(); }
-    }
-
-    int tok_a = 100, tok_b = 200;  // arbitrary real token ids
-    float *log_a_r = malloc(V*sizeof(float)), *log_b_r = malloc(V*sizeof(float));
-    float *log_a_b = malloc(V*sizeof(float)), *log_b_b = malloc(V*sizeof(float));
-    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float));
-
-    // Reference: two single forwards (a updates state at pos 0, then b at pos 1).
-    embed_lookup(wf, tok_a, ha); ref_forward_1(wf, ha, kvr, lsr, fds, 0, log_a_r);
-    embed_lookup(wf, tok_b, hb); ref_forward_1(wf, hb, kvr, lsr, fds, 1, log_b_r);
-
-    // Batched: one 2-position forward on fresh caches.
-    embed_lookup(wf, tok_a, ha); embed_lookup(wf, tok_b, hb);
-    backbone_forward_2(wf, ha, hb, kvb, lsb, fds, 0, 1, log_a_b, log_b_b, NULL);
-
-    double err_a = 0, err_b = 0;
-    for (int i = 0; i < V; i++) { err_a = fmax(err_a, fabs(log_a_r[i]-log_a_b[i])); err_b = fmax(err_b, fabs(log_b_r[i]-log_b_b[i])); }
-    int am_r = cpu_argmax(log_a_r, V), am_b = cpu_argmax(log_a_b, V);
-    int bm_r = cpu_argmax(log_b_r, V), bm_b = cpu_argmax(log_b_b, V);
-    fprintf(stderr, "[mtp-vfwd] tokenA argmax ref=%d batched=%d | logit max_err=%.3e\n", am_r, am_b, err_a);
-    fprintf(stderr, "[mtp-vfwd] tokenB argmax ref=%d batched=%d | logit max_err=%.3e\n", bm_r, bm_b, err_b);
-    int ok = (am_r == am_b) && (bm_r == bm_b) && err_a < 1e-2 && err_b < 1e-2;
-    fprintf(stderr, "[mtp-vfwd] %s\n", ok ? "PASS: batched forward == reference (assembly correct)" : "FAIL: batched forward diverges");
-
-    for (int i = 0; i < L; i++) {
-        if (kvr[i]) { free(kvr[i]->k_cache); free(kvr[i]->v_cache); free(kvr[i]); }
-        if (kvb[i]) { free(kvb[i]->k_cache); free(kvb[i]->v_cache); free(kvb[i]); }
-        if (lsr[i]) linear_attn_state_free(lsr[i]);
-        if (lsb[i]) linear_attn_state_free(lsb[i]);
-        if (fds[i] >= 0) close(fds[i]);
-    }
-    free(fds); free(kvr); free(kvb); free(lsr); free(lsb);
-    free(log_a_r); free(log_b_r); free(log_a_b); free(log_b_b); free(ha); free(hb);
-    return ok ? 0 : 1;
-}
-
-// 4c-i: validate draft-reject rollback. After a batched verify forward of
-// [t_next@P, draft@P+1], rolling back must leave the state identical to having
-// processed only t_next@P (a single forward). Otherwise rejects corrupt output.
-static int mtp_verify_rollback(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf) { fprintf(stderr, "[mtp-vroll] requires GPU\n"); return 1; }
-    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
-    int Ld = g_cfg.num_layers;
-    int *fds = malloc(Ld * sizeof(int));
-    KVCache **kvv = calloc(Ld, sizeof(KVCache*)), **kvg = calloc(Ld, sizeof(KVCache*));
-    LinearAttnState **lsv = calloc(Ld, sizeof(LinearAttnState*)), **lsg = calloc(Ld, sizeof(LinearAttnState*));
-    int cap = 64;
-    for (int i = 0; i < Ld; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
-        fds[i] = open(p, O_RDONLY);
-        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
-            kvv[i] = calloc(1, sizeof(KVCache)); kvv[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float)); kvv[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
-            kvg[i] = calloc(1, sizeof(KVCache)); kvg[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float)); kvg[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
-        } else { lsv[i] = linear_attn_state_new(); lsg[i] = linear_attn_state_new(); }
-    }
-    float *scratch = malloc(V * sizeof(float)), *h = malloc(Hd * sizeof(float));
-    int prefix[3] = { 100, 200, 300 }; int P = 3;
-    for (int pp = 0; pp < P; pp++) {
-        embed_lookup(wf, prefix[pp], h); ref_forward_1(wf, h, kvv, lsv, fds, pp, scratch);
-        embed_lookup(wf, prefix[pp], h); ref_forward_1(wf, h, kvg, lsg, fds, pp, scratch);
-    }
-    int t_next = 400, draft = 500;
-    VerifyRollback rb; verify_rollback_init(&rb);
-    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float)), *la = malloc(V*sizeof(float)), *lb = malloc(V*sizeof(float));
-    embed_lookup(wf, t_next, ha); embed_lookup(wf, draft, hb);
-    backbone_forward_2(wf, ha, hb, kvv, lsv, fds, P, P + 1, la, lb, &rb);
-    verify_rollback_apply(&rb, kvv, lsv);
-    // Ground truth: single forward of t_next@P.
-    embed_lookup(wf, t_next, h); ref_forward_1(wf, h, kvg, lsg, fds, P, scratch);
-
-    double max_err = 0.0; int len_mismatch = 0;
-    for (int i = 0; i < Ld; i++) {
-        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
-            if (kvv[i]->len != kvg[i]->len) len_mismatch++;
-            int n = kvg[i]->len * kv_dim;
-            for (int j = 0; j < n; j++) {
-                max_err = fmax(max_err, fabs(kvv[i]->k_cache[j] - kvg[i]->k_cache[j]));
-                max_err = fmax(max_err, fabs(kvv[i]->v_cache[j] - kvg[i]->v_cache[j]));
-            }
-        } else {
-            for (int j = 0; j < verify_conv_sz(); j++) max_err = fmax(max_err, fabs(lsv[i]->conv_state[j] - lsg[i]->conv_state[j]));
-            for (int j = 0; j < verify_ssm_sz();  j++) max_err = fmax(max_err, fabs(lsv[i]->ssm_state[j]  - lsg[i]->ssm_state[j]));
-        }
-    }
-    int ok = (len_mismatch == 0) && (max_err < 1e-3);
-    fprintf(stderr, "[mtp-vroll] kv len mismatches=%d | state max_err=%.3e | %s\n",
-            len_mismatch, max_err, ok ? "PASS: reject rollback restores a-only state" : "FAIL: rollback corrupts state");
-
-    verify_rollback_free(&rb);
-    for (int i = 0; i < Ld; i++) {
-        if (kvv[i]) { free(kvv[i]->k_cache); free(kvv[i]->v_cache); free(kvv[i]); }
-        if (kvg[i]) { free(kvg[i]->k_cache); free(kvg[i]->v_cache); free(kvg[i]); }
-        if (lsv[i]) linear_attn_state_free(lsv[i]);
-        if (lsg[i]) linear_attn_state_free(lsg[i]);
-        if (fds[i] >= 0) close(fds[i]);
-    }
-    free(fds); free(kvv); free(kvg); free(lsv); free(lsg);
-    free(scratch); free(h); free(ha); free(hb); free(la); free(lb);
-    return ok ? 0 : 1;
-}
 
 #define MTP_IS_EOS(t) ((t) == g_cfg.eos_token_1 || (t) == g_cfg.eos_token_2)
 
-// 4c-ii: the verify/accept decode loop. Runs baseline greedy and MTP-verify on
-// the same prompt using the same CPU blocks, confirms identical output (lossless),
-// and reports speedup + acceptance. (Absolute tok/s reflects the CPU-orchestrated
-// block path, not the production GPU pipeline; the MTP/baseline RATIO is the
-// meaningful number.)
-static int mtp_generate(WeightFile *wf, const char *model_path, int max_new) {
-    if (!g_metal || !g_metal->wf_buf || !g_mtp_cache.ready) {
-        fprintf(stderr, "[mtp-gen] requires GPU + MTP weights (run with FLASHCHAT_MTP=1)\n"); return 1;
-    }
-    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, Ld = g_cfg.num_layers;
-    int *fds = malloc(Ld * sizeof(int));
-    KVCache **kv = calloc(Ld, sizeof(KVCache*));
-    LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
-    int cap = 8192;
-    for (int i = 0; i < Ld; i++) {
-        char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
-        fds[i] = open(p, O_RDONLY);
-        if (((i + 1) % g_cfg.full_attn_interval) == 0) {
-            kv[i] = calloc(1, sizeof(KVCache));
-            kv[i]->k_cache = calloc((size_t)cap*kv_dim, sizeof(float));
-            kv[i]->v_cache = calloc((size_t)cap*kv_dim, sizeof(float));
-        } else ls[i] = linear_attn_state_new();
-    }
-    #define RESET_STATE() do { for (int i=0;i<Ld;i++){ if(kv[i]) kv[i]->len=0; if(ls[i]){ memset(ls[i]->conv_state,0,verify_conv_sz()*sizeof(float)); memset(ls[i]->ssm_state,0,verify_ssm_sz()*sizeof(float)); } } } while(0)
-
-    int prompt[] = { 9707, 11, 358, 1079, 4378, 264, 13027, 729, 311 };  // arbitrary valid ids
-    int np = (int)(sizeof(prompt) / sizeof(prompt[0]));
-    float *h = malloc(Hd*sizeof(float)), *logits = malloc(V*sizeof(float));
-    int *base_tok = malloc(max_new*sizeof(int)), *mtp_tok = malloc(max_new*sizeof(int));
-
-    // ---- Baseline greedy (sequential single forwards) ----
-    RESET_STATE();
-    for (int p = 0; p < np; p++) { embed_lookup(wf, prompt[p], h); ref_forward_1(wf, h, kv, ls, fds, p, logits); }
-    int tok = cpu_argmax(logits, V), pos = np, bn = 0;
-    double t0 = now_ms();
-    while (bn < max_new) {
-        base_tok[bn++] = tok; if (MTP_IS_EOS(tok)) break;
-        embed_lookup(wf, tok, h); ref_forward_1(wf, h, kv, ls, fds, pos, logits); pos++; tok = cpu_argmax(logits, V);
-    }
-    double base_ms = now_ms() - t0;
-
-    // ---- MTP verify/accept ----
-    RESET_STATE(); g_mtp_kv_len = 0; g_mtp_base_pos = 0;
-    for (int p = 0; p < np; p++) { embed_lookup(wf, prompt[p], h); ref_forward_1(wf, h, kv, ls, fds, p, logits); }
-    int t_next = cpu_argmax(logits, V);
-    float *hcur = malloc(Hd*sizeof(float)); memcpy(hcur, h, Hd*sizeof(float));
-    pos = np;
-    VerifyRollback rb; verify_rollback_init(&rb);
-    float *ha = malloc(Hd*sizeof(float)), *hb = malloc(Hd*sizeof(float)), *la = malloc(V*sizeof(float)), *lb = malloc(V*sizeof(float));
-    int mn = 0, accepts = 0, checks = 0, fwd_calls = 0;
-    double t1 = now_ms();
-    while (mn < max_new) {
-        if (MTP_IS_EOS(t_next)) { mtp_tok[mn++] = t_next; break; }
-        int d = -1; mtp_shadow_draft_token(wf, model_path, hcur, t_next, &d);
-        if (d < 0) {  // no draft: plain single step
-            mtp_tok[mn++] = t_next;
-            embed_lookup(wf, t_next, ha); ref_forward_1(wf, ha, kv, ls, fds, pos, la); fwd_calls++;
-            memcpy(hcur, ha, Hd*sizeof(float)); pos++; t_next = cpu_argmax(la, V);
-            continue;
-        }
-        embed_lookup(wf, t_next, ha); embed_lookup(wf, d, hb);
-        backbone_forward_2(wf, ha, hb, kv, ls, fds, pos, pos+1, la, lb, &rb); fwd_calls++;
-        int t_v1 = cpu_argmax(la, V);
-        mtp_tok[mn++] = t_next; checks++;
-        if (t_v1 == d) {  // accept draft
-            accepts++;
-            if (mn < max_new) mtp_tok[mn++] = d;
-            // Advance the MTP KV for the accepted draft's position (input h(pos), token d)
-            // so the MTP attention context has no gap. Each committed token must be
-            // appended to the MTP KV exactly once, in order.
-            { int dummy = -1; mtp_shadow_draft_token(wf, model_path, ha, d, &dummy); }
-            memcpy(hcur, hb, Hd*sizeof(float)); t_next = cpu_argmax(lb, V); pos += 2;
-        } else {          // reject: undo b, emit verified token next
-            verify_rollback_apply(&rb, kv, ls);
-            memcpy(hcur, ha, Hd*sizeof(float)); t_next = t_v1; pos += 1;
-        }
-    }
-    double mtp_ms = now_ms() - t1;
-
-    int n = bn < mn ? bn : mn, mism = 0;
-    for (int i = 0; i < n; i++) if (base_tok[i] != mtp_tok[i]) { mism++; if (mism == 1) fprintf(stderr, "[mtp-gen] first mismatch at %d: base=%d mtp=%d\n", i, base_tok[i], mtp_tok[i]); }
-    double acc = checks ? 100.0*accepts/checks : 0.0;
-    fprintf(stderr, "[mtp-gen] baseline: %d tok in %.0f ms (%.2f tok/s)\n", bn, base_ms, 1000.0*bn/base_ms);
-    fprintf(stderr, "[mtp-gen] mtp:      %d tok in %.0f ms (%.2f tok/s) | %d forwards | acceptance=%.1f%% (%d/%d)\n",
-            mn, mtp_ms, 1000.0*mn/mtp_ms, fwd_calls, acc, accepts, checks);
-    fprintf(stderr, "[mtp-gen] speedup=%.2fx | tokens/forward: base=1.00 mtp=%.2f\n",
-            mtp_ms > 0 ? (base_ms/bn) / (mtp_ms/mn) : 0.0, (double)mn/fwd_calls);
-    fprintf(stderr, "[mtp-gen] lossless check: %d/%d tokens match baseline | %s\n",
-            n - mism, n, mism == 0 ? "PASS: identical output" : "FAIL: output diverges");
-
-    verify_rollback_free(&rb);
-    for (int i = 0; i < Ld; i++) { if (kv[i]){ free(kv[i]->k_cache); free(kv[i]->v_cache); free(kv[i]); } if (ls[i]) linear_attn_state_free(ls[i]); if (fds[i]>=0) close(fds[i]); }
-    free(fds); free(kv); free(ls); free(h); free(logits); free(base_tok); free(mtp_tok); free(hcur); free(ha); free(hb); free(la); free(lb);
-    #undef RESET_STATE
-    return mism == 0 ? 0 : 1;
-}
 
 // Production single-token forward (reuses fused_layer_forward, faithful). h holds
 // the token embedding on entry; on return h is the pre-norm hidden, logits filled.
@@ -6422,7 +5046,7 @@ static void prod_forward_1(WeightFile *wf, float *h, int pos, KVCache **kv,
     free(n);
 }
 
-// GpuStateSnap typedef'd earlier (before linear_block_2).
+// GpuStateSnap typedef'd earlier.
 static void gpu_snap_alloc(GpuStateSnap *s) {
     s->delta = calloc(g_cfg.num_linear_layers, sizeof(float*));
     s->conv  = calloc(g_cfg.num_linear_layers, sizeof(float*));
@@ -6453,148 +5077,10 @@ static void gpu_snap_restore(GpuStateSnap *s, KVCache **kv) {
             memcpy([g_metal->buf_conv_state[li] contents],  s->conv[li],  3*12288*sizeof(float)); }
     }
 }
-// Reject-rollback: restore state to token-a-only. Full layers: kvlen captured
-// PRE-token-a, so a-only len = kvlen+1 (keep a, drop b). Linear: delta/conv were
-// captured POST-token-a (in linear_block_2), so restore them directly.
-static void batched_rollback_apply(GpuStateSnap *s, KVCache **kv) {
-    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-        if (((layer + 1) % g_cfg.full_attn_interval) == 0) { kv[layer]->len = s->kvlen[layer] + 1; }
-        else { int li = linear_idx_of(layer);
-            memcpy([g_metal->buf_delta_state[li] contents], s->delta[li], 64*128*128*sizeof(float));
-            memcpy([g_metal->buf_conv_state[li] contents],  s->conv[li],  3*12288*sizeof(float)); }
-    }
-}
 
-// 4d-ii: the amortized batched 2-position forward on faithful GPU primitives.
-// full-attn = attn_block_2, linear = linear_block_2 (GPU delta-net), MoE = moe_block_2.
 // All weight-bound matmuls are batched (matmul2); operates on production GPU state.
-static double g_vf2_prof_attn, g_vf2_prof_linear, g_vf2_prof_moe, g_vf2_prof_head;
 
-static void fused_layer_forward_2(WeightFile *wf, float *ha, float *hb,
-                                  KVCache **kv, int *fds, int pos_a, int pos_b,
-                                  float *log_a, float *log_b, GpuStateSnap *rb) {
-    int Hd = g_cfg.hidden_dim;
-    static int s_prof = -1;
-    if (s_prof < 0) s_prof = getenv("FLASHCHAT_VF2_PROF") ? 1 : 0;
-    double _tp = 0;
-    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-        if (s_prof) _tp = now_ms();
-        if (((layer + 1) % g_cfg.full_attn_interval) == 0) {
-            if (rb) rb->kvlen[layer] = kv[layer]->len;  // pre-token-a KV len (rollback)
-            attn_block_2(wf, layer, ha, hb, kv[layer], pos_a, pos_b);
-            if (s_prof) g_vf2_prof_attn += now_ms() - _tp;
-        } else {
-            linear_block_2(wf, layer, ha, hb, rb);      // captures post-a delta/conv if rb
-            if (s_prof) g_vf2_prof_linear += now_ms() - _tp;
-        }
-        if (s_prof) _tp = now_ms();
-        if (g_cfg.num_experts == 0)
-            dense_mlp_block_2(wf, layer, ha, hb);
-        else
-            moe_block_2(wf, layer, ha, hb, fds[layer]);
-        if (s_prof) g_vf2_prof_moe += now_ms() - _tp;
-        if (getenv("MTP_VF2_DBG")) {
-            double na2=0; for(int i=0;i<Hd;i++) na2+=ha[i]*ha[i];
-            int is_full=((layer+1)%g_cfg.full_attn_interval)==0;
-            double rel=-1; if(g_vf2_ref_on && g_vf2_ref[layer]){ double e=0,r=0; for(int i=0;i<Hd;i++){e=fmax(e,fabs(ha[i]-g_vf2_ref[layer][i])); r=fmax(r,fabs(g_vf2_ref[layer][i]));} rel=r>0?e/r:e; }
-            fprintf(stderr,"[vf2-dbg] layer %2d %s |ha|=%.4f rel_vs_prod=%.3e\n",layer,is_full?"FULL":"lin ",sqrt(na2),rel);
-        }
-    }
-    if (s_prof) _tp = now_ms();
-    uint16_t *norm_w = get_tensor_ptr(wf, "model.norm.weight");
-    float *na = malloc(Hd*sizeof(float)), *nb = malloc(Hd*sizeof(float));
-    cpu_rms_norm(ha, norm_w, na, Hd, g_cfg.rms_norm_eps);
-    cpu_rms_norm(hb, norm_w, nb, Hd, g_cfg.rms_norm_eps);
-    TensorInfo *wi=get_tensor_info(wf,"lm_head.weight"), *si=get_tensor_info(wf,"lm_head.scales"), *bi=get_tensor_info(wf,"lm_head.biases");
-    gpu_dequant_matmul2(g_metal, (uint32_t*)((char*)wf->data+wi->offset), (uint16_t*)((char*)wf->data+si->offset),
-                        (uint16_t*)((char*)wf->data+bi->offset), na, nb, log_a, log_b, g_cfg.vocab_size, Hd, g_cfg.group_size);
-    free(na); free(nb);
-    if (s_prof) {
-        g_vf2_prof_head += now_ms() - _tp;
-        fprintf(stderr, "[vf2-prof] cumulative: attn=%.1fms linear=%.1fms moe+shared=%.1fms head=%.1fms "
-                        "| moe: route=%.1f load=%.1f gpu=%.1f shared=%.1f\n",
-                g_vf2_prof_attn, g_vf2_prof_linear, g_vf2_prof_moe, g_vf2_prof_head,
-                g_mb2_route, g_mb2_load, g_mb2_gpu, g_mb2_shared);
-    }
-}
 
-// 4d-ii validation: fused_layer_forward_2 must match two sequential production
-// forwards (prod_forward_1) over ALL layers at decode positions — the end-to-end
-// faithfulness check that catches fp compounding across 40 layers.
-static int mtp_verify_forward2(WeightFile *wf, const char *model_path) {
-    (void)model_path;
-    if (!g_metal || !g_metal->wf_buf || !g_metal->delta_net_step) { fprintf(stderr, "[mtp-vf2] requires GPU\n"); return 1; }
-    int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads*g_cfg.head_dim, Ld = g_cfg.num_layers, K = g_cfg.num_experts_per_tok;
-    int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld,sizeof(void*));
-    KVCache **kv = calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld,sizeof(LinearAttnState*));
-    int cap = 256;
-    for (int i=0;i<Ld;i++){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/layer_%02d.bin",g_flashchat_experts_dir,i); fds[i]=open(p,O_RDONLY);
-        if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} }
-        if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)cap*kv_dim,sizeof(float)); }
-        else ls[i]=linear_attn_state_new(); }
-    float *h=malloc(Hd*sizeof(float)), *scratch=malloc(V*sizeof(float));
-    int P = getenv("MTP_VF2_P") ? atoi(getenv("MTP_VF2_P")) : 35;  // <32 => production uses CPU attn too
-    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
-    for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++) h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
-    GpuStateSnap snap; gpu_snap_alloc(&snap); gpu_snap_save(&snap, kv);
-
-    int ta=400, tb=500;
-    float *Hao=malloc(Hd*sizeof(float)),*Hbo=malloc(Hd*sizeof(float)),*la_o=malloc(V*sizeof(float)),*lb_o=malloc(V*sizeof(float));
-    embed_lookup(wf,ta,Hao); prod_forward_1(wf,Hao,P,kv,ls,fds,mmaps,K,la_o);
-    embed_lookup(wf,tb,Hbo); prod_forward_1(wf,Hbo,P+1,kv,ls,fds,mmaps,K,lb_o);
-
-    gpu_snap_restore(&snap, kv);
-    float *Hat=malloc(Hd*sizeof(float)),*Hbt=malloc(Hd*sizeof(float)),*la_t=malloc(V*sizeof(float)),*lb_t=malloc(V*sizeof(float));
-    embed_lookup(wf,ta,Hat); embed_lookup(wf,tb,Hbt);
-    // DBG: capture production per-layer hidden for token a, then restore state for the batched run.
-    if (getenv("MTP_VF2_DBG")) {
-        gpu_snap_restore(&snap, kv);
-        float *hr=malloc(Hd*sizeof(float)); embed_lookup(wf,ta,hr);
-        for (int L=0; L<Ld; L++) { int isf=((L+1)%g_cfg.full_attn_interval)==0;
-            fused_layer_forward(wf,L,hr,isf?kv[L]:NULL,isf?NULL:ls[L],P,mmaps[L],K,fds[L]); complete_deferred_experts();
-            if(!g_vf2_ref[L]) g_vf2_ref[L]=malloc(Hd*sizeof(float)); memcpy(g_vf2_ref[L],hr,Hd*sizeof(float)); }
-        free(hr); g_vf2_ref_on=1; gpu_snap_restore(&snap, kv);
-    }
-    fused_layer_forward_2(wf,Hat,Hbt,kv,fds,P,P+1,la_t,lb_t,NULL);
-    g_vf2_ref_on=0;
-
-    double ea=0,eb=0,ref=0; for(int i=0;i<V;i++){ ea=fmax(ea,fabs(la_o[i]-la_t[i])); eb=fmax(eb,fabs(lb_o[i]-lb_t[i])); ref=fmax(ref,fabs(la_o[i])); }
-    int aa_o=cpu_argmax(la_o,V),aa_t=cpu_argmax(la_t,V),bb_o=cpu_argmax(lb_o,V),bb_t=cpu_argmax(lb_t,V);
-    double ra=ref>0?ea/ref:ea, rb=ref>0?eb/ref:eb;
-    fprintf(stderr,"[mtp-vf2] tokenA argmax prod=%d batched=%d rel=%.3e | tokenB argmax prod=%d batched=%d rel=%.3e\n", aa_o,aa_t,ra,bb_o,bb_t,rb);
-    int ok = (aa_o==aa_t)&&(bb_o==bb_t);
-    fprintf(stderr,"[mtp-vf2] %s (argmax match is what matters for lossless verify; rel err is fp drift over 40 layers)\n", ok?"PASS: batched forward argmax matches production":"DIVERGE: argmax differs");
-
-    // ---- Amortization timing: batched 2-position forward vs two single forwards ----
-    // (both warm now). This is the per-verify cost ratio that sets the speedup.
-    const int MT = 3;
-    double t = now_ms();
-    for (int m = 0; m < MT; m++) {
-        gpu_snap_restore(&snap, kv);
-        embed_lookup(wf, ta, Hao); prod_forward_1(wf, Hao, P, kv, ls, fds, mmaps, K, la_o);
-        embed_lookup(wf, tb, Hbo); prod_forward_1(wf, Hbo, P+1, kv, ls, fds, mmaps, K, lb_o);
-    }
-    double seq2 = (now_ms() - t) / MT;     // cost of 2 single forwards (2 tokens)
-    t = now_ms();
-    for (int m = 0; m < MT; m++) {
-        gpu_snap_restore(&snap, kv);
-        embed_lookup(wf, ta, Hat); embed_lookup(wf, tb, Hbt);
-        fused_layer_forward_2(wf, Hat, Hbt, kv, fds, P, P+1, la_t, lb_t, NULL);
-    }
-    double batched2 = (now_ms() - t) / MT;  // cost of 1 batched forward (2 positions)
-    double cost_ratio = batched2 / seq2;
-    fprintf(stderr, "[mtp-vf2] timing: 2x single=%.1f ms | batched2=%.1f ms | cost_ratio=%.3f\n", seq2, batched2, cost_ratio);
-    for (double A = 0.55; A <= 0.85; A += 0.15) {
-        double speedup = (1.0 + A) * seq2 / (2.0 * batched2);  // (1+A) tokens per batched forward
-        fprintf(stderr, "[mtp-vf2] projected speedup @ acceptance %.0f%% = %.2fx\n", A*100, speedup);
-    }
-
-    gpu_snap_free(&snap);
-    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i]) linear_attn_state_free(ls[i]); if(mmaps[i]){struct stat st; fstat(fds[i],&st); munmap(mmaps[i],st.st_size);} if(fds[i]>=0) close(fds[i]); }
-    free(fds); free(mmaps); free(kv); free(ls); free(h); free(scratch);
-    free(Hao); free(Hbo); free(la_o); free(lb_o); free(Hat); free(Hbt); free(la_t); free(lb_t);
-    return ok?0:1;
-}
 
 // 4d-i: verify/accept loop on the PRODUCTION forward (faithful hiddens), verify
 // done as two sequential production forwards (no amortization yet — validates
@@ -6656,197 +5142,18 @@ static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new)
     return mism==0 ? 0 : 1;
 }
 
-// Dense MTP draft: produce one draft token from the dense MTP head given the
-// backbone hidden (hcur) and the accepted token. Context-free self-attention
-// (single token, copy-V — like the 35B which still hit 55-83%). Dense MLP head.
-static int dense_mtp_draft(WeightFile *wf, const float *hcur, int t_next, int do_append, float *out_hidden) {
-    int H = g_cfg.hidden_dim, V = g_cfg.vocab_size, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
-    int qpd = g_cfg.num_attn_heads * g_cfg.head_dim * 2, qd = g_cfg.num_attn_heads * g_cfg.head_dim;
-    int kvd = g_cfg.num_kv_heads * g_cfg.head_dim, hpk = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
-    #define MG(n) get_tensor_ptr(wf, "mtp." n)
-    uint16_t *pfh=MG("pre_fc_norm_hidden.weight"), *pfe=MG("pre_fc_norm_embedding.weight"), *mnorm=MG("norm.weight");
-    uint32_t *fcw=MG("fc.weight"); uint16_t *fcs=MG("fc.scales"),*fcb=MG("fc.biases");
-    uint16_t *iln=MG("layers.0.input_layernorm.weight"), *paln=MG("layers.0.post_attention_layernorm.weight");
-    uint16_t *qn=MG("layers.0.self_attn.q_norm.weight"), *kn=MG("layers.0.self_attn.k_norm.weight");
-    uint32_t *qw=MG("layers.0.self_attn.q_proj.weight"); uint16_t *qs=MG("layers.0.self_attn.q_proj.scales"),*qb=MG("layers.0.self_attn.q_proj.biases");
-    uint32_t *kw=MG("layers.0.self_attn.k_proj.weight"); uint16_t *ks=MG("layers.0.self_attn.k_proj.scales"),*kb=MG("layers.0.self_attn.k_proj.biases");
-    uint32_t *vw=MG("layers.0.self_attn.v_proj.weight"); uint16_t *vs=MG("layers.0.self_attn.v_proj.scales"),*vb=MG("layers.0.self_attn.v_proj.biases");
-    uint32_t *ow=MG("layers.0.self_attn.o_proj.weight"); uint16_t *os=MG("layers.0.self_attn.o_proj.scales"),*ob=MG("layers.0.self_attn.o_proj.biases");
-    uint32_t *mgw=MG("layers.0.mlp.gate_proj.weight"); uint16_t *mgs=MG("layers.0.mlp.gate_proj.scales"),*mgb=MG("layers.0.mlp.gate_proj.biases");
-    uint32_t *muw=MG("layers.0.mlp.up_proj.weight");   uint16_t *mus=MG("layers.0.mlp.up_proj.scales"),  *mub=MG("layers.0.mlp.up_proj.biases");
-    uint32_t *mdw=MG("layers.0.mlp.down_proj.weight"); uint16_t *mds=MG("layers.0.mlp.down_proj.scales"),*mdb=MG("layers.0.mlp.down_proj.biases");
-    #undef MG
-    if (!fcw || !mgw) return -1;
-    float eps = g_cfg.rms_norm_eps;
-    float *emb=malloc(H*4),*hn=malloc(H*4),*en=malloc(H*4),*fc_in=malloc(2*H*4),*x=malloc(H*4),*res=malloc(H*4),*normed=malloc(H*4);
-    embed_lookup(wf, t_next, emb);
-    cpu_rms_norm(hcur, pfh, hn, H, eps); cpu_rms_norm(emb, pfe, en, H, eps);
-    memcpy(fc_in, en, H*4); memcpy(fc_in+H, hn, H*4);
-    fast_dequant_matvec(fcw,fcs,fcb, fc_in, x, H, 2*H, gsz);
-    memcpy(res, x, H*4);
-    cpu_rms_norm(x, iln, normed, H, eps);
-    float *qp=malloc(qpd*4),*k=malloc(kvd*4),*v=malloc(kvd*4),*q=malloc(qd*4),*qg=malloc(qd*4),*ao=calloc(qd,4),*ap=malloc(H*4);
-    fast_dequant_matvec(qw,qs,qb,normed,qp,qpd,H,gsz);
-    fast_dequant_matvec(kw,ks,kb,normed,k,kvd,H,gsz);
-    fast_dequant_matvec(vw,vs,vb,normed,v,kvd,H,gsz);
-    for (int h=0;h<g_cfg.num_attn_heads;h++){ float*s=qp+h*2*g_cfg.head_dim; memcpy(q+h*g_cfg.head_dim,s,g_cfg.head_dim*4); memcpy(qg+h*g_cfg.head_dim,s+g_cfg.head_dim,g_cfg.head_dim*4); }
-    for (int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*inv*bf16_to_f32(qn[i]); }
-    for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
-    // Real causal self-attention over a persistent MTP KV cache (replaces copy-V):
-    // append this token's K/V, attend over [0..len]. Built from accepted tokens only.
-    // Real causal self-attention over committed MTP KV cache + the current token.
-    // do_append persists the current token's K/V (committed-token rule); rollout
-    // drafts pass do_append=0 (attend over context, don't pollute the cache).
-    apply_rotary_emb(q, k, g_mtp_base_pos + g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
-    int ncomm = (g_mtp_k_cache && g_mtp_v_cache) ? g_mtp_kv_len : 0;
-    int ctx = ncomm + 1;  // committed positions + current token
-    float ascale = 1.0f / sqrtf((float)g_cfg.head_dim);
-    for (int h=0;h<g_cfg.num_attn_heads;h++){
-        int kvh=h/hpk; float *qh=q+h*g_cfg.head_dim;
-        float *sc=malloc(ctx*sizeof(float));
-        for (int p=0;p<ncomm;p++){ const float *kp=g_mtp_k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale; }
-        { const float *kp=k+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[ncomm]=dt*ascale; }
-        cpu_softmax(sc, ctx);
-        float *oh=ao+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
-        for (int p=0;p<ncomm;p++){ const float *vp=g_mtp_v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d]; }
-        { const float *vp=v+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[ncomm]*vp[d]; }
-        free(sc);
-    }
-    if (do_append && g_mtp_k_cache && g_mtp_v_cache && g_mtp_kv_len < GPU_KV_SEQ) {
-        memcpy(g_mtp_k_cache + (size_t)g_mtp_kv_len*kvd, k, kvd*4);
-        memcpy(g_mtp_v_cache + (size_t)g_mtp_kv_len*kvd, v, kvd*4);
-        g_mtp_kv_len++;
-    }
-    for (int i=0;i<qd;i++) ao[i]*=cpu_sigmoid(qg[i]);
-    fast_dequant_matvec(ow,os,ob, ao, ap, H, qd, gsz);
-    for (int i=0;i<H;i++) x[i]=res[i]+ap[i];
-    float *hp=malloc(H*4),*g=malloc(inter*4),*u=malloc(inter*4),*a=malloc(inter*4),*o=malloc(H*4);
-    cpu_rms_norm(x, paln, hp, H, eps);
-    fast_dequant_matvec(mgw,mgs,mgb, hp, g, inter, H, gsz);
-    fast_dequant_matvec(muw,mus,mub, hp, u, inter, H, gsz);
-    cpu_swiglu(g,u,a,inter);
-    fast_dequant_matvec(mdw,mds,mdb, a, o, H, inter, gsz);
-    for (int i=0;i<H;i++) x[i]+=o[i];
-    if (out_hidden) memcpy(out_hidden, x, H*4);  // pre-final-norm MTP hidden (for rollout chaining)
-    float *fn=malloc(H*4),*logits=malloc(V*4);
-    cpu_rms_norm(x, mnorm, fn, H, eps);
-    lm_head_forward(wf, fn, logits);
-    int draft = cpu_argmax(logits, V);
-    free(emb);free(hn);free(en);free(fc_in);free(x);free(res);free(normed);
-    free(qp);free(k);free(v);free(q);free(qg);free(ao);free(ap);
-    free(hp);free(g);free(u);free(a);free(o);free(fn);free(logits);
-    return draft;
-}
 
-// Lightweight MTP-KV advance: append a committed token's K/V to the MTP cache
-// without the draft's lm_head/mlp/attention/o_proj. Used on accept (for the
-// accepted draft d) to keep the MTP attention context gap-free, cheaply.
-static void dense_mtp_advance(WeightFile *wf, const float *hcur, int t) {
-    if (!g_mtp_k_cache || g_mtp_kv_len >= GPU_KV_SEQ) return;
-    int H=g_cfg.hidden_dim, gsz=g_cfg.group_size, kvd=g_cfg.num_kv_heads*g_cfg.head_dim, qd=g_cfg.num_attn_heads*g_cfg.head_dim;
-    float eps=g_cfg.rms_norm_eps;
-    #define MG(n) get_tensor_ptr(wf, "mtp." n)
-    uint16_t *pfh=MG("pre_fc_norm_hidden.weight"), *pfe=MG("pre_fc_norm_embedding.weight"), *iln=MG("layers.0.input_layernorm.weight"), *kn=MG("layers.0.self_attn.k_norm.weight");
-    uint32_t *fcw=MG("fc.weight"); uint16_t *fcs=MG("fc.scales"),*fcb=MG("fc.biases");
-    uint32_t *kw=MG("layers.0.self_attn.k_proj.weight"); uint16_t *ks=MG("layers.0.self_attn.k_proj.scales"),*kb=MG("layers.0.self_attn.k_proj.biases");
-    uint32_t *vw=MG("layers.0.self_attn.v_proj.weight"); uint16_t *vs=MG("layers.0.self_attn.v_proj.scales"),*vb=MG("layers.0.self_attn.v_proj.biases");
-    #undef MG
-    float *emb=malloc(H*4),*hn=malloc(H*4),*en=malloc(H*4),*fc_in=malloc(2*H*4),*x=malloc(H*4),*normed=malloc(H*4),*k=malloc(kvd*4),*v=malloc(kvd*4),*qdum=calloc(qd,4);
-    embed_lookup(wf, t, emb);
-    cpu_rms_norm(hcur,pfh,hn,H,eps); cpu_rms_norm(emb,pfe,en,H,eps);
-    memcpy(fc_in,en,H*4); memcpy(fc_in+H,hn,H*4);
-    fast_dequant_matvec(fcw,fcs,fcb, fc_in, x, H, 2*H, gsz);
-    cpu_rms_norm(x, iln, normed, H, eps);
-    fast_dequant_matvec(kw,ks,kb,normed,k,kvd,H,gsz);
-    fast_dequant_matvec(vw,vs,vb,normed,v,kvd,H,gsz);
-    for (int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=k+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float inv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*inv*bf16_to_f32(kn[i]); }
-    apply_rotary_emb(qdum, k, g_mtp_base_pos + g_mtp_kv_len, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
-    memcpy(g_mtp_k_cache+(size_t)g_mtp_kv_len*kvd, k, kvd*4);
-    memcpy(g_mtp_v_cache+(size_t)g_mtp_kv_len*kvd, v, kvd*4);
-    g_mtp_kv_len++;
-    free(emb);free(hn);free(en);free(fc_in);free(x);free(normed);free(k);free(v);free(qdum);
-}
 
-// THE FINISH LINE: dense MTP speculative decode end-to-end. Baseline greedy vs
-// MTP draft/verify (batched 2-position forward), lossless check + real tok/s.
-// Reject uses a single re-forward to advance state (simple+correct; proper
-// post-a rollback is a later optimization).
-static int mtp_generate_dense(WeightFile *wf, const char *model_path, int max_new) {
-    if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts != 0) { fprintf(stderr, "[mtp-dense] requires dense GPU model\n"); return 1; }
-    // Attention is unified on GPU across baseline (fused_layer_forward), depth-2 verify
-    // (attn_block_2) and depth-N verify (dense_layer_forward_N) — all use gpu_full_attention[_batch]
-    // at every position, so verify bit-matches baseline (lossless) AND the verify enjoys GPU attention.
-    (void)model_path;
-    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4;
-    int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
-    KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
-    int cap=8192;
-    for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
-    // Real coding prompt (tokenized) for a representative acceptance/speedup number;
-    // fall back to an arbitrary seed if the tokenizer is unavailable.
-    int fb[]={9707,11,358,1079,4378,264,13027,729,311};
-    int *prompt; int np;
-    PromptTokens *pt = encode_prompt_text_to_tokens(
-        "Write a Python function to merge two sorted lists into one sorted list.\n\ndef merge_sorted(a, b):\n    ");
-    if (pt && pt->count > 0) { np=pt->count; prompt=malloc(np*4); for(int i=0;i<np;i++) prompt[i]=(int)pt->ids[i]; }
-    else { np=9; prompt=malloc(np*4); memcpy(prompt,fb,np*4); }
-    float *h=malloc(Hd*4),*logits=malloc(V*4); int *base_tok=malloc(max_new*4),*mtp_tok=malloc(max_new*4);
-    #define IS_EOS(t) ((t)==g_cfg.eos_token_1||(t)==g_cfg.eos_token_2)
-
-    // baseline
-    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
-    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
-    int tok=cpu_argmax(logits,V),pos=np,bn=0; double t0=now_ms();
-    while(bn<max_new){ base_tok[bn++]=tok; if(IS_EOS(tok))break; embed_lookup(wf,tok,h); prod_forward_1(wf,h,pos,kv,ls,fds,mmaps,K,logits); pos++; tok=cpu_argmax(logits,V);}
-    double base_ms=now_ms()-t0;
-
-    // MTP dense verify
-    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
-    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
-    int t_next=cpu_argmax(logits,V); float *hcur=malloc(Hd*4); memcpy(hcur,h,Hd*4); pos=np;
-    // MTP self-attention KV cache (built from accepted tokens; one append per committed token)
-    int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
-    if (!g_mtp_k_cache) { g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, 4); }
-    g_mtp_kv_len = 0; g_mtp_base_pos = 0;
-    GpuStateSnap snap; gpu_snap_alloc(&snap);
-    float *ha=malloc(Hd*4),*hb=malloc(Hd*4),*la=malloc(V*4),*lb=malloc(V*4);
-    g_prof_matmulN=g_prof_attncpu=g_prof_delta=0;  // reset profiler for the depth-2 MTP run
-    int mn=0,accepts=0,checks=0; double t1=now_ms();
-    while(mn<max_new){
-        if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
-        int d=dense_mtp_draft(wf,hcur,t_next,1,NULL);
-        if(d<0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,ha); prod_forward_1(wf,ha,pos,kv,ls,fds,mmaps,K,la); memcpy(hcur,ha,Hd*4); pos++; t_next=cpu_argmax(la,V); continue; }
-        embed_lookup(wf,t_next,ha); embed_lookup(wf,d,hb);
-        fused_layer_forward_2(wf,ha,hb,kv,fds,pos,pos+1,la,lb,&snap);  // captures post-a rollback state
-        int t_v1=cpu_argmax(la,V); mtp_tok[mn++]=t_next; checks++;
-        if(t_v1==d){ accepts++; if(mn<max_new) mtp_tok[mn++]=d; dense_mtp_advance(wf,ha,d); /* advance MTP KV for accepted draft d (cheap) */ memcpy(hcur,hb,Hd*4); t_next=cpu_argmax(lb,V); pos+=2; }
-        else { batched_rollback_apply(&snap,kv); memcpy(hcur,ha,Hd*4); t_next=t_v1; pos++; }  // drop b, keep a — no re-forward
-    }
-    double mtp_ms=now_ms()-t1;
-    int n=bn<mn?bn:mn,mism=0; for(int i=0;i<n;i++) if(base_tok[i]!=mtp_tok[i]){mism++; if(mism==1)fprintf(stderr,"[mtp-dense] first mismatch @%d base=%d mtp=%d\n",i,base_tok[i],mtp_tok[i]);}
-    double acc=checks?100.0*accepts/checks:0;
-    fprintf(stderr,"[mtp-dense] baseline: %d tok %.0f ms (%.2f tok/s)\n",bn,base_ms,1000.0*bn/base_ms);
-    fprintf(stderr,"[mtp-dense] mtp:      %d tok %.0f ms (%.2f tok/s) | acceptance=%.1f%% (%d/%d)\n",mn,mtp_ms,1000.0*mn/mtp_ms,acc,accepts,checks);
-    fprintf(stderr,"[mtp-dense] SPEEDUP=%.2fx | lossless: %d/%d match %s\n", base_ms>0&&mtp_ms>0?(1000.0*mn/mtp_ms)/(1000.0*bn/base_ms):0, n-mism,n, mism==0?"PASS":"FAIL");
-    double prof_acct=g_prof_matmulN+g_prof_attncpu+g_prof_delta;
-    fprintf(stderr,"[mtp-prof] over MTP run: GPU matmulN=%.0f ms (%.1f%%) | CPU full-attn=%.0f ms (%.1f%%) | GPU delta-net=%.0f ms (%.1f%%) | other=%.0f ms\n",
-        g_prof_matmulN,100.0*g_prof_matmulN/mtp_ms, g_prof_attncpu,100.0*g_prof_attncpu/mtp_ms, g_prof_delta,100.0*g_prof_delta/mtp_ms, mtp_ms-prof_acct);
-    gpu_snap_free(&snap);
-    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
-    free(fds);free(mmaps);free(kv);free(ls);free(h);free(logits);free(base_tok);free(mtp_tok);free(hcur);free(ha);free(hb);free(la);free(lb);
-    #undef IS_EOS
-    return mism==0?0:1;
-}
 
 // Depth-N batched forward: N positions through all layers + norm + batched lm_head.
 // hs[N*H] in/out (ends as per-position pre-norm hidden); logits[N*V] out.
-// General N-position forward (dense AND MoE — branches only at the MLP inside
-// dense_layer_forward_N). hs is N*H in/out; logits is N*V out. fds[layer] is the
-// packed-expert fd for MoE layers (ignored for dense / full-attn layers).
-static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *fds, int *pos, float *logits) {
+// General N-position forward (branches only at the MLP inside batched_layer_forward_N).
+// hs is N*H in/out; logits is N*V out. fds[layer] is the packed-expert fd for the MoE
+// MLP (ignored for full-attn layers).
+static void fused_batched_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *fds, int *pos, float *logits) {
     int H=g_cfg.hidden_dim, V=g_cfg.vocab_size, gsz=g_cfg.group_size;
     for (int layer=0; layer<g_cfg.num_layers; layer++)
-        dense_layer_forward_N(wf, layer, hs, N, kv[layer], pos, fds ? fds[layer] : -1);
+        batched_layer_forward_N(wf, layer, hs, N, kv[layer], pos, fds ? fds[layer] : -1);
     uint16_t *nw=get_tensor_ptr(wf,"model.norm.weight");
     float *nd=malloc((size_t)N*H*4);
     for (int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H, nw, nd+(size_t)t*H, H, g_cfg.rms_norm_eps);
@@ -6855,8 +5162,8 @@ static void fused_dense_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv
     free(nd);
 }
 
-// Depth-N faithfulness: fused_dense_forward_N (N positions) must argmax-match N
-// sequential production forwards. Validates the N-generalized dense layer.
+// Depth-N faithfulness: fused_batched_forward_N (N positions) must argmax-match N
+// sequential production forwards. Validates the N-generalized batched layer.
 static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr,"[mtp-vfN] requires GPU\n"); return 1; }
@@ -6879,7 +5186,7 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     gpu_snap_restore(&snap,kv);
     float *hs=malloc((size_t)N*Hd*4),*ln=malloc((size_t)N*V*4); int posv[4]={P,P+1,P+2,P+3};
     for(int t=0;t<N;t++) embed_lookup(wf,toks[t],hs+(size_t)t*Hd);
-    fused_dense_forward_N(wf,hs,N,kv,fds,posv,ln);
+    fused_batched_forward_N(wf,hs,N,kv,fds,posv,ln);
     int allmatch=1; for(int t=0;t<N;t++){ int ao=cpu_argmax(lo+(size_t)t*V,V),an=cpu_argmax(ln+(size_t)t*V,V); double e=0,r=0; for(int i=0;i<V;i++){e=fmax(e,fabs(lo[(size_t)t*V+i]-ln[(size_t)t*V+i]));r=fmax(r,fabs(lo[(size_t)t*V+i]));} fprintf(stderr,"[mtp-vfN] pos%d argmax prod=%d batchedN=%d rel=%.2e\n",t,ao,an,r>0?e/r:e); if(ao!=an)allmatch=0; }
     fprintf(stderr,"[mtp-vfN] %s\n", allmatch?"PASS: depth-N forward matches production":"DIVERGE");
     gpu_snap_free(&snap);
@@ -6888,84 +5195,6 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     return allmatch?0:1;
 }
 
-// Depth-D dense MTP speculative decode: roll out D drafts (autoregressive MTP),
-// verify all D+1 positions in one batched forward, accept the longest correct
-// prefix. Full-accept keeps state; partial-accept rolls back via a short re-forward.
-static int mtp_generate_dense_depth(WeightFile *wf, const char *model_path, int max_new, int D) {
-    (void)model_path;  // attention unified on GPU across baseline + verify (see mtp_generate_dense)
-    if (!g_metal || !g_metal->wf_buf || g_cfg.num_experts != 0) { fprintf(stderr,"[mtp-d%d] requires dense GPU\n",D); return 1; }
-    int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, K=4;
-    int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
-    KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
-    int cap=8192;
-    for(int i=0;i<Ld;i++){ fds[i]=-1; if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
-    // Real coding prompt (tokenized) for a representative acceptance/speedup number;
-    // fall back to an arbitrary seed if the tokenizer is unavailable.
-    int fb[]={9707,11,358,1079,4378,264,13027,729,311};
-    int *prompt; int np;
-    PromptTokens *pt = encode_prompt_text_to_tokens(
-        "Write a Python function to merge two sorted lists into one sorted list.\n\ndef merge_sorted(a, b):\n    ");
-    if (pt && pt->count > 0) { np=pt->count; prompt=malloc(np*4); for(int i=0;i<np;i++) prompt[i]=(int)pt->ids[i]; }
-    else { np=9; prompt=malloc(np*4); memcpy(prompt,fb,np*4); }
-    float *h=malloc(Hd*4),*logits=malloc(V*4); int *base_tok=malloc(max_new*4),*mtp_tok=malloc(max_new*4);
-    #define IS_EOS(t) ((t)==g_cfg.eos_token_1||(t)==g_cfg.eos_token_2)
-    // baseline
-    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
-    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
-    int tok=cpu_argmax(logits,V),pos=np,bn=0; double t0=now_ms();
-    while(bn<max_new){ base_tok[bn++]=tok; if(IS_EOS(tok))break; embed_lookup(wf,tok,h); prod_forward_1(wf,h,pos,kv,ls,fds,mmaps,K,logits); pos++; tok=cpu_argmax(logits,V);}
-    double base_ms=now_ms()-t0;
-    // MTP depth-D verify
-    reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
-    for(int p=0;p<np;p++){ embed_lookup(wf,prompt[p],h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,logits);}
-    int t_next=cpu_argmax(logits,V); float *hcur=malloc(Hd*4); memcpy(hcur,h,Hd*4); pos=np;
-    if(!g_mtp_k_cache){ g_mtp_k_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,4); g_mtp_v_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,4);} g_mtp_kv_len=0;
-    GpuStateSnap snap; gpu_snap_alloc(&snap);
-    int *drafts=malloc(D*4); float *mh=malloc((size_t)D*Hd*4);
-    float *hs=malloc((size_t)(D+1)*Hd*4),*ln=malloc((size_t)(D+1)*V*4); int *posv=malloc((D+1)*4);
-    g_prof_matmulN=g_prof_attncpu=g_prof_delta=0;  // reset profiler for the depth-3 MTP run
-    int mn=0,accepts=0,checks=0; double t1=now_ms();
-    while(mn<max_new){
-        if(IS_EOS(t_next)){ mtp_tok[mn++]=t_next; break; }
-        // rollout D drafts (no MTP-KV append; chain MTP hiddens)
-        int nd=0; const float *mhp=hcur;
-        for(int j=0;j<D;j++){ int dj=dense_mtp_draft(wf,mhp,(j==0?t_next:drafts[j-1]),0,mh+(size_t)j*Hd); if(dj<0)break; drafts[j]=dj; mhp=mh+(size_t)j*Hd; nd++; }
-        if(nd==0){ mtp_tok[mn++]=t_next; embed_lookup(wf,t_next,hs); prod_forward_1(wf,hs,pos,kv,ls,fds,mmaps,K,ln); dense_mtp_advance(wf,hcur,t_next); memcpy(hcur,hs,Hd*4); pos++; t_next=cpu_argmax(ln,V); continue; }
-        int Nv=nd+1;
-        gpu_snap_save(&snap,kv);
-        embed_lookup(wf,t_next,hs); for(int j=0;j<nd;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
-        for(int t=0;t<Nv;t++) posv[t]=pos+t;
-        fused_dense_forward_N(wf,hs,Nv,kv,fds,posv,ln);
-        mtp_tok[mn++]=t_next;
-        int acc=0;
-        for(int j=0;j<nd;j++){ int tv=cpu_argmax(ln+(size_t)j*V,V); checks++; if(drafts[j]==tv){ accepts++; acc++; if(mn<max_new)mtp_tok[mn++]=drafts[j]; } else break; }
-        int next_tok = cpu_argmax(ln+(size_t)acc*V,V);  // acc==nd: bonus; acc<nd: real reject token
-        float *hcommit = hs;
-        if(acc<nd){ // partial: rollback + re-forward the acc+1 committed tokens
-            gpu_snap_restore(&snap,kv);
-            embed_lookup(wf,t_next,hs); for(int j=0;j<acc;j++) embed_lookup(wf,drafts[j],hs+(size_t)(j+1)*Hd);
-            for(int t=0;t<acc+1;t++) posv[t]=pos+t;
-            fused_dense_forward_N(wf,hs,acc+1,kv,fds,posv,ln);
-            next_tok = cpu_argmax(ln+(size_t)acc*V,V);
-        }
-        // MTP-KV advance for committed tokens (t_next + accepted drafts)
-        dense_mtp_advance(wf,hcur,t_next);
-        for(int j=0;j<acc;j++) dense_mtp_advance(wf,hcommit+(size_t)j*Hd,drafts[j]);
-        memcpy(hcur,hcommit+(size_t)acc*Hd,Hd*4);
-        t_next=next_tok; pos += acc+1;
-    }
-    double mtp_ms=now_ms()-t1;
-    int n=bn<mn?bn:mn,mism=0; for(int i=0;i<n;i++) if(base_tok[i]!=mtp_tok[i]){mism++; if(mism==1)fprintf(stderr,"[mtp-d%d] first mismatch @%d base=%d mtp=%d\n",D,i,base_tok[i],mtp_tok[i]);}
-    double accpct=checks?100.0*accepts/checks:0;
-    fprintf(stderr,"[mtp-d%d] baseline: %d tok %.0f ms (%.2f tok/s)\n",D,bn,base_ms,1000.0*bn/base_ms);
-    fprintf(stderr,"[mtp-d%d] mtp(depth-%d): %d tok %.0f ms (%.2f tok/s) | per-draft accept=%.1f%% (%d/%d)\n",D,D,mn,mtp_ms,1000.0*mn/mtp_ms,accpct,accepts,checks);
-    fprintf(stderr,"[mtp-d%d] SPEEDUP=%.2fx | lossless: %d/%d match %s\n",D, base_ms>0&&mtp_ms>0?(1000.0*mn/mtp_ms)/(1000.0*bn/base_ms):0, n-mism,n, mism==0?"PASS":"FAIL");
-    gpu_snap_free(&snap);
-    for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
-    free(fds);free(mmaps);free(kv);free(ls);free(h);free(logits);free(base_tok);free(mtp_tok);free(hcur);free(drafts);free(mh);free(hs);free(ln);free(posv);
-    #undef IS_EOS
-    return mism==0?0:1;
-}
 
 // ============================================================================
 // Linear attention layer forward (GatedDeltaNet, single token, incremental)
@@ -8312,38 +6541,6 @@ static void init_layer_scratch(void) {
     s_gated_out  = calloc(g_cfg.linear_total_value, sizeof(float));
 }
 
-// Dense FFN (Qwen3.6-27B dense model, num_experts==0): no routing, no experts,
-// no shared expert — just hidden = h_mid + down_proj(swiglu(gate_proj(h_post), up_proj(h_post))).
-// All matvecs use matvec_fast (in_dim 5120/17408 > 4096 v3 limit). h_post is the
-// post-attention-norm of h_mid; output written into hidden_out.
-static void dense_mlp_forward(WeightFile *wf, int layer, const float *h_post,
-                              const float *h_mid, float *hidden_out) {
-    int H = g_cfg.hidden_dim, inter = g_cfg.dense_intermediate, gsz = g_cfg.group_size;
-    char nm[256];
-    #define DW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
-    uint32_t *gw=DW("gate_proj.weight"); uint16_t *gs=DW("gate_proj.scales"),*gb=DW("gate_proj.biases");
-    uint32_t *uw=DW("up_proj.weight");   uint16_t *us=DW("up_proj.scales"),  *ub=DW("up_proj.biases");
-    uint32_t *dw=DW("down_proj.weight"); uint16_t *ds=DW("down_proj.scales"),*db=DW("down_proj.biases");
-    #undef DW
-    float *g=malloc(inter*sizeof(float)),*u=malloc(inter*sizeof(float)),*a=malloc(inter*sizeof(float)),*o=malloc(H*sizeof(float));
-    // gate and up are independent and share the same input (h_post) -> batch into ONE
-    // command buffer (one commit+wait, one input upload) instead of two. down depends on
-    // swiglu(gate,up) so it stays a separate dispatch.
-    if (g_metal && metal_weights_ready(g_metal)) {
-        BatchMatvecSpec sp[2] = {
-            { gw,gs,gb, g, (uint32_t)inter, (uint32_t)H, (uint32_t)gsz, 0 },
-            { uw,us,ub, u, (uint32_t)inter, (uint32_t)H, (uint32_t)gsz, 1 },
-        };
-        gpu_batch_matvec(g_metal, h_post, (uint32_t)H, sp, 2);
-    } else {
-        fast_dequant_matvec(gw,gs,gb,h_post,g,inter,H,gsz);
-        fast_dequant_matvec(uw,us,ub,h_post,u,inter,H,gsz);
-    }
-    cpu_swiglu(g,u,a,inter);
-    fast_dequant_matvec(dw,ds,db,a,o,H,inter,gsz);
-    for (int i=0;i<H;i++) hidden_out[i] = h_mid[i] + o[i];
-    free(g); free(u); free(a); free(o);
-}
 
 static void fused_layer_forward(
     WeightFile *wf,
@@ -8794,35 +6991,18 @@ static void fused_layer_forward(
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
-        // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
+        // GPU attention: defer dispatches to CMD2 (fused into a single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
-        // MoE takes the fused CMD2 path; dense (num_experts==0) has no CMD2, so it runs
-        // the standalone gpu_full_attention helper over the same buf_kv_k mirror (written
-        // unconditionally above). This makes dense DECODE use GPU attention too — prefill
-        // already does (dense_layer_forward_N) — so the server leans into GPU attention for
-        // ALL production paths, not just prefill. Big win at long context (O(seq) CPU
-        // attention per token per layer was the dense decode tax in e.g. the 12K case).
-        // NO len>=32 threshold for dense: the dense MTP verify (attn_block_2 /
-        // dense_layer_forward_N) uses the SAME GPU kernels at EVERY position, so baseline and
-        // verify make identical GPU/CPU decisions -> bit-match -> lossless. (MoE keeps >=32.)
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ &&
                               g_cfg.num_experts > 0);
-        int dense_gpu_ready = (g_cfg.num_experts == 0 && g_dense_gpu_attn &&
-                               g_metal && g_metal->attn_scores_pipe &&
-                               fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
-                               kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
-        } else if (dense_gpu_ready) {
-            // Dense: standalone GPU full-attention over buf_kv_k/v[fa_idx] (seq_len=kv->len),
-            // result lands in attn_out (CPU buffer) consumed by the dense fallback o_proj.
-            gpu_full_attention(fa_idx, kv->len, q, q_gate, attn_out);
         } else {
             // CPU fallback
             for (int h = 0; h < g_cfg.num_attn_heads; h++) {
@@ -8858,16 +7038,9 @@ static void fused_layer_forward(
     } else if (gpu_linear_attn) {
         // ---- GPU linear attention: already computed in CMD1 ----
         // batch_out[6] already contains gated_rms_norm output (linear_total_value floats)
-        if (g_cfg.num_experts == 0) {
-            // Dense takes the non-fused fallback o_proj, which reads attn_out_for_oproj
-            // directly — so copy the gated output into a real buffer (not a sentinel).
-            memcpy(s_gated_out, [g_metal->batch_out[6] contents], g_cfg.linear_total_value * sizeof(float));
-            attn_out_for_oproj = s_gated_out;
-        } else {
-            // MoE: fused CMD2 path reads batch_out[6] directly; sentinel just signals non-NULL.
-            static float gpu_linear_sentinel;
-            attn_out_for_oproj = &gpu_linear_sentinel;
-        }
+        // MoE: fused CMD2 path reads batch_out[6] directly; sentinel just signals non-NULL.
+        static float gpu_linear_sentinel;
+        attn_out_for_oproj = &gpu_linear_sentinel;
     } else {
         // ---- Linear attention CPU compute ----
         if (!linear_attn_bypass) {
@@ -9057,8 +7230,7 @@ static void fused_layer_forward(
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ
-                         && g_cfg.num_experts > 0);  // dense: no MoE-fused CMD2, use CPU attn + fallback
+                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
@@ -9306,14 +7478,6 @@ static void fused_layer_forward(
             fast_batch_matvec(h_post, g_cfg.hidden_dim, moe_specs, 4);
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
-    }
-
-    // ---- DENSE FFN branch (num_experts==0): no routing/experts/CMD3 ----
-    // h_mid (=residual+o_proj) and h_post (=post_attn_norm) are computed above.
-    if (g_cfg.num_experts == 0) {
-        dense_mlp_forward(wf, layer_idx, h_post, h_mid, hidden);
-        if (g_timing_enabled) { g_timing.total += now_ms() - t_layer_start; g_timing.count++; }
-        return;
     }
 
     // ---- Softmax + top-K (CPU) ----
@@ -13237,14 +11401,12 @@ static void serve_loop(
                 g_cfg.num_layers, g_cfg.hidden_dim, g_cfg.vocab_size,
                 g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim,
                 g_cfg.num_full_attn_layers, g_cfg.num_linear_layers);
-    if (g_cfg.num_experts > 0) {
+    {
         size_t expert_bytes = active_expert_size();
         double expert_size_per_token_mib = ((double)expert_bytes * (double)K) / (1024.0 * 1024.0);
         server_logf("[serve]   experts: total=%d active_per_token=%d trained_active_per_token=%d expert_size=%zu expert_size_per_token=%.1f MiB\n",
                     g_cfg.num_experts, K, g_cfg.num_experts_per_tok,
                     expert_bytes, expert_size_per_token_mib);
-    } else {
-        server_logf("[serve]   experts: dense model (active_per_token=0)\n");
     }
     server_logf("[serve]   max_response_tokens: %d\n", max_tokens);
     server_logf("[serve]   reasoning: %s\n", g_default_reasoning_enabled ? "enabled" : "disabled");
@@ -13599,13 +11761,8 @@ static void serve_loop(
         // Split prefill: system prompt first, then conversation
         int sys_token_end = req.used_snapshot ? 0 : sys_prompt_token_count;
         if (!snapshot_restored && sys_token_end > 0) {
-            // Prefill system prompt tokens. Dense models use a batched (chunked) forward
-            // that is bit-exact to the token-by-token path but ~8x fewer weight-read passes
-            // (critical for large agent system prompts, e.g. OpenCode's ~12k tokens). MoE
-            // stays token-by-token (batched MoE forward is not faithful).
-            if (g_cfg.num_experts == 0 && batched_prefill_enabled()) {
-                serve_prefill_dense_batched(wf, serve_embed_batch, pt, 0, sys_token_end, kv_caches, &pos, NULL);
-            } else
+            // Prefill system prompt tokens token-by-token. (The faithful batched forward
+            // is wired for the MTP draft/verify path at decode time, not for prefill.)
             for (int i = 0; i < sys_token_end; i++) {
                 if (serve_embed_batch) {
                     memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
@@ -13682,11 +11839,6 @@ static void serve_loop(
 
         // Prefill remaining tokens (conversation, or all tokens if snapshot restored)
         int prefill_start = sys_token_end;
-        if (g_cfg.num_experts == 0 && batched_prefill_enabled()) {
-            // Dense: batched chunked prefill; last token's hidden feeds the first decode logits.
-            if (pt->count > prefill_start)
-                serve_prefill_dense_batched(wf, serve_embed_batch, pt, prefill_start, pt->count, kv_caches, &pos, hidden);
-        } else
         for (int i = prefill_start; i < pt->count; i++) {
             if (serve_embed_batch) {
                 memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
@@ -14003,7 +12155,7 @@ tool_call_checked:
                     embed_lookup(wf, next_token, mtp_hs);
                     for (int j = 0; j < nd; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
                     for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
-                    fused_dense_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                    fused_batched_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
                     if (g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
 
                     // One-shot debug: compare draft logits vs verify logits for position 0
@@ -14076,7 +12228,7 @@ tool_call_checked:
                         embed_lookup(wf, next_token, mtp_hs);
                         for (int j = 0; j < acc; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
                         for (int t = 0; t < acc+1; t++) mtp_posv[t] = pos + t;
-                        fused_dense_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                        fused_batched_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
                         seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
                         if (g_server_debug_enabled) mtp_refwd_ms = now_ms() - _t_refwd;
                     }
@@ -14288,19 +12440,8 @@ enum {
     OPT_NO_MTP,
     OPT_MTP_PREFLIGHT,
     OPT_MTP_BENCH_MATMUL,
-    OPT_MTP_BENCH_ATTN,
-    OPT_MTP_BENCH_MOE,
-    OPT_MTP_VERIFY_LAYER,
-    OPT_MTP_VERIFY_FORWARD,
-    OPT_MTP_VERIFY_ROLLBACK,
-    OPT_MTP_VERIFY_DEEP,
-    OPT_MTP_VERIFY_LINEAR,
-    OPT_MTP_VERIFY_FORWARD2,
-    OPT_MTP_GENERATE,
     OPT_MTP_GENERATE_GPU,
-    OPT_MTP_GENERATE_DENSE,
     OPT_MTP_VERIFY_FORWARDN,
-    OPT_MTP_GENERATE_DEPTH3,
     OPT_CONFIG,
     OPT_TEMPERATURE,
     OPT_TOP_P,
@@ -14365,19 +12506,8 @@ int main(int argc, char **argv) {
         int cache_roundtrip_test_requested = 0;
         int mtp_preflight_requested = 0;
         int mtp_bench_matmul_requested = 0;
-        int mtp_bench_attn_requested = 0;
-        int mtp_bench_moe_requested = 0;
-        int mtp_verify_layer_requested = 0;
-        int mtp_verify_forward_requested = 0;
-        int mtp_verify_rollback_requested = 0;
-        int mtp_verify_deep_requested = 0;
-        int mtp_verify_linear_requested = 0;
-        int mtp_verify_forward2_requested = 0;
-        int mtp_generate_requested = 0;
         int mtp_generate_gpu_requested = 0;
-        int mtp_generate_dense_requested = 0;
         int mtp_verify_forwardN_requested = 0;
-        int mtp_generate_depth3_requested = 0;
         
         int serve_port = 0;   // from --serve <port>
 
@@ -14593,19 +12723,8 @@ int main(int argc, char **argv) {
             {"no-mtp",        no_argument,       0, OPT_NO_MTP},
             {"mtp-preflight",  no_argument,       0, OPT_MTP_PREFLIGHT},
             {"mtp-bench-matmul", no_argument,     0, OPT_MTP_BENCH_MATMUL},
-            {"mtp-bench-attn", no_argument,       0, OPT_MTP_BENCH_ATTN},
-            {"mtp-bench-moe", no_argument,        0, OPT_MTP_BENCH_MOE},
-            {"mtp-verify-layer", no_argument,     0, OPT_MTP_VERIFY_LAYER},
-            {"mtp-verify-forward", no_argument,   0, OPT_MTP_VERIFY_FORWARD},
-            {"mtp-verify-rollback", no_argument,  0, OPT_MTP_VERIFY_ROLLBACK},
-            {"mtp-verify-deep", no_argument,      0, OPT_MTP_VERIFY_DEEP},
-            {"mtp-verify-linear", no_argument,    0, OPT_MTP_VERIFY_LINEAR},
-            {"mtp-verify-forward2", no_argument,  0, OPT_MTP_VERIFY_FORWARD2},
-            {"mtp-generate", no_argument,         0, OPT_MTP_GENERATE},
             {"mtp-generate-gpu", no_argument,     0, OPT_MTP_GENERATE_GPU},
-            {"mtp-generate-dense", no_argument,   0, OPT_MTP_GENERATE_DENSE},
             {"mtp-verify-forwardN", no_argument,  0, OPT_MTP_VERIFY_FORWARDN},
-            {"mtp-generate-depth3", no_argument,  0, OPT_MTP_GENERATE_DEPTH3},
             {"config",        required_argument, 0, OPT_CONFIG},
             {"temperature",   required_argument, 0, OPT_TEMPERATURE},
             {"top-p",         required_argument, 0, OPT_TOP_P},
@@ -14652,19 +12771,8 @@ int main(int argc, char **argv) {
                 case OPT_NO_MTP: g_mtp_predictions = 0; break;
                 case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
-                case OPT_MTP_BENCH_ATTN: mtp_bench_attn_requested = 1; break;
-                case OPT_MTP_BENCH_MOE: mtp_bench_moe_requested = 1; break;
-                case OPT_MTP_VERIFY_LAYER: mtp_verify_layer_requested = 1; break;
-                case OPT_MTP_VERIFY_FORWARD: mtp_verify_forward_requested = 1; break;
-                case OPT_MTP_VERIFY_ROLLBACK: mtp_verify_rollback_requested = 1; break;
-                case OPT_MTP_VERIFY_DEEP: mtp_verify_deep_requested = 1; break;
-                case OPT_MTP_VERIFY_LINEAR: mtp_verify_linear_requested = 1; break;
-                case OPT_MTP_VERIFY_FORWARD2: mtp_verify_forward2_requested = 1; break;
-                case OPT_MTP_GENERATE: mtp_generate_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
-                case OPT_MTP_GENERATE_DENSE: mtp_generate_dense_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; g_mtp_predictions = 1; break;
-                case OPT_MTP_GENERATE_DEPTH3: mtp_generate_depth3_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_CONFIG: config_file_override = optarg; break;  // already pre-scanned
                 case OPT_TEMPERATURE: cli_temperature = strtof(optarg, NULL); has_cli_temperature = 1; break;
                 case OPT_TOP_P: cli_top_p = strtof(optarg, NULL); has_cli_top_p = 1; break;
@@ -14731,16 +12839,16 @@ int main(int argc, char **argv) {
                 batch = 0;                        // disabled
             } else if (raw == 1) {
                 // Automatic: enable only where the batched verify is bit-faithful.
-                // The batched verify is now bit-faithful for BOTH dense and MoE
+                // The batched verify is bit-faithful for MoE
                 // (linear attention + MoE expert FFN reuse the production GPU
-                // kernels — see routed_ffn_1 / mtp-verify-forward2), so automatic
+                // kernels — see routed_ffn_1 / --mtp-verify-forwardN), so automatic
                 // enables MTP at the proven batch size wherever the model carries
                 // MTP artifacts.
                 batch = 2;
             } else {
                 batch = raw;                      // explicit predictor batch size
             }
-            // The N-position verify (fused_dense_forward_N -> matmulN) supports up to
+            // The N-position verify (fused_batched_forward_N -> matmulN) supports up to
             // 8 columns; cap the predictor batch there.
             if (batch > 8) {
                 fprintf(stderr, "[mtp] predictor batch size %d exceeds the N-position verify limit; clamping to 8\n", batch);
@@ -14939,44 +13047,11 @@ int main(int argc, char **argv) {
         if (mtp_bench_matmul_requested) {
             return mtp_bench_matmul(wf);
         }
-        if (mtp_bench_attn_requested) {
-            return mtp_bench_attn(wf);
-        }
-        if (mtp_bench_moe_requested) {
-            return mtp_bench_moe(wf, model_path);
-        }
-        if (mtp_verify_layer_requested) {
-            return mtp_verify_layer(wf, model_path);
-        }
-        if (mtp_verify_forward_requested) {
-            return mtp_verify_forward(wf, model_path);
-        }
-        if (mtp_verify_rollback_requested) {
-            return mtp_verify_rollback(wf, model_path);
-        }
-        if (mtp_verify_deep_requested) {
-            return mtp_verify_deep(wf, model_path);
-        }
-        if (mtp_verify_linear_requested) {
-            return mtp_verify_linear(wf, model_path);
-        }
-        if (mtp_verify_forward2_requested) {
-            return mtp_verify_forward2(wf, model_path);
-        }
-        if (mtp_generate_requested) {
-            return mtp_generate(wf, model_path, 48);
-        }
         if (mtp_generate_gpu_requested) {
             return mtp_generate_gpu(wf, model_path, 48);
         }
-        if (mtp_generate_dense_requested) {
-            return mtp_generate_dense(wf, model_path, 64);
-        }
         if (mtp_verify_forwardN_requested) {
             return mtp_verify_forwardN(wf, model_path);
-        }
-        if (mtp_generate_depth3_requested) {
-            return mtp_generate_dense_depth(wf, model_path, 64, 3);
         }
 
         // ---- Load vocabulary ----
@@ -15121,14 +13196,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (g_cfg.num_experts == 0 && batched_prefill_enabled()) {
-            double t_prefill_batch = now_ms();
-            serve_prefill_dense_batched(wf, embed_batch, pt, 0, pt->count, kv_caches, &pos, hidden);
-            if (g_timing_enabled) {
-                printf("  [prefill] dense chunked %d/%d tokens: %.0f ms\n",
-                       pt->count, pt->count, now_ms() - t_prefill_batch);
-            }
-        } else {
+        {
             // ---- Batch prefill loop ----
             // Process all prompt tokens through the model. For intermediate tokens
             // (not the last), we use discard_deferred_experts() which waits for the GPU
@@ -15371,11 +13439,6 @@ int main(int argc, char **argv) {
         printf("Total time:     %.1f s\n", total_time / 1000.0);
         if (g_timing_enabled) {
             printf("TTFT:           %.0f ms\n", ttft_ms);
-            if (g_prof_dense_chunk_layers > 0) {
-                printf("Dense chunks:   %d layer-chunks (attn %.1f ms, mlp %.1f ms)\n",
-                       g_prof_dense_chunk_layers,
-                       g_prof_dense_chunk_attn, g_prof_dense_chunk_mlp);
-            }
         }
         printf("Tokens:         %d generated\n", total_generated);
         if (total_generated > 1) {

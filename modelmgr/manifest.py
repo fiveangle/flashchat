@@ -92,10 +92,6 @@ class Manifest:
     user_defined: bool = False
 
     @property
-    def is_dense(self) -> bool:
-        return int(self.architecture.get("num_experts", 0)) == 0
-
-    @property
     def num_experts_per_tok(self) -> int:
         return int(self.architecture.get("num_experts_per_tok", 0) or 0)
 
@@ -186,8 +182,8 @@ def parse_manifest(data: dict, source_path: str | None = None, user_defined: boo
     for key in _REQUIRED_ARCH_KEYS:
         if key not in arch:
             raise ManifestError(f"{where}: architecture missing '{key}'")
-    if int(arch.get("num_experts", 0)) == 0 and "intermediate_size" not in arch:
-        raise ManifestError(f"{where}: dense model (num_experts=0) requires architecture.intermediate_size")
+    if int(arch.get("num_experts", 0)) == 0:
+        raise ManifestError(f"{where}: dense models (num_experts=0) are not supported")
 
     shared = {
         rel: _parse_artifact(rel, raw, where)

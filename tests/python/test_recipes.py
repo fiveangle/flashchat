@@ -21,7 +21,6 @@ class TestRecipePlanning(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")
-        self.dense = registry.get("qwen3.6-27b")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -30,11 +29,11 @@ class TestRecipePlanning(unittest.TestCase):
         return [s.step for s in plan.steps]
 
     def test_valid_tree_plans_nothing(self):
-        for manifest in (self.moe, self.dense):
-            snapshot = make_snapshot(self.tmp.name, manifest)
-            for vname in manifest.variants:
-                plan = recipes.plan(manifest, vname, snapshot)
-                self.assertTrue(plan.empty, f"{manifest.id}:{vname}: {plan.steps}")
+        manifest = self.moe
+        snapshot = make_snapshot(self.tmp.name, manifest)
+        for vname in manifest.variants:
+            plan = recipes.plan(manifest, vname, snapshot)
+            self.assertTrue(plan.empty, f"{manifest.id}:{vname}: {plan.steps}")
 
     def test_fresh_snapshot_plans_full_recipe(self):
         snapshot = make_snapshot(self.tmp.name, self.moe, variants=[])
@@ -66,15 +65,6 @@ class TestRecipePlanning(unittest.TestCase):
         self.assertTrue(recipes.plan(self.moe, "q4", snapshot).empty)
         plan = recipes.plan(self.moe, "q4", snapshot, want_optional=True)
         self.assertIn("compile_native:bf16_mtp", self.steps_of(plan))
-
-    def test_dense_model_never_plans_expert_steps(self):
-        snapshot = make_snapshot(self.tmp.name, self.dense, variants=[])
-        import shutil
-        shutil.rmtree(paths.flashchat_dir(snapshot))
-        steps = self.steps_of(recipes.plan(self.dense, "q4", snapshot))
-        self.assertNotIn("compile_native:experts", steps)
-        self.assertNotIn("compile_native:mtp_experts", steps)
-        self.assertIn("compile_native:non_experts", steps)
 
     def test_deleted_weights_replans_only_that_step(self):
         snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])

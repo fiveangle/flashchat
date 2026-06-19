@@ -128,8 +128,8 @@ echo ""
 echo "=== Manage TUI (non-destructive) ==="
 output=$(printf 'q\n' | run_fc manage 2>&1)
 assert_contains "manage lists models" "Manage models" "$output"
-# index 6 = the native qwen3.6-35b-a3b in the id-sorted manage list
-output=$(printf '6\nq\nq\n' | run_fc manage 2>&1)
+# index 4 = the native qwen3.6-35b-a3b in the sorted manage list
+output=$(printf '4\nq\nq\n' | run_fc manage 2>&1)
 assert_contains "manage model view shows snapshot" "snapshot:" "$output"
 assert_contains "manage model view shows artifacts" "packed_experts/" "$output"
 assert_contains "manage offers verify actions" "deep verify" "$output"

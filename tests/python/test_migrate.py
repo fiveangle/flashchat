@@ -113,7 +113,7 @@ class TestConfigAndState(MigrateBase):
         self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "3")
 
     def test_config_migration_is_idempotent(self):
-        configfile.update({"MODEL": "Qwen-Qwen36-27B"})
+        configfile.update({"MODEL": "Qwen-Qwen36-35B-A3B"})
         self.assertTrue(migrate.migrate_user_config(self.registry))
         self.assertEqual(migrate.migrate_user_config(self.registry), {})
 

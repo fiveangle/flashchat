@@ -254,8 +254,7 @@ flashchat_model_active_experts() {
     flashchat_model_field "$1" "num_experts_per_tok"
 }
 
-# Total routed experts. 0 (or empty) => dense model: no packed_experts/ or
-# expert_index.json runtime artifacts (the MLP is quantized into model_weights.bin).
+# Total routed experts for a MoE model (always > 0 for supported models).
 flashchat_model_num_experts() {
     local n
     n=$(flashchat_model_field "$1" "num_experts")

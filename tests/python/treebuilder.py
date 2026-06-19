@@ -17,7 +17,6 @@ sys.path.insert(0, REPO_ROOT)
 from modelmgr import paths
 from modelmgr.artifacts import (
     MTP_BASE_TENSORS,
-    MTP_DENSE_TENSORS,
     MTP_MOE_TENSORS,
     ArtifactDir,
     expert_pack_size,
@@ -34,8 +33,7 @@ def weights_config_for(manifest, variant) -> dict:
 def make_weights_json(manifest, variant) -> dict:
     tensors = {"embed_tokens.weight": {"offset": 0, "size": 16}}
     if manifest.mtp_artifacts_required:
-        required = MTP_BASE_TENSORS + (
-            MTP_DENSE_TENSORS if manifest.is_dense else MTP_MOE_TENSORS)
+        required = MTP_BASE_TENSORS + MTP_MOE_TENSORS
         for name in required:
             tensors[name] = {"offset": 0, "size": 16, "dtype": "BF16"}
     return {

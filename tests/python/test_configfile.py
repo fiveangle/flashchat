@@ -24,9 +24,9 @@ class TestConfigFile(unittest.TestCase):
             f.write(text)
 
     def test_load_parses_quoted_values(self):
-        self.write('MODEL="Qwen-Qwen36-27B"\nSERVER_PORT="9999"\n')
+        self.write('MODEL="Qwen-Qwen36-35B-A3B"\nSERVER_PORT="9999"\n')
         values = configfile.load(self.path)
-        self.assertEqual(values["MODEL"], "Qwen-Qwen36-27B")
+        self.assertEqual(values["MODEL"], "Qwen-Qwen36-35B-A3B")
         self.assertEqual(values["SERVER_PORT"], "9999")
 
     def test_last_occurrence_wins_like_bash_source(self):
@@ -44,9 +44,9 @@ class TestConfigFile(unittest.TestCase):
 
     def test_update_appends_new_keys(self):
         self.write('MODEL="m"\n')
-        configfile.update({"MODEL_BASE": "qwen3.6-27b", "MODEL_VARIANT": "q4"}, path=self.path)
+        configfile.update({"MODEL_BASE": "qwen3.6-35b-a3b", "MODEL_VARIANT": "q4"}, path=self.path)
         values = configfile.load(self.path)
-        self.assertEqual(values["MODEL_BASE"], "qwen3.6-27b")
+        self.assertEqual(values["MODEL_BASE"], "qwen3.6-35b-a3b")
         self.assertEqual(values["MODEL_VARIANT"], "q4")
         with open(self.path) as f:
             first = f.readline().strip()

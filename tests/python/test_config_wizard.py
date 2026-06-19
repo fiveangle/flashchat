@@ -99,17 +99,6 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
         self.assertIn("Active experts (K, default 8, max 16) [16]:", out.getvalue())
         self.assertEqual(changes["ACTIVE_EXPERTS"], "16")
 
-    def test_dense_model_does_not_prompt_k(self):
-        manifest = self.registry.get("qwen3.6-27b")
-        replies = "\n".join(["4", "0.7", "0.8", "20", "0.0", "1.5", "1.0", "1"]) + "\n"
-
-        out = io.StringIO()
-        with patch("sys.stdin", io.StringIO(replies)), redirect_stdout(out):
-            changes = config_wizard._select_sampling_profile(manifest)
-
-        self.assertNotIn("Active experts", out.getvalue())
-        self.assertNotIn("ACTIVE_EXPERTS", changes)
-
 
 if __name__ == "__main__":
     unittest.main()

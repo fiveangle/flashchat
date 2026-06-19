@@ -236,9 +236,8 @@ MTP_BASE_TENSORS = (
     "mtp.layers.0.self_attn.q_proj.weight",
     "mtp.norm.weight",
 )
-# MoE MTP heads have an expert router; dense MTP heads have a plain MLP.
+# MoE MTP heads have an expert router.
 MTP_MOE_TENSORS = ("mtp.layers.0.mlp.gate.weight",)
-MTP_DENSE_TENSORS = ("mtp.layers.0.mlp.gate_proj.weight",)
 
 
 def expert_pack_size(hidden: int, moe: int, bits: int, group_size: int) -> int:
@@ -300,13 +299,13 @@ def packed_layout_matches(manifest: Manifest, variant: Variant, layout_path: str
     )
 
 
-def mtp_tensors_present(weights_json_path: str, dense: bool = False) -> bool:
+def mtp_tensors_present(weights_json_path: str) -> bool:
     try:
         with open(weights_json_path) as f:
             tensors = json.load(f).get("tensors", {})
     except (OSError, json.JSONDecodeError):
         return False
-    required = MTP_BASE_TENSORS + (MTP_DENSE_TENSORS if dense else MTP_MOE_TENSORS)
+    required = MTP_BASE_TENSORS + MTP_MOE_TENSORS
     for name in required:
         if name not in tensors:
             return False
@@ -437,8 +436,7 @@ def check_artifact(manifest: Manifest, variant: Variant, adir: ArtifactDir,
             return ArtifactStatus(rel, "invalid", required, "model_weights.json missing")
         if not weights_config_matches(manifest, variant, weights_json):
             return ArtifactStatus(rel, "invalid", required, "config mismatch with model")
-        if manifest.mtp_artifacts_required and not mtp_tensors_present(
-                weights_json, dense=manifest.is_dense):
+        if manifest.mtp_artifacts_required and not mtp_tensors_present(weights_json):
             # Weights are usable for plain inference; MTP needs a rebuild.
             return ArtifactStatus(rel, "incomplete", required,
                                   "MTP tensors absent — rebuild weights to enable MTP")

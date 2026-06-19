@@ -23,7 +23,7 @@ def load_shipped():
 class TestShippedManifests(unittest.TestCase):
     def test_all_shipped_manifests_parse(self):
         shipped = load_shipped()
-        self.assertEqual(len(shipped), 5)
+        self.assertEqual(len(shipped), 4)
         ids = set()
         for path, data in shipped.items():
             m = parse_manifest(data, source_path=path)
@@ -95,11 +95,10 @@ class TestManifestValidation(unittest.TestCase):
             d["default_variant"] = "q2"
         self._expect_error(mutate, "default_variant")
 
-    def test_dense_requires_intermediate_size(self):
+    def test_dense_model_rejected(self):
         def mutate(d):
             d["architecture"]["num_experts"] = 0
-            d["architecture"].pop("intermediate_size", None)
-        self._expect_error(mutate, "intermediate_size")
+        self._expect_error(mutate, "dense models")
 
     def test_invalid_id_rejected(self):
         def mutate(d):

@@ -25,12 +25,6 @@ _NATIVE_MOE_ARTIFACTS = {
     "vocab.bin": {"from_shared": "vocab.bin"},
     "bf16/": {"from_shared": "bf16/", "optional": True},
 }
-_NATIVE_DENSE_ARTIFACTS = {
-    "model_weights.bin": {"step": "compile_native:non_experts",
-                          "companions": ["model_weights.json"]},
-    "vocab.bin": {"from_shared": "vocab.bin"},
-    "bf16/": {"from_shared": "bf16/", "optional": True},
-}
 _MLX_ARTIFACTS = {
     "expert_index.json": {"step": "generate_expert_index"},
     "model_weights.bin": {"step": "extract_weights",
@@ -91,13 +85,12 @@ def derive_manifest(hf_repo: str, hf_config: dict, registry: Registry,
                             c.get("rope_parameters", {}).get("rope_theta", 10000000.0)),
     }
     if int(architecture["num_experts"]) == 0:
-        architecture["intermediate_size"] = c.get("intermediate_size", 0)
+        raise AddModelError("dense models (num_experts=0) are not supported")
 
     # Quantization metadata present => pre-quantized source; absent =>
     # native BF16 that we compile ourselves (q4 + q8 variants on offer).
     qc = hf_config.get("quantization_config", hf_config.get("quantization", {}))
     native = not bool(qc)
-    dense = int(architecture["num_experts"]) == 0
     mtp_layers = c.get("mtp_num_hidden_layers", hf_config.get("mtp_num_hidden_layers", 0))
 
     # Borrow special tokens + sampling profiles from a shipped model with the
@@ -112,7 +105,7 @@ def derive_manifest(hf_repo: str, hf_config: dict, registry: Registry,
 
     model_id = hf_repo.replace("/", "-").replace(".", "").lower()
     if native:
-        artifacts = json.loads(json.dumps(_NATIVE_DENSE_ARTIFACTS if dense else _NATIVE_MOE_ARTIFACTS))
+        artifacts = json.loads(json.dumps(_NATIVE_MOE_ARTIFACTS))
         offered = variants or ["q4", "q8"]
         shared = {"vocab.bin": {"step": "export_tokenizer"}}
         if mtp_layers:

@@ -403,7 +403,7 @@ import sys
 
 registry_path, manifest_path = sys.argv[1:]
 with open(registry_path) as f:
-    model = json.load(f)["models"]["Qwen-Qwen36-27B"]
+    model = json.load(f)["models"]["Qwen-Qwen36-35B-A3B"]
 quant = model.get("quantization", {})
 config = {
     "hidden_size": model["hidden_size"],
@@ -454,7 +454,7 @@ with open(manifest_path, "w") as f:
     json.dump({"config": config, "tensors": tensors}, f)
 PY
 cat > "$RESTART_CONFIG" <<EOF
-MODEL="Qwen-Qwen36-27B"
+MODEL="Qwen-Qwen36-35B-A3B"
 MODEL_PATH="${RESTART_MODEL_ROOT}"
 MAX_TOKENS="1"
 SAMPLING_PROFILE="custom"
