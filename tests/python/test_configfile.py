@@ -8,7 +8,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
 
-from modelmgr import configfile
+from modelmgr import configfile, paths
 
 
 class TestConfigFile(unittest.TestCase):
@@ -61,6 +61,20 @@ class TestConfigFile(unittest.TestCase):
         nested = os.path.join(self.tmp.name, "sub", "config")
         configfile.update({"MODEL": "x"}, path=nested)
         self.assertEqual(configfile.load(nested)["MODEL"], "x")
+
+    def test_update_preserves_file_when_content_is_unchanged(self):
+        self.write('MODEL="x"\n')
+        before = os.stat(self.path).st_mtime_ns
+        configfile.update({"MODEL": "x"}, path=self.path)
+        self.assertEqual(os.stat(self.path).st_mtime_ns, before)
+
+    def test_write_json_atomic_preserves_file_when_content_is_unchanged(self):
+        json_path = os.path.join(self.tmp.name, "registry.json")
+        data = {"models": {"m": {"name": "M"}}}
+        paths.write_json_atomic(json_path, data)
+        before = os.stat(json_path).st_mtime_ns
+        paths.write_json_atomic(json_path, data)
+        self.assertEqual(os.stat(json_path).st_mtime_ns, before)
 
     def test_env_override_in_get(self):
         self.write('MODEL="file-value"\n')

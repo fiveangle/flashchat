@@ -67,9 +67,14 @@ def update(changes: dict, path: str | None = None) -> None:
         lines.append(f'{key}="{value}"')
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    new_text = "\n".join(lines) + "\n"
+    if os.path.isfile(path):
+        with open(path) as f:
+            if f.read() == new_text:
+                return
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write(new_text)
     os.replace(tmp, path)
 
 

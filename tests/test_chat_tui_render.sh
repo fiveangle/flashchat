@@ -159,7 +159,7 @@ if ! grep -q '"reasoning":true' "${body_file}.show"; then
 fi
 
 raw_plain_output="$(
-    printf 'hello without thinking\n/quit\n' |
+    printf 'hello without thinking\n/q\n' |
         HOME="${TMPDIR}/home-plain" FLASHCHAT_MODEL=Mock FLASHCHAT_REASONING=0 FLASHCHAT_SHOW_THINKING=0 \
             "$CHAT" --host 127.0.0.1 --port "$port" --max-tokens 200 2>&1
 )"

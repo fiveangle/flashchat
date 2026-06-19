@@ -80,6 +80,41 @@ flashchat_set_config_value() {
     fi
 }
 
+read_menu_key() {
+    local prompt="$1"
+    local valid="$2"
+    local invalid_message="${3:-Invalid choice.}"
+    local key rest
+    printf "%s" "$prompt"
+    local clear_line=$'\r\033[2K'
+    local warn_start="" warn_end=""
+    if [ -t 1 ] && [ "$(flashchat_get COLOR_OUTPUT 2>/dev/null || echo 1)" != "0" ]; then
+        warn_start=$'\033[1;33m'
+        warn_end=$'\033[0m'
+    fi
+    while true; do
+        if ! IFS= read -r -s -n 1 key; then
+            echo ""
+            return 1
+        fi
+        if [ "$key" = $'\e' ]; then
+            if IFS= read -r -s -n 1 -t 1 rest && [ "$rest" = "[" ]; then
+                while IFS= read -r -s -n 1 rest; do
+                    [[ "$rest" =~ [A-Za-z~] ]] && break
+                done
+            fi
+            printf "%s%s%s%s %s" "$clear_line" "$prompt" "$warn_start" "$invalid_message" "$warn_end"
+            continue
+        fi
+        if [[ "$key" == [$valid] ]]; then
+            printf "%s%s%s\n" "$clear_line" "$prompt" "$key"
+            REPLY="$key"
+            return 0
+        fi
+        printf "%s%s%s%s %s" "$clear_line" "$prompt" "$warn_start" "$invalid_message" "$warn_end"
+    done
+}
+
 confirm_show_thinking_for_chat() {
     local reasoning show_thinking
     reasoning="$(flashchat_get REASONING)"
@@ -1480,7 +1515,7 @@ interactive_menu() {
         echo "Quantization: $(current_quantization_label)"
         echo "$server_line"
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]anage, [Q]uit"
-        read -p "> " -n 1 -r || { echo ""; echo "Goodbye!"; break; }
+        read_menu_key "> " "nNdDsSoOcCmMqQ" "Invalid selection — please choose N, D, S, O, C, M, or Q." || { echo "Goodbye!"; break; }
 
         case "$REPLY" in
             n|N)

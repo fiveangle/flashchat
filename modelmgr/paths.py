@@ -117,8 +117,12 @@ def read_json(path: str):
 
 def write_json_atomic(path: str, data, indent: int = 2) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = json.dumps(data, indent=indent) + "\n"
+    if os.path.isfile(path):
+        with open(path) as f:
+            if f.read() == text:
+                return
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(data, f, indent=indent)
-        f.write("\n")
+        f.write(text)
     os.replace(tmp, path)

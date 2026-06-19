@@ -662,6 +662,32 @@ else
     assert_pass "no command exits cleanly"
 fi
 
+# Escape sequences such as arrow keys must not be interpreted as menu choices.
+TMP_MENU_HOME="$(mktemp -d /tmp/flashchat-menu-input.XXXXXX)"
+if menu_output="$(printf '\033[Dq' | HOME="$TMP_MENU_HOME" "$FLASHCHAT" 2>&1)"; then
+    if [[ "$menu_output" == *"Select a chat dialog to resume"* ]]; then
+        assert_fail "main menu ignores arrow escape sequences" "left arrow triggered Dialog menu"
+    else
+        assert_pass "main menu ignores arrow escape sequences"
+    fi
+else
+    assert_fail "main menu ignores arrow escape sequences" "launcher exited non-zero"
+fi
+rm -rf "$TMP_MENU_HOME"
+
+TMP_MENU_HOME="$(mktemp -d /tmp/flashchat-menu-input.XXXXXX)"
+if menu_output="$(printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxq' | HOME="$TMP_MENU_HOME" "$FLASHCHAT" 2>&1)"; then
+    prompt_count="$(printf '%s\n' "$menu_output" | grep -c '^> ' || true)"
+    if [[ "$prompt_count" = "1" && "$menu_output" == *"Invalid selection"* ]]; then
+        assert_pass "main menu suppresses invalid key prompt spam"
+    else
+        assert_fail "main menu suppresses invalid key prompt spam" "saw $prompt_count prompts or no invalid-choice hint"
+    fi
+else
+    assert_fail "main menu suppresses invalid key prompt spam" "launcher exited non-zero"
+fi
+rm -rf "$TMP_MENU_HOME"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

@@ -60,6 +60,37 @@ static int flag_enabled(const char *value) {
     return 1;
 }
 
+typedef enum {
+    CHAT_CMD_NONE = 0,
+    CHAT_CMD_QUIT,
+    CHAT_CMD_CLEAR,
+    CHAT_CMD_SESSIONS,
+} chat_command_t;
+
+static int slash_prefix_matches(const char *input, const char *command) {
+    if (!input || input[0] != '/' || !input[1]) return 0;
+    return strncmp(input + 1, command, strlen(input + 1)) == 0;
+}
+
+static chat_command_t parse_chat_command(const char *input) {
+    struct {
+        const char *name;
+        chat_command_t command;
+    } commands[] = {
+        {"quit", CHAT_CMD_QUIT},
+        {"exit", CHAT_CMD_QUIT},
+        {"clear", CHAT_CMD_CLEAR},
+        {"sessions", CHAT_CMD_SESSIONS},
+    };
+    chat_command_t match = CHAT_CMD_NONE;
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        if (!slash_prefix_matches(input, commands[i].name)) continue;
+        if (match != CHAT_CMD_NONE && match != commands[i].command) return CHAT_CMD_NONE;
+        match = commands[i].command;
+    }
+    return match;
+}
+
 // ============================================================================
 // Session persistence
 // ============================================================================
@@ -1101,18 +1132,23 @@ int main(int argc, char **argv) {
         input_line[MAX_INPUT_LINE - 1] = 0;
         free(line);
 
-        if (strcmp(input_line, "/quit") == 0 || strcmp(input_line, "/exit") == 0) {
-            printf("Goodbye.\n");
+        chat_command_t command = parse_chat_command(input_line);
+        switch (command) {
+            case CHAT_CMD_QUIT:
+                printf("Goodbye.\n");
+                break;
+            case CHAT_CMD_CLEAR:
+                generate_session_id(session_id, sizeof(session_id));
+                printf("[new session: %s]\n\n", session_id);
+                continue;
+            case CHAT_CMD_SESSIONS:
+                session_list();
+                continue;
+            case CHAT_CMD_NONE:
+                break;
+        }
+        if (command == CHAT_CMD_QUIT) {
             break;
-        }
-        if (strcmp(input_line, "/clear") == 0) {
-            generate_session_id(session_id, sizeof(session_id));
-            printf("[new session: %s]\n\n", session_id);
-            continue;
-        }
-        if (strcmp(input_line, "/sessions") == 0) {
-            session_list();
-            continue;
         }
 
         // Save user turn
