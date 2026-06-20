@@ -90,6 +90,13 @@ recording **prefill (TTFT)** and **decode (tok/s)** separately to `assets/api_pe
 `make bench-report` compares the latest rows to prior commits (keyed on `hw_model`) and
 flags regressions.
 
+Do **not** selectively revert or omit `assets/api_perf_log.tsv` rows produced by normal
+validation commands such as `make api-smoke`, `make bench-api`, or related test
+surfaces. The log is a watchdog/sentinel artifact: its value is time-inverted because
+future regressions may need historical rows that did not look important when they were
+captured. If normal testing generated rows, preserve them unless the user explicitly
+asks to discard them or the rows are known corrupt/non-test output.
+
 This design exists because the perf log silently went stale for the entire MTP + dense
 arc: the suite followed a single configured model, so new models/quants were never
 measured. Coverage is now structural, not manual — **but two things still require a human:**
