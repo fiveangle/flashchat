@@ -73,6 +73,22 @@ class TestRecipePlanning(unittest.TestCase):
         plan = recipes.plan(self.moe, "q4", snapshot)
         self.assertEqual(self.steps_of(plan), ["compile_native:non_experts"])
 
+    def test_missing_mtp_tensors_only_rebuild_when_mtp_wanted(self):
+        from modelmgr.artifacts import MTP_BASE_TENSORS, MTP_MOE_TENSORS
+
+        snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])
+        weights_json = os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.json")
+        with open(weights_json) as f:
+            data = json.load(f)
+        for name in MTP_BASE_TENSORS + MTP_MOE_TENSORS:
+            data["tensors"].pop(name, None)
+        with open(weights_json, "w") as f:
+            json.dump(data, f)
+
+        self.assertTrue(recipes.plan(self.moe, "q4", snapshot).empty)
+        plan = recipes.plan(self.moe, "q4", snapshot, want_mtp=True)
+        self.assertEqual(self.steps_of(plan), ["compile_native:non_experts"])
+
     def test_stale_step_version_triggers_rebuild(self):
         snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])
         adir = ArtifactDir(paths.variant_dir(snapshot, "q4"))

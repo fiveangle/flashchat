@@ -23,9 +23,9 @@ with open(src) as f:
     data = json.load(f)
 
 model = data["models"]["Qwen-Qwen36-35B-A3B"]
-model["mtp_default_predictions"] = 1
+model["mtp_default_predictions"] = 0
 model["sampling_profiles"]["instruct"]["mtp_default_predictions"] = 3
-data["server_defaults"] = {"mtp_default_predictions": 2}
+data["server_defaults"] = {"mtp_default_predictions": 0}
 
 with open(dst, "w") as f:
     json.dump(data, f, indent=2)
@@ -86,8 +86,8 @@ with open(sys.argv[1], "w") as f:
 PY
 
 server_default_value=$(run_get_mtp bash -c 'source lib/config.sh; flashchat_load_config; flashchat_get MTP')
-if [ "$server_default_value" != "2" ]; then
-    echo "FAIL: server MTP default expected 2, got '$server_default_value'" >&2
+if [ "$server_default_value" != "0" ]; then
+    echo "FAIL: server MTP default expected 0, got '$server_default_value'" >&2
     exit 1
 fi
 

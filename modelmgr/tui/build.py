@@ -19,6 +19,10 @@ def want_optional() -> bool:
     return configfile.get("MTP_BF16", "0") == "1"
 
 
+def want_mtp() -> bool:
+    return configfile.mtp_enabled()
+
+
 def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: str,
                          assume_yes: bool = False, force: bool = False) -> bool:
     """Walk download -> build -> offload-offer for one (model, variant).
@@ -27,18 +31,21 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
     snapshot = paths.snapshot_dir(cache_dir, manifest.hf_repo)
 
     plan = (recipes.plan(manifest, variant_name, snapshot, want_optional=want_optional(),
-                         force=force)
+                         want_mtp=want_mtp(), force=force)
             if snapshot else None)
 
     if snapshot is None or plan.needs_download:
-        if not _offer_download_or_restore(registry, manifest, cache_dir, assume_yes):
+        restored_or_downloaded = _offer_download_or_restore(
+            registry, manifest, cache_dir, assume_yes)
+        if not restored_or_downloaded:
             return False
-        snapshot = paths.snapshot_dir(cache_dir, manifest.hf_repo)
+        snapshot = restored_or_downloaded
         if snapshot is None:
             print(common.red("download did not produce a snapshot"))
             return False
         plan = recipes.plan(manifest, variant_name, snapshot,
-                            want_optional=want_optional(), force=force)
+                            want_optional=want_optional(), want_mtp=want_mtp(),
+                            force=force)
 
     if plan.empty:
         return True
@@ -69,7 +76,8 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
         progress.finish()
 
     from ..artifacts import variant_ready
-    if not variant_ready(manifest, variant_name, snapshot, want_optional=False):
+    if not variant_ready(manifest, variant_name, snapshot, want_optional=False,
+                         want_mtp=want_mtp()):
         print(common.red("build finished but verification failed — "
                          "check 'flashchat manage' for details"))
         return False
@@ -80,7 +88,7 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
 
 
 def _offer_download_or_restore(registry: Registry, manifest: Manifest,
-                               cache_dir: str, assume_yes: bool) -> bool:
+                               cache_dir: str, assume_yes: bool) -> str | None:
     od = offload_dir()
     if od and offload.archive_state(manifest, od) != "none":
         print(f"\nOriginals for {manifest.name} are archived on {od}.")
@@ -90,12 +98,12 @@ def _offer_download_or_restore(registry: Registry, manifest: Manifest,
                 offload.restore_originals(
                     manifest, paths.snapshot_dir(cache_dir, manifest.hf_repo) or "",
                     od, progress=progress)
-                return True
+                return paths.snapshot_dir(cache_dir, manifest.hf_repo)
             except offload.OffloadError:
                 # fall through to a full restore (archive may be full-tree)
                 try:
                     offload.restore_full(manifest, cache_dir, od, progress=progress)
-                    return True
+                    return paths.snapshot_dir(cache_dir, manifest.hf_repo)
                 except offload.OffloadError as e:
                     print(common.red(f"restore failed: {e}"))
             finally:
@@ -103,13 +111,12 @@ def _offer_download_or_restore(registry: Registry, manifest: Manifest,
     print(f"\n{manifest.name} needs the original model from HuggingFace "
           f"({manifest.hf_repo}).")
     if not assume_yes and not common.confirm("Download now?"):
-        return False
+        return None
     progress = common.ProgressLine()
     try:
-        download_snapshot(manifest.hf_repo, cache_dir, progress=progress)
+        return download_snapshot(manifest.hf_repo, cache_dir, progress=progress)
     finally:
         progress.finish()
-    return True
 
 
 def offer_offload_originals(registry: Registry, manifest: Manifest, snapshot: str,

@@ -399,7 +399,8 @@ def spec_required(manifest: Manifest, spec: ArtifactSpec, want_optional: bool = 
 
 def check_artifact(manifest: Manifest, variant: Variant, adir: ArtifactDir,
                    spec: ArtifactSpec, deep: bool = False,
-                   want_optional: bool = False, progress=None) -> ArtifactStatus:
+                   want_optional: bool = False, want_mtp: bool = False,
+                   progress=None) -> ArtifactStatus:
     required = spec_required(manifest, spec, want_optional)
     rel = spec.relpath
 
@@ -437,7 +438,7 @@ def check_artifact(manifest: Manifest, variant: Variant, adir: ArtifactDir,
             return ArtifactStatus(rel, "invalid", required, "model_weights.json missing")
         if not weights_config_matches(manifest, variant, weights_json):
             return ArtifactStatus(rel, "invalid", required, "config mismatch with model")
-        if manifest.mtp_artifacts_required and not mtp_tensors_present(weights_json):
+        if want_mtp and manifest.mtp_artifacts_required and not mtp_tensors_present(weights_json):
             # Weights are usable for plain inference; MTP needs a rebuild.
             return ArtifactStatus(rel, "incomplete", required,
                                   "MTP tensors absent — rebuild weights to enable MTP")
@@ -449,7 +450,7 @@ def check_artifact(manifest: Manifest, variant: Variant, adir: ArtifactDir,
 
 def variant_status(manifest: Manifest, variant_name: str, snapshot: str,
                    deep: bool = False, want_optional: bool = False,
-                   progress=None) -> list:
+                   want_mtp: bool = False, progress=None) -> list:
     """Status of every artifact a variant declares (shared deps included
     implicitly via the from_shared links materialized in the variant dir)."""
     from . import paths
@@ -460,7 +461,8 @@ def variant_status(manifest: Manifest, variant_name: str, snapshot: str,
     out = []
     for spec in variant.artifacts.values():
         out.append(check_artifact(manifest, variant, adir, spec, deep=deep,
-                                  want_optional=want_optional, progress=progress))
+                                  want_optional=want_optional, want_mtp=want_mtp,
+                                  progress=progress))
     return out
 
 
@@ -480,8 +482,9 @@ def shared_status(manifest: Manifest, snapshot: str, deep: bool = False,
 
 
 def variant_ready(manifest: Manifest, variant_name: str, snapshot: str,
-                  want_optional: bool = False) -> bool:
+                  want_optional: bool = False, want_mtp: bool = False) -> bool:
     return all(
         s.satisfied
-        for s in variant_status(manifest, variant_name, snapshot, want_optional=want_optional)
+        for s in variant_status(manifest, variant_name, snapshot,
+                                want_optional=want_optional, want_mtp=want_mtp)
     )

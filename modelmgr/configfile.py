@@ -51,6 +51,11 @@ def get(key: str, default: str = "", path: str | None = None) -> str:
     return load(path).get(key, default)
 
 
+def mtp_enabled(path: str | None = None) -> bool:
+    value = get("MTP", "", path).strip().lower()
+    return value not in ("", "0", "off", "no", "false", "default", "registry")
+
+
 def update(changes: dict, path: str | None = None) -> None:
     """Set keys, editing existing lines in place and appending new ones."""
     path = path or paths.config_file_path()

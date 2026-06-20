@@ -85,6 +85,14 @@ class TestConfigFile(unittest.TestCase):
             del os.environ["FLASHCHAT_MODEL"]
         self.assertEqual(configfile.get("MODEL", path=self.path), "file-value")
 
+    def test_mtp_enabled_parser(self):
+        for value in ("", "0", "off", "no", "false", "default", "registry"):
+            configfile.update({"MTP": value}, path=self.path)
+            self.assertFalse(configfile.mtp_enabled(path=self.path), value)
+        for value in ("1", "2", "auto", "on", "yes", "true"):
+            configfile.update({"MTP": value}, path=self.path)
+            self.assertTrue(configfile.mtp_enabled(path=self.path), value)
+
 
 if __name__ == "__main__":
     unittest.main()

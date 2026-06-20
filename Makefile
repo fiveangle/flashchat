@@ -108,8 +108,10 @@ CHAT_TARGET = $(BUILD_DIR)/chat
 CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
 LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
+RAM_PRESSURE_TARGET = tools/ram_pressure
+RAM_PRESSURE_SRC = tools/ram_pressure.c
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -150,6 +152,7 @@ help:
 	@printf "  make build-infer   Alias for infer\n"
 	@printf "  make chat          Build interactive chat client\n"
 	@printf "  make build-chat    Alias for chat\n"
+	@printf "  make ram-pressure  Build RAM pressure utility for memory-constrained testing\n"
 	@printf "  make metallib      Precompile Metal shaders\n"
 	@printf "  make print-build-config  Show compiler and optimization settings\n"
 	@printf "\n"
@@ -214,6 +217,8 @@ infer: $(INFER_TARGET)
 
 chat: $(CHAT_TARGET)
 
+ram-pressure: $(RAM_PRESSURE_TARGET)
+
 # Build the binary (shaders compiled at runtime from source)
 $(TARGET): $(MAIN_SRC) $(SHADER_SRC)
 	@$(MAKE) --no-print-directory print-build-config
@@ -237,6 +242,9 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) $(LINENOISE_SRC) $(LINENOISE_HDR)
 	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CHAT_CFLAGS) -framework Foundation $(CHAT_SRC) $(LINENOISE_SRC) -o $(CHAT_TARGET)
+
+$(RAM_PRESSURE_TARGET): $(RAM_PRESSURE_SRC)
+	$(CC) -O2 -Wall -Wextra $(RAM_PRESSURE_SRC) -o $(RAM_PRESSURE_TARGET)
 
 clean: archive-debug
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)

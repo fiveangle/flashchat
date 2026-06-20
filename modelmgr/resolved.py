@@ -21,7 +21,7 @@ from .registry import Registry, resolved_id
 
 # Global server defaults forwarded verbatim to the engine (legacy
 # top-level "server_defaults" object).
-SERVER_DEFAULTS = {"mtp_default_predictions": 2}
+SERVER_DEFAULTS = {"mtp_default_predictions": 0}
 
 # Architecture keys copied into each flat entry, in emission order.
 _ARCH_KEYS = (

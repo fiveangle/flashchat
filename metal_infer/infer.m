@@ -250,6 +250,10 @@ static int parse_mtp_predictions(const char *value) {
         strcasecmp(value, "yes") == 0) {
         return 1;                                             // automatic
     }
+    if (strcasecmp(value, "default") == 0 ||
+        strcasecmp(value, "registry") == 0) {
+        return -1;                                            // registry default
+    }
     if (strcasecmp(value, "false") == 0 ||
         strcasecmp(value, "off") == 0 ||
         strcasecmp(value, "no") == 0) {

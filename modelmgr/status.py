@@ -5,6 +5,7 @@ wizard, the manage TUI, and the launch-time `ensure` checks.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from . import configfile, offload, paths
@@ -64,7 +65,8 @@ class ModelStatus:
 
 
 def hf_cache_dir() -> str:
-    return configfile.get("HUGGINGFACE_CACHE_DIR", paths.DEFAULT_HF_CACHE)
+    return os.path.expanduser(
+        configfile.get("HUGGINGFACE_CACHE_DIR", paths.DEFAULT_HF_CACHE))
 
 
 def offload_dir() -> str:
@@ -85,7 +87,6 @@ def model_status(registry: Registry, manifest: Manifest,
     offload_snapshot = None
     offload_originals_bytes = 0
     if check_offload and offload_root:
-        import os
         root = os.path.expanduser(offload_root)
         if os.path.isdir(root):
             archive = offload.archive_state(manifest, root)

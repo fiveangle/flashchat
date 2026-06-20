@@ -155,7 +155,7 @@
     }
   },
   "mtp": {
-    "default_predictions": 1,
+    "default_predictions": 0,
     "num_hidden_layers": 1
   },
   "thinking_capable": false

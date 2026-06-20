@@ -60,7 +60,8 @@ def run(interactive: bool = True) -> bool:
 
     from .artifacts import variant_ready
     snapshot = _selected_snapshot(manifest)
-    ready = bool(snapshot and variant_ready(manifest, variant_name, snapshot))
+    ready = bool(snapshot and variant_ready(manifest, variant_name, snapshot,
+                                           want_mtp=configfile.mtp_enabled()))
     if not ready and interactive:
         from .tui import build
         ready = build.ensure_variant_built(registry, manifest, variant_name)
@@ -126,7 +127,8 @@ def shell_exports() -> str:
         manifest, variant_name = selection
         snapshot = _selected_snapshot(manifest) or ""
         from .artifacts import variant_ready
-        ready = bool(snapshot and variant_ready(manifest, variant_name, snapshot))
+        ready = bool(snapshot and variant_ready(manifest, variant_name, snapshot,
+                                               want_mtp=configfile.mtp_enabled()))
         resolved.write(registry)
         lines += [
             f"FC_MODEL_ID={_shquote(resolved_id(manifest, variant_name))}",

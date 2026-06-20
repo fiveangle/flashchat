@@ -66,6 +66,24 @@ class TestVariantStatusLabels(unittest.TestCase):
         self.assertEqual(s.summary_line("q4"), "not downloaded")
         self.assertEqual(s.summary_line("q8"), "not downloaded")
 
+    def test_hf_cache_dir_expands_tilde(self):
+        old_home = os.environ.get("HOME")
+        old_cache = os.environ.get("FLASHCHAT_HUGGINGFACE_CACHE_DIR")
+        try:
+            os.environ["HOME"] = self.tmp.name
+            os.environ["FLASHCHAT_HUGGINGFACE_CACHE_DIR"] = "~/hf-cache"
+            self.assertEqual(status.hf_cache_dir(),
+                             os.path.join(self.tmp.name, "hf-cache"))
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+            if old_cache is None:
+                os.environ.pop("FLASHCHAT_HUGGINGFACE_CACHE_DIR", None)
+            else:
+                os.environ["FLASHCHAT_HUGGINGFACE_CACHE_DIR"] = old_cache
+
 
 if __name__ == "__main__":
     unittest.main()

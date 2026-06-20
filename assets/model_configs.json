@@ -74,7 +74,7 @@
         }
       },
       "source_format": "native_bf16",
-      "mtp_default_predictions": 1,
+      "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     },
     "Qwen-Qwen3-Next-80B-A3B-Instruct-8bit": {
@@ -151,7 +151,7 @@
         }
       },
       "source_format": "native_bf16",
-      "mtp_default_predictions": 1,
+      "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     },
     "mlx-community-Qwen35-397B-A17B-4bit": {
@@ -227,7 +227,7 @@
           "reasoning": 0
         }
       },
-      "mtp_default_predictions": 1
+      "mtp_default_predictions": 0
     },
     "unsloth-Qwen36-35B-A3B-UD-MLX-4bit": {
       "name": "Qwen3.6-35B-A3B-UD-MLX-4bit",
@@ -301,7 +301,7 @@
           "reasoning": 0
         }
       },
-      "mtp_default_predictions": 1
+      "mtp_default_predictions": 0
     },
     "Qwen-Qwen36-35B-A3B": {
       "name": "Qwen3.6-35B-A3B-4bit",
@@ -376,7 +376,7 @@
         }
       },
       "source_format": "native_bf16",
-      "mtp_default_predictions": 1,
+      "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     },
     "Qwen-Qwen36-35B-A3B-8bit": {
@@ -452,12 +452,12 @@
         }
       },
       "source_format": "native_bf16",
-      "mtp_default_predictions": 1,
+      "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     }
   },
   "default_model": "Qwen-Qwen36-35B-A3B",
   "server_defaults": {
-    "mtp_default_predictions": 2
+    "mtp_default_predictions": 0
   }
 }

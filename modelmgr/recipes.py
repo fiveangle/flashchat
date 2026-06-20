@@ -38,13 +38,14 @@ class Plan:
 
 
 def _artifact_needs_build(manifest: Manifest, variant, adir: ArtifactDir, spec,
-                          want_optional: bool, force: bool):
+                          want_optional: bool, want_mtp: bool, force: bool):
     """(needs, reason, detail) for one declared artifact."""
     if not spec_required(manifest, spec, want_optional):
         return False, "", ""
     if force:
         return True, "forced", ""
-    status = check_artifact(manifest, variant, adir, spec, want_optional=want_optional)
+    status = check_artifact(manifest, variant, adir, spec,
+                            want_optional=want_optional, want_mtp=want_mtp)
     if status.state in ("missing", "incomplete", "size-mismatch", "hash-mismatch", "invalid"):
         return True, "missing" if status.state == "missing" else "invalid", status.detail
     if spec.step:
@@ -74,7 +75,8 @@ def _source_blobs_present(manifest: Manifest, snapshot: str) -> bool:
 
 
 def plan(manifest: Manifest, variant_name: str, snapshot: str,
-         want_optional: bool = False, force: bool = False) -> Plan:
+         want_optional: bool = False, want_mtp: bool = False,
+         force: bool = False) -> Plan:
     variant = manifest.variant(variant_name)
     shared_adir = ArtifactDir(paths.shared_dir(snapshot), manifest.id, "shared")
     variant_adir = ArtifactDir(paths.variant_dir(snapshot, variant_name),
@@ -86,7 +88,7 @@ def plan(manifest: Manifest, variant_name: str, snapshot: str,
     needed_shared = []
     for spec in manifest.shared_artifacts.values():
         needs, reason, detail = _artifact_needs_build(
-            manifest, variant, shared_adir, spec, want_optional, force)
+            manifest, variant, shared_adir, spec, want_optional, want_mtp, force)
         if needs:
             needed_shared.append((spec, reason, detail))
 
@@ -98,12 +100,12 @@ def plan(manifest: Manifest, variant_name: str, snapshot: str,
             if not spec_required(manifest, spec, want_optional):
                 continue
             status = check_artifact(manifest, variant, variant_adir, spec,
-                                    want_optional=want_optional)
+                                    want_optional=want_optional, want_mtp=want_mtp)
             if force or not status.satisfied or status.state == "missing":
                 materialize.append(spec.relpath)
             continue
         needs, reason, detail = _artifact_needs_build(
-            manifest, variant, variant_adir, spec, want_optional, force)
+            manifest, variant, variant_adir, spec, want_optional, want_mtp, force)
         if needs:
             needed_variant.append((spec, reason, detail))
 

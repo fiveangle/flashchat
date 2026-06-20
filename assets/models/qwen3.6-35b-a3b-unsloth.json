@@ -105,6 +105,6 @@
     }
   },
   "mtp": {
-    "default_predictions": 1
+    "default_predictions": 0
   }
 }

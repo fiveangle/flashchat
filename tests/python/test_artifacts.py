@@ -126,6 +126,23 @@ class TestVariantVerification(unittest.TestCase):
         os.unlink(os.path.join(paths.shared_dir(snapshot), "vocab.bin"))
         self.assertFalse(variant_ready(self.moe, "q4", snapshot))
 
+    def test_missing_mtp_tensors_pass_when_mtp_not_wanted(self):
+        import json
+
+        from modelmgr.artifacts import MTP_BASE_TENSORS, MTP_MOE_TENSORS
+
+        snapshot = make_snapshot(self.tmp.name, self.moe, variants=["q4"])
+        weights_json = os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.json")
+        with open(weights_json) as f:
+            data = json.load(f)
+        for name in MTP_BASE_TENSORS + MTP_MOE_TENSORS:
+            data["tensors"].pop(name, None)
+        with open(weights_json, "w") as f:
+            json.dump(data, f)
+
+        self.assertTrue(variant_ready(self.moe, "q4", snapshot))
+        self.assertFalse(variant_ready(self.moe, "q4", snapshot, want_mtp=True))
+
     def test_wrong_quant_config_detected(self):
         # q8 weights manifest copied into the q4 dir must fail the
         # dimension/quant cross-check even though files exist.
@@ -158,7 +175,10 @@ class TestVariantVerification(unittest.TestCase):
         data["tensors"] = {"embed_tokens.weight": {"offset": 0, "size": 16}}
         with open(weights_json, "w") as f:
             json.dump(data, f)
-        states = {s.relpath: s for s in variant_status(self.moe, "q4", snapshot)}
+        states = {
+            s.relpath: s
+            for s in variant_status(self.moe, "q4", snapshot, want_mtp=True)
+        }
         self.assertEqual(states["model_weights.bin"].state, "incomplete")
         self.assertIn("MTP", states["model_weights.bin"].detail)
         self.assertFalse(states["model_weights.bin"].satisfied)
