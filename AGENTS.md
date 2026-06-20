@@ -95,7 +95,10 @@ validation commands such as `make api-smoke`, `make bench-api`, or related test
 surfaces. The log is a watchdog/sentinel artifact: its value is time-inverted because
 future regressions may need historical rows that did not look important when they were
 captured. If normal testing generated rows, preserve them unless the user explicitly
-asks to discard them or the rows are known corrupt/non-test output.
+asks to discard them or the rows are known corrupt/non-test output. When committing a
+verified unit of work, include `assets/api_perf_log.tsv` by default if it changed; do
+not treat it as incidental dirty-worktree noise or exclude it from the commit just
+because the code change lives elsewhere.
 
 This design exists because the perf log silently went stale for the entire MTP + dense
 arc: the suite followed a single configured model, so new models/quants were never
