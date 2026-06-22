@@ -440,6 +440,9 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 // MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
+static double g_prof_mtp_layers = 0, g_prof_mtp_norm = 0, g_prof_mtp_head = 0;
+static double g_prof_mtp_moe_route = 0, g_prof_mtp_moe_io = 0, g_prof_mtp_moe_expert = 0, g_prof_mtp_moe_shared = 0;
+static int g_prof_mtp_moe_calls = 0, g_prof_mtp_moe_fallbacks = 0, g_prof_mtp_moe_union_sum = 0, g_prof_mtp_moe_union_max = 0;
 // Per-layer production reference (token a) for MTP_VF2_DBG divergence probe.
 // matmulN kernel select. 0 = v3 (one row/simdgroup), 1 = tiled-X v4, 2 = v5 (multi-row
 // per simdgroup for load-latency hiding). v4 staged X in threadgroup memory but measured
@@ -4921,8 +4924,10 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
     float *hp = malloc((size_t)N*H*sizeof(float));
     int   *idx = malloc((size_t)N*K*sizeof(int));
     float *wt  = malloc((size_t)N*K*sizeof(float));
+    double _t_route = now_ms();
     for (int t = 0; t < N; t++)
         moe_route(wf, layer, hs+(size_t)t*H, hp+(size_t)t*H, idx+(size_t)t*K, wt+(size_t)t*K);
+    g_prof_mtp_moe_route += now_ms() - _t_route;
     float *moe = calloc((size_t)N*H, sizeof(float));
 
     // Union of all unique experts across all tokens
@@ -4933,20 +4938,28 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         if (e >= 0 && e < g_cfg.num_experts && !seen[e]) { seen[e] = 1; uni[n_union++] = e; }
     }
     g_moe_last_union = n_union;
+    g_prof_mtp_moe_calls++;
+    g_prof_mtp_moe_union_sum += n_union;
+    if (n_union > g_prof_mtp_moe_union_max) g_prof_mtp_moe_union_max = n_union;
 
     // If GPU is unavailable or the union exceeds our multi-expert buffer slots,
     // fall back to the per-expert routed_ffn_1 path (slower but always correct).
     if (!g_metal || n_union > MAX_K) {
+        g_prof_mtp_moe_fallbacks++;
         void *buf = malloc(esz);
         float *eo = malloc(H*sizeof(float));
         for (int u = 0; u < n_union; u++) {
             int e = uni[u];
+            double _t_io = now_ms();
             if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
+            g_prof_mtp_moe_io += now_ms() - _t_io;
             for (int t = 0; t < N; t++) {
                 int kk = -1;
                 for (int k = 0; k < K; k++) if (idx[(size_t)t*K+k] == e) { kk = k; break; }
                 if (kk >= 0) {
+                    double _t_expert = now_ms();
                     routed_ffn_1(buf, hp+(size_t)t*H, eo);
+                    g_prof_mtp_moe_expert += now_ms() - _t_expert;
                     cpu_vec_madd(moe+(size_t)t*H, eo, wt[(size_t)t*K+kk], H);
                 }
             }
@@ -4963,7 +4976,9 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         void *buf = malloc(esz);
         for (int u = 0; u < n_union; u++) {
             int e = uni[u];
+            double _t_io = now_ms();
             if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
+            g_prof_mtp_moe_io += now_ms() - _t_io;
             memcpy([g_metal->buf_multi_expert_data[u] contents], buf, esz);
         }
         free(buf);
@@ -4981,9 +4996,11 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
             memcpy([g_metal->buf_multi_expert_input contents],
                    hp + (size_t)t * H, (size_t)H * sizeof(float));
 
+            double _t_expert = now_ms();
             id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
             gpu_encode_experts_batched(g_metal, cmd, MAX_K, valid, expert_bufs);
             [cmd commit]; [cmd waitUntilCompleted];
+            g_prof_mtp_moe_expert += now_ms() - _t_expert;
 
             for (int k = 0; k < K; k++) {
                 int e = idx[(size_t)t*K+k];
@@ -4997,11 +5014,13 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
     }
 
     float *shared = malloc(H*sizeof(float));
+    double _t_shared = now_ms();
     for (int t = 0; t < N; t++) {
         shared_expert_1(wf, layer, hp+(size_t)t*H, shared);
         for (int i = 0; i < H; i++)
             hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[i];
     }
+    g_prof_mtp_moe_shared += now_ms() - _t_shared;
     free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared);
 }
 
@@ -5156,22 +5175,39 @@ static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new)
 // MLP (ignored for full-attn layers).
 static void fused_batched_forward_N(WeightFile *wf, float *hs, int N, KVCache **kv, int *fds, int *pos, float *logits) {
     int H=g_cfg.hidden_dim, V=g_cfg.vocab_size, gsz=g_cfg.group_size;
+    double _t_layers = now_ms();
     for (int layer=0; layer<g_cfg.num_layers; layer++)
         batched_layer_forward_N(wf, layer, hs, N, kv[layer], pos, fds ? fds[layer] : -1);
+    g_prof_mtp_layers += now_ms() - _t_layers;
     uint16_t *nw=get_tensor_ptr(wf,"model.norm.weight");
     float *nd=malloc((size_t)N*H*4);
+    double _t_norm = now_ms();
     for (int t=0;t<N;t++) cpu_rms_norm(hs+(size_t)t*H, nw, nd+(size_t)t*H, H, g_cfg.rms_norm_eps);
+    g_prof_mtp_norm += now_ms() - _t_norm;
     TensorInfo *wi=get_tensor_info(wf,"lm_head.weight"),*si=get_tensor_info(wf,"lm_head.scales"),*bi=get_tensor_info(wf,"lm_head.biases");
+    double _t_head = now_ms();
     gpu_dequant_matmulN(g_metal,(uint32_t*)((char*)wf->data+wi->offset),(uint16_t*)((char*)wf->data+si->offset),(uint16_t*)((char*)wf->data+bi->offset), nd, logits, V, H, gsz, N);
+    g_prof_mtp_head += now_ms() - _t_head;
     free(nd);
 }
 
 // Depth-N faithfulness: fused_batched_forward_N (N positions) must argmax-match N
 // sequential production forwards. Validates the N-generalized batched layer.
+static double max_abs_diff_f32(const float *a, const float *b, size_t n) {
+    double max_diff = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > max_diff) max_diff = d;
+    }
+    return max_diff;
+}
+
 static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     (void)model_path;
     if (!g_metal || !g_metal->wf_buf) { fprintf(stderr,"[mtp-vfN] requires GPU\n"); return 1; }
     int Hd=g_cfg.hidden_dim, V=g_cfg.vocab_size, kv_dim=g_cfg.num_kv_heads*g_cfg.head_dim, Ld=g_cfg.num_layers, N=4;
+    const char *n_env = getenv("FLASHCHAT_VERIFY_FORWARDN_N");
+    if (n_env && n_env[0]) { int v = atoi(n_env); if (v > 0 && v <= 8) N = v; }
     int K=g_cfg.num_experts_per_tok>0?g_cfg.num_experts_per_tok:4;
     int *fds=malloc(Ld*sizeof(int)); void **mmaps=calloc(Ld,sizeof(void*));
     KVCache **kv=calloc(Ld,sizeof(KVCache*)); LinearAttnState **ls=calloc(Ld,sizeof(LinearAttnState*));
@@ -5181,22 +5217,105 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
             if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} } }
         if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
     float *h=malloc(Hd*4),*scratch=malloc(V*4); int P=35;
+    const char *p_env = getenv("FLASHCHAT_VERIFY_FORWARDN_PREFIX");
+    if (p_env && p_env[0]) { int v = atoi(p_env); if (v >= 0 && v < cap - N - 1) P = v; }
+    fprintf(stderr,"[mtp-vfN] start prefix=%d N=%d\n", P, N);
     reset_delta_net_state(); for(int i=0;i<Ld;i++) if(kv[i]) kv[i]->len=0;
     for(int p=0;p<P;p++){ for(int i=0;i<Hd;i++)h[i]=sinf((i+p*5)*0.01f)*0.4f; embed_lookup(wf,100+p,h); prod_forward_1(wf,h,p,kv,ls,fds,mmaps,K,scratch); }
+    fprintf(stderr,"[mtp-vfN] prefix complete\n");
     GpuStateSnap snap; gpu_snap_alloc(&snap); gpu_snap_save(&snap,kv);
-    int toks[4]={400,401,402,403};
+    int toks[8]={400,401,402,403,404,405,406,407};
     float *lo=malloc((size_t)N*V*4); // oracle logits per position
     for(int t=0;t<N;t++){ embed_lookup(wf,toks[t],h); prod_forward_1(wf,h,P+t,kv,ls,fds,mmaps,K,lo+(size_t)t*V); }
+    fprintf(stderr,"[mtp-vfN] sequential chunk complete\n");
+    GpuStateSnap seq_snap; gpu_snap_alloc(&seq_snap); gpu_snap_save(&seq_snap,kv);
+    float **seq_k = calloc((size_t)Ld, sizeof(float*)), **seq_v = calloc((size_t)Ld, sizeof(float*));
+    for (int layer=0; layer<Ld; layer++) if(kv[layer]) {
+        size_t sz = (size_t)kv[layer]->len * kv_dim * sizeof(float);
+        seq_k[layer] = malloc(sz); seq_v[layer] = malloc(sz);
+        memcpy(seq_k[layer], kv[layer]->k_cache, sz);
+        memcpy(seq_v[layer], kv[layer]->v_cache, sz);
+    }
     gpu_snap_restore(&snap,kv);
-    float *hs=malloc((size_t)N*Hd*4),*ln=malloc((size_t)N*V*4); int posv[4]={P,P+1,P+2,P+3};
+    float *hs=malloc((size_t)N*Hd*4),*ln=malloc((size_t)N*V*4); int posv[8];
+    for (int t=0; t<N; t++) posv[t] = P + t;
     for(int t=0;t<N;t++) embed_lookup(wf,toks[t],hs+(size_t)t*Hd);
+    g_prof_matmulN = g_prof_attncpu = g_prof_delta = 0.0;
+    g_prof_mtp_layers = g_prof_mtp_norm = g_prof_mtp_head = 0.0;
+    g_prof_mtp_moe_route = g_prof_mtp_moe_io = g_prof_mtp_moe_expert = g_prof_mtp_moe_shared = 0.0;
+    g_prof_mtp_moe_calls = g_prof_mtp_moe_fallbacks = g_prof_mtp_moe_union_sum = g_prof_mtp_moe_union_max = 0;
+    double _t_batchedN = now_ms();
     fused_batched_forward_N(wf,hs,N,kv,fds,posv,ln);
+    double batchedN_ms = now_ms() - _t_batchedN;
+    fprintf(stderr,"[mtp-vfN] batched chunk complete %.1fms\n", batchedN_ms);
+    fprintf(stderr,"[mtp-vfN-prof] total=%.1f layers=%.1f norm=%.1f lm_head=%.1f matmulN=%.1f delta=%.1f attn_cpu=%.1f moe_route=%.1f moe_io=%.1f moe_expert=%.1f moe_shared=%.1f union_avg=%.2f union_max=%d fallbacks=%d other=%.1f\n",
+            batchedN_ms, g_prof_mtp_layers, g_prof_mtp_norm, g_prof_mtp_head,
+            g_prof_matmulN, g_prof_delta, g_prof_attncpu,
+            g_prof_mtp_moe_route, g_prof_mtp_moe_io, g_prof_mtp_moe_expert, g_prof_mtp_moe_shared,
+            g_prof_mtp_moe_calls > 0 ? (double)g_prof_mtp_moe_union_sum / (double)g_prof_mtp_moe_calls : 0.0,
+            g_prof_mtp_moe_union_max, g_prof_mtp_moe_fallbacks,
+            batchedN_ms - g_prof_mtp_layers - g_prof_mtp_norm - g_prof_mtp_head);
     int allmatch=1; for(int t=0;t<N;t++){ int ao=cpu_argmax(lo+(size_t)t*V,V),an=cpu_argmax(ln+(size_t)t*V,V); double e=0,r=0; for(int i=0;i<V;i++){e=fmax(e,fabs(lo[(size_t)t*V+i]-ln[(size_t)t*V+i]));r=fmax(r,fabs(lo[(size_t)t*V+i]));} fprintf(stderr,"[mtp-vfN] pos%d argmax prod=%d batchedN=%d rel=%.2e\n",t,ao,an,r>0?e/r:e); if(ao!=an)allmatch=0; }
-    fprintf(stderr,"[mtp-vfN] %s\n", allmatch?"PASS: depth-N forward matches production":"DIVERGE");
+    double state_tol = 1e-4;
+    const char *tol_env = getenv("FLASHCHAT_VERIFY_FORWARDN_STATE_TOL");
+    if (tol_env && tol_env[0]) { double v = atof(tol_env); if (v >= 0.0) state_tol = v; }
+    int state_ok = 1;
+    double max_kv_diff = 0.0, max_delta_diff = 0.0, max_conv_diff = 0.0;
+    for (int layer=0; layer<Ld; layer++) {
+        if (kv[layer]) {
+            if (kv[layer]->len != seq_snap.kvlen[layer]) {
+                fprintf(stderr,"[mtp-vfN] state layer=%d kv_len prod=%d batchedN=%d\n", layer, seq_snap.kvlen[layer], kv[layer]->len);
+                state_ok = 0;
+            }
+            int len = kv[layer]->len < seq_snap.kvlen[layer] ? kv[layer]->len : seq_snap.kvlen[layer];
+            size_t n = (size_t)len * kv_dim;
+            double dk = max_abs_diff_f32(seq_k[layer], kv[layer]->k_cache, n);
+            double dv = max_abs_diff_f32(seq_v[layer], kv[layer]->v_cache, n);
+            if (dk > max_kv_diff) max_kv_diff = dk;
+            if (dv > max_kv_diff) max_kv_diff = dv;
+            if (dk > state_tol || dv > state_tol) state_ok = 0;
+        } else {
+            int li = linear_idx_of(layer);
+            size_t delta_n = (size_t)64 * 128 * 128;
+            size_t conv_n = (size_t)3 * 12288;
+            double dd = max_abs_diff_f32(seq_snap.delta[li], (float *)[g_metal->buf_delta_state[li] contents], delta_n);
+            double dc = max_abs_diff_f32(seq_snap.conv[li], (float *)[g_metal->buf_conv_state[li] contents], conv_n);
+            if (dd > max_delta_diff) max_delta_diff = dd;
+            if (dc > max_conv_diff) max_conv_diff = dc;
+            if (dd > state_tol || dc > state_tol) state_ok = 0;
+        }
+    }
+    float *follow_batched=malloc((size_t)V*4), *follow_seq=malloc((size_t)V*4);
+    embed_lookup(wf, toks[N], h); prod_forward_1(wf,h,P+N,kv,ls,fds,mmaps,K,follow_batched);
+    for (int layer=0; layer<Ld; layer++) {
+        if (kv[layer]) {
+            kv[layer]->len = seq_snap.kvlen[layer];
+            size_t sz = (size_t)seq_snap.kvlen[layer] * kv_dim * sizeof(float);
+            memcpy(kv[layer]->k_cache, seq_k[layer], sz);
+            memcpy(kv[layer]->v_cache, seq_v[layer], sz);
+        } else {
+            int li = linear_idx_of(layer);
+            memcpy([g_metal->buf_delta_state[li] contents], seq_snap.delta[li], (size_t)64*128*128*sizeof(float));
+            memcpy([g_metal->buf_conv_state[li] contents], seq_snap.conv[li], (size_t)3*12288*sizeof(float));
+        }
+    }
+    embed_lookup(wf, toks[N], h); prod_forward_1(wf,h,P+N,kv,ls,fds,mmaps,K,follow_seq);
+    int follow_b = cpu_argmax(follow_batched,V), follow_s = cpu_argmax(follow_seq,V);
+    double follow_e=0, follow_r=0;
+    for(int i=0;i<V;i++){ follow_e=fmax(follow_e,fabs(follow_batched[i]-follow_seq[i])); follow_r=fmax(follow_r,fabs(follow_seq[i])); }
+    int follow_ok = (follow_b == follow_s);
+    fprintf(stderr,"[mtp-vfN] state %s max_kv=%.2e max_delta=%.2e max_conv=%.2e tol=%.2e\n",
+            state_ok?"PASS":"DIVERGE", max_kv_diff, max_delta_diff, max_conv_diff, state_tol);
+    fprintf(stderr,"[mtp-vfN] follow argmax prod=%d batchedN=%d rel=%.2e %s\n",
+            follow_s, follow_b, follow_r>0?follow_e/follow_r:follow_e, follow_ok?"PASS":"DIVERGE");
+    fprintf(stderr,"[mtp-vfN] %s\n", (allmatch&&state_ok&&follow_ok)?"PASS: depth-N forward/state matches production":"DIVERGE");
+    free(follow_batched); free(follow_seq);
+    for (int layer=0; layer<Ld; layer++) { free(seq_k[layer]); free(seq_v[layer]); }
+    free(seq_k); free(seq_v); gpu_snap_free(&seq_snap);
     gpu_snap_free(&snap);
     for(int i=0;i<Ld;i++){ if(kv[i]){free(kv[i]->k_cache);free(kv[i]->v_cache);free(kv[i]);} if(ls[i])linear_attn_state_free(ls[i]); }
     free(fds);free(mmaps);free(kv);free(ls);free(h);free(scratch);free(lo);free(hs);free(ln);
-    return allmatch?0:1;
+    return (allmatch&&state_ok&&follow_ok)?0:1;
 }
 
 
@@ -11958,6 +12077,8 @@ static void serve_loop(
         int *mtp_drafts = NULL, *mtp_posv = NULL;
         int mtp_q[8]; int mtp_q_len = 0, mtp_q_idx = 0;   // accepted drafts pending drain-emit
         int mtp_seed_pending = 0, mtp_seed = -1;          // next seed to emit-then-produce
+        double mtp_total_draft_ms = 0.0, mtp_total_verify_ms = 0.0, mtp_total_refwd_ms = 0.0, mtp_total_iter_ms = 0.0;
+        int mtp_spec_iters = 0, mtp_refwd_iters = 0, mtp_full_reject_iters = 0, mtp_verified_positions = 0;
         if (mtp_shadow_available) {
             gpu_snap_alloc(&mtp_snap); mtp_snap_ready = 1;
             mtp_hs   = malloc((size_t)mtp_B*mtp_H*sizeof(float));
@@ -12016,6 +12137,9 @@ static void serve_loop(
         double t_first_response = 0.0;
         if (mtp_shadow_available && g_server_debug_enabled) {
             g_prof_matmulN = g_prof_attncpu = g_prof_delta = 0.0;
+            g_prof_mtp_layers = g_prof_mtp_norm = g_prof_mtp_head = 0.0;
+            g_prof_mtp_moe_route = g_prof_mtp_moe_io = g_prof_mtp_moe_expert = g_prof_mtp_moe_shared = 0.0;
+            g_prof_mtp_moe_calls = g_prof_mtp_moe_fallbacks = g_prof_mtp_moe_union_sum = g_prof_mtp_moe_union_max = 0;
         }
         // Native Qwen3 generation prompt opens with <think>\n when reasoning
         // is on, so the model starts INSIDE the think block — generation will
@@ -12281,8 +12405,16 @@ tool_call_checked:
                         seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
                         if (g_server_debug_enabled) mtp_refwd_ms = now_ms() - _t_refwd;
                     }
+                    mtp_spec_iters++;
+                    mtp_verified_positions += Nv;
+                    if (acc < nd) mtp_refwd_iters++;
+                    if (acc == 0) mtp_full_reject_iters++;
+                    mtp_total_draft_ms += mtp_draft_ms;
+                    mtp_total_verify_ms += mtp_verify_ms;
+                    mtp_total_refwd_ms += mtp_refwd_ms;
                     if (g_server_debug_enabled) {
                         mtp_iter_ms = now_ms() - _t_iter;
+                        mtp_total_iter_ms += mtp_iter_ms;
                         server_log_errorf("[mtp-debug] %s iter draft=%.2fms verify=%.2fms refwd=%.2fms total=%.2fms nd=%d acc=%d\n",
                                           request_id, mtp_draft_ms, mtp_verify_ms, mtp_refwd_ms, mtp_iter_ms, nd, acc);
                     }
@@ -12352,6 +12484,13 @@ tool_call_checked:
             }
             server_log_errorf("[mtp] %s speculative summary accepted=%d drafts=%d acceptance=%.1f%% per-pos=[%s]\n",
                               request_id, mtp_shadow_hits, mtp_shadow_checks, acc_rate, mtp_pos_buf);
+            if (mtp_spec_iters > 0) {
+                server_log_errorf("[mtp] %s economics spec_iters=%d verified_positions=%d refwd_iters=%d full_rejects=%d "
+                                  "draft_ms=%.1f verify_ms=%.1f refwd_ms=%.1f iter_ms=%.1f avg_iter_ms=%.2f\n",
+                                  request_id, mtp_spec_iters, mtp_verified_positions, mtp_refwd_iters, mtp_full_reject_iters,
+                                  mtp_total_draft_ms, mtp_total_verify_ms, mtp_total_refwd_ms, mtp_total_iter_ms,
+                                  mtp_total_iter_ms / (double)mtp_spec_iters);
+            }
         }
         mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
         g_overlap_in_decode = 0;
@@ -12452,6 +12591,14 @@ tool_call_checked:
                                   g_prof_attncpu, 100.0 * g_prof_attncpu / gen_ms,
                                   g_prof_delta, 100.0 * g_prof_delta / gen_ms,
                                   gen_ms - prof_total, 100.0 * (gen_ms - prof_total) / gen_ms);
+                server_log_errorf("[mtp-prof] %s verify_split layers=%.0fms norm=%.0fms lm_head=%.0fms moe_route=%.0fms moe_io=%.0fms moe_expert=%.0fms moe_shared=%.0fms\n",
+                                  request_id,
+                                  g_prof_mtp_layers, g_prof_mtp_norm, g_prof_mtp_head,
+                                  g_prof_mtp_moe_route, g_prof_mtp_moe_io, g_prof_mtp_moe_expert, g_prof_mtp_moe_shared);
+                server_log_errorf("[mtp-prof] %s moe_union calls=%d avg=%.2f max=%d fallbacks=%d\n",
+                                  request_id, g_prof_mtp_moe_calls,
+                                  g_prof_mtp_moe_calls > 0 ? (double)g_prof_mtp_moe_union_sum / (double)g_prof_mtp_moe_calls : 0.0,
+                                  g_prof_mtp_moe_union_max, g_prof_mtp_moe_fallbacks);
             }
         }
         free(final_json);
@@ -12821,7 +12968,7 @@ int main(int argc, char **argv) {
                 case OPT_MTP_PREFLIGHT: mtp_preflight_requested = 1; g_mtp_predictions = 1; break;
                 case OPT_MTP_BENCH_MATMUL: mtp_bench_matmul_requested = 1; break;
                 case OPT_MTP_GENERATE_GPU: mtp_generate_gpu_requested = 1; g_mtp_predictions = 1; break;
-                case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; g_mtp_predictions = 1; break;
+                case OPT_MTP_VERIFY_FORWARDN: mtp_verify_forwardN_requested = 1; break;
                 case OPT_CONFIG: config_file_override = optarg; break;  // already pre-scanned
                 case OPT_TEMPERATURE: cli_temperature = strtof(optarg, NULL); has_cli_temperature = 1; break;
                 case OPT_TOP_P: cli_top_p = strtof(optarg, NULL); has_cli_top_p = 1; break;
