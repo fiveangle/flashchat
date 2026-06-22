@@ -4851,6 +4851,13 @@ static void batched_layer_forward_N(WeightFile *wf, int layer, float *hs, int N,
 // ============================================================================
 static int g_moe_last_union = 0;  // |union of the two tokens' routed experts| (diagnostic)
 
+static int parallel_pread_experts_into(
+    int packed_fd,
+    int *expert_indices,
+    int K,
+    id<MTLBuffer> __strong *dst_bufs,
+    int *valid
+);
 
 // Single-token routed expert FFN: out = down(swiglu(gate(x), up(x))).
 static void routed_ffn_1(void *buf, const float *x, float *out) {
@@ -4906,6 +4913,40 @@ static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, floa
     float w = cpu_sigmoid(score);
     for (int i = 0; i < H; i++) shared_out[i] *= w;
     free(sg); free(su); free(sa);
+}
+
+static void shared_expert_N(WeightFile *wf, int layer, const float *h_post, int N, float *shared_out) {
+    int H = g_cfg.hidden_dim, SI = g_cfg.shared_intermediate, gsz = g_cfg.group_size;
+    char nm[256];
+    #define SWN(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint32_t *sgw = SWN("shared_expert.gate_proj.weight"); uint16_t *sgs = SWN("shared_expert.gate_proj.scales"), *sgb = SWN("shared_expert.gate_proj.biases");
+    uint32_t *suw = SWN("shared_expert.up_proj.weight");   uint16_t *sus = SWN("shared_expert.up_proj.scales"),   *sub = SWN("shared_expert.up_proj.biases");
+    uint32_t *sdw = SWN("shared_expert.down_proj.weight"); uint16_t *sds = SWN("shared_expert.down_proj.scales"), *sdb = SWN("shared_expert.down_proj.biases");
+    uint32_t *segw = SWN("shared_expert_gate.weight");     uint16_t *segs = SWN("shared_expert_gate.scales"),     *segb = SWN("shared_expert_gate.biases");
+    #undef SWN
+    float *sg = malloc((size_t)N*SI*sizeof(float));
+    float *su = malloc((size_t)N*SI*sizeof(float));
+    float *sa = malloc((size_t)N*SI*sizeof(float));
+    float *score = malloc((size_t)N*sizeof(float));
+    if (!sg || !su || !sa || !score) {
+        for (int t = 0; t < N; t++) shared_expert_1(wf, layer, h_post + (size_t)t*H, shared_out + (size_t)t*H);
+        free(sg); free(su); free(sa); free(score);
+        return;
+    }
+    MMJob in_jobs[2] = {
+        {sgw,sgs,sgb,h_post,sg,(uint32_t)SI,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+        {suw,sus,sub,h_post,su,(uint32_t)SI,(uint32_t)H,(uint32_t)gsz,(uint32_t)N}
+    };
+    gpu_dequant_matmulN_batch(g_metal, in_jobs, 2);
+    for (int t = 0; t < N; t++)
+        gpu_swiglu(g_metal, sg + (size_t)t*SI, su + (size_t)t*SI, sa + (size_t)t*SI, SI);
+    gpu_dequant_matmulN(g_metal, sdw, sds, sdb, sa, shared_out, H, SI, gsz, N);
+    for (int t = 0; t < N; t++) {
+        fast_dequant_matvec(segw, segs, segb, h_post + (size_t)t*H, score + t, 1, H, gsz);
+        float w = cpu_sigmoid(score[t]);
+        for (int i = 0; i < H; i++) shared_out[(size_t)t*H+i] *= w;
+    }
+    free(sg); free(su); free(sa); free(score);
 }
 
 
@@ -4973,15 +5014,12 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         for (int i = 0; i < g_cfg.num_experts; i++) union_slot[i] = -1;
         for (int u = 0; u < n_union; u++) union_slot[uni[u]] = u;
 
-        void *buf = malloc(esz);
-        for (int u = 0; u < n_union; u++) {
-            int e = uni[u];
-            double _t_io = now_ms();
-            if (pread(packed_fd, buf, esz, (off_t)e * esz) != (ssize_t)esz) continue;
-            g_prof_mtp_moe_io += now_ms() - _t_io;
-            memcpy([g_metal->buf_multi_expert_data[u] contents], buf, esz);
-        }
-        free(buf);
+        int union_valid[MAX_K] = {0};
+        id<MTLBuffer> __strong union_bufs[MAX_K] = {nil};
+        for (int u = 0; u < n_union; u++) union_bufs[u] = g_metal->buf_multi_expert_data[u];
+        double _t_io = now_ms();
+        parallel_pread_experts_into(packed_fd, uni, n_union, union_bufs, union_valid);
+        g_prof_mtp_moe_io += now_ms() - _t_io;
 
         for (int t = 0; t < N; t++) {
             int valid[MAX_K] = {0};
@@ -4990,7 +5028,7 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
                 int e = idx[(size_t)t*K+k];
                 int slot = union_slot[e];
                 if (slot < 0) continue;
-                valid[slot] = 1;
+                valid[slot] = union_valid[slot];
                 expert_bufs[slot] = g_metal->buf_multi_expert_data[slot];
             }
             memcpy([g_metal->buf_multi_expert_input contents],
@@ -5006,6 +5044,7 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
                 int e = idx[(size_t)t*K+k];
                 int slot = union_slot[e];
                 if (slot < 0) continue;
+                if (!union_valid[slot]) continue;
                 float *out = (float *)[g_metal->buf_multi_expert_out[slot] contents];
                 cpu_vec_madd(moe + (size_t)t * H, out, wt[(size_t)t*K+k], H);
             }
@@ -5013,12 +5052,12 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         free(union_slot);
     }
 
-    float *shared = malloc(H*sizeof(float));
+    float *shared = malloc((size_t)N*H*sizeof(float));
     double _t_shared = now_ms();
+    shared_expert_N(wf, layer, hp, N, shared);
     for (int t = 0; t < N; t++) {
-        shared_expert_1(wf, layer, hp+(size_t)t*H, shared);
         for (int i = 0; i < H; i++)
-            hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[i];
+            hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[(size_t)t*H+i];
     }
     g_prof_mtp_moe_shared += now_ms() - _t_shared;
     free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared);
@@ -12323,13 +12362,24 @@ tool_call_checked:
                 if (nd > 0) {
                     mtp_did_spec = 1;
                     int Nv = nd + 1;
+                    int mtp_use_batched_verify = getenv("FLASHCHAT_MTP_BATCH_VERIFY") ? 1 : 0;
+                    int acc = 0;
+                    int seed_tok = -1;
+                    int verified_positions_this_iter = 0;
                     double _t_verify = g_server_debug_enabled ? now_ms() : 0.0;
-                    gpu_snap_save(&mtp_snap, kv_caches);
-                    embed_lookup(wf, next_token, mtp_hs);
-                    for (int j = 0; j < nd; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
-                    for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
-                    fused_batched_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
-                    if (g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
+                    if (mtp_use_batched_verify) {
+                        gpu_snap_save(&mtp_snap, kv_caches);
+                        embed_lookup(wf, next_token, mtp_hs);
+                        for (int j = 0; j < nd; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
+                        for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
+                        fused_batched_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                        verified_positions_this_iter = Nv;
+                    } else {
+                        embed_lookup(wf, next_token, mtp_hs);
+                        prod_forward_1(wf, mtp_hs, pos, kv_caches, (LinearAttnState **)layer_states,
+                                       layer_fds, layer_mmaps, K, mtp_ln);
+                        verified_positions_this_iter = 1;
+                    }
 
                     // One-shot debug: compare draft logits vs verify logits for position 0
                     if (g_server_debug_enabled && nd > 0) {
@@ -12385,29 +12435,46 @@ tool_call_checked:
                         }
                     }
 
-                    // Accept the longest correct prefix.
-                    int acc = 0;
-                    for (int j = 0; j < nd; j++) {
-                        mtp_shadow_checks++;
-                        if (j < 8) mtp_pos_checks[j]++;
-                        int tv = MTP_PICK(mtp_ln + (size_t)j*mtp_V);
-                        if (mtp_drafts[j] == tv) { acc++; mtp_shadow_hits++; if (j < 8) mtp_pos_hits[j]++; } else break;
-                    }
-                    int seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);  // corrected (acc<nd) or bonus
-                    if (acc < nd) {
-                        // Partial: undo the speculative tail, re-forward the acc+1 committed positions.
-                        double _t_refwd = g_server_debug_enabled ? now_ms() : 0.0;
-                        gpu_snap_restore(&mtp_snap, kv_caches);
-                        embed_lookup(wf, next_token, mtp_hs);
-                        for (int j = 0; j < acc; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
-                        for (int t = 0; t < acc+1; t++) mtp_posv[t] = pos + t;
-                        fused_batched_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                    if (mtp_use_batched_verify) {
+                        for (int j = 0; j < nd; j++) {
+                            mtp_shadow_checks++;
+                            if (j < 8) mtp_pos_checks[j]++;
+                            int tv = MTP_PICK(mtp_ln + (size_t)j*mtp_V);
+                            if (mtp_drafts[j] == tv) { acc++; mtp_shadow_hits++; if (j < 8) mtp_pos_hits[j]++; } else break;
+                        }
                         seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
-                        if (g_server_debug_enabled) mtp_refwd_ms = now_ms() - _t_refwd;
+                        if (acc < nd) {
+                            double _t_refwd = g_server_debug_enabled ? now_ms() : 0.0;
+                            gpu_snap_restore(&mtp_snap, kv_caches);
+                            embed_lookup(wf, next_token, mtp_hs);
+                            for (int j = 0; j < acc; j++) embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
+                            for (int t = 0; t < acc+1; t++) mtp_posv[t] = pos + t;
+                            fused_batched_forward_N(wf, mtp_hs, acc+1, kv_caches, layer_fds, mtp_posv, mtp_ln);
+                            seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
+                            if (g_server_debug_enabled) mtp_refwd_ms = now_ms() - _t_refwd;
+                        }
+                    } else {
+                        for (int j = 0; j < nd; j++) {
+                            mtp_shadow_checks++;
+                            if (j < 8) mtp_pos_checks[j]++;
+                            int tv = MTP_PICK(mtp_ln + (size_t)j*mtp_V);
+                            if (mtp_drafts[j] != tv) { seed_tok = tv; break; }
+                            acc++;
+                            mtp_shadow_hits++;
+                            if (j < 8) mtp_pos_hits[j]++;
+                            embed_lookup(wf, mtp_drafts[j], mtp_hs + (size_t)(j+1)*mtp_H);
+                            prod_forward_1(wf, mtp_hs + (size_t)(j+1)*mtp_H, pos + j + 1,
+                                           kv_caches, (LinearAttnState **)layer_states,
+                                           layer_fds, layer_mmaps, K, mtp_ln + (size_t)(j+1)*mtp_V);
+                            verified_positions_this_iter++;
+                        }
+                        if (acc == nd) seed_tok = MTP_PICK(mtp_ln + (size_t)acc*mtp_V);
+                        if (g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
                     }
+                    if (mtp_use_batched_verify && g_server_debug_enabled) mtp_verify_ms = now_ms() - _t_verify;
                     mtp_spec_iters++;
-                    mtp_verified_positions += Nv;
-                    if (acc < nd) mtp_refwd_iters++;
+                    mtp_verified_positions += verified_positions_this_iter;
+                    if (mtp_use_batched_verify && acc < nd) mtp_refwd_iters++;
                     if (acc == 0) mtp_full_reject_iters++;
                     mtp_total_draft_ms += mtp_draft_ms;
                     mtp_total_verify_ms += mtp_verify_ms;
