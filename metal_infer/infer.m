@@ -2351,6 +2351,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
+    id<MTLComputePipelineState> swiglu_batched;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
@@ -2572,6 +2573,7 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
+    ctx->swiglu_batched = makePipe(@"swiglu_fused_batched");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
@@ -3571,6 +3573,36 @@ static void gpu_swiglu(MetalCtx *ctx, const float *gate, const float *up, float 
     uint32_t d = (uint32_t)dim;
     [e setBytes:&d length:4 atIndex:3];
     [e dispatchThreadgroups:MTLSizeMake((d + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    memcpy(out, [obuf contents], sz);
+}
+
+static void gpu_swiglu_N(MetalCtx *ctx, const float *gate, const float *up, float *out, int dim, int N) {
+    if (!ctx->swiglu_batched) {
+        for (int t = 0; t < N; t++)
+            gpu_swiglu(ctx, gate + (size_t)t*dim, up + (size_t)t*dim, out + (size_t)t*dim, dim);
+        return;
+    }
+    static id<MTLBuffer> gbuf = nil, ubuf = nil, obuf = nil;
+    size_t sz = (size_t)N * dim * sizeof(float);
+    if (!gbuf || (size_t)[gbuf length] < sz) gbuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    if (!ubuf || (size_t)[ubuf length] < sz) ubuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    if (!obuf || (size_t)[obuf length] < sz) obuf = [ctx->device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    memcpy([gbuf contents], gate, sz);
+    memcpy([ubuf contents], up, sz);
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:ctx->swiglu_batched];
+    [e setBuffer:gbuf offset:0 atIndex:0];
+    [e setBuffer:ubuf offset:0 atIndex:1];
+    [e setBuffer:obuf offset:0 atIndex:2];
+    uint32_t d = (uint32_t)dim, n = (uint32_t)N;
+    [e setBytes:&d length:4 atIndex:3];
+    [e setBytes:&n length:4 atIndex:4];
+    uint32_t total = d * n;
+    [e dispatchThreadgroups:MTLSizeMake((total + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [e endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -4893,6 +4925,33 @@ static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_p
     free(scores);
 }
 
+static void moe_route_N(WeightFile *wf, int layer, const float *hidden, int N, float *h_post, int *idx, float *wt) {
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, E = g_cfg.num_experts, gsz = g_cfg.group_size;
+    char nm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", layer);
+    uint16_t *post_w = get_tensor_ptr(wf, nm);
+    for (int t = 0; t < N; t++)
+        cpu_rms_norm(hidden + (size_t)t*H, post_w, h_post + (size_t)t*H, H, g_cfg.rms_norm_eps);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", layer);   uint32_t *gw = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.scales", layer);   uint16_t *gs = get_tensor_ptr(wf, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.biases", layer);   uint16_t *gb = get_tensor_ptr(wf, nm);
+    float *scores = malloc((size_t)N*E*sizeof(float));
+    if (!scores) {
+        for (int t = 0; t < N; t++)
+            moe_route(wf, layer, hidden + (size_t)t*H, h_post + (size_t)t*H, idx + (size_t)t*K, wt + (size_t)t*K);
+        return;
+    }
+    gpu_dequant_matmulN(g_metal, gw, gs, gb, h_post, scores, E, H, gsz, N);
+    for (int t = 0; t < N; t++) {
+        float *st = scores + (size_t)t*E;
+        cpu_softmax(st, E);
+        cpu_topk(st, E, K, idx + (size_t)t*K, wt + (size_t)t*K);
+        if (getenv("MOE_DBG") && layer <= 1) { fprintf(stderr,"[moe-dbg-block] L%d hpost0=%.6f experts=[",layer,h_post[(size_t)t*H]); for(int k=0;k<K;k++)fprintf(stderr,"%d ",idx[(size_t)t*K+k]); fprintf(stderr,"]\n"); }
+        cpu_normalize_weights(wt + (size_t)t*K, K);
+    }
+    free(scores);
+}
+
 
 // Shared expert + gate for one token: returns shared_out (gated), needs h_post.
 static void shared_expert_1(WeightFile *wf, int layer, const float *h_post, float *shared_out) {
@@ -4938,8 +4997,7 @@ static void shared_expert_N(WeightFile *wf, int layer, const float *h_post, int 
         {suw,sus,sub,h_post,su,(uint32_t)SI,(uint32_t)H,(uint32_t)gsz,(uint32_t)N}
     };
     gpu_dequant_matmulN_batch(g_metal, in_jobs, 2);
-    for (int t = 0; t < N; t++)
-        gpu_swiglu(g_metal, sg + (size_t)t*SI, su + (size_t)t*SI, sa + (size_t)t*SI, SI);
+    gpu_swiglu_N(g_metal, sg, su, sa, SI, N);
     gpu_dequant_matmulN(g_metal, sdw, sds, sdb, sa, shared_out, H, SI, gsz, N);
     for (int t = 0; t < N; t++) {
         fast_dequant_matvec(segw, segs, segb, h_post + (size_t)t*H, score + t, 1, H, gsz);
@@ -4966,8 +5024,7 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
     int   *idx = malloc((size_t)N*K*sizeof(int));
     float *wt  = malloc((size_t)N*K*sizeof(float));
     double _t_route = now_ms();
-    for (int t = 0; t < N; t++)
-        moe_route(wf, layer, hs+(size_t)t*H, hp+(size_t)t*H, idx+(size_t)t*K, wt+(size_t)t*K);
+    moe_route_N(wf, layer, hs, N, hp, idx, wt);
     g_prof_mtp_moe_route += now_ms() - _t_route;
     float *moe = calloc((size_t)N*H, sizeof(float));
 
@@ -12128,8 +12185,9 @@ static void serve_loop(
             mtp_seed_hidden = malloc((size_t)mtp_H*sizeof(float));
             if (!g_mtp_k_cache) g_mtp_k_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
             if (!g_mtp_v_cache) g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
-            server_log_errorf("[mtp] %s draft/verify speculative decode ACTIVE (predictor batch size=%d)\n",
-                              request_id, mtp_B);
+            server_log_errorf("[mtp] %s draft/verify speculative decode ACTIVE (predictor batch size=%d, verify=%s)\n",
+                              request_id, mtp_B,
+                              getenv("FLASHCHAT_MTP_BATCH_VERIFY") ? "batched-scaffold" : "production");
         }
 
         if (final_norm_w) {
@@ -13262,7 +13320,7 @@ int main(int argc, char **argv) {
             if (mtp.tensors_present && mtp.packed_experts_present) {
                 fprintf(stderr, "[mtp] enabled; predictor batch size=%d; artifacts detected (%s)\n",
                         g_mtp_predictions, mtp.packed_dir);
-                fprintf(stderr, "[mtp] draft/verify speculative decode ACTIVE in server decode path (lossless: batched verify is bit-faithful)\n");
+                fprintf(stderr, "[mtp] draft/verify speculative decode ACTIVE in server decode path (verify=production; set FLASHCHAT_MTP_BATCH_VERIFY=1 for batched scaffold profiling)\n");
             } else {
                 fprintf(stderr, "[mtp] requested but artifacts are incomplete; using existing decode path\n");
                 fprintf(stderr, "[mtp] tensors=%s packed_experts=%s\n",
