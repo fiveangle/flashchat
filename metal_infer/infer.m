@@ -1292,7 +1292,7 @@ static int mtp_preflight_forward(WeightFile *wf) {
 
 static int mtp_forward(WeightFile *wf, const char *model_path,
                        const float *input_hidden, const float *next_embedding,
-                       float *out_hidden, int *out_draft_token, int log_details) {
+                       float *out_hidden, int *out_draft_token, float *out_draft_margin, int log_details) {
     (void)model_path;
     if (!g_mtp_cache.ready) {
         fprintf(stderr, "[mtp] forward failed: MTP weight cache is incomplete\n");
@@ -1598,6 +1598,9 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
     if (out_draft_token) {
         *out_draft_token = -1;
     }
+    if (out_draft_margin) {
+        *out_draft_margin = 0.0f;
+    }
     if (get_tensor_info(wf, "lm_head.weight") &&
         get_tensor_info(wf, "lm_head.scales") &&
         get_tensor_info(wf, "lm_head.biases")) {
@@ -1606,13 +1609,28 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
             lm_head_forward(wf, final_normed, logits);
             mtp_trace_vector(trace_call, "logits", logits, g_cfg.vocab_size);
             mtp_trace_top_values(trace_call, "logits", logits, g_cfg.vocab_size);
-            int draft_token = cpu_argmax(logits, g_cfg.vocab_size);
+            int draft_token = -1;
+            float best = -FLT_MAX;
+            float second = -FLT_MAX;
+            for (int i = 0; i < g_cfg.vocab_size; i++) {
+                float v = logits[i];
+                if (v > best) {
+                    second = best;
+                    best = v;
+                    draft_token = i;
+                } else if (v > second) {
+                    second = v;
+                }
+            }
             if (out_draft_token) {
                 *out_draft_token = draft_token;
             }
+            if (out_draft_margin && draft_token >= 0 && isfinite(best) && isfinite(second)) {
+                *out_draft_margin = best - second;
+            }
             if (log_details) {
-                fprintf(stderr, "[mtp] decoder preflight draft_token=%d draft_logit=%.6f\n",
-                        draft_token, logits[draft_token]);
+                fprintf(stderr, "[mtp] decoder preflight draft_token=%d draft_logit=%.6f margin=%.6f\n",
+                        draft_token, logits[draft_token], out_draft_margin ? *out_draft_margin : 0.0f);
             }
             free(logits);
         }
@@ -1645,7 +1663,7 @@ static int mtp_preflight_decoder_layer(WeightFile *wf, const char *model_path) {
     }
 
     int draft_token = -1;
-    int rc = mtp_forward(wf, model_path, hidden, embedding, out_hidden, &draft_token, 1);
+    int rc = mtp_forward(wf, model_path, hidden, embedding, out_hidden, &draft_token, NULL, 1);
     float out_rms = vec_rms(out_hidden, g_cfg.hidden_dim);
     fprintf(stderr, "[mtp] reusable forward preflight out_rms=%.6f draft_token=%d\n",
             out_rms, draft_token);
@@ -1687,7 +1705,7 @@ static int mtp_shadow_draft_token(WeightFile *wf, const char *model_path,
                           accepted_token, g_mtp_kv_len);
     }
     int draft_token = -1;
-    int rc = mtp_forward(wf, model_path, backbone_hidden, embedding, mtp_hidden, &draft_token, 0);
+    int rc = mtp_forward(wf, model_path, backbone_hidden, embedding, mtp_hidden, &draft_token, NULL, 0);
     free(embedding);
     free(mtp_hidden);
     if (out_draft_token) *out_draft_token = draft_token;
@@ -4925,7 +4943,8 @@ static void moe_route(WeightFile *wf, int layer, const float *hidden, float *h_p
     free(scores);
 }
 
-static void moe_route_N(WeightFile *wf, int layer, const float *hidden, int N, float *h_post, int *idx, float *wt) {
+static void moe_route_N(WeightFile *wf, int layer, const float *hidden, int N, float *h_post, int *idx, float *wt,
+                        float *shared_gate, float *shared_up, float *shared_gate_score) {
     int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, E = g_cfg.num_experts, gsz = g_cfg.group_size;
     char nm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.post_attention_layernorm.weight", layer);
@@ -4935,13 +4954,28 @@ static void moe_route_N(WeightFile *wf, int layer, const float *hidden, int N, f
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", layer);   uint32_t *gw = get_tensor_ptr(wf, nm);
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.scales", layer);   uint16_t *gs = get_tensor_ptr(wf, nm);
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.biases", layer);   uint16_t *gb = get_tensor_ptr(wf, nm);
+    #define MRW(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+    uint32_t *sgw = MRW("shared_expert.gate_proj.weight"); uint16_t *sgs = MRW("shared_expert.gate_proj.scales"), *sgb = MRW("shared_expert.gate_proj.biases");
+    uint32_t *suw = MRW("shared_expert.up_proj.weight");   uint16_t *sus = MRW("shared_expert.up_proj.scales"),   *sub = MRW("shared_expert.up_proj.biases");
+    uint32_t *segw = MRW("shared_expert_gate.weight");     uint16_t *segs = MRW("shared_expert_gate.scales"),     *segb = MRW("shared_expert_gate.biases");
+    #undef MRW
     float *scores = malloc((size_t)N*E*sizeof(float));
     if (!scores) {
         for (int t = 0; t < N; t++)
             moe_route(wf, layer, hidden + (size_t)t*H, h_post + (size_t)t*H, idx + (size_t)t*K, wt + (size_t)t*K);
         return;
     }
-    gpu_dequant_matmulN(g_metal, gw, gs, gb, h_post, scores, E, H, gsz, N);
+    if (shared_gate && shared_up && shared_gate_score && sgw && sgs && sgb && suw && sus && sub && segw && segs && segb) {
+        MMJob jobs[4] = {
+            {gw,gs,gb,h_post,scores,(uint32_t)E,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {sgw,sgs,sgb,h_post,shared_gate,(uint32_t)g_cfg.shared_intermediate,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {suw,sus,sub,h_post,shared_up,(uint32_t)g_cfg.shared_intermediate,(uint32_t)H,(uint32_t)gsz,(uint32_t)N},
+            {segw,segs,segb,h_post,shared_gate_score,1,(uint32_t)H,(uint32_t)gsz,(uint32_t)N}
+        };
+        gpu_dequant_matmulN_batch(g_metal, jobs, 4);
+    } else {
+        gpu_dequant_matmulN(g_metal, gw, gs, gb, h_post, scores, E, H, gsz, N);
+    }
     for (int t = 0; t < N; t++) {
         float *st = scores + (size_t)t*E;
         cpu_softmax(st, E);
@@ -5018,15 +5052,19 @@ static void shared_expert_N(WeightFile *wf, int layer, const float *h_post, int 
 // each expert. Branches only at the MLP — same routing/experts/shared/combine as
 // production, so it stays bit-faithful at any N.
 static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_fd) {
-    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok;
+    int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, SI = g_cfg.shared_intermediate;
     size_t esz = active_expert_size();
     float *hp = malloc((size_t)N*H*sizeof(float));
     int   *idx = malloc((size_t)N*K*sizeof(int));
     float *wt  = malloc((size_t)N*K*sizeof(float));
+    float *shared_gate = malloc((size_t)N*SI*sizeof(float));
+    float *shared_up = malloc((size_t)N*SI*sizeof(float));
+    float *shared_score = malloc((size_t)N*sizeof(float));
     double _t_route = now_ms();
-    moe_route_N(wf, layer, hs, N, hp, idx, wt);
+    moe_route_N(wf, layer, hs, N, hp, idx, wt, shared_gate, shared_up, shared_score);
     g_prof_mtp_moe_route += now_ms() - _t_route;
     float *moe = calloc((size_t)N*H, sizeof(float));
+    float *shared = calloc((size_t)N*H, sizeof(float));
 
     // Union of all unique experts across all tokens
     int *seen = calloc(g_cfg.num_experts, sizeof(int));
@@ -5063,6 +5101,9 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
             }
         }
         free(buf); free(eo);
+        double _t_shared = now_ms();
+        shared_expert_N(wf, layer, hp, N, shared);
+        g_prof_mtp_moe_shared += now_ms() - _t_shared;
     } else {
         // Fast path: load union experts into GPU buffers once, then dispatch
         // all K experts for each token in a single command buffer (one
@@ -5077,6 +5118,10 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
         double _t_io = now_ms();
         parallel_pread_experts_into(packed_fd, uni, n_union, union_bufs, union_valid);
         g_prof_mtp_moe_io += now_ms() - _t_io;
+        char nm[256];
+        #define MBS(suf) (snprintf(nm,sizeof(nm),"model.layers.%d.mlp." suf,layer), get_tensor_ptr(wf,nm))
+        uint32_t *sdw = MBS("shared_expert.down_proj.weight"); uint16_t *sds = MBS("shared_expert.down_proj.scales"), *sdb = MBS("shared_expert.down_proj.biases");
+        #undef MBS
 
         for (int t = 0; t < N; t++) {
             int valid[MAX_K] = {0};
@@ -5090,10 +5135,32 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
             }
             memcpy([g_metal->buf_multi_expert_input contents],
                    hp + (size_t)t * H, (size_t)H * sizeof(float));
+            if (shared_gate && shared_up) {
+                memcpy([g_metal->buf_shared_gate contents], shared_gate + (size_t)t*SI, (size_t)SI * sizeof(float));
+                memcpy([g_metal->buf_shared_up contents], shared_up + (size_t)t*SI, (size_t)SI * sizeof(float));
+            }
 
             double _t_expert = now_ms();
             id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
             gpu_encode_experts_batched(g_metal, cmd, MAX_K, valid, expert_bufs);
+            if (shared_gate && shared_up && shared_score && sdw && sds && sdb) {
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->swiglu];
+                    [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                    uint32_t dim = (uint32_t)SI;
+                    [enc setBytes:&dim length:4 atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    H, SI, g_cfg.group_size);
+            }
             [cmd commit]; [cmd waitUntilCompleted];
             g_prof_mtp_moe_expert += now_ms() - _t_expert;
 
@@ -5105,19 +5172,25 @@ static void moe_block_N(WeightFile *wf, int layer, float *hs, int N, int packed_
                 float *out = (float *)[g_metal->buf_multi_expert_out[slot] contents];
                 cpu_vec_madd(moe + (size_t)t * H, out, wt[(size_t)t*K+k], H);
             }
+            if (shared_gate && shared_up && shared_score && sdw && sds && sdb) {
+                float w = cpu_sigmoid(shared_score[t]);
+                float *sout = (float *)[g_metal->buf_shared_out contents];
+                for (int i = 0; i < H; i++) shared[(size_t)t*H+i] = sout[i] * w;
+            }
+        }
+        if (!(shared_gate && shared_up && shared_score && sdw && sds && sdb)) {
+            double _t_shared = now_ms();
+            shared_expert_N(wf, layer, hp, N, shared);
+            g_prof_mtp_moe_shared += now_ms() - _t_shared;
         }
         free(union_slot);
     }
 
-    float *shared = malloc((size_t)N*H*sizeof(float));
-    double _t_shared = now_ms();
-    shared_expert_N(wf, layer, hp, N, shared);
     for (int t = 0; t < N; t++) {
         for (int i = 0; i < H; i++)
             hs[(size_t)t*H+i] = hs[(size_t)t*H+i] + moe[(size_t)t*H+i] + shared[(size_t)t*H+i];
     }
-    g_prof_mtp_moe_shared += now_ms() - _t_shared;
-    free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared);
+    free(hp); free(idx); free(wt); free(moe); free(seen); free(uni); free(shared); free(shared_gate); free(shared_up); free(shared_score);
 }
 
 
@@ -12168,18 +12241,30 @@ static void serve_loop(
         const int mtp_H = g_cfg.hidden_dim, mtp_V = g_cfg.vocab_size;
         const int mtp_kvd = g_cfg.num_kv_heads * g_cfg.head_dim;
         const int mtp_B = g_mtp_predictions > 1 ? g_mtp_predictions : 2;  // batch size (positions)
+        int mtp_batch_verify_requested = getenv("FLASHCHAT_MTP_BATCH_VERIFY") ? 1 : 0;
+        float mtp_batch_verify_margin_min = 4.0f;
+        const char *mtp_margin_env = getenv("FLASHCHAT_MTP_BATCH_VERIFY_MARGIN");
+        if (mtp_margin_env && mtp_margin_env[0]) {
+            mtp_batch_verify_margin_min = strtof(mtp_margin_env, NULL);
+            if (!isfinite(mtp_batch_verify_margin_min) || mtp_batch_verify_margin_min < 0.0f) {
+                mtp_batch_verify_margin_min = 4.0f;
+            }
+        }
         GpuStateSnap mtp_snap; int mtp_snap_ready = 0;
         float *mtp_hs = NULL, *mtp_ln = NULL, *mtp_seed_hidden = NULL, *mtp_mh = NULL;
+        float *mtp_margins = NULL;
         int *mtp_drafts = NULL, *mtp_posv = NULL;
         int mtp_q[8]; int mtp_q_len = 0, mtp_q_idx = 0;   // accepted drafts pending drain-emit
         int mtp_seed_pending = 0, mtp_seed = -1;          // next seed to emit-then-produce
         double mtp_total_draft_ms = 0.0, mtp_total_verify_ms = 0.0, mtp_total_refwd_ms = 0.0, mtp_total_iter_ms = 0.0;
         int mtp_spec_iters = 0, mtp_refwd_iters = 0, mtp_full_reject_iters = 0, mtp_verified_positions = 0;
+        int mtp_batched_verify_iters = 0, mtp_prod_verify_iters = 0;
         if (mtp_shadow_available) {
             gpu_snap_alloc(&mtp_snap); mtp_snap_ready = 1;
             mtp_hs   = malloc((size_t)mtp_B*mtp_H*sizeof(float));
             mtp_ln   = malloc((size_t)mtp_B*mtp_V*sizeof(float));
             mtp_mh   = malloc((size_t)mtp_B*mtp_H*sizeof(float));   // MTP rollout hiddens
+            mtp_margins = malloc((size_t)mtp_B*sizeof(float));
             mtp_drafts = malloc((size_t)mtp_B*sizeof(int));
             mtp_posv = malloc((size_t)mtp_B*sizeof(int));
             mtp_seed_hidden = malloc((size_t)mtp_H*sizeof(float));
@@ -12187,7 +12272,11 @@ static void serve_loop(
             if (!g_mtp_v_cache) g_mtp_v_cache = calloc((size_t)GPU_KV_SEQ*mtp_kvd, sizeof(float));
             server_log_errorf("[mtp] %s draft/verify speculative decode ACTIVE (predictor batch size=%d, verify=%s)\n",
                               request_id, mtp_B,
-                              getenv("FLASHCHAT_MTP_BATCH_VERIFY") ? "batched-scaffold" : "production");
+                              mtp_batch_verify_requested ? "batched-scaffold" : "production");
+            if (mtp_batch_verify_requested) {
+                server_log_errorf("[mtp] %s batched verifier gate margin_min=%.2f\n",
+                                  request_id, mtp_batch_verify_margin_min);
+            }
         }
 
         if (final_norm_w) {
@@ -12411,16 +12500,24 @@ tool_call_checked:
                     float emb[mtp_H];
                     for (int j = 0; j < mtp_B - 1; j++) {
                         int dj = -1;
+                        float dm = 0.0f;
                         embed_lookup(wf, tok, emb);
-                        if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, 0) != 0 || dj < 0) break;
+                        if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, &dm, 0) != 0 || dj < 0) break;
                         mtp_drafts[j] = dj; mhp = mtp_mh + (size_t)j*mtp_H; tok = dj; nd++;
+                        if (mtp_margins) mtp_margins[j] = dm;
                     }
                     if (g_server_debug_enabled) mtp_draft_ms = now_ms() - _t_draft;
                 }
                 if (nd > 0) {
                     mtp_did_spec = 1;
                     int Nv = nd + 1;
-                    int mtp_use_batched_verify = getenv("FLASHCHAT_MTP_BATCH_VERIFY") ? 1 : 0;
+                    float mtp_min_margin = FLT_MAX;
+                    for (int j = 0; j < nd; j++) {
+                        float dm = mtp_margins ? mtp_margins[j] : 0.0f;
+                        if (dm < mtp_min_margin) mtp_min_margin = dm;
+                    }
+                    int mtp_use_batched_verify = (mtp_batch_verify_requested &&
+                                                  mtp_min_margin >= mtp_batch_verify_margin_min) ? 1 : 0;
                     int acc = 0;
                     int seed_tok = -1;
                     int verified_positions_this_iter = 0;
@@ -12432,11 +12529,13 @@ tool_call_checked:
                         for (int t = 0; t < Nv; t++) mtp_posv[t] = pos + t;
                         fused_batched_forward_N(wf, mtp_hs, Nv, kv_caches, layer_fds, mtp_posv, mtp_ln);
                         verified_positions_this_iter = Nv;
+                        mtp_batched_verify_iters++;
                     } else {
                         embed_lookup(wf, next_token, mtp_hs);
                         prod_forward_1(wf, mtp_hs, pos, kv_caches, (LinearAttnState **)layer_states,
                                        layer_fds, layer_mmaps, K, mtp_ln);
                         verified_positions_this_iter = 1;
+                        mtp_prod_verify_iters++;
                     }
 
                     // One-shot debug: compare draft logits vs verify logits for position 0
@@ -12540,8 +12639,9 @@ tool_call_checked:
                     if (g_server_debug_enabled) {
                         mtp_iter_ms = now_ms() - _t_iter;
                         mtp_total_iter_ms += mtp_iter_ms;
-                        server_log_errorf("[mtp-debug] %s iter draft=%.2fms verify=%.2fms refwd=%.2fms total=%.2fms nd=%d acc=%d\n",
-                                          request_id, mtp_draft_ms, mtp_verify_ms, mtp_refwd_ms, mtp_iter_ms, nd, acc);
+                        server_log_errorf("[mtp-debug] %s iter draft=%.2fms verify=%.2fms refwd=%.2fms total=%.2fms nd=%d acc=%d mode=%s margin=%.2f\n",
+                                          request_id, mtp_draft_ms, mtp_verify_ms, mtp_refwd_ms, mtp_iter_ms, nd, acc,
+                                          mtp_use_batched_verify ? "batched" : "production", mtp_min_margin);
                     }
                     // MTP attention KV: keep only the committed prefix's entries (the
                     // rollout appended the input tokens; drop the rejected tail).
@@ -12611,8 +12711,9 @@ tool_call_checked:
                               request_id, mtp_shadow_hits, mtp_shadow_checks, acc_rate, mtp_pos_buf);
             if (mtp_spec_iters > 0) {
                 server_log_errorf("[mtp] %s economics spec_iters=%d verified_positions=%d refwd_iters=%d full_rejects=%d "
-                                  "draft_ms=%.1f verify_ms=%.1f refwd_ms=%.1f iter_ms=%.1f avg_iter_ms=%.2f\n",
+                                  "batched_iters=%d production_iters=%d draft_ms=%.1f verify_ms=%.1f refwd_ms=%.1f iter_ms=%.1f avg_iter_ms=%.2f\n",
                                   request_id, mtp_spec_iters, mtp_verified_positions, mtp_refwd_iters, mtp_full_reject_iters,
+                                  mtp_batched_verify_iters, mtp_prod_verify_iters,
                                   mtp_total_draft_ms, mtp_total_verify_ms, mtp_total_refwd_ms, mtp_total_iter_ms,
                                   mtp_total_iter_ms / (double)mtp_spec_iters);
             }
@@ -12620,7 +12721,7 @@ tool_call_checked:
         mtp_overlap_report(mtp_shadow_hits, mtp_shadow_checks);
         g_overlap_in_decode = 0;
         if (mtp_snap_ready) gpu_snap_free(&mtp_snap);
-        free(mtp_hs); free(mtp_ln); free(mtp_mh); free(mtp_drafts); free(mtp_posv); free(mtp_seed_hidden);
+        free(mtp_hs); free(mtp_ln); free(mtp_mh); free(mtp_margins); free(mtp_drafts); free(mtp_posv); free(mtp_seed_hidden);
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
             server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
