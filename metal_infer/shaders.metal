@@ -368,27 +368,28 @@ kernel void dequant_matvec_4bit_v3(
         uint32_t packed = w_row[col];
         uint x_base = col * 8;
 
-        // Dequantize 8 nibbles and multiply with cached x
-        // Rearranged: (nibble * scale + bias) * x = nibble * (scale*x) + bias*x
-        // Pre-compute scale*x and bias*x, then use FMA for dequant+multiply in one op.
-        // This reduces per-nibble from (convert + mul + add + mul + add) to (convert + FMA + add).
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+        float xv0 = x_shared[x_base + 0];
+        float xv1 = x_shared[x_base + 1];
+        float xv2 = x_shared[x_base + 2];
+        float xv3 = x_shared[x_base + 3];
+        float xv4 = x_shared[x_base + 4];
+        float xv5 = x_shared[x_base + 5];
+        float xv6 = x_shared[x_base + 6];
+        float xv7 = x_shared[x_base + 7];
 
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+        float partial = float((packed >>  0) & 0xF) * xv0;
+        partial = fma(float((packed >>  4) & 0xF), xv1, partial);
+        partial = fma(float((packed >>  8) & 0xF), xv2, partial);
+        partial = fma(float((packed >> 12) & 0xF), xv3, partial);
+        partial = fma(float((packed >> 16) & 0xF), xv4, partial);
+        partial = fma(float((packed >> 20) & 0xF), xv5, partial);
+        partial = fma(float((packed >> 24) & 0xF), xv6, partial);
+        partial = fma(float((packed >> 28) & 0xF), xv7, partial);
+
+        float sum_x = (xv0 + xv1) + (xv2 + xv3);
+        sum_x += (xv4 + xv5) + (xv6 + xv7);
+
+        acc = fma(scale, partial, fma(bias, sum_x, acc));
     }
 
     // ---- SIMD reduction: sum across 32 lanes ----
@@ -442,15 +443,19 @@ kernel void dequant_matvec_8bit_v3(
         uint32_t packed = w_row[col];
         uint x_base = col * 4;
 
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float xv0 = x_shared[x_base + 0];
+        float xv1 = x_shared[x_base + 1];
+        float xv2 = x_shared[x_base + 2];
+        float xv3 = x_shared[x_base + 3];
 
-        acc += fma(float((packed >>  0) & 0xFF), sx0, bx0);
-        acc += fma(float((packed >>  8) & 0xFF), sx1, bx1);
-        acc += fma(float((packed >> 16) & 0xFF), sx2, bx2);
-        acc += fma(float((packed >> 24) & 0xFF), sx3, bx3);
+        float partial = float((packed >>  0) & 0xFF) * xv0;
+        partial = fma(float((packed >>  8) & 0xFF), xv1, partial);
+        partial = fma(float((packed >> 16) & 0xFF), xv2, partial);
+        partial = fma(float((packed >> 24) & 0xFF), xv3, partial);
+
+        float sum_x = (xv0 + xv1) + (xv2 + xv3);
+
+        acc = fma(scale, partial, fma(bias, sum_x, acc));
     }
 
     float sum = simd_sum(acc);
@@ -902,12 +907,19 @@ kernel void dequant_matmulN_4bit_v5(
         uint x_base = col * 8;
         for (uint n = 0; n < N; n++) {
             device const float* xn = X + (size_t)n * in_dim;
+            float partial[ROWS_PER_SIMD];
+            for (uint r = 0; r < ROWS_PER_SIMD; r++) partial[r] = 0.0f;
+            float sum_x = 0.0f;
             for (uint k = 0; k < 8; k++) {
                 float xv = xn[x_base + k];
+                sum_x += xv;
                 for (uint r = 0; r < ROWS_PER_SIMD; r++) {
                     float nib = float((packed[r] >> (k * 4)) & 0xF);
-                    acc[r][n] = fma(nib, scale[r] * xv, fma(bias[r], xv, acc[r][n]));
+                    partial[r] = fma(nib, xv, partial[r]);
                 }
+            }
+            for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+                acc[r][n] = fma(scale[r], partial[r], fma(bias[r], sum_x, acc[r][n]));
             }
         }
     }
@@ -968,12 +980,19 @@ kernel void dequant_matmulN_8bit_v5(
         uint x_base = col * 4;
         for (uint n = 0; n < N; n++) {
             device const float* xn = X + (size_t)n * in_dim;
+            float partial[ROWS_PER_SIMD];
+            for (uint r = 0; r < ROWS_PER_SIMD; r++) partial[r] = 0.0f;
+            float sum_x = 0.0f;
             for (uint k = 0; k < 4; k++) {
                 float xv = xn[x_base + k];
+                sum_x += xv;
                 for (uint r = 0; r < ROWS_PER_SIMD; r++) {
                     float q = float((packed[r] >> (k * 8)) & 0xFF);
-                    acc[r][n] = fma(q, scale[r] * xv, fma(bias[r], xv, acc[r][n]));
+                    partial[r] = fma(q, xv, partial[r]);
                 }
+            }
+            for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+                acc[r][n] = fma(scale[r], partial[r], fma(bias[r], sum_x, acc[r][n]));
             }
         }
     }
