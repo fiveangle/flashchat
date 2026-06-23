@@ -1568,6 +1568,112 @@ kernel void attn_values_batched(
 
 
 // ============================================================================
+// Quantized-KV variants (FLASHCHAT_KV_QUANT=q8|q4). Dequant-on-read: the K/V
+// cache holds symmetric per-(token, kv_head) quantized values plus an fp16
+// scale per head vector. bits=8 -> signed int8; bits=4 -> two nibbles/byte at
+// a +8 offset (low nibble = even index). Math matches the C kv_quantize_token.
+// ============================================================================
+
+kernel void attn_scores_quant(
+    device const float* Q          [[buffer(0)]],  // [num_heads, head_dim]
+    device const uchar* K_cache    [[buffer(1)]],  // packed q8/q4 K cache
+    device float*       scores     [[buffer(2)]],
+    constant uint&      head_dim   [[buffer(3)]],
+    constant uint&      kv_dim     [[buffer(4)]],  // logical kv_dim (num_kv_heads*head_dim)
+    constant uint&      seq_len    [[buffer(5)]],
+    constant uint&      seq_stride [[buffer(6)]],
+    constant float&     scale      [[buffer(7)]],
+    constant uint&      heads_per_kv [[buffer(8)]],
+    constant uint&      num_seq_tgs  [[buffer(9)]],
+    device const half*  k_scale    [[buffer(10)]], // [seq, num_kv_heads]
+    constant uint&      bits       [[buffer(11)]], // 8 or 4
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint pos = tgid % num_seq_tgs;
+    uint h = tgid / num_seq_tgs;
+    if (pos >= seq_len) return;
+
+    uint num_kv_heads = kv_dim / head_dim;
+    uint kv_h = h / heads_per_kv;
+    device const float* qh = Q + h * head_dim;
+    float ks = float(k_scale[pos * num_kv_heads + kv_h]);
+
+    float acc = 0.0f;
+    if (bits == 8) {
+        device const char* kp = (device const char*)K_cache + pos * kv_dim + kv_h * head_dim;
+        for (uint d = lid; d < head_dim; d += tg_size) {
+            acc += qh[d] * (float(kp[d]) * ks);
+        }
+    } else {
+        uint half_hd = head_dim >> 1;
+        device const uchar* kp = K_cache + pos * (kv_dim >> 1) + kv_h * half_hd;
+        for (uint d = lid; d < head_dim; d += tg_size) {
+            uchar byte = kp[d >> 1];
+            int nib = (d & 1) ? (byte >> 4) : (byte & 0xF);
+            acc += qh[d] * (float(nib - 8) * ks);
+        }
+    }
+
+    // SIMD reduction (identical to attn_scores_batched)
+    float simd_val = simd_sum(acc);
+    threadgroup float shared[32];
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = simd_sum(shared[simd_lane]);
+        if (simd_lane == 0) {
+            scores[h * seq_stride + pos] = val * scale;
+        }
+    }
+}
+
+kernel void attn_values_quant(
+    device const float* scores   [[buffer(0)]],
+    device const uchar* V_cache  [[buffer(1)]],  // packed q8/q4 V cache
+    device float*       out      [[buffer(2)]],
+    constant uint&      head_dim  [[buffer(3)]],
+    constant uint&      kv_dim    [[buffer(4)]],
+    constant uint&      seq_len   [[buffer(5)]],
+    constant uint&      seq_stride [[buffer(6)]],
+    constant uint&      heads_per_kv [[buffer(7)]],
+    device const half*  v_scale   [[buffer(8)]], // [seq, num_kv_heads]
+    constant uint&      bits      [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint d = tid % head_dim;
+    uint h = tid / head_dim;
+
+    uint num_kv_heads = kv_dim / head_dim;
+    uint kv_h = h / heads_per_kv;
+    device const float* s = scores + h * seq_stride;
+
+    float acc = 0.0f;
+    if (bits == 8) {
+        device const char* V = (device const char*)V_cache;
+        for (uint p = 0; p < seq_len; p++) {
+            float vs = float(v_scale[p * num_kv_heads + kv_h]);
+            acc += s[p] * (float(V[p * kv_dim + kv_h * head_dim + d]) * vs);
+        }
+    } else {
+        uint half_hd = head_dim >> 1;
+        for (uint p = 0; p < seq_len; p++) {
+            float vs = float(v_scale[p * num_kv_heads + kv_h]);
+            uchar byte = V_cache[p * (kv_dim >> 1) + kv_h * half_hd + (d >> 1)];
+            int nib = (d & 1) ? (byte >> 4) : (byte & 0xF);
+            acc += s[p] * (float(nib - 8) * vs);
+        }
+    }
+    out[h * head_dim + d] = acc;
+}
+
+
+// ============================================================================
 // Kernel 9: Sigmoid element-wise gate
 // ============================================================================
 // out[i] = x[i] * sigmoid(gate[i])

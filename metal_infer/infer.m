@@ -469,6 +469,101 @@ static inline int verify_gpu_attn_enabled(void) {
     return g_verify_gpu_attn;
 }
 
+// KV-cache quantization (FLASHCHAT_KV_QUANT=off|q8|q4). Production single-token
+// decode path only (the MTP/verify path keeps fp32 buffers — see kv-quant plan).
+// Symmetric per-(token, kv_head) quant: one fp16 scale per head_dim vector,
+// scale = max_abs / qmax (qmax 127 for q8, 7 for q4); q4 packs two nibbles/byte
+// at a +8 offset (low nibble = even index). Mirrors MTPLX kv_quant.py.
+static int g_kv_quant_bits = -1;  // -1 unresolved; 0 off; 8 q8; 4 q4
+static inline int kv_quant_bits(void) {
+    if (g_kv_quant_bits < 0) {
+        const char *m = getenv("FLASHCHAT_KV_QUANT");
+        if (m && (!strcmp(m, "q8") || !strcmp(m, "int8") || !strcmp(m, "8"))) g_kv_quant_bits = 8;
+        else if (m && (!strcmp(m, "q4") || !strcmp(m, "int4") || !strcmp(m, "4"))) g_kv_quant_bits = 4;
+        else g_kv_quant_bits = 0;  // off / unset / unknown
+    }
+    return g_kv_quant_bits;
+}
+// Packed bytes of quantized K (or V) storage per cached token across all kv heads.
+// Falls back to the fp32 token size when quantization is off, so buffer-sizing
+// callers can use this unconditionally.
+static inline size_t kv_token_bytes(void) {
+    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+    int b = kv_quant_bits();
+    if (b == 8) return kv_dim;
+    if (b == 4) return kv_dim / 2;
+    return kv_dim * sizeof(float);
+}
+// fp16 scales per cached token (one per kv head); 0 when not quantizing.
+static inline size_t kv_scales_per_token(void) {
+    return kv_quant_bits() ? (size_t)g_cfg.num_kv_heads : 0;
+}
+
+// Quantize one token's K or V vector [num_kv_heads*head_dim], symmetric per head.
+// q_out: int8_t[kv_dim] (q8) or uint8_t[kv_dim/2] (q4). scale_out: __fp16[num_kv_heads].
+static void kv_quantize_token(const float *x, void *q_out, __fp16 *scale_out,
+                              int num_kv_heads, int head_dim, int bits) {
+    const float qmax = (bits == 8) ? 127.0f : 7.0f;
+    for (int h = 0; h < num_kv_heads; h++) {
+        const float *xh = x + h * head_dim;
+        float maxabs = 1e-6f;
+        for (int d = 0; d < head_dim; d++) { float a = fabsf(xh[d]); if (a > maxabs) maxabs = a; }
+        float scale = maxabs / qmax;
+        if (scale < 1e-6f) scale = 1e-6f;
+        scale_out[h] = (__fp16)scale;
+        float inv = 1.0f / scale;
+        if (bits == 8) {
+            int8_t *q = (int8_t *)q_out + h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                float r = roundf(xh[d] * inv);
+                if (r > qmax) r = qmax; else if (r < -qmax) r = -qmax;
+                q[d] = (int8_t)r;
+            }
+        } else {  // bits == 4: pack two nibbles/byte, +8 offset, low nibble = even index
+            uint8_t *q = (uint8_t *)q_out + h * (head_dim / 2);
+            for (int d = 0; d < head_dim; d += 2) {
+                float r0 = roundf(xh[d] * inv);     if (r0 > qmax) r0 = qmax; else if (r0 < -qmax) r0 = -qmax;
+                float r1 = roundf(xh[d + 1] * inv); if (r1 > qmax) r1 = qmax; else if (r1 < -qmax) r1 = -qmax;
+                uint8_t lo = (uint8_t)((int)r0 + 8);
+                uint8_t hi = (uint8_t)((int)r1 + 8);
+                q[d / 2] = (uint8_t)(lo | (hi << 4));
+            }
+        }
+    }
+}
+// Dequantize a single cached element (pos, kv_head, d) — CPU read fallback only.
+static inline float kv_dequant_elem(const void *q, const __fp16 *scale, int pos, int kv_h,
+                                    int d, int num_kv_heads, int head_dim, int bits) {
+    float s = (float)scale[(size_t)pos * num_kv_heads + kv_h];
+    if (bits == 8) {
+        const int8_t *b = (const int8_t *)q + (size_t)pos * num_kv_heads * head_dim + (size_t)kv_h * head_dim;
+        return (float)b[d] * s;
+    }
+    const uint8_t *b = (const uint8_t *)q + (size_t)pos * num_kv_heads * (head_dim / 2) + (size_t)kv_h * (head_dim / 2);
+    uint8_t byte = b[d >> 1];
+    int nib = (d & 1) ? (byte >> 4) : (byte & 0xF);
+    return (float)(nib - 8) * s;
+}
+// Reconstruct one token's KV vector [kv_dim] to float from a prompt-cache blob
+// stored at `disk_rank` precision (32 fp32, 16 bf16, 8 q8, 4 q4). Used when an
+// on-disk cache is more precise than the runtime mode and must be downconverted.
+static void kv_disk_token_to_float(const void *blob, const __fp16 *scale, int pos,
+                                   int num_kv_heads, int head_dim, int disk_rank, float *out) {
+    int kv_dim = num_kv_heads * head_dim;
+    if (disk_rank == 32) {
+        memcpy(out, (const float *)blob + (size_t)pos * kv_dim, (size_t)kv_dim * sizeof(float));
+    } else if (disk_rank == 16) {
+        const uint16_t *p = (const uint16_t *)blob + (size_t)pos * kv_dim;
+        for (int d = 0; d < kv_dim; d++) {
+            uint32_t bits = (uint32_t)p[d] << 16; float f; memcpy(&f, &bits, 4); out[d] = f;  // bf16 -> f32
+        }
+    } else {  // q8 (8) or q4 (4): per-(token, kv_head) scale via kv_dequant_elem
+        for (int h = 0; h < num_kv_heads; h++)
+            for (int d = 0; d < head_dim; d++)
+                out[h * head_dim + d] = kv_dequant_elem(blob, scale, pos, h, d, num_kv_heads, head_dim, disk_rank);
+    }
+}
+
 // Architecture-aware performance defaults. Derives the fastest CORRECT runtime config from
 // the loaded model so each model auto-gets its best settings
 // without hand-tuning env vars. Explicit env vars still override. Call once after the model
@@ -482,11 +577,13 @@ static void configure_arch_perf(void) {
     else if (getenv("FLASHCHAT_VERIFY_GPU_ATTN"))  g_verify_gpu_attn = 1;
     else                                          g_verify_gpu_attn = 0;
     (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
+    (void)kv_quant_bits(); // resolve KV-cache quant mode from env (default off)
     fprintf(stderr,
-        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d | "
+        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s | "
         "mtp=lossless draft/verify when MTP artifacts present\n",
         g_cfg.num_experts, g_delta_dispatch_batch, g_verify_gpu_attn,
-        matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3));
+        matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
+        kv_quant_bits()==8 ? "q8" : (kv_quant_bits()==4 ? "q4" : "off"));
 }
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
@@ -2374,6 +2471,8 @@ typedef struct {
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
+    id<MTLComputePipelineState> attn_scores_quant_pipe;  // dequant-on-read q8/q4
+    id<MTLComputePipelineState> attn_values_quant_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [g_cfg.hidden_dim or max projection input]
@@ -2422,6 +2521,8 @@ typedef struct {
     // GPU attention buffers (for full attention layers)
     id<MTLBuffer> buf_kv_k[MAX_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[MAX_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_kv_kscale[MAX_FULL_ATTN_LAYERS];  // fp16 K scales (KV-quant only)
+    id<MTLBuffer> buf_kv_vscale[MAX_FULL_ATTN_LAYERS];  // fp16 V scales (KV-quant only)
     id<MTLBuffer> buf_mtp_kv_k;     // dedicated GPU K cache for MTP head attention
     id<MTLBuffer> buf_mtp_kv_v;     // dedicated GPU V cache for MTP head attention
     id<MTLBuffer> buf_attn_q;       // [g_cfg.num_attn_heads * g_cfg.head_dim floats] all query heads
@@ -2595,6 +2696,10 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
+    if (kv_quant_bits()) {
+        ctx->attn_scores_quant_pipe = makePipe(@"attn_scores_quant");
+        ctx->attn_values_quant_pipe = makePipe(@"attn_values_quant");
+    }
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
@@ -2711,16 +2816,26 @@ static MetalCtx *metal_setup(void) {
     // GPU attention buffers
     {
         size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;  // 512
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+        size_t kv_fp32_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+        // Production KV buffers shrink to packed bytes under KV-quant; the MTP
+        // buffers below stay fp32 (the verify/MTP path is not quantized).
+        size_t kv_cache_size = (size_t)GPU_KV_SEQ * kv_token_bytes();
+        size_t kv_scale_size = (size_t)GPU_KV_SEQ * kv_scales_per_token() * sizeof(__fp16);
         for (int i = 0; i < g_cfg.num_full_attn_layers; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
+            if (kv_scale_size) {
+                ctx->buf_kv_kscale[i] = [ctx->device newBufferWithLength:kv_scale_size
+                                                                 options:MTLResourceStorageModeShared];
+                ctx->buf_kv_vscale[i] = [ctx->device newBufferWithLength:kv_scale_size
+                                                                 options:MTLResourceStorageModeShared];
+            }
         }
-        ctx->buf_mtp_kv_k = [ctx->device newBufferWithLength:kv_cache_size
+        ctx->buf_mtp_kv_k = [ctx->device newBufferWithLength:kv_fp32_size
                                                       options:MTLResourceStorageModeShared];
-        ctx->buf_mtp_kv_v = [ctx->device newBufferWithLength:kv_cache_size
+        ctx->buf_mtp_kv_v = [ctx->device newBufferWithLength:kv_fp32_size
                                                       options:MTLResourceStorageModeShared];
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -4404,15 +4519,34 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 // ============================================================================
 
 typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
+    float *k_cache;  // fp32 K [max_seq, num_kv_heads * head_dim] (KV-quant off)
+    float *v_cache;  // fp32 V
+    void  *kq;       // packed q8/q4 K (KV-quant on) [max_seq, kv_token_bytes]
+    void  *vq;       // packed q8/q4 V
+    __fp16 *k_scale; // per-(token, kv_head) K scales [max_seq, num_kv_heads]
+    __fp16 *v_scale; // per-(token, kv_head) V scales
     int len;         // current number of cached entries
 } KVCache;
 
+// Allocate K/V storage for `cap` tokens, honoring the active KV-quant mode.
+static void kv_cache_alloc_storage(KVCache *c, size_t cap) {
+    if (kv_quant_bits()) {
+        size_t tb = kv_token_bytes();        // packed bytes/token
+        size_t sp = kv_scales_per_token();   // scales/token
+        c->kq = calloc(cap, tb);
+        c->vq = calloc(cap, tb);
+        c->k_scale = calloc(cap * sp, sizeof(__fp16));
+        c->v_scale = calloc(cap * sp, sizeof(__fp16));
+    } else {
+        size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+        c->k_cache = calloc(cap * kv_dim, sizeof(float));
+        c->v_cache = calloc(cap * kv_dim, sizeof(float));
+    }
+}
+
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * g_cfg.num_kv_heads * g_cfg.head_dim, sizeof(float));
-    c->v_cache = calloc(MAX_SEQ_LEN * g_cfg.num_kv_heads * g_cfg.head_dim, sizeof(float));
+    kv_cache_alloc_storage(c, (size_t)MAX_SEQ_LEN);
     c->len = 0;
     return c;
 }
@@ -4421,6 +4555,10 @@ static void kv_cache_free(KVCache *c) {
     if (c) {
         free(c->k_cache);
         free(c->v_cache);
+        free(c->kq);
+        free(c->vq);
+        free(c->k_scale);
+        free(c->v_scale);
         free(c);
     }
 }
@@ -5281,13 +5419,14 @@ static void gpu_snap_restore(GpuStateSnap *s, KVCache **kv) {
 static int mtp_generate_gpu(WeightFile *wf, const char *model_path, int max_new) {
     if (!g_metal || !g_metal->wf_buf || !g_mtp_cache.ready) { fprintf(stderr, "[mtp-gpu] requires GPU + MTP\n"); return 1; }
     int Hd = g_cfg.hidden_dim, V = g_cfg.vocab_size, kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim, Ld = g_cfg.num_layers, K = g_cfg.num_experts_per_tok;
+    (void)kv_dim;  // KV storage now sized via kv_cache_alloc_storage()
     int *fds = malloc(Ld*sizeof(int)); void **mmaps = calloc(Ld, sizeof(void*));
     KVCache **kv = calloc(Ld, sizeof(KVCache*)); LinearAttnState **ls = calloc(Ld, sizeof(LinearAttnState*));
     for (int i = 0; i < Ld; i++) {
         char p[PATH_MAX]; snprintf(p, sizeof(p), "%s/layer_%02d.bin", g_flashchat_experts_dir, i);
         fds[i] = open(p, O_RDONLY); mmaps[i] = NULL;
         if (fds[i] >= 0) { struct stat st; if (fstat(fds[i], &st)==0 && st.st_size>0){ void *m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m; } }
-        if (((i + 1) % g_cfg.full_attn_interval) == 0) { kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); kv[i]->v_cache=calloc((size_t)GPU_KV_SEQ*kv_dim,sizeof(float)); }
+        if (((i + 1) % g_cfg.full_attn_interval) == 0) { kv[i]=calloc(1,sizeof(KVCache)); kv_cache_alloc_storage(kv[i], (size_t)GPU_KV_SEQ); }
         else ls[i] = linear_attn_state_new();
     }
     int prompt[] = { 9707, 11, 358, 1079, 4378, 264, 13027, 729, 311 }; int np = (int)(sizeof(prompt)/sizeof(prompt[0]));
@@ -5384,7 +5523,7 @@ static int mtp_verify_forwardN(WeightFile *wf, const char *model_path) {
     for(int i=0;i<Ld;i++){ fds[i]=-1;
         if (g_cfg.num_experts>0){ char p[PATH_MAX]; snprintf(p,sizeof(p),"%s/layer_%02d.bin",g_flashchat_experts_dir,i); fds[i]=open(p,O_RDONLY);
             if(fds[i]>=0){ struct stat st; if(fstat(fds[i],&st)==0&&st.st_size>0){void*m=mmap(NULL,st.st_size,PROT_READ,MAP_PRIVATE,fds[i],0); if(m!=MAP_FAILED) mmaps[i]=m;} } }
-        if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv[i]->k_cache=calloc((size_t)cap*kv_dim,4); kv[i]->v_cache=calloc((size_t)cap*kv_dim,4);} else ls[i]=linear_attn_state_new(); }
+        if(((i+1)%g_cfg.full_attn_interval)==0){ kv[i]=calloc(1,sizeof(KVCache)); kv_cache_alloc_storage(kv[i], (size_t)cap);} else ls[i]=linear_attn_state_new(); }
     float *h=malloc(Hd*4),*scratch=malloc(V*4); int P=35;
     const char *p_env = getenv("FLASHCHAT_VERIFY_FORWARDN_PREFIX");
     if (p_env && p_env[0]) { int v = atoi(p_env); if (v >= 0 && v < cap - N - 1) P = v; }
@@ -7263,17 +7402,35 @@ static void fused_layer_forward(
 
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
-        memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-        memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
-
         int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
-        if (g_metal && g_metal->attn_scores_pipe &&
-            fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
-            cache_pos < GPU_KV_SEQ) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                   k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                   v_out, kv_dim * sizeof(float));
+        int qb = kv_quant_bits();
+        int gpu_kv_write = (g_metal && g_metal->attn_scores_pipe &&
+                            fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+                            cache_pos < GPU_KV_SEQ);
+        if (qb) {
+            size_t tb = kv_token_bytes();       // packed bytes/token
+            size_t sp = kv_scales_per_token();  // scales/token
+            uint8_t *kq = (uint8_t *)kv->kq + (size_t)cache_pos * tb;
+            uint8_t *vq = (uint8_t *)kv->vq + (size_t)cache_pos * tb;
+            __fp16 *ks = kv->k_scale + (size_t)cache_pos * sp;
+            __fp16 *vs = kv->v_scale + (size_t)cache_pos * sp;
+            kv_quantize_token(k_out, kq, ks, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+            kv_quantize_token(v_out, vq, vs, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+            if (gpu_kv_write) {
+                memcpy((uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * tb, kq, tb);
+                memcpy((uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * tb, vq, tb);
+                memcpy((uint8_t *)[g_metal->buf_kv_kscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), ks, sp * sizeof(__fp16));
+                memcpy((uint8_t *)[g_metal->buf_kv_vscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), vs, sp * sizeof(__fp16));
+            }
+        } else {
+            memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
+            memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+            if (gpu_kv_write) {
+                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                       k_out, kv_dim * sizeof(float));
+                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                       v_out, kv_dim * sizeof(float));
+            }
         }
         kv->len++;
 
@@ -7296,22 +7453,33 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback
+            // CPU fallback (runs at <32 tokens; dequant-on-read under KV-quant)
+            int qb = kv_quant_bits();
             for (int h = 0; h < g_cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * g_cfg.head_dim;
                 float *scores = malloc(kv->len * sizeof(float));
                 for (int p = 0; p < kv->len; p++) {
-                    float *kp = kv->k_cache + p * kv_dim + kv_h * g_cfg.head_dim;
                     float dot = 0.0f;
-                    for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
+                    if (qb) {
+                        for (int d = 0; d < g_cfg.head_dim; d++)
+                            dot += qh[d] * kv_dequant_elem(kv->kq, kv->k_scale, p, kv_h, d, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+                    } else {
+                        float *kp = kv->k_cache + p * kv_dim + kv_h * g_cfg.head_dim;
+                        for (int d = 0; d < g_cfg.head_dim; d++) dot += qh[d] * kp[d];
+                    }
                     scores[p] = dot * scale;
                 }
                 cpu_softmax(scores, kv->len);
                 float *oh = attn_out + h * g_cfg.head_dim;
                 for (int p = 0; p < kv->len; p++) {
-                    float *vp = kv->v_cache + p * kv_dim + kv_h * g_cfg.head_dim;
-                    for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    if (qb) {
+                        for (int d = 0; d < g_cfg.head_dim; d++)
+                            oh[d] += scores[p] * kv_dequant_elem(kv->vq, kv->v_scale, p, kv_h, d, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+                    } else {
+                        float *vp = kv->v_cache + p * kv_dim + kv_h * g_cfg.head_dim;
+                        for (int d = 0; d < g_cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    }
                 }
                 free(scores);
             }
@@ -7569,10 +7737,12 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // Enc A1: attn_scores_batched
+            uint32_t qbits = (uint32_t)kv_quant_bits();
+            // Enc A1: attn_scores (fp32 batched, or dequant-on-read quant variant)
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                [enc setComputePipelineState:qbits ? g_metal->attn_scores_quant_pipe
+                                                   : g_metal->attn_scores_pipe];
                 [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
@@ -7583,6 +7753,10 @@ static void fused_layer_forward(
                 [enc setBytes:&scale     length:4 atIndex:7];
                 [enc setBytes:&hpkv      length:4 atIndex:8];
                 [enc setBytes:&sl        length:4 atIndex:9];
+                if (qbits) {
+                    [enc setBuffer:g_metal->buf_kv_kscale[fa_idx] offset:0 atIndex:10];
+                    [enc setBytes:&qbits length:4 atIndex:11];
+                }
                 uint32_t total_tgs = sl * g_cfg.num_attn_heads;
                 [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -7602,7 +7776,8 @@ static void fused_layer_forward(
             // Enc A3: attn_values_batched
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_values_pipe];
+                [enc setComputePipelineState:qbits ? g_metal->attn_values_quant_pipe
+                                                   : g_metal->attn_values_pipe];
                 [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
@@ -7611,6 +7786,10 @@ static void fused_layer_forward(
                 [enc setBytes:&sl        length:4 atIndex:5];
                 [enc setBytes:&seq_stride length:4 atIndex:6];
                 [enc setBytes:&hpkv      length:4 atIndex:7];
+                if (qbits) {
+                    [enc setBuffer:g_metal->buf_kv_vscale[fa_idx] offset:0 atIndex:8];
+                    [enc setBytes:&qbits length:4 atIndex:9];
+                }
                 uint32_t total_threads = g_cfg.head_dim * g_cfg.num_attn_heads;
                 uint32_t tgs = (total_threads + 255) / 256;
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
@@ -10386,22 +10565,79 @@ static void clear_runtime_state_serve(void **layer_states, KVCache **kv_caches) 
 }
 
 typedef struct {
-    float *k_snapshot;
-    float *v_snapshot;
+    float *k_snapshot;   // raw bytes: fp32 K, OR packed q8/q4 K when KV-quant is active
+    float *v_snapshot;   // (typed float* for legacy callers; treated as a byte blob)
+    __fp16 *k_scale;     // per-(token, kv_head) K scales — quant modes only, else NULL
+    __fp16 *v_scale;
     int len;
 } KVSnapshot;
 
+// Downconvert one full-attn layer's K and V prompt-cache snapshot from disk_rank
+// to the runtime quant mode (runtime_bits 8 or 4), in place. Reconstructs float
+// then re-quantizes per token. Returns 0 on success.
+static int kv_convert_snapshot_layer(KVSnapshot *s, int token_count, int kv_dim,
+                                     int disk_rank, int runtime_bits) {
+    if (runtime_bits != 8 && runtime_bits != 4) return -1;  // fp32 runtime only matches fp32 disk
+    int num_kv_heads = g_cfg.num_kv_heads, head_dim = g_cfg.head_dim;
+    size_t tb = (runtime_bits == 8) ? (size_t)kv_dim : (size_t)kv_dim / 2;  // packed bytes/token
+    size_t sp = (size_t)num_kv_heads;                                       // scales/token
+    float *fbuf = malloc((size_t)kv_dim * sizeof(float));
+    if (!fbuf) return -1;
+    for (int which = 0; which < 2; which++) {  // 0 = K, 1 = V
+        void *src = which ? (void *)s->v_snapshot : (void *)s->k_snapshot;
+        __fp16 *src_scale = which ? s->v_scale : s->k_scale;
+        uint8_t *dst = malloc((size_t)token_count * tb);
+        __fp16 *dst_scale = malloc((size_t)token_count * sp * sizeof(__fp16));
+        if (!dst || !dst_scale) { free(dst); free(dst_scale); free(fbuf); return -1; }
+        for (int p = 0; p < token_count; p++) {
+            kv_disk_token_to_float(src, src_scale, p, num_kv_heads, head_dim, disk_rank, fbuf);
+            kv_quantize_token(fbuf, dst + (size_t)p * tb, dst_scale + (size_t)p * sp, num_kv_heads, head_dim, runtime_bits);
+        }
+        if (which) { free(s->v_snapshot); free(s->v_scale); s->v_snapshot = (float *)dst; s->v_scale = dst_scale; }
+        else       { free(s->k_snapshot); free(s->k_scale); s->k_snapshot = (float *)dst; s->k_scale = dst_scale; }
+    }
+    free(fbuf);
+    return 0;
+}
+
 enum {
-    SYSPROMPT_CACHE_VERSION = 1,
+    // v2 adds optional KV scale chunks and allows the KV_K/KV_V chunks to hold
+    // packed q8/q4 bytes; the stored precision is detected from chunk sizes, not
+    // a header field. v1 (fp32-only) files use a different filename (-v1) and are
+    // simply not found by a v2 binary.
+    SYSPROMPT_CACHE_VERSION = 2,
     SYSPROMPT_CACHE_KIND_KV_K = 1,
     SYSPROMPT_CACHE_KIND_KV_V = 2,
     SYSPROMPT_CACHE_KIND_LA_CONV = 3,
     SYSPROMPT_CACHE_KIND_LA_SSM = 4,
     SYSPROMPT_CACHE_KIND_GPU_DELTA = 5,
     SYSPROMPT_CACHE_KIND_GPU_CONV = 6,
+    SYSPROMPT_CACHE_KIND_KV_K_SCALE = 7,
+    SYSPROMPT_CACHE_KIND_KV_V_SCALE = 8,
     SYSPROMPT_CACHE_ALG_RAW = 0,
     SYSPROMPT_CACHE_ALG_LZFSE = 1,
 };
+
+// KV cache precision as a comparable rank (higher = more precise). Used to decide
+// whether an on-disk prefix cache can repopulate the current runtime KV buffers:
+// reuse iff disk_rank >= runtime_rank (a more-precise cache downconverts on load;
+// a less-precise cache is invalidated rather than upconverted).
+static inline int kv_runtime_precision_rank(void) {
+    int b = kv_quant_bits();
+    return b == 8 ? 8 : (b == 4 ? 4 : 32);  // fp32 = 32
+}
+// Infer the stored precision rank of a KV_K/KV_V chunk from its uncompressed size.
+// Returns 32 (fp32), 16 (bf16), 8 (q8), 4 (q4), or 0 if the size matches none.
+static inline int kv_disk_precision_rank(uint64_t raw_size, int token_count, int kv_dim) {
+    if (token_count <= 0 || kv_dim <= 0) return 0;
+    if (raw_size % (uint64_t)token_count) return 0;
+    uint64_t bpt = raw_size / (uint64_t)token_count;  // bytes per token
+    if (bpt == (uint64_t)kv_dim * 4) return 32;
+    if (bpt == (uint64_t)kv_dim * 2) return 16;
+    if (bpt == (uint64_t)kv_dim)     return 8;
+    if (bpt == (uint64_t)kv_dim / 2) return 4;
+    return 0;
+}
 
 typedef struct {
     char magic[8];
@@ -10612,8 +10848,12 @@ static void free_system_prompt_snapshots(KVSnapshot *kv_snapshots,
         if (kv_snapshots) {
             free(kv_snapshots[i].k_snapshot);
             free(kv_snapshots[i].v_snapshot);
+            free(kv_snapshots[i].k_scale);
+            free(kv_snapshots[i].v_scale);
             kv_snapshots[i].k_snapshot = NULL;
             kv_snapshots[i].v_snapshot = NULL;
+            kv_snapshots[i].k_scale = NULL;
+            kv_snapshots[i].v_scale = NULL;
             kv_snapshots[i].len = 0;
         }
         if (la_conv_snapshots) {
@@ -10645,23 +10885,35 @@ static int restore_system_prompt_snapshots(int token_count,
                                            void **gpu_conv_snapshots,
                                            void **layer_states,
                                            KVCache **kv_caches) {
-    size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
     size_t ssm_state_size = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
+    int qb = kv_quant_bits();
+    size_t tb = kv_token_bytes();                  // packed bytes/token (fp32 size when off)
+    size_t sp = kv_scales_per_token();             // scales/token (0 when off)
+    size_t kv_blob = (size_t)token_count * tb;
+    size_t scale_blob = (size_t)token_count * sp * sizeof(__fp16);
 
     for (int i = 0; i < g_cfg.num_layers; i++) {
         if (kv_caches[i] && kv_snapshots[i].k_snapshot && kv_snapshots[i].v_snapshot) {
-            size_t sz = (size_t)token_count * kv_dim * sizeof(float);
-            memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
-            memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
+            void *kdst = qb ? kv_caches[i]->kq : (void *)kv_caches[i]->k_cache;
+            void *vdst = qb ? kv_caches[i]->vq : (void *)kv_caches[i]->v_cache;
+            memcpy(kdst, kv_snapshots[i].k_snapshot, kv_blob);
+            memcpy(vdst, kv_snapshots[i].v_snapshot, kv_blob);
+            if (qb && kv_snapshots[i].k_scale && kv_snapshots[i].v_scale) {
+                memcpy(kv_caches[i]->k_scale, kv_snapshots[i].k_scale, scale_blob);
+                memcpy(kv_caches[i]->v_scale, kv_snapshots[i].v_scale, scale_blob);
+            }
             kv_caches[i]->len = kv_snapshots[i].len;
             if (g_metal) {
                 int fa_idx = (i + 1) / g_cfg.full_attn_interval - 1;
                 if (fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers) {
                     size_t gpu_tokens = token_count < GPU_KV_SEQ ? (size_t)token_count : (size_t)GPU_KV_SEQ;
-                    size_t gpu_sz = gpu_tokens * kv_dim * sizeof(float);
-                    memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_snapshots[i].k_snapshot, gpu_sz);
-                    memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_snapshots[i].v_snapshot, gpu_sz);
+                    memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_snapshots[i].k_snapshot, gpu_tokens * tb);
+                    memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_snapshots[i].v_snapshot, gpu_tokens * tb);
+                    if (qb) {
+                        memcpy([g_metal->buf_kv_kscale[fa_idx] contents], kv_snapshots[i].k_scale, gpu_tokens * sp * sizeof(__fp16));
+                        memcpy([g_metal->buf_kv_vscale[fa_idx] contents], kv_snapshots[i].v_scale, gpu_tokens * sp * sizeof(__fp16));
+                    }
                 }
             }
         }
@@ -10694,20 +10946,36 @@ static int capture_system_prompt_snapshots(int token_count,
                                            void **gpu_conv_snapshots,
                                            void **layer_states,
                                            KVCache **kv_caches) {
-    size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
     size_t ssm_state_size = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
+    int qb = kv_quant_bits();
+    size_t tb = kv_token_bytes();       // packed bytes/token (fp32 size when off)
+    size_t sp = kv_scales_per_token();  // scales/token (0 when off)
 
     for (int i = 0; i < g_cfg.num_layers; i++) {
         if (kv_caches[i]) {
-            size_t sz = (size_t)token_count * kv_dim * sizeof(float);
+            size_t kv_blob = (size_t)token_count * tb;
+            size_t scale_blob = (size_t)token_count * sp * sizeof(__fp16);
+            void *ksrc = qb ? kv_caches[i]->kq : (void *)kv_caches[i]->k_cache;
+            void *vsrc = qb ? kv_caches[i]->vq : (void *)kv_caches[i]->v_cache;
             free(kv_snapshots[i].k_snapshot);
             free(kv_snapshots[i].v_snapshot);
-            kv_snapshots[i].k_snapshot = malloc(sz);
-            kv_snapshots[i].v_snapshot = malloc(sz);
+            free(kv_snapshots[i].k_scale);
+            free(kv_snapshots[i].v_scale);
+            kv_snapshots[i].k_scale = NULL;
+            kv_snapshots[i].v_scale = NULL;
+            kv_snapshots[i].k_snapshot = malloc(kv_blob);
+            kv_snapshots[i].v_snapshot = malloc(kv_blob);
             if (!kv_snapshots[i].k_snapshot || !kv_snapshots[i].v_snapshot) return -1;
-            memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
-            memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
+            memcpy(kv_snapshots[i].k_snapshot, ksrc, kv_blob);
+            memcpy(kv_snapshots[i].v_snapshot, vsrc, kv_blob);
+            if (qb) {
+                kv_snapshots[i].k_scale = malloc(scale_blob);
+                kv_snapshots[i].v_scale = malloc(scale_blob);
+                if (!kv_snapshots[i].k_scale || !kv_snapshots[i].v_scale) return -1;
+                memcpy(kv_snapshots[i].k_scale, kv_caches[i]->k_scale, scale_blob);
+                memcpy(kv_snapshots[i].v_scale, kv_caches[i]->v_scale, scale_blob);
+            }
             kv_snapshots[i].len = kv_caches[i]->len;
         }
         if (layer_states[i]) {
@@ -10951,7 +11219,12 @@ static int save_system_prompt_disk_cache(const char *model_path,
 
     uint64_t raw_total = 0, stored_total = 0;
     uint32_t chunk_count = 0;
-    size_t kv_sz = (size_t)token_count * hdr.kv_dim * sizeof(float);
+    // KV blob size follows the runtime mode the snapshots were captured in:
+    // fp32 -> token*kv_dim*4, q8 -> token*kv_dim, q4 -> token*kv_dim/2, plus a
+    // scale chunk per side under quant. The stored precision is recovered on
+    // load from these sizes (no precision header field).
+    size_t kv_sz = (size_t)token_count * kv_token_bytes();
+    size_t scale_sz = (size_t)token_count * kv_scales_per_token() * sizeof(__fp16);
     for (int i = 0; i < g_cfg.num_layers; i++) {
         if (kv_snapshots[i].k_snapshot && kv_snapshots[i].v_snapshot) {
             if (write_cache_chunk(f, SYSPROMPT_CACHE_KIND_KV_K, i, kv_snapshots[i].k_snapshot, kv_sz, &raw_total, &stored_total) != 0 ||
@@ -10961,6 +11234,15 @@ static int save_system_prompt_disk_cache(const char *model_path,
                 return -1;
             }
             chunk_count += 2;
+            if (scale_sz && kv_snapshots[i].k_scale && kv_snapshots[i].v_scale) {
+                if (write_cache_chunk(f, SYSPROMPT_CACHE_KIND_KV_K_SCALE, i, kv_snapshots[i].k_scale, scale_sz, &raw_total, &stored_total) != 0 ||
+                    write_cache_chunk(f, SYSPROMPT_CACHE_KIND_KV_V_SCALE, i, kv_snapshots[i].v_scale, scale_sz, &raw_total, &stored_total) != 0) {
+                    fclose(f);
+                    unlink(tmp_path);
+                    return -1;
+                }
+                chunk_count += 2;
+            }
         }
         if (la_conv_snapshots[i] && la_ssm_snapshots[i]) {
             if (write_cache_chunk(f, SYSPROMPT_CACHE_KIND_LA_CONV, i, la_conv_snapshots[i], (size_t)hdr.conv_state_size, &raw_total, &stored_total) != 0 ||
@@ -11186,7 +11468,10 @@ static int load_system_prompt_disk_cache(const char *model_path,
     }
 
     int kv_k_count = 0, kv_v_count = 0, conv_count = 0, ssm_count = 0, gpu_delta_count = 0, gpu_conv_count = 0;
-    size_t kv_sz = (size_t)hdr.token_count * hdr.kv_dim * sizeof(float);
+    int kv_kscale_count = 0, kv_vscale_count = 0;
+    int disk_rank = 0;  // stored KV precision (32/16/8/4), inferred from KV chunk size
+    // Expected scale-chunk size IF the cache is quantized (one fp16 per (token, kv_head)).
+    size_t disk_scale_sz = (size_t)hdr.token_count * g_cfg.num_kv_heads * sizeof(__fp16);
     int ok = 1;
     int invalid = 0;
     for (uint32_t c = 0; c < hdr.chunk_count; c++) {
@@ -11205,19 +11490,37 @@ static int load_system_prompt_disk_cache(const char *model_path,
         }
         int layer = chunk.layer;
         switch (chunk.kind) {
-            case SYSPROMPT_CACHE_KIND_KV_K:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; invalid = 1; free(payload); break; }
+            case SYSPROMPT_CACHE_KIND_KV_K: {
+                int r = kv_disk_precision_rank(chunk.raw_size, hdr.token_count, hdr.kv_dim);
+                if (layer < 0 || layer >= g_cfg.num_layers || r == 0 || (disk_rank && r != disk_rank)) { ok = 0; invalid = 1; free(payload); break; }
+                disk_rank = r;
                 free(tmp_kv[layer].k_snapshot);
                 tmp_kv[layer].k_snapshot = payload;
                 tmp_kv[layer].len = hdr.token_count;
                 kv_k_count++;
                 break;
-            case SYSPROMPT_CACHE_KIND_KV_V:
-                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != kv_sz) { ok = 0; invalid = 1; free(payload); break; }
+            }
+            case SYSPROMPT_CACHE_KIND_KV_V: {
+                int r = kv_disk_precision_rank(chunk.raw_size, hdr.token_count, hdr.kv_dim);
+                if (layer < 0 || layer >= g_cfg.num_layers || r == 0 || (disk_rank && r != disk_rank)) { ok = 0; invalid = 1; free(payload); break; }
+                disk_rank = r;
                 free(tmp_kv[layer].v_snapshot);
                 tmp_kv[layer].v_snapshot = payload;
                 tmp_kv[layer].len = hdr.token_count;
                 kv_v_count++;
+                break;
+            }
+            case SYSPROMPT_CACHE_KIND_KV_K_SCALE:
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != disk_scale_sz) { ok = 0; invalid = 1; free(payload); break; }
+                free(tmp_kv[layer].k_scale);
+                tmp_kv[layer].k_scale = (__fp16 *)payload;
+                kv_kscale_count++;
+                break;
+            case SYSPROMPT_CACHE_KIND_KV_V_SCALE:
+                if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != disk_scale_sz) { ok = 0; invalid = 1; free(payload); break; }
+                free(tmp_kv[layer].v_scale);
+                tmp_kv[layer].v_scale = (__fp16 *)payload;
+                kv_vscale_count++;
                 break;
             case SYSPROMPT_CACHE_KIND_LA_CONV:
                 if (layer < 0 || layer >= g_cfg.num_layers || chunk.raw_size != hdr.conv_state_size) { ok = 0; invalid = 1; free(payload); break; }
@@ -11285,6 +11588,39 @@ static int load_system_prompt_disk_cache(const char *model_path,
         free(tmp_kv); free(tmp_conv); free(tmp_ssm); free(tmp_gpu_delta); free(tmp_gpu_conv);
         if (invalid_cache) *invalid_cache = invalid;
         return -1;
+    }
+
+    // --- KV precision gate (single on-disk location, any quant mode) ---
+    // Reuse the cache only if its stored precision is at least the runtime's:
+    //   disk_rank > runtime_rank  -> downconvert on load (e.g. fp32 cache -> q8 run)
+    //   disk_rank == runtime_rank -> verbatim (bit-exact)
+    //   disk_rank < runtime_rank  -> invalidate: discard + reprefill upward (no upconvert)
+    {
+        int runtime_rank = kv_runtime_precision_rank();
+        int runtime_bits = kv_quant_bits();
+        // A quantized cache must carry one scale chunk per side per full-attn layer.
+        if ((disk_rank == 8 || disk_rank == 4) &&
+            (kv_kscale_count != g_cfg.num_full_attn_layers || kv_vscale_count != g_cfg.num_full_attn_layers)) {
+            invalid = 1;
+        }
+        if (!invalid && disk_rank < runtime_rank) {
+            invalid = 1;  // less precise than configured -> regenerate at higher precision
+        }
+        if (!invalid && disk_rank != runtime_rank) {
+            for (int i = 0; i < g_cfg.num_layers && !invalid; i++) {
+                if (!tmp_kv[i].k_snapshot) continue;  // linear layer: no KV
+                if (kv_convert_snapshot_layer(&tmp_kv[i], (int)hdr.token_count, (int)hdr.kv_dim,
+                                              disk_rank, runtime_bits) != 0) {
+                    invalid = 1;
+                }
+            }
+        }
+        if (invalid) {
+            free_system_prompt_snapshots(tmp_kv, tmp_conv, tmp_ssm, tmp_gpu_delta, tmp_gpu_conv);
+            free(tmp_kv); free(tmp_conv); free(tmp_ssm); free(tmp_gpu_delta); free(tmp_gpu_conv);
+            if (invalid_cache) *invalid_cache = 1;
+            return -1;
+        }
     }
 
     free_system_prompt_snapshots(kv_snapshots, la_conv_snapshots, la_ssm_snapshots, gpu_delta_snapshots, gpu_conv_snapshots);
@@ -13466,6 +13802,14 @@ int main(int argc, char **argv) {
             metal_set_weights(g_metal, wf->data, wf->size);
         }
 
+        // KV-quant shrinks the production buf_kv_k/v buffers; the MTP/verify
+        // paths still treat them as fp32, so they are mutually exclusive.
+        if (kv_quant_bits() &&
+            (mtp_bench_matmul_requested || mtp_generate_gpu_requested || mtp_verify_forwardN_requested)) {
+            fprintf(stderr, "[fatal] FLASHCHAT_KV_QUANT is incompatible with the MTP/verify paths "
+                            "(they require fp32 KV). Unset FLASHCHAT_KV_QUANT to use --mtp-*.\n");
+            return 1;
+        }
         if (mtp_bench_matmul_requested) {
             return mtp_bench_matmul(wf);
         }
