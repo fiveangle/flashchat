@@ -174,6 +174,8 @@ until a compact resource layout or tensor-pool strategy is validated at full
 - **Sampling/runtime generation knobs must stay consistent across config, API request parsing, server runtime signatures, docs, and smoke-test perf logging.** Do not add hidden sampler defaults that cannot be inspected or overridden from Flashchat's normal user surfaces.
 - **Model-specific sampling profiles belong in `assets/model_configs.json`.** The Flashchat config should select a `SAMPLING_PROFILE`, with `custom` reserved for manually managed sampler/reasoning values.
 - **Multi-token prediction policy:** MTP is a model/profile/server-default capability, not just a debugging flag. Treat user config `MTP` as a numeric draft budget: empty means use the registry fallback chain, `0` means force disabled, `1` means automatic, and `2+` means that predictor batch size. Model and profile metadata use `mtp_default_predictions`; profile values override server defaults, server defaults override model defaults, and model defaults should be `1` unless there is a specific reason otherwise. MTP-capable models can require extracted MTP artifacts independently of the selected runtime budget.
+- **Python interpreter resolution must go through `lib/python.sh`.** The launcher never calls bare `python3` for venv creation or package install — always `flashchat_python_bin` (or its resolved path). On macOS 26, `/usr/bin/python3` is CLT 3.9 and will shadow any Homebrew Python on PATH; `python3 -m venv` against it produces a 3.9 venv that cannot import `modelmgr/` because the codebase uses PEP 604 union syntax unconditionally. Minimum supported interpreter is 3.10; the resolver enforces this and refuses to fall back silently.
+- **Stale-venv recovery is silent.** If an existing `metal_infer/.venv/` interpreter falls below the supported Python floor, `ensure_venv` recreates it with a one-line log message — no user prompt, no consent screen, because nothing on the user's system is being modified (Homebrew Python lives under `/opt/homebrew/`, not `/usr/`). The venv is regenerated state, not user data.
 - **When a verified coherent unit of work is complete, ask whether it should be committed before ending the turn.** Don’t interrupt active debugging for every small change, but after implementation plus relevant verification, make the commit checkpoint explicit instead of leaving it implicit.
 
 ### C/Objective-C
@@ -285,6 +287,40 @@ import sys
 
 import pandas as pd
 import matplotlib.pyplot as plt
+```
+
+### Python Interpreter Resolution
+
+The launcher (`flashchat`) and any helper script that needs to create a venv or run `pip install` **must** source `lib/python.sh` and call `flashchat_python_bin`. Never call `python3` directly in shell. Reasons:
+
+- **macOS 26 ships `/usr/bin/python3 = 3.9`** from CommandLineTools. That `python3` shadows any Homebrew Python the user has installed (`/opt/homebrew/bin/python3` is later on PATH for shells that have run `brew shellenv`, but a fresh terminal or a non-interactive script can still hit CLT first).
+- **`python3 -m venv` inherits the parent interpreter.** A venv is a thin wrapper around an existing Python binary — there is no "use a different Python" knob. If you `python3 -m venv` against CLT 3.9, your venv is 3.9, full stop.
+- **`modelmgr/` uses PEP 604 union syntax unconditionally** (`str | None`, `dict | None`, ~50+ sites across `artifacts.py`, `manifest.py`, `migrate.py`, `configfile.py`, `status.py`, etc.). 3.9 cannot parse these at import time, so the first `modelmgr` import raises `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` and the user gets a "Setup incomplete" screen for what looks like a setup bug.
+
+`flashchat_python_bin` resolves in this priority:
+
+1. `$FLASHCHAT_PYTHON` — explicit override (path is verified executable and meets the version floor).
+2. `/opt/homebrew/bin/python3` — Apple Silicon Homebrew. Probed, must report ≥ 3.10.
+3. `/usr/local/bin/python3` — Intel Homebrew legacy prefix. Probed, must report ≥ 3.10.
+4. `python3` from PATH — last resort, must report ≥ 3.10.
+
+If no candidate satisfies the floor, the helper exits non-zero with a clear actionable message ("`brew install python`" or "set `FLASHCHAT_PYTHON`"). It **never** modifies the user's `PATH`, default `python3`, or any system-level state.
+
+**Minimum supported Python: 3.10.** PEP 604 is the floor. Do not introduce `match` statements or PEP 695 type aliases without also bumping `FLASHCHAT_MIN_PYTHON_MINOR` in `lib/python.sh`.
+
+**Stale-venv handling.** `ensure_venv` in the launcher checks whether the existing `metal_infer/.venv/bin/python` meets the floor; if it doesn't (e.g., the venv was created with CLT 3.9 from a previous flashchat run), the venv is recreated silently using the resolver's chosen interpreter. A single `Recreating project venv (existing interpreter below Python 3.10).` line is logged. This is intentional: regenerating `metal_infer/.venv/` is regenerating derived state, not user data — no consent screen needed.
+
+**Testing the resolver in isolation:**
+
+```bash
+# Default (PATH has whatever it has)
+source lib/python.sh && flashchat_python_bin
+
+# Simulate a CLT-only PATH — should still find Homebrew Python
+PATH="/usr/bin:/bin:/usr/sbin:/sbin" bash -c 'source lib/python.sh && flashchat_python_bin'
+
+# Force-fail: pin to CLT 3.9, expect non-zero exit and an actionable error
+FLASHCHAT_PYTHON=/usr/bin/python3 bash -c 'source lib/python.sh && flashchat_python_bin'
 ```
 
 ## Architecture Notes

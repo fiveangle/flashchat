@@ -36,6 +36,7 @@ set +m  # Disable job control messages
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/lib/config.sh"
+source "${SCRIPT_DIR}/lib/python.sh"
 
 # Global flags
 VERBOSE=0
@@ -601,8 +602,12 @@ ensure_model_ready() {
 FLASHCHAT_VENV=""
 
 ensure_venv() {
+    local host_py
+    host_py=$(flashchat_python_bin) || return 1
+
     if [ -n "$FLASHCHAT_VENV" ] && [ -f "$FLASHCHAT_VENV/bin/python" ]; then
-        if "$FLASHCHAT_VENV/bin/python" -c "import numpy, huggingface_hub" >/dev/null 2>&1; then
+        if "$FLASHCHAT_VENV/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (${FLASHCHAT_MIN_PYTHON_MAJOR}, ${FLASHCHAT_MIN_PYTHON_MINOR}) else 1)" >/dev/null 2>&1 \
+           && "$FLASHCHAT_VENV/bin/python" -c "import numpy, huggingface_hub" >/dev/null 2>&1; then
             return 0
         fi
         echo "Updating project virtual environment packages..."
@@ -612,9 +617,15 @@ ensure_venv() {
 
     FLASHCHAT_VENV="$SCRIPT_DIR/metal_infer/.venv"
 
+    if [ -f "$FLASHCHAT_VENV/bin/python" ] \
+       && ! "$FLASHCHAT_VENV/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (${FLASHCHAT_MIN_PYTHON_MAJOR}, ${FLASHCHAT_MIN_PYTHON_MINOR}) else 1)" >/dev/null 2>&1; then
+        log "Recreating project venv (existing interpreter below Python ${FLASHCHAT_MIN_PYTHON_MAJOR}.${FLASHCHAT_MIN_PYTHON_MINOR})."
+        rm -rf "$FLASHCHAT_VENV"
+    fi
+
     if [ ! -f "$FLASHCHAT_VENV/bin/python" ]; then
         echo "Creating Python virtual environment..."
-        python3 -m venv "$FLASHCHAT_VENV"
+        "$host_py" -m venv "$FLASHCHAT_VENV"
     fi
 
     if ! "$FLASHCHAT_VENV/bin/python" -c "import numpy, huggingface_hub" >/dev/null 2>&1; then
