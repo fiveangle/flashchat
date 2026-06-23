@@ -125,6 +125,7 @@ static int g_system_prompt_cache_max_entries = 2;
 static char g_system_prompt_cache_dir[PATH_MAX] = {0};
 static int g_mtp_predictions = -1;
 static int g_mtp_active_experts = 1;
+static int g_mtp_bf16_enabled = 0;
 // Draft-model expert acceleration (empirical probe + genuine speedup): keep the
 // MTP head's single expert layer RAM-resident instead of pread-per-draft, and run
 // its dequant on the GPU instead of the CPU. Both are bit-identical to the legacy
@@ -879,6 +880,7 @@ typedef struct {
 
 static TensorHTEntry tensor_ht[TENSOR_HT_SIZE];
 static int tensor_ht_built = 0;
+static TensorManifest *tensor_ht_manifest = NULL;
 
 static uint32_t fnv1a(const char *s) {
     uint32_t h = 2166136261u;
@@ -890,7 +892,7 @@ static uint32_t fnv1a(const char *s) {
 }
 
 static void build_tensor_ht(TensorManifest *m) {
-    if (tensor_ht_built) return;
+    if (tensor_ht_built && tensor_ht_manifest == m) return;
     memset(tensor_ht, 0, sizeof(tensor_ht));
     for (int i = 0; i < m->num_tensors; i++) {
         uint32_t idx = fnv1a(m->tensors[i].name) & (TENSOR_HT_SIZE - 1);
@@ -901,10 +903,11 @@ static void build_tensor_ht(TensorManifest *m) {
         tensor_ht[idx].value = &m->tensors[i];
     }
     tensor_ht_built = 1;
+    tensor_ht_manifest = m;
 }
 
 static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
-    if (!tensor_ht_built) build_tensor_ht(m);
+    if (!tensor_ht_built || tensor_ht_manifest != m) build_tensor_ht(m);
     uint32_t idx = fnv1a(name) & (TENSOR_HT_SIZE - 1);
     while (tensor_ht[idx].key) {
         if (strcmp(tensor_ht[idx].key, name) == 0) {
@@ -1140,11 +1143,11 @@ static void build_mtp_cache(WeightFile *wf, WeightFile *bf16_wf) {
     g_mtp_cache.seg_b = get_tensor_ptr_optional(mtp_wf, "mtp.layers.0.mlp.shared_expert_gate.biases");
     g_mtp_cache.norm_w = get_tensor_ptr_optional(mtp_wf, "mtp.norm.weight");
 
-    // Detect BF16 mode: if the MTP fc.weight exists but its companion scales/biases
-    // do not, the extraction script kept MTP weights in native BF16.
-    g_mtp_cache.bf16_mode = (g_mtp_cache.fc_w != NULL &&
+    // Detect BF16 mode: an explicitly selected BF16 artifact is authoritative.
+    // Otherwise, old inline-BF16 manifests are identified by missing companions.
+    g_mtp_cache.bf16_mode = (bf16_wf != NULL) ||
+                             (g_mtp_cache.fc_w != NULL &&
                               (g_mtp_cache.fc_s == NULL || g_mtp_cache.fc_b == NULL));
-
     int common_ready;
     if (g_mtp_cache.bf16_mode) {
         common_ready =
@@ -1432,6 +1435,8 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         goto cleanup;
     }
 
+    mtp_trace_vector(trace_call, "input_hidden", input_hidden, g_cfg.hidden_dim);
+    mtp_trace_vector(trace_call, "next_embedding", next_embedding, g_cfg.hidden_dim);
     cpu_rms_norm(input_hidden, g_mtp_cache.pre_fc_norm_hidden_w, hidden_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     cpu_rms_norm(next_embedding, g_mtp_cache.pre_fc_norm_embedding_w, embedding_norm, g_cfg.hidden_dim, g_cfg.rms_norm_eps);
     mtp_trace_vector(trace_call, "pre_fc_hidden_norm", hidden_norm, g_cfg.hidden_dim);
@@ -1735,7 +1740,6 @@ static int mtp_forward(WeightFile *wf, const char *model_path,
         fprintf(stderr, "[mtp] decoder preflight draft logits skipped; lm_head tensors not present\n");
     }
     rc = (isfinite(final_rms) && final_rms > 0.0f) ? 0 : 1;
-
 cleanup:
     free(hidden_norm); free(embedding_norm); free(fc_in); free(x);
     free(residual); free(normed); free(q_proj); free(k); free(v); free(q); free(q_gate);
@@ -12070,8 +12074,9 @@ static void serve_loop(
                 g_default_temperature, g_default_top_p, g_default_top_k, g_default_min_p,
                 g_default_presence_penalty, g_default_repetition_penalty);
     if (g_mtp_predictions > 0 && g_mtp_cache.ready) {
-        server_logf("[serve]   mtp: predictor_batch=%d mtp_active_experts=%d\n",
-                    g_mtp_predictions, g_mtp_active_experts);
+        server_logf("[serve]   mtp: predictor_batch=%d mtp_active_experts=%d drafter=%s\n",
+                    g_mtp_predictions, g_mtp_active_experts,
+                    g_mtp_cache.bf16_mode ? "bf16" : "quantized");
     } else if (g_mtp_predictions > 0) {
         // Requested but the head never loaded — almost always missing artifacts.
         // This is the line that explains an empty MTP log; load-time detail prints
@@ -12838,7 +12843,7 @@ tool_call_checked:
                         int dj = -1;
                         float dm = 0.0f;
                         embed_lookup(wf, tok, emb);
-                        if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, &dm, 0) != 0 || dj < 0) break;
+            if (mtp_forward(wf, model_path, mhp, emb, mtp_mh + (size_t)j*mtp_H, &dj, &dm, 0) != 0 || dj < 0) break;
                         mtp_drafts[j] = dj; mhp = mtp_mh + (size_t)j*mtp_H; tok = dj; nd++;
                         if (mtp_margins) mtp_margins[j] = dm;
                     }
@@ -13439,6 +13444,14 @@ int main(int argc, char **argv) {
                             g_mtp_predictions = parse_mtp_predictions(quote + 1);
                         }
                     }
+                    if (strncmp(line, "MTP_BF16=", 9) == 0) {
+                        char *quote = strchr(line + 9, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            g_mtp_bf16_enabled = server_flag_enabled(quote + 1);
+                        }
+                    }
                     if (strncmp(line, "ACTIVE_EXPERTS=", 15) == 0) {
                         char *quote = strchr(line + 15, '"');
                         if (quote) {
@@ -13768,6 +13781,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[mtp] artifacts detected but disabled; using existing decode path\n");
         }
         if (g_mtp_predictions > 0) {
+            const char *mtp_bf16_env = getenv("FLASHCHAT_MTP_BF16");
+            if (mtp_bf16_env && mtp_bf16_env[0]) {
+                g_mtp_bf16_enabled = server_flag_enabled(mtp_bf16_env);
+            }
             // Check for separate BF16 MTP weights in a sibling bf16/ directory.
             WeightFile *bf16_mtp_wf = NULL;
             char bf16_weights_path[PATH_MAX];
@@ -13775,11 +13792,15 @@ int main(int argc, char **argv) {
             const char *wf_dir = dirname(strdup(weights_path));
             snprintf(bf16_weights_path, sizeof(bf16_weights_path), "%s/bf16/mtp_weights.bin", wf_dir);
             snprintf(bf16_manifest_path, sizeof(bf16_manifest_path), "%s/bf16/mtp_weights.json", wf_dir);
-            if (access(bf16_weights_path, R_OK) == 0 && access(bf16_manifest_path, R_OK) == 0) {
+            if (g_mtp_bf16_enabled && access(bf16_weights_path, R_OK) == 0 && access(bf16_manifest_path, R_OK) == 0) {
                 bf16_mtp_wf = open_weights(bf16_weights_path, bf16_manifest_path);
                 if (bf16_mtp_wf) {
                     fprintf(stderr, "[mtp] loaded BF16 predictor weights from %s\n", bf16_weights_path);
                 }
+            } else if (g_mtp_bf16_enabled) {
+                fprintf(stderr, "[mtp] BF16 predictor requested but weights are missing at %s\n", bf16_weights_path);
+            } else if (access(bf16_weights_path, R_OK) == 0 && access(bf16_manifest_path, R_OK) == 0) {
+                fprintf(stderr, "[mtp] BF16 predictor weights available but disabled by MTP_BF16=0\n");
             }
             build_mtp_cache(wf, bf16_mtp_wf);
         }
