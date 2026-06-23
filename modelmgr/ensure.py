@@ -4,16 +4,19 @@ Order matters:
 1. migration (old layout must be converted before status checks)
 2. onboarding (no config file -> first-run setup)
 3. selected-model readiness (offer to build what is missing)
-4. consolidated offload offer (quiet when the volume is unreachable)
+4. recovery flow when the model still isn't ready (run from archive,
+   switch model, or quit)
 5. resolved registry view refresh (the engine reads it)
 """
 from __future__ import annotations
 
 import os
 
-from . import configfile, migrate, paths, resolved
+from . import configfile, migrate, offload, paths, resolved
 from .registry import Registry, resolved_id
 from .status import hf_cache_dir, offload_dir, selected_model
+
+_ONE_OFF_MARKER = ".one_off_model_path"
 
 
 def _selected_snapshot(manifest) -> str | None:
@@ -27,8 +30,58 @@ def _selected_snapshot(manifest) -> str | None:
     return paths.snapshot_dir(hf_cache_dir(), manifest.hf_repo)
 
 
+def _clear_one_off_marker() -> None:
+    marker = os.path.join(paths.config_dir(), _ONE_OFF_MARKER)
+    if os.path.isfile(marker):
+        os.unlink(marker)
+
+
+def _offer_recovery(registry: Registry, manifest, variant_name: str) -> bool:
+    """When the configured model can't be made ready, offer alternatives:
+    run from the archived runtime (one-off, no config change), switch to
+    a different model, or quit."""
+    from .artifacts import variant_ready
+    from .tui import common, config_wizard
+
+    od = offload_dir()
+    if od and offload.archive_state(manifest, od) == "full":
+        offload_snapshot = paths.snapshot_dir(od, manifest.hf_repo)
+        if offload_snapshot and variant_ready(
+                manifest, variant_name, offload_snapshot,
+                want_mtp=configfile.mtp_enabled()):
+            size = paths.dir_size_bytes(
+                paths.variant_dir(offload_snapshot, variant_name))
+            print(f"\nThe {manifest.name} [{variant_name}] runtime artifacts "
+                  f"({paths.human_bytes(size)}) are available in the offload "
+                  f"archive at {od}.")
+            if common.confirm("Run from the archive this once "
+                              "(no changes to your setup)?", default=False):
+                marker = os.path.join(paths.config_dir(), _ONE_OFF_MARKER)
+                with open(marker, "w") as f:
+                    f.write(offload_snapshot)
+                return True
+            print()
+
+    if common.confirm("Select a different model instead?", default=False):
+        config_wizard.run(registry)
+        registry = Registry.load()
+        new_selection = selected_model(registry)
+        if new_selection is None:
+            return False
+        new_manifest, new_variant = new_selection
+        new_snapshot = _selected_snapshot(new_manifest)
+        return bool(new_snapshot and variant_ready(
+            new_manifest, new_variant, new_snapshot,
+            want_mtp=configfile.mtp_enabled()))
+
+    print(common.red("\nCannot start the server without prepared model "
+                     "artifacts."))
+    return False
+
+
 def run(interactive: bool = True) -> bool:
     """Returns True when the configured model is ready to serve."""
+    _clear_one_off_marker()
     registry = Registry.load()
 
     if configfile.exists() and migrate.needed(registry):
@@ -66,9 +119,13 @@ def run(interactive: bool = True) -> bool:
         from .tui import build
         ready = build.ensure_variant_built(registry, manifest, variant_name)
 
-    if interactive:
-        from .tui.build import launch_time_offload_offer
-        launch_time_offload_offer(registry)
+    if not ready and interactive:
+        ready = _offer_recovery(registry, manifest, variant_name)
+        if ready:
+            registry = Registry.load()
+            new_selection = selected_model(registry)
+            if new_selection:
+                manifest, variant_name = new_selection
 
     # Keep the engine-facing keys coherent with the selection.
     configfile.update({

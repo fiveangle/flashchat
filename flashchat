@@ -592,11 +592,14 @@ cmd_manage() {
 # Model readiness — quick non-interactive check, interactive repair on failure
 # -----------------------------------------------------------------------------
 ensure_model_ready() {
-    ensure_venv
+    ensure_venv || return 1
     if run_python -m modelmgr ensure --non-interactive >/dev/null 2>&1; then
         return 0
     fi
-    run_python -m modelmgr ensure
+    if run_python -m modelmgr ensure; then
+        return 0
+    fi
+    return 1
 }
 
 FLASHCHAT_VENV=""
@@ -1195,13 +1198,20 @@ cmd_serve() {
     flashchat_load_config
     
     # Verify the model is ready (download/extract/repair via Python core)
-    ensure_model_ready
-    
+    if ! ensure_model_ready; then
+        echo "Model not ready — server not started."
+        return 1
+    fi
+
+    # ensure may have changed the selected model (config wizard) or signaled
+    # a one-off run-from-archive path; refresh config + check for marker.
+    flashchat_load_config
+
     local server_port
     server_port="${port:-$(flashchat_get SERVER_PORT)}"
     local server_host
     server_host="$(flashchat_server_connect_host)"
-    
+
     # Check if WE already started the server
     if is_server_running; then
         if server_signature_matches_config; then
@@ -1252,6 +1262,16 @@ cmd_serve() {
     local _model_path _config_file _server_log _server_debug _server_http_log
     _model_path="$(flashchat_get MODEL_PATH)"
     _config_file="$(flashchat_get CONFIG_FILE)"
+    # One-off run-from-archive: ensure.run may have written a transient marker
+    # pointing at an offload snapshot with ready runtime artifacts. Use it for
+    # this launch only — no config file change.
+    local _one_off_marker
+    _one_off_marker="$(flashchat_get CONFIG_DIR)/.one_off_model_path"
+    if [ -f "$_one_off_marker" ]; then
+        _model_path="$(cat "$_one_off_marker")"
+        rm -f "$_one_off_marker"
+        echo "Running one-off from archived model at: $_model_path"
+    fi
     [ -n "${FLASHCHAT_SERVER_LOG}" ]      && _server_log="$FLASHCHAT_SERVER_LOG"           || _server_log="$(flashchat_get SERVER_LOG_PATH)"
     [ -n "${FLASHCHAT_SERVER_DEBUG}" ]    && _server_debug="$FLASHCHAT_SERVER_DEBUG"       || _server_debug="$(flashchat_get SERVER_DEBUG)"
     [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ] && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG" || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"

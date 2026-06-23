@@ -132,7 +132,7 @@ def offer_offload_originals(registry: Registry, manifest: Manifest, snapshot: st
         return
     report = offload.preflight(od, needed_bytes=size)
     if not report.ok:
-        return  # quiet: launch-time ensure will surface persistent problems
+        return
     print(f"\nThe original model files ({paths.human_bytes(size)}) are no longer "
           f"needed for inference — the runtime artifacts are self-contained.")
     print(f"They can be archived to {od} and restored any time "
@@ -150,49 +150,5 @@ def offer_offload_originals(registry: Registry, manifest: Manifest, snapshot: st
             print(common.green(f"archived {paths.human_bytes(moved)} to {od}"))
         except offload.OffloadError as e:
             print(common.red(f"offload failed: {e}"))
-        finally:
-            progress.finish()
-
-
-def launch_time_offload_offer(registry: Registry) -> None:
-    """Consolidated startup offer for models with valid runtimes + local
-    originals. Quiet when the offload volume is unreachable."""
-    od = offload_dir()
-    if not od:
-        return
-    report = offload.preflight(od)
-    if not report.ok:
-        return
-    from ..status import all_statuses
-
-    candidates = []
-    for status in all_statuses(registry, enabled_only=True, check_offload=False):
-        m = status.manifest
-        if m.id in registry.state.never_offload:
-            continue
-        if status.originals_local and status.any_ready and status.snapshot:
-            candidates.append(status)
-    if not candidates:
-        return
-    total = sum(s.originals_bytes for s in candidates)
-    names = ", ".join(s.manifest.name for s in candidates)
-    print(f"\nOriginals for {len(candidates)} model(s) ({names}, "
-          f"{paths.human_bytes(total)}) can be archived to {od}.")
-    reply = common.prompt("Archive now? [y/N/never]", "n").lower()
-    if reply == "never":
-        for s in candidates:
-            registry.state.never_offload.append(s.manifest.id)
-        registry.state.save()
-        return
-    if reply not in ("y", "yes"):
-        return
-    for s in candidates:
-        progress = common.ProgressLine()
-        try:
-            moved = offload.offload_originals(s.manifest, s.snapshot, od,
-                                              progress=progress)
-            print(common.green(f"  {s.manifest.name}: archived {paths.human_bytes(moved)}"))
-        except offload.OffloadError as e:
-            print(common.red(f"  {s.manifest.name}: {e}"))
         finally:
             progress.finish()
