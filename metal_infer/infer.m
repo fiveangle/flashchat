@@ -462,6 +462,21 @@ static inline int delta_dispatch_batch_enabled(void) {
     if (g_delta_dispatch_batch < 0) g_delta_dispatch_batch = getenv("FLASHCHAT_NO_DELTA_DISPATCH_BATCH") ? 0 : 1;
     return g_delta_dispatch_batch;
 }
+
+// Fused flash attention kernel for decode (FLASHCHAT_FUSED_ATTN=0|1, default ON).
+// Replaces 4 separate attention kernels (scores+softmax+values+sigmoid) with a
+// single online-softmax kernel. GQA-amortized: one TG per KV head loads K/V once
+// and reuses across all query heads sharing that KV head. fp32 KV only —
+// quantized KV falls back to the 3-kernel path.
+static int g_fused_attn = -1;
+static inline int fused_attn_enabled(void) {
+    if (g_fused_attn < 0) {
+        const char *e = getenv("FLASHCHAT_FUSED_ATTN");
+        g_fused_attn = (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false"))) ? 0 : 1;
+    }
+    return g_fused_attn;
+}
+
 // GPU full-attention in the batched MTP verify path (default OFF; FLASHCHAT_VERIFY_GPU_ATTN=1).
 // When off, the full-attention layers of the batched verify run on CPU.
 static int g_verify_gpu_attn = -1;
@@ -579,12 +594,14 @@ static void configure_arch_perf(void) {
     else                                          g_verify_gpu_attn = 0;
     (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
     (void)kv_quant_bits(); // resolve KV-cache quant mode from env (default off)
+    (void)fused_attn_enabled(); // resolve fused attention from env (default on)
     fprintf(stderr,
-        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s | "
+        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s fused_attn=%d | "
         "mtp=lossless draft/verify when MTP artifacts present\n",
         g_cfg.num_experts, g_delta_dispatch_batch, g_verify_gpu_attn,
         matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
-        kv_quant_bits()==8 ? "q8" : (kv_quant_bits()==4 ? "q4" : "off"));
+        kv_quant_bits()==8 ? "q8" : (kv_quant_bits()==4 ? "q4" : "off"),
+        fused_attn_enabled());
 }
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
@@ -2478,6 +2495,7 @@ typedef struct {
     id<MTLComputePipelineState> attn_scores_quant_pipe;  // dequant-on-read q8/q4
     id<MTLComputePipelineState> attn_values_quant_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
+    id<MTLComputePipelineState> flash_attn_fused_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [g_cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -2705,6 +2723,7 @@ static MetalCtx *metal_setup(void) {
         ctx->attn_values_quant_pipe = makePipe(@"attn_values_quant");
     }
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->flash_attn_fused_pipe = makePipe(@"flash_attn_fused_decode");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -7696,6 +7715,11 @@ static void fused_layer_forward(
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
+    int gpu_attn_fused = (gpu_attn_fuse && fused_attn_enabled()
+                          && g_metal->flash_attn_fused_pipe
+                          && kv_quant_bits() == 0
+                          && g_cfg.head_dim == 256);
+
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
@@ -7742,76 +7766,94 @@ static void fused_layer_forward(
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
             uint32_t qbits = (uint32_t)kv_quant_bits();
-            // Enc A1: attn_scores (fp32 batched, or dequant-on-read quant variant)
-            {
+
+            if (gpu_attn_fused) {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:qbits ? g_metal->attn_scores_quant_pipe
-                                                   : g_metal->attn_scores_pipe];
-                [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
-                [enc setBytes:&hd        length:4 atIndex:3];
-                [enc setBytes:&kvd       length:4 atIndex:4];
-                [enc setBytes:&sl        length:4 atIndex:5];
-                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setComputePipelineState:g_metal->flash_attn_fused_pipe];
+                [enc setBuffer:g_metal->buf_attn_q       offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:0 atIndex:2];
+                [enc setBuffer:g_metal->buf_attn_gate    offset:0 atIndex:3];
+                [enc setBuffer:g_metal->buf_attn_out     offset:0 atIndex:4];
+                [enc setBytes:&kvd       length:4 atIndex:5];
+                [enc setBytes:&sl        length:4 atIndex:6];
                 [enc setBytes:&scale     length:4 atIndex:7];
                 [enc setBytes:&hpkv      length:4 atIndex:8];
-                [enc setBytes:&sl        length:4 atIndex:9];
-                if (qbits) {
-                    [enc setBuffer:g_metal->buf_kv_kscale[fa_idx] offset:0 atIndex:10];
-                    [enc setBytes:&qbits length:4 atIndex:11];
-                }
-                uint32_t total_tgs = sl * g_cfg.num_attn_heads;
-                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-            // Enc A2: attn_softmax_batched
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_softmax_pipe];
-                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
-                [enc setBytes:&sl         length:4 atIndex:1];
-                [enc setBytes:&seq_stride  length:4 atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
-            }
-            // Enc A3: attn_values_batched
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:qbits ? g_metal->attn_values_quant_pipe
-                                                   : g_metal->attn_values_pipe];
-                [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
-                [enc setBytes:&hd        length:4 atIndex:3];
-                [enc setBytes:&kvd       length:4 atIndex:4];
-                [enc setBytes:&sl        length:4 atIndex:5];
-                [enc setBytes:&seq_stride length:4 atIndex:6];
-                [enc setBytes:&hpkv      length:4 atIndex:7];
-                if (qbits) {
-                    [enc setBuffer:g_metal->buf_kv_vscale[fa_idx] offset:0 atIndex:8];
-                    [enc setBytes:&qbits length:4 atIndex:9];
+            } else {
+                // Enc A1: attn_scores (fp32 batched, or dequant-on-read quant variant)
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:qbits ? g_metal->attn_scores_quant_pipe
+                                                       : g_metal->attn_scores_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&scale     length:4 atIndex:7];
+                    [enc setBytes:&hpkv      length:4 atIndex:8];
+                    [enc setBytes:&sl        length:4 atIndex:9];
+                    if (qbits) {
+                        [enc setBuffer:g_metal->buf_kv_kscale[fa_idx] offset:0 atIndex:10];
+                        [enc setBytes:&qbits length:4 atIndex:11];
+                    }
+                    uint32_t total_tgs = sl * g_cfg.num_attn_heads;
+                    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
                 }
-                uint32_t total_threads = g_cfg.head_dim * g_cfg.num_attn_heads;
-                uint32_t tgs = (total_threads + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-            // Enc A4: sigmoid_gate
-            {
-                uint32_t qdim = g_cfg.num_attn_heads * g_cfg.head_dim;
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
-                [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
-                [enc setBytes:&qdim length:4 atIndex:2];
-                uint32_t tgs = (qdim + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
+                // Enc A2: attn_softmax_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                    [enc setBytes:&sl         length:4 atIndex:1];
+                    [enc setBytes:&seq_stride  length:4 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A3: attn_values_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:qbits ? g_metal->attn_values_quant_pipe
+                                                       : g_metal->attn_values_pipe];
+                    [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&hpkv      length:4 atIndex:7];
+                    if (qbits) {
+                        [enc setBuffer:g_metal->buf_kv_vscale[fa_idx] offset:0 atIndex:8];
+                        [enc setBytes:&qbits length:4 atIndex:9];
+                    }
+                    uint32_t total_threads = g_cfg.head_dim * g_cfg.num_attn_heads;
+                    uint32_t tgs = (total_threads + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // Enc A4: sigmoid_gate
+                {
+                    uint32_t qdim = g_cfg.num_attn_heads * g_cfg.head_dim;
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+                    [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
+                    [enc setBytes:&qdim length:4 atIndex:2];
+                    uint32_t tgs = (qdim + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
             }
         }
 

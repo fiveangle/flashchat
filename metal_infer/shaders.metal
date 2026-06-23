@@ -1691,6 +1691,137 @@ kernel void sigmoid_gate(
 
 
 // ============================================================================
+// Kernel 9b: Fused flash attention for decode (single query token)
+// ============================================================================
+//
+// Replaces attn_scores_batched + attn_softmax_batched + attn_values_batched +
+// sigmoid_gate with a single kernel. Scores stay in registers/threadgroup
+// (never written to global memory). Uses online softmax (log-sum-exp).
+//
+// One threadgroup per query head (num_attn_heads TGs), 256 threads each.
+// Each TG loads Q for its head once, then iterates over the KV cache in blocks
+// of BK=8 positions. K/V for the kv_head are loaded into threadgroup memory
+// (shared between K and V since they're never needed simultaneously).
+// Each simdgroup computes one score (dot product via simd_sum), the online
+// softmax rescales the running max/sum and output accumulator, then V is
+// loaded and accumulated. The sigmoid gate is fused into the final write.
+//
+// This eliminates the scores buffer round-trip (1MB of global memory traffic
+// for seq_len=8192) and 3 encoder dispatch overheads vs the 3-kernel approach.
+//
+// Dispatch: grid = (num_attn_heads, 1, 1), 256 threads per TG.
+// Requires: head_dim=256, fp32 KV cache (no quantization), seq_len >= 1.
+
+#define FA_HD 256
+#define FA_BK 8
+
+kernel void flash_attn_fused_decode(
+    device const float* Q          [[buffer(0)]],  // [num_heads, head_dim]
+    device const float* K_cache    [[buffer(1)]],  // [max_seq, kv_dim] fp32
+    device const float* V_cache    [[buffer(2)]],  // [max_seq, kv_dim]
+    device const float* gate       [[buffer(3)]],  // [num_heads, head_dim]
+    device float*       out        [[buffer(4)]],  // [num_heads, head_dim]
+    constant uint&      kv_dim     [[buffer(5)]],  // num_kv_heads * head_dim
+    constant uint&      seq_len    [[buffer(6)]],
+    constant float&     scale      [[buffer(7)]],  // 1/sqrt(HD)
+    constant uint&      heads_per_kv [[buffer(8)]],
+    uint h     [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]]
+) {
+    if (tid >= FA_HD) return;
+
+    constexpr int FA_STRIDE = FA_HD + 8;
+
+    threadgroup float Qs[FA_STRIDE];
+    threadgroup float KVs[FA_BK * FA_STRIDE];
+    threadgroup float shared_scores[FA_BK];
+    threadgroup float shared_max;
+    threadgroup float shared_sum;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* qh = Q + h * FA_HD;
+
+    float o_acc = 0.0f;
+
+    if (tid == 0) {
+        shared_max = -1e30f;
+        shared_sum = 0.0f;
+    }
+
+    Qs[tid] = qh[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kb = 0; kb < seq_len; kb += FA_BK) {
+        uint block_size = min((uint)FA_BK, seq_len - kb);
+
+        for (uint i = 0; i < FA_BK; i++) {
+            uint pos = kb + i;
+            if (pos < seq_len) {
+                KVs[i * FA_STRIDE + tid] = K_cache[pos * kv_dim + kv_h * FA_HD + tid];
+            } else {
+                KVs[i * FA_STRIDE + tid] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint sg_id = tid / 32;
+        uint sg_lane = tid % 32;
+
+        if (sg_id < FA_BK) {
+            float partial = 0.0f;
+            for (uint d = 0; d < FA_HD / 32; d++) {
+                uint elem = sg_lane + d * 32;
+                partial += Qs[elem] * KVs[sg_id * FA_STRIDE + elem];
+            }
+            float score = simd_sum(partial) * scale;
+            if (sg_lane == 0) {
+                shared_scores[sg_id] = (sg_id < block_size) ? score : -1e30f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float block_max = -1e30f;
+        for (uint i = 0; i < block_size; i++) {
+            block_max = max(block_max, shared_scores[i]);
+        }
+
+        float running_max = shared_max;
+        float new_max = max(running_max, block_max);
+        float factor = exp(running_max - new_max);
+
+        float running_sum = shared_sum * factor;
+        o_acc *= factor;
+
+        for (uint i = 0; i < FA_BK; i++) {
+            uint pos = kb + i;
+            if (pos < seq_len) {
+                KVs[i * FA_STRIDE + tid] = V_cache[pos * kv_dim + kv_h * FA_HD + tid];
+            } else {
+                KVs[i * FA_STRIDE + tid] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < block_size; i++) {
+            float es = exp(shared_scores[i] - new_max);
+            running_sum += es;
+            o_acc += es * KVs[i * FA_STRIDE + tid];
+        }
+
+        if (tid == 0) {
+            shared_max = new_max;
+            shared_sum = running_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sum = 1.0f / shared_sum;
+    float g = 1.0f / (1.0f + exp(-gate[h * FA_HD + tid]));
+    out[h * FA_HD + tid] = o_acc * inv_sum * g;
+}
+
+
+// ============================================================================
 // Kernel 10: GatedDeltaNet linear attention step (single token, all heads)
 // ============================================================================
 //
