@@ -477,6 +477,19 @@ static inline int fused_attn_enabled(void) {
     return g_fused_attn;
 }
 
+// GPU RoPE kernel (FLASHCHAT_GPU_ROPE=0|1, default ON). Applies rotary position
+// embeddings on GPU with metal::fast::cos/sin and a precomputed freq table,
+// eliminating CPU powf/cosf/sinf from the hot path. The freq table is rebuilt
+// per token position (cheap — rotary_dim/2 entries) and uploaded to a GPU buffer.
+static int g_gpu_rope = -1;
+static inline int gpu_rope_enabled(void) {
+    if (g_gpu_rope < 0) {
+        const char *e = getenv("FLASHCHAT_GPU_ROPE");
+        g_gpu_rope = (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false"))) ? 0 : 1;
+    }
+    return g_gpu_rope;
+}
+
 // GPU full-attention in the batched MTP verify path (default OFF; FLASHCHAT_VERIFY_GPU_ATTN=1).
 // When off, the full-attention layers of the batched verify run on CPU.
 static int g_verify_gpu_attn = -1;
@@ -595,13 +608,14 @@ static void configure_arch_perf(void) {
     (void)matmuln_mode();  // resolve matmulN kernel from env (default v5)
     (void)kv_quant_bits(); // resolve KV-cache quant mode from env (default off)
     (void)fused_attn_enabled(); // resolve fused attention from env (default on)
+    (void)gpu_rope_enabled();   // resolve GPU RoPE from env (default on)
     fprintf(stderr,
-        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s fused_attn=%d | "
+        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s fused_attn=%d gpu_rope=%d | "
         "mtp=lossless draft/verify when MTP artifacts present\n",
         g_cfg.num_experts, g_delta_dispatch_batch, g_verify_gpu_attn,
         matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
         kv_quant_bits()==8 ? "q8" : (kv_quant_bits()==4 ? "q4" : "off"),
-        fused_attn_enabled());
+        fused_attn_enabled(), gpu_rope_enabled());
 }
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
@@ -2496,6 +2510,8 @@ typedef struct {
     id<MTLComputePipelineState> attn_values_quant_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
     id<MTLComputePipelineState> flash_attn_fused_pipe;
+    id<MTLComputePipelineState> rope_apply_pipe;
+    id<MTLBuffer> buf_rope_freq;  // [rotary_dim/2] precomputed inv_freq * pos
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [g_cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -2724,6 +2740,7 @@ static MetalCtx *metal_setup(void) {
     }
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->flash_attn_fused_pipe = makePipe(@"flash_attn_fused_decode");
+    ctx->rope_apply_pipe = makePipe(@"rope_apply");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -2867,6 +2884,8 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_attn_out    = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_rope_freq   = [ctx->device newBufferWithLength:(g_cfg.rotary_dim / 2) * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
                g_cfg.num_full_attn_layers, kv_cache_size / 1e6,
@@ -4534,6 +4553,18 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             kh[i]        = k0 * cos_a - k1 * sin_a;
             kh[i + half]  = k0 * sin_a + k1 * cos_a;
         }
+    }
+}
+
+// Precompute RoPE frequency table for a given position and upload to GPU buffer.
+// The table stores inv_freq[i] * pos for i=0..half-1, so the GPU kernel only
+// needs to do cos/sin + 2 FMAs per pair (no powf, no multiply by pos).
+static void gpu_rope_upload_freq(MetalCtx *ctx, int pos) {
+    int half = g_cfg.rotary_dim / 2;
+    float *freq = (float *)[ctx->buf_rope_freq contents];
+    for (int i = 0; i < half; i++) {
+        float inv_freq = 1.0f / powf(g_cfg.rope_theta, (float)(2 * i) / g_cfg.rotary_dim);
+        freq[i] = (float)pos * inv_freq;
     }
 }
 
@@ -7382,6 +7413,7 @@ static void fused_layer_forward(
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
+    int gpu_rope_ready = 0;
 
     if (is_full) {
         // ---- Full attention CPU compute ----
@@ -7420,8 +7452,34 @@ static void fused_layer_forward(
             }
         }
 
-        // RoPE
-        apply_rotary_emb(q, k_out, pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+        // RoPE — K always on CPU (must be RoPE'd before KV cache store).
+        // Q: CPU when GPU RoPE is off or GPU attention isn't ready; GPU otherwise
+        // (GPU RoPE dispatches in CMD2 before attention, using fast::cos/sin).
+        // Only enable when gpu_attn_ready is also true (RoPE dispatch is in CMD2's
+        // gpu_attn_fuse block) — otherwise Q would be un-RoPE'd for CPU attention.
+        gpu_rope_ready = (gpu_rope_enabled() && g_metal && g_metal->rope_apply_pipe
+                          && g_metal->buf_rope_freq && kv->len >= 32);
+        if (!gpu_rope_ready) {
+            apply_rotary_emb(q, k_out, pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
+        } else {
+            // RoPE K on CPU only
+            int half = g_cfg.rotary_dim / 2;
+            for (int h = 0; h < g_cfg.num_kv_heads; h++) {
+                float *kh = k_out + h * g_cfg.head_dim;
+                for (int i = 0; i < half; i++) {
+                    float freq = 1.0f / powf(g_cfg.rope_theta, (float)(2 * i) / g_cfg.rotary_dim);
+                    float angle = (float)pos * freq;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+                    float k0 = kh[i];
+                    float k1 = kh[i + half];
+                    kh[i]        = k0 * cos_a - k1 * sin_a;
+                    kh[i + half]  = k0 * sin_a + k1 * cos_a;
+                }
+            }
+            // Precompute freq table for Q's GPU RoPE dispatch
+            gpu_rope_upload_freq(g_metal, pos);
+        }
 
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
@@ -7766,6 +7824,29 @@ static void fused_layer_forward(
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
             uint32_t qbits = (uint32_t)kv_quant_bits();
+
+            // GPU RoPE on Q (K was already RoPE'd on CPU before KV cache store).
+            // Dispatches before attention, operates on buf_attn_q in-place.
+            if (gpu_rope_ready) {
+                uint32_t nh = g_cfg.num_attn_heads;
+                uint32_t nkv = g_cfg.num_kv_heads;
+                uint32_t rdim = g_cfg.rotary_dim;
+                uint32_t apply_k = 0;  // K already RoPE'd on CPU before KV cache store
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rope_apply_pipe];
+                [enc setBuffer:g_metal->buf_attn_q   offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_rope_freq offset:0 atIndex:2];
+                [enc setBytes:&nh   length:4 atIndex:3];
+                [enc setBytes:&nkv  length:4 atIndex:4];
+                [enc setBytes:&hd   length:4 atIndex:5];
+                [enc setBytes:&rdim length:4 atIndex:6];
+                [enc setBytes:&apply_k length:4 atIndex:7];
+                uint32_t half = rdim / 2;
+                [enc dispatchThreadgroups:MTLSizeMake((half + 31) / 32, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc endEncoding];
+            }
 
             if (gpu_attn_fused) {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];

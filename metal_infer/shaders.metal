@@ -1519,7 +1519,7 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_max = simd_max(shared_max[simd_lane]);
     }
-    threadgroup float broadcast_max;
+    threadgroup float broadcast_max = -1e30f;
     if (lid == 0) broadcast_max = global_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_max = broadcast_max;
@@ -1540,7 +1540,7 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_sum = simd_sum(shared_sum[simd_lane]);
     }
-    threadgroup float broadcast_sum;
+    threadgroup float broadcast_sum = 0.0f;
     if (lid == 0) broadcast_sum = global_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_sum = broadcast_sum;
@@ -1837,6 +1837,62 @@ kernel void flash_attn_fused_decode(
     float inv_sum = 1.0f / shared_sum;
     float g = 1.0f / (1.0f + exp(-gate[h * FA_HD + tid]));
     out[h * FA_HD + tid] = o_acc * inv_sum * g;
+}
+
+
+// ============================================================================
+// Kernel 9c: GPU RoPE (rotary position embedding) for decode
+// ============================================================================
+//
+// Applies RoPE in-place to Q (and optionally K) using a precomputed frequency
+// table. Uses metal::fast::cos/sin (SFU instructions, ~1 cycle) instead of CPU
+// cosf/sinf. The frequency table (inv_freq * pos) is precomputed once per
+// position on CPU, so the GPU kernel only does cos/sin + 2 FMAs per pair.
+//
+// MLX-default pairing: (x[i], x[i + half_dim]) where half_dim = rotary_dim / 2.
+// Only the first rotary_dim dimensions of each head are rotated; the rest
+// pass through unchanged.
+//
+// Dispatch: grid = (ceil(half_dim/32), 1, 1), threadsPerThreadgroup = 32.
+// Each thread handles one frequency pair across all Q heads (and K if apply_k=1).
+
+kernel void rope_apply(
+    device float*       q          [[buffer(0)]],  // [num_heads, head_dim] in/out
+    device float*       k          [[buffer(1)]],  // [num_kv_heads, head_dim] in/out (or NULL)
+    device const float* freq_table [[buffer(2)]],  // [half_dim] precomputed: inv_freq[i] * pos
+    constant uint&      num_heads  [[buffer(3)]],
+    constant uint&      num_kv_heads [[buffer(4)]],
+    constant uint&      head_dim   [[buffer(5)]],
+    constant uint&      rotary_dim [[buffer(6)]],
+    constant uint&      apply_k    [[buffer(7)]],  // 1 = apply RoPE to K, 0 = Q only
+    uint tid [[thread_position_in_grid]]
+) {
+    uint half_dim = rotary_dim / 2;
+    if (tid >= half_dim) return;
+
+    float angle = freq_table[tid];
+    float cos_a = metal::fast::cos(angle);
+    float sin_a = metal::fast::sin(angle);
+
+    for (uint h = 0; h < num_heads; h++) {
+        uint base = h * head_dim + tid;
+        uint pair = base + half_dim;
+        float q0 = q[base];
+        float q1 = q[pair];
+        q[base] = q0 * cos_a - q1 * sin_a;
+        q[pair] = q0 * sin_a + q1 * cos_a;
+    }
+
+    if (apply_k) {
+        for (uint h = 0; h < num_kv_heads; h++) {
+            uint base = h * head_dim + tid;
+            uint pair = base + half_dim;
+            float k0 = k[base];
+            float k1 = k[pair];
+            k[base] = k0 * cos_a - k1 * sin_a;
+            k[pair] = k0 * sin_a + k1 * cos_a;
+        }
+    }
 }
 
 
