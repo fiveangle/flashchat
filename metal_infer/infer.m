@@ -2583,6 +2583,7 @@ typedef struct {
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
+    id<MTLComputePipelineState> rms_norm_q_weighted; // per-head Q norm with weight (full-attn)
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
@@ -2745,6 +2746,7 @@ static MetalCtx *metal_setup(void) {
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
+    ctx->rms_norm_q_weighted = makePipe(@"rms_norm_q_weighted");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
@@ -7414,6 +7416,7 @@ static void fused_layer_forward(
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
     int gpu_rope_ready = 0;
+    int gpu_q_norm = 0;
 
     if (is_full) {
         // ---- Full attention CPU compute ----
@@ -7430,10 +7433,12 @@ static void fused_layer_forward(
             memcpy(q_gate + h * g_cfg.head_dim, src + g_cfg.head_dim, g_cfg.head_dim * sizeof(float));
         }
 
-        // Q/K RMSNorm
+        // Q/K RMSNorm — K always on CPU (must be norm'd before KV cache store).
+        // Q: CPU when GPU path is off; GPU otherwise (norm dispatch in CMD2 before RoPE).
         uint16_t *qnorm_w = lc->q_norm_w;
         uint16_t *knorm_w = lc->k_norm_w;
-        if (qnorm_w) {
+        gpu_q_norm = (gpu_rope_ready && qnorm_w && g_metal->rms_norm_q_weighted);
+        if (!gpu_q_norm && qnorm_w) {
             for (int h = 0; h < g_cfg.num_attn_heads; h++) {
                 float *qh = q + h * g_cfg.head_dim;
                 float sum_sq = 0.0f;
@@ -7824,6 +7829,24 @@ static void fused_layer_forward(
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
             uint32_t qbits = (uint32_t)kv_quant_bits();
+
+            // GPU Q norm (skip if Q was norm'd on CPU). Dispatches before RoPE.
+            if (gpu_q_norm) {
+                id<MTLBuffer> qnorm_buf;
+                NSUInteger qnorm_off;
+                metal_weight_arg(g_metal, lc->q_norm_w, (size_t)g_cfg.head_dim * sizeof(uint16_t),
+                                 &qnorm_buf, &qnorm_off);
+                float eps = g_cfg.rms_norm_eps;
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->rms_norm_q_weighted];
+                [enc setBuffer:g_metal->buf_attn_q offset:0 atIndex:0];
+                [enc setBuffer:qnorm_buf offset:qnorm_off atIndex:1];
+                [enc setBytes:&hd  length:4 atIndex:2];
+                [enc setBytes:&eps length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
 
             // GPU RoPE on Q (K was already RoPE'd on CPU before KV cache store).
             // Dispatches before attention, operates on buf_attn_q in-place.
