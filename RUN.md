@@ -24,7 +24,6 @@ Before running Flashchat, you need:
 
 - An Apple Silicon Mac with at least 16GB of RAM
 - Enough free internal SSD space for the selected model and generated expert data
-- Xcode Command Line Tools for building the Metal inference binaries
 
 On first run, `flashchat` will guide you through the rest:
 
@@ -129,7 +128,6 @@ Runs a single prompt and prints the response.
 ```
 
 Runs performance benchmarks. Uses configuration for model paths.
-
 ### Tool Template Debugging
 
 ```bash
