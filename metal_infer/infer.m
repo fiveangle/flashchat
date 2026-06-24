@@ -2500,6 +2500,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
+    id<MTLComputePipelineState> residual_rms_norm_bf16;  // fused residual + norm
     id<MTLComputePipelineState> swiglu;
     id<MTLComputePipelineState> swiglu_batched;
     // GPU attention pipelines
@@ -2730,6 +2731,7 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
+    ctx->residual_rms_norm_bf16 = makePipe(@"residual_rms_norm_bf16");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->swiglu_batched = makePipe(@"swiglu_fused_batched");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
@@ -7785,8 +7787,7 @@ static void fused_layer_forward(
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
-        g_metal->residual_add && g_metal->rms_norm_sum &&
-        g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
+        g_metal->residual_rms_norm_bf16 && lc->post_attn_norm_w) {
         // ---- FULLY FUSED CMD2 ----
         // For GPU attention (full-attn layers): attention dispatches are prepended,
         //   o_proj reads from buf_attn_out instead of batch_out[6].
@@ -7992,55 +7993,27 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-            uint32_t dim = g_cfg.hidden_dim;
-            [enc setComputePipelineState:g_metal->residual_add];
-            [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
-            [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
-            [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // ---- Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq) ----
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-            uint32_t dim = g_cfg.hidden_dim;
-            [enc setComputePipelineState:g_metal->rms_norm_sum];
-            [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
-            [enc setBytes:&dim length:4 atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
+        // ---- Enc 2: fused residual_add + rms_norm (3 dispatches -> 1) ----
         {
             NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
                                                (const char *)[g_metal->wf_buf contents]);
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = g_cfg.hidden_dim;
             float eps = g_cfg.rms_norm_eps;
-            [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
-            [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];  // x
-            [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1]; // weight (bf16)
-            [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];  // sum_sq
-            [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];  // out = h_post
-            [enc setBytes:&dim length:4 atIndex:4];
-            [enc setBytes:&eps length:4 atIndex:5];
-            uint32_t tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            [enc setComputePipelineState:g_metal->residual_rms_norm_bf16];
+            [enc setBuffer:g_metal->buf_residual offset:0       atIndex:0];  // a = residual
+            [enc setBuffer:g_metal->buf_output   offset:0       atIndex:1];  // b = o_proj result
+            [enc setBuffer:g_metal->wf_buf       offset:norm_off atIndex:2]; // weight (bf16)
+            [enc setBuffer:g_metal->buf_input    offset:0       atIndex:3];  // out = h_post (normed)
+            [enc setBuffer:g_metal->buf_h_mid    offset:0       atIndex:4];  // mid = residual+oproj (for combine)
+            [enc setBytes:&dim length:4 atIndex:5];
+            [enc setBytes:&eps length:4 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
         }
 
-        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
+        // ---- Enc 3-6: routing + shared expert projections (read buf_input) ----
         BatchMatvecSpec moe_specs[4] = {
             { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)g_cfg.num_experts,        g_cfg.hidden_dim, g_cfg.group_size, 0 },
             { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)g_cfg.shared_intermediate, g_cfg.hidden_dim, g_cfg.group_size, 1 },

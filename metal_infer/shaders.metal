@@ -1429,6 +1429,62 @@ kernel void residual_add(
 
 
 // ============================================================================
+// Kernel 5b: Fused residual_add + RMS norm (sum_sq + apply with bf16 weights)
+// ============================================================================
+//
+// Replaces 3 separate dispatches (residual_add + rms_norm_sum_sq +
+// rms_norm_apply_bf16) with a single kernel. The residual is computed,
+// sum of squares accumulated via simd_sum, then the norm is applied with
+// bf16 weight multiplication — all in one pass with one threadgroup barrier
+// instead of 2 global-memory round-trips for the sum_sq value.
+//
+// Dispatch: 1 threadgroup, 256 threads. Each thread processes strided elements.
+// Outputs: mid[i] = a[i] + b[i]  (unnormalized residual + o_proj)
+//          out[i] = mid[i] * rsqrt(sum_sq / dim + eps) * weight[i]  (normalized)
+
+kernel void residual_rms_norm_bf16(
+    device const float*    a       [[buffer(0)]],  // residual [dim]
+    device const float*    b       [[buffer(1)]],  // o_proj output [dim]
+    device const uint16_t* weight  [[buffer(2)]],  // bf16 norm weights [dim]
+    device float*          out     [[buffer(3)]],  // normalized output [dim]
+    device float*          mid     [[buffer(4)]],  // unnormalized residual+oproj [dim]
+    constant uint&         dim     [[buffer(5)]],
+    constant float&        eps     [[buffer(6)]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float val = a[i] + b[i];
+        mid[i] = val;
+        acc += val * val;
+    }
+
+    float simd_val = simd_sum(acc);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    threadgroup float shared[32];
+    threadgroup float total_sq_tg;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simd_groups) ? shared[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) total_sq_tg = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = rsqrt(total_sq_tg / float(dim) + eps);
+    for (uint i = lid; i < dim; i += tg_size) {
+        out[i] = mid[i] * inv_rms * bf16_to_f32(weight[i]);
+    }
+}
+
+
+// ============================================================================
 // Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
 //
