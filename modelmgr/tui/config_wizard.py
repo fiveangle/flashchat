@@ -307,30 +307,36 @@ def _fmt_bytes(b: int) -> str:
 
 
 def _kv_quant_setting(manifest, window: int) -> dict:
-    """KV cache quantization (off/q8/q4). Shows the wired GPU KV-buffer RAM each
-    mode needs at the chosen window, computed from the model's KV geometry."""
+    """KV cache quantization (off/q8/q4) as a numbered menu. Each option shows
+    the wired GPU KV-buffer RAM it needs at the chosen window, computed from the
+    model's KV geometry."""
     a = manifest.architecture
     n_kv = int(a.get("num_key_value_heads", 0) or 0)
     head_dim = int(a.get("head_dim", 0) or 0)
     n_full = int(a.get("num_hidden_layers", 0) or 0) // max(
         1, int(a.get("full_attention_interval", 1) or 1))
     kv_dim = n_kv * head_dim
-    # GPU bytes/token across all full-attn layers (K + V [+ fp16 scales per side]).
-    per_tok = {
-        "off": 2 * kv_dim * 4,
-        "q8":  2 * kv_dim + 2 * (n_kv * 2),
-        "q4":  2 * (kv_dim // 2) + 2 * (n_kv * 2),
-    }
-    if kv_dim > 0 and n_full > 0:
-        print(f"\nKV cache quantization — GPU KV-buffer RAM at {window:,}-token window:")
-        print(f"  off : {_fmt_bytes(per_tok['off'] * n_full * window):>9}  (fp32, lossless)")
-        print(f"  q8  : {_fmt_bytes(per_tok['q8']  * n_full * window):>9}  (~lossless, recommended for large windows)")
-        print(f"  q4  : {_fmt_bytes(per_tok['q4']  * n_full * window):>9}  (lossy, smallest)")
+    have_ram = kv_dim > 0 and n_full > 0
+    # mode, GPU bytes/token across all full-attn layers (K + V [+ fp16 scales]), note
+    modes = [
+        ("off", 2 * kv_dim * 4,              "fp32, lossless"),
+        ("q8",  2 * kv_dim + 2 * (n_kv * 2), "~lossless, best for large windows"),
+        ("q4",  2 * (kv_dim // 2) + 2 * (n_kv * 2), "lossy, smallest"),
+    ]
+    names = [m[0] for m in modes]
     current = (configfile.get("KV_QUANT", "") or "off").lower()
-    value = common.prompt("KV cache quantization [off/q8/q4]", current).strip().lower()
-    if value not in ("off", "q8", "q4"):
-        print(common.yellow(f"  unknown '{value}'; using off"))
-        value = "off"
+    default_idx = names.index(current) + 1 if current in names else 1
+
+    common.heading("KV cache quantization")
+    if have_ram:
+        print(f"GPU KV-buffer RAM at {window:,}-token window:\n")
+    for i, (name, per_tok, note) in enumerate(modes, 1):
+        ram = f"{_fmt_bytes(per_tok * n_full * window):>9}" if have_ram else ""
+        mark = common.dim(" (current)") if name == current else ""
+        print(f"  {i}) {name:<3} {ram}   {note}{mark}")
+
+    choice = common.select_number(len(modes), "Select", default=default_idx)
+    value = names[choice - 1] if choice else current
     return {"KV_QUANT": "" if value == "off" else value}
 
 
