@@ -38,6 +38,7 @@ _ARCH_KEYS = (
     "shared_expert_intermediate_size",
     "intermediate_size",
     "full_attention_interval",
+    "max_context",
     "linear_num_value_heads",
     "linear_num_key_heads",
     "linear_key_head_dim",

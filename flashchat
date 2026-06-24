@@ -425,6 +425,10 @@ cmd_status() {
     echo "Quantization: $(current_quantization_label)"
     echo "Sampling profile: $(flashchat_get SAMPLING_PROFILE)"
     echo "Max response length: $(flashchat_get MAX_TOKENS) tokens"
+    _ctx_win="$(flashchat_get CONTEXT_WINDOW)"
+    echo "Context window: ${_ctx_win:-65536 (default)} tokens"
+    _kvq="$(flashchat_get KV_QUANT)"
+    echo "KV cache quantization: ${_kvq:-off}"
     echo "Reasoning: $(flashchat_get REASONING)"
     echo "Temperature: $(flashchat_get TEMPERATURE) (randomness - higher = more creative)"
     echo "Top-p: $(flashchat_get TOP_P) (nucleus sampling - controls diversity)"
@@ -1283,6 +1287,8 @@ cmd_serve() {
     FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
     FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
     FLASHCHAT_ACTIVE_EXPERTS="$(flashchat_get ACTIVE_EXPERTS)" \
+    FLASHCHAT_CONTEXT_WINDOW="$(flashchat_get CONTEXT_WINDOW)" \
+    FLASHCHAT_KV_QUANT="$(flashchat_get KV_QUANT)" \
     "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" \
         --config "$_config_file" --model "$_model_path" > /dev/null 2>&1 &
     local infer_pid=$!

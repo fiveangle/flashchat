@@ -19,6 +19,7 @@
     "moe_intermediate_size": 1024,
     "shared_expert_intermediate_size": 1024,
     "full_attention_interval": 4,
+    "max_context": 262144,
     "linear_num_value_heads": 64,
     "linear_num_key_heads": 16,
     "linear_key_head_dim": 128,

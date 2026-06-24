@@ -87,7 +87,14 @@ ModelConfig g_cfg;
 
 // Pipeline and cache limits (not model-dependent)
 #define MAX_SEQ_LEN 1048576
-#define GPU_KV_SEQ  8192
+
+// Context window = number of KV positions backed by GPU buffers. Runtime-resolved
+// from FLASHCHAT_CONTEXT_WINDOW (clamped to the model's trained max_context) in
+// configure_arch_perf(); GPU_KV_SEQ expands to the resolved global so every KV
+// buffer size, attention seq_stride, and bounds check tracks the same value.
+#define DEFAULT_CONTEXT_WINDOW 65536
+static int g_gpu_kv_seq = DEFAULT_CONTEXT_WINDOW;
+#define GPU_KV_SEQ  g_gpu_kv_seq
 
 // Model path has NO hardcoded default. It must be supplied explicitly (--model or
 // config); a missing model path is a fatal error, never a silent fallback to some
@@ -609,13 +616,26 @@ static void configure_arch_perf(void) {
     (void)kv_quant_bits(); // resolve KV-cache quant mode from env (default off)
     (void)fused_attn_enabled(); // resolve fused attention from env (default on)
     (void)gpu_rope_enabled();   // resolve GPU RoPE from env (default on)
+
+    // Context window (KV positions): env override else default, clamped to the
+    // model's trained max_context. Sizes all GPU KV buffers, so resolve before
+    // metal_setup() (which runs later in main).
+    {
+        int win = DEFAULT_CONTEXT_WINDOW;
+        const char *e = getenv("FLASHCHAT_CONTEXT_WINDOW");
+        if (e && *e) { int v = atoi(e); if (v > 0) win = v; }
+        if (win < 512) win = 512;
+        if (g_cfg.max_context > 0 && win > g_cfg.max_context) win = g_cfg.max_context;
+        g_gpu_kv_seq = win;
+    }
+
     fprintf(stderr,
-        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s fused_attn=%d gpu_rope=%d | "
+        "[perf] experts=%d | delta_batch=%d verify_gpu_attn=%d matmulN=v%d kv_quant=%s fused_attn=%d gpu_rope=%d kv_window=%d | "
         "mtp=lossless draft/verify when MTP artifacts present\n",
         g_cfg.num_experts, g_delta_dispatch_batch, g_verify_gpu_attn,
         matmuln_mode()==2 ? 5 : (matmuln_mode()==1 ? 4 : 3),
         kv_quant_bits()==8 ? "q8" : (kv_quant_bits()==4 ? "q4" : "off"),
-        fused_attn_enabled(), gpu_rope_enabled());
+        fused_attn_enabled(), gpu_rope_enabled(), g_gpu_kv_seq);
 }
 // Rows covered per threadgroup for the active kernel. v5 packs ROWS_PER_SIMD rows per
 // simdgroup (must match shaders.metal ROWS_PER_SIMD): 8 simdgroups * ROWS_PER_SIMD.
@@ -2877,10 +2897,16 @@ static MetalCtx *metal_setup(void) {
                                                                  options:MTLResourceStorageModeShared];
             }
         }
-        ctx->buf_mtp_kv_k = [ctx->device newBufferWithLength:kv_fp32_size
-                                                      options:MTLResourceStorageModeShared];
-        ctx->buf_mtp_kv_v = [ctx->device newBufferWithLength:kv_fp32_size
-                                                      options:MTLResourceStorageModeShared];
+        // MTP head KV buffers are fp32 and scale with the window; only the MTP
+        // draft/verify path uses them, so allocate only when MTP is enabled
+        // (g_mtp_predictions is finalized before metal_setup). Off by default ⇒
+        // these stay NULL and the dependent MTP paths short-circuit on the NULL check.
+        if (g_mtp_predictions > 0) {
+            ctx->buf_mtp_kv_k = [ctx->device newBufferWithLength:kv_fp32_size
+                                                          options:MTLResourceStorageModeShared];
+            ctx->buf_mtp_kv_v = [ctx->device newBufferWithLength:kv_fp32_size
+                                                          options:MTLResourceStorageModeShared];
+        }
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * g_cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)g_cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)

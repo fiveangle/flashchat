@@ -60,6 +60,13 @@ def run(registry: Registry) -> None:
     changes["MAX_TOKENS"] = common.prompt(
         "Max response tokens", configfile.get("MAX_TOKENS", "8192"))
 
+    cw = _context_window_setting(manifest)
+    changes.update(cw)
+    effective_window = (
+        int(cw["CONTEXT_WINDOW"]) if cw["CONTEXT_WINDOW"]
+        else (min(65536, manifest.max_context) if manifest.max_context > 0 else 65536))
+    changes.update(_kv_quant_setting(manifest, effective_window))
+
     changes.update(_select_sampling_profile(manifest))
     changes.update(_server_settings())
     changes.update(_storage_settings())
@@ -110,6 +117,11 @@ def _print_summary(registry: Registry) -> None:
     active = configfile.get("ACTIVE_EXPERTS", "")
     if current and current[0].num_experts_per_tok > 0:
         print(f"Active experts (K): {active or current[0].num_experts_per_tok}")
+    win = configfile.get("CONTEXT_WINDOW", "") or "65536 (default)"
+    model_max = current[0].max_context if current else 0
+    max_label = f" (model max {model_max})" if model_max > 0 else ""
+    print(f"Context window: {win} tokens{max_label}")
+    print(f"KV cache quantization: {configfile.get('KV_QUANT', '') or 'off'}")
     print()
 
 
@@ -268,6 +280,58 @@ def _select_sampling_profile(manifest) -> dict:
             value = str(max_k)
         out["ACTIVE_EXPERTS"] = "" if value == default_k else value
     return out
+
+
+def _context_window_setting(manifest) -> dict:
+    """Top-level prompt: KV context window in tokens. Larger = more RAM
+    (q8 KV ≈ 10 KiB/token; pair big windows with FLASHCHAT_KV_QUANT=q8 on small
+    machines). Ships at 64K; clamps to the model's trained max_context."""
+    max_ctx = manifest.max_context
+    default_win = min(65536, max_ctx) if max_ctx > 0 else 65536
+    current_win = configfile.get("CONTEXT_WINDOW", "")
+    if current_win.isdigit() and max_ctx > 0 and int(current_win) > max_ctx:
+        print(common.yellow(f"  saved context window {current_win} exceeds model max {max_ctx}; using {max_ctx}"))
+        current_win = str(max_ctx)
+    current_win = current_win or str(default_win)
+    max_label = f", max {max_ctx}" if max_ctx > 0 else ""
+    value = common.prompt(
+        f"Context window (tokens, default {default_win}{max_label})", current_win)
+    if value.isdigit() and max_ctx > 0 and int(value) > max_ctx:
+        print(common.yellow(f"  context window {value} exceeds model max {max_ctx}; saving {max_ctx}"))
+        value = str(max_ctx)
+    return {"CONTEXT_WINDOW": "" if value == str(default_win) else value}
+
+
+def _fmt_bytes(b: int) -> str:
+    return f"{b / 2**30:.2f} GB" if b >= 2**30 else f"{b / 2**20:.0f} MB"
+
+
+def _kv_quant_setting(manifest, window: int) -> dict:
+    """KV cache quantization (off/q8/q4). Shows the wired GPU KV-buffer RAM each
+    mode needs at the chosen window, computed from the model's KV geometry."""
+    a = manifest.architecture
+    n_kv = int(a.get("num_key_value_heads", 0) or 0)
+    head_dim = int(a.get("head_dim", 0) or 0)
+    n_full = int(a.get("num_hidden_layers", 0) or 0) // max(
+        1, int(a.get("full_attention_interval", 1) or 1))
+    kv_dim = n_kv * head_dim
+    # GPU bytes/token across all full-attn layers (K + V [+ fp16 scales per side]).
+    per_tok = {
+        "off": 2 * kv_dim * 4,
+        "q8":  2 * kv_dim + 2 * (n_kv * 2),
+        "q4":  2 * (kv_dim // 2) + 2 * (n_kv * 2),
+    }
+    if kv_dim > 0 and n_full > 0:
+        print(f"\nKV cache quantization — GPU KV-buffer RAM at {window:,}-token window:")
+        print(f"  off : {_fmt_bytes(per_tok['off'] * n_full * window):>9}  (fp32, lossless)")
+        print(f"  q8  : {_fmt_bytes(per_tok['q8']  * n_full * window):>9}  (~lossless, recommended for large windows)")
+        print(f"  q4  : {_fmt_bytes(per_tok['q4']  * n_full * window):>9}  (lossy, smallest)")
+    current = (configfile.get("KV_QUANT", "") or "off").lower()
+    value = common.prompt("KV cache quantization [off/q8/q4]", current).strip().lower()
+    if value not in ("off", "q8", "q4"):
+        print(common.yellow(f"  unknown '{value}'; using off"))
+        value = "off"
+    return {"KV_QUANT": "" if value == "off" else value}
 
 
 def _server_settings() -> dict:

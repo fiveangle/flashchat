@@ -101,6 +101,8 @@ typedef struct {
 
     int mtp_default_predictions;
 
+    int max_context;        // model's trained max context (max_position_embeddings); 0 = unknown
+
     char extract_weights_script[128];
     char repack_experts_script[128];
 } ModelConfig;
@@ -321,6 +323,7 @@ static int load_model_config(const char *json_path, const char *model_id, ModelC
     CFG_INT(moe_intermediate, "moe_intermediate_size");
     CFG_INT(shared_intermediate, "shared_expert_intermediate_size");
     CFG_INT(full_attn_interval, "full_attention_interval");
+    CFG_INT(max_context, "max_context");
 
     p = json_find_key_until(model_object, model_end, "quantization");
     if (p) {

@@ -97,6 +97,11 @@ class Manifest:
         return int(self.architecture.get("num_experts_per_tok", 0) or 0)
 
     @property
+    def max_context(self) -> int:
+        """Model's trained max context (max_position_embeddings); 0 if unknown."""
+        return int(self.architecture.get("max_context", 0) or 0)
+
+    @property
     def mtp_artifacts_required(self) -> bool:
         # Mirrors the old bash model_mtp_artifacts_required(): native models
         # with an MTP head carry mtp_num_hidden_layers; quantized community
