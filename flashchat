@@ -68,6 +68,93 @@ current_quantization_label() {
     echo "${bits}-bit"
 }
 
+# "q4 / fp32" — weight quantization / KV-cache quantization for the menu header.
+quant_pair_label() {
+    local wbits kvlabel
+    wbits=$(flashchat_model_quant_bits "$(flashchat_get MODEL)")
+    wbits="${wbits:-4}"
+    # Live KV-cache quantization label wins (the server is the only place that
+    # knows the resolved kv_quant mode at runtime); fall back to the user-
+    # configured value, then to "fp32" — the infer binary's default when
+    # FLASHCHAT_KV_QUANT is unset. The fallback chain keeps the menu stable
+    # across cold starts where /health isn't reachable yet.
+    kvlabel=$(flashchat_kv_cache_quantization)
+    printf 'q%s/%s' "$wbits" "$kvlabel"
+}
+
+# Context usage meter: a 0 -> max_context (in k) horizontal bar filled to the
+# most recent request's context length, with the configured-window KV RAM in
+# parens. Format mirrors the user's spec:
+#   Context Used: 0k [|||...|||          ] 256k (2.6GiB)
+#                ^used  ^bar (fixed width)   ^max  ^ram
+# Reads 0 used when no server / no requests yet, and degrades to "0 / 0"
+# when neither the server nor the registry can resolve a max window.
+render_context_meter() {
+    local server_status="$1"
+    local model_id window kvq used=0 maxctx rambytes live_max live_bytes
+    model_id=$(flashchat_get MODEL)
+    window=$(flashchat_get CONTEXT_WINDOW); [ -n "$window" ] || window=65536
+    kvq=$(flashchat_get KV_QUANT); [ -n "$kvq" ] || kvq=off
+
+    # Authoritative source: the server's /health (its g_gpu_kv_seq and chosen
+    # kv_quant mode are the actual values it ran with, which can drift from
+    # config if the launcher clamped the window to the model's max_context).
+    case "$server_status" in
+        Running*)
+            live_max=$(flashchat_kv_cache_max 2>/dev/null)
+            live_bytes=$(flashchat_kv_cache_total_bytes 2>/dev/null)
+            used=$(flashchat_kv_cache_used 2>/dev/null)
+            [ -n "$used" ] || used=0
+            ;;
+    esac
+
+    # Fallback: registry geometry + configured window/quant. Used when /health
+    # is unreachable so the menu still shows a meaningful right-end and RAM.
+    local fallback
+    fallback=$(flashchat_kv_meter_data "$model_id" "$window" "$kvq")
+    local fb_max=${fallback%% *}
+    local fb_bytes=${fallback##* }
+    [[ "$fb_max"   =~ ^[0-9]+$ ]] || fb_max=0
+    [[ "$fb_bytes" =~ ^[0-9]+$ ]] || fb_bytes=0
+
+    maxctx=${live_max:-$fb_max}
+    rambytes=${live_bytes:-$fb_bytes}
+    [ -n "$maxctx" ]   || maxctx=0
+    [ -n "$rambytes" ] || rambytes=0
+    [[ "$maxctx"   =~ ^[0-9]+$ ]] || maxctx=0
+    [[ "$rambytes" =~ ^[0-9]+$ ]] || rambytes=0
+
+    local width=55 fill=0
+    if [ "$maxctx" -gt 0 ]; then
+        fill=$(( used * width / maxctx ))
+        [ "$fill" -gt "$width" ] && fill=$width
+        [ "$fill" -lt 0 ] && fill=0
+    fi
+    local bar
+    bar="$(printf '%*s' "$fill" '' | tr ' ' '|')$(printf '%*s' "$((width - fill))" '' | tr ' ' ' ')"
+    local ram_h
+    ram_h=$(awk -v b="$rambytes" 'BEGIN{
+        if (b+0 <= 0) { printf "0 MiB"; exit }
+        if (b+0 >= 1073741824) printf "%.2f GiB", b/1073741824
+        else printf "%.0f MiB", b/1048576
+    }')
+    # Trailing labels collapse to "?" when nothing resolvable — distinguishes
+    # "server not running" from "model truly has no max_context registered".
+    local max_disp ram_disp
+    if [ "$maxctx" -gt 0 ]; then
+        max_disp="$(( (maxctx + 512) / 1024 ))k"
+    else
+        max_disp="?"
+    fi
+    if [ "$rambytes" -gt 0 ]; then
+        ram_disp="$ram_h"
+    else
+        ram_disp="?"
+    fi
+    printf 'Context Used: %dk [%s] %s (%s)\n' \
+        "$(( (used + 512) / 1024 ))" "$bar" "$max_disp" "$ram_disp"
+}
+
 flashchat_set_config_value() {
     local key="$1"
     local value="$2"
@@ -1547,10 +1634,9 @@ interactive_menu() {
         echo "=================================================="
         echo "           Flashchat Management"
         echo "=================================================="
-        echo "Status: $setup_status at $server_url"
-        echo "Model: $(flashchat_get MODEL)"
-        echo "Quantization: $(current_quantization_label)"
         echo "$server_line"
+        echo "Model: $(flashchat_get MODEL)   Quantization (model/kv-cache): $(quant_pair_label)"
+        render_context_meter "$server_status"
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]anage, [Q]uit"
         read_menu_key "> " "nNdDsSoOcCmMqQ" "Invalid selection — please choose N, D, S, O, C, M, or Q." || { echo "Goodbye!"; break; }
 

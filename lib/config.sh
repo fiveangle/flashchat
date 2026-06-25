@@ -46,6 +46,8 @@ FLASHCHAT_DEFAULT_SYSTEM_PROMPT_CACHE_DIR=""
 FLASHCHAT_DEFAULT_MTP=""
 FLASHCHAT_DEFAULT_MTP_BF16="0"
 FLASHCHAT_DEFAULT_ACTIVE_EXPERTS=""
+FLASHCHAT_DEFAULT_KV_QUANT=""
+FLASHCHAT_DEFAULT_CONTEXT_WINDOW=""
 FLASHCHAT_MAX_ACTIVE_EXPERTS="16"
 FLASHCHAT_DEFAULT_COLOR_OUTPUT="1"
 FLASHCHAT_DEFAULT_SAMPLING_PROFILE=""
@@ -76,6 +78,8 @@ SYSTEM_PROMPT_CACHE_DIR=""
 MTP=""
 MTP_BF16=""
 ACTIVE_EXPERTS=""
+KV_QUANT=""
+CONTEXT_WINDOW=""
 COLOR_OUTPUT=""
 SAMPLING_PROFILE=""
 REASONING=""
@@ -261,6 +265,45 @@ flashchat_model_num_experts() {
     echo "${n:-0}"
 }
 
+# Number of system-prompt cache entries (.fcache files) on disk for a model.
+# Mirrors the engine's cache-dir resolution: custom dir -> <dir>/<model>/q<bits>/
+# system_prompt_cache, else <model_path>/flashchat/q<bits>/system_prompt_cache.
+flashchat_sysprompt_cache_count() {
+    local model_id="$1" bits custom dir model_path
+    [ -n "$model_id" ] || { echo 0; return; }
+    bits=$(flashchat_model_quant_bits "$model_id"); bits="${bits:-4}"
+    custom=$(flashchat_get SYSTEM_PROMPT_CACHE_DIR)
+    if [ -n "$custom" ]; then
+        dir="${custom}/${model_id}/q${bits}/system_prompt_cache"
+    else
+        model_path=$(flashchat_model_path_for_id "$model_id" 2>/dev/null)
+        [ -n "$model_path" ] || { echo 0; return; }
+        dir="${model_path}/flashchat/q${bits}/system_prompt_cache"
+    fi
+    find "$dir" -maxdepth 1 -name '*.fcache' 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Context-meter inputs for a model: prints "MAX_CONTEXT KV_RAM_BYTES" where
+# KV_RAM_BYTES is the wired GPU KV-buffer size for `window` tokens at the given
+# kv-quant mode (off|q8|q4). One python call (registry geometry + arithmetic).
+flashchat_kv_meter_data() {
+    local model_id="$1" window="$2" kvq="$3"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -n "$model_id" ] && [ -f "$config_file" ] || { echo "0 0"; return 1; }
+    python3 -c "
+import json, sys
+cf, mid, win, kvq = sys.argv[1], sys.argv[2], int(sys.argv[3] or 0), (sys.argv[4] or 'off').lower()
+m = json.load(open(cf)).get('models', {}).get(mid, {})
+n_kv = int(m.get('num_key_value_heads', 0) or 0)
+kv_dim = n_kv * int(m.get('head_dim', 0) or 0)
+n_full = int(m.get('num_hidden_layers', 0) or 0) // max(1, int(m.get('full_attention_interval', 1) or 1))
+if kvq in ('q8', 'int8', '8'):   per = 2*kv_dim + 2*(n_kv*2)
+elif kvq in ('q4', 'int4', '4'): per = 2*(kv_dim//2) + 2*(n_kv*2)
+else:                            per = 2*kv_dim*4
+print(int(m.get('max_context', 0) or 0), per * n_full * win)
+" "$config_file" "$model_id" "$window" "$kvq" 2>/dev/null || echo "0 0"
+}
+
 # Resolve the *effective* active-experts value: $FLASHCHAT_ACTIVE_EXPERTS env
 # override if set and >0, else the model's trained num_experts_per_tok from
 # the registry. The env var is the user's escape hatch (e.g. for sweeping K
@@ -362,6 +405,109 @@ for model_id, model in data.get('models', {}).items():
 }
 
 # -----------------------------------------------------------------------------
+# Live KV-cache introspection (queries the running infer server's /health)
+# -----------------------------------------------------------------------------
+# Returns 0 if a fresh /health response is captured, non-zero otherwise. Uses
+# a 2s curl timeout so an unreachable server doesn't stall the TUI render —
+# the menu is informational, never a control signal.
+_flashchat_kv_cache_health_json() {
+    local host port url
+    # flashchat_server_connect_host is defined in the main launcher script
+    # (turns 0.0.0.0/:: into 127.0.0.1 for curl). When lib/config.sh is sourced
+    # standalone (other tools, tests) we fall back to 127.0.0.1 to stay
+    # self-contained — the menu only ever calls this from the main launcher,
+    # so the fallback path is purely defensive.
+    if declare -F flashchat_server_connect_host >/dev/null 2>&1; then
+        host="$(flashchat_server_connect_host)"
+    else
+        host="127.0.0.1"
+    fi
+    port="$(flashchat_get SERVER_PORT)"
+    url="http://${host}:${port}/health"
+    curl -fsS --max-time 2 "$url" 2>/dev/null
+}
+
+# Query /health and pull a single top-level field. Returns empty string if
+# the server is down, the field is missing, or the response is unparseable.
+# Recognized fields match the infer.m /health payload:
+#   context_used       — int: positions filled by the most recent request
+#   max_context        — int: configured context window in tokens
+#   kv_quantization    — str: "fp32" | "q8" | "q4"
+#   kv_total_bytes     — int: bytes of GPU buffer footprint at the configured window
+flashchat_kv_cache_field() {
+    local field="$1"
+    [ -n "$field" ] || return 1
+    local body
+    body="$(_flashchat_kv_cache_health_json)" || return 1
+    [ -n "$body" ] || return 1
+    python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+val = data.get(sys.argv[2], '')
+if isinstance(val, bool):
+    print('true' if val else 'false')
+elif val is None:
+    print('')
+else:
+    print(val)
+" "$body" "$field" 2>/dev/null
+}
+
+# Convenience: live KV-cache quantization label with a graceful fallback so
+# the TUI menu always shows *something* even when /health is unreachable
+# (cold start, server stopped, port collision). Falls back to the user-config
+# value, then to "fp32" — the same default the infer binary uses when
+# FLASHCHAT_KV_QUANT is unset. This keeps the menu label stable across the
+# "server not yet running" → "server starting" → "server running" transitions.
+flashchat_kv_cache_quantization() {
+    local q
+    q="$(flashchat_kv_cache_field kv_quantization 2>/dev/null)"
+    if [ -n "$q" ]; then
+        echo "$q"
+        return
+    fi
+    q=$(flashchat_get KV_QUANT)
+    case "$q" in
+        q8|8)  echo "q8" ;;
+        q4|4)  echo "q4" ;;
+        *)     echo "fp32" ;;
+    esac
+}
+
+# Returns the live "context_used" position count, or 0 when /health is
+# unreachable. The meter renders "0k" gracefully on cold start.
+flashchat_kv_cache_used() {
+    local v
+    v="$(flashchat_kv_cache_field context_used 2>/dev/null)"
+    [ -n "$v" ] && echo "$v"
+}
+
+# Returns the server's resolved context window in tokens, or the
+# config-derived CONTEXT_WINDOW as a fallback. Empty string only when neither
+# is available (the meter renders with max=0 → empty bar).
+flashchat_kv_cache_max() {
+    local v
+    v="$(flashchat_kv_cache_field max_context 2>/dev/null)"
+    if [ -n "$v" ]; then
+        echo "$v"
+        return
+    fi
+    v=$(flashchat_get CONTEXT_WINDOW)
+    [ -n "$v" ] && echo "$v"
+}
+
+# Returns the configured-window KV cache footprint in bytes, or 0 when not
+# available (meter renders "(0 MiB)" rather than empty parens).
+flashchat_kv_cache_total_bytes() {
+    local v
+    v="$(flashchat_kv_cache_field kv_total_bytes 2>/dev/null)"
+    [ -n "$v" ] && echo "$v"
+}
+
+# -----------------------------------------------------------------------------
 # Detect the HuggingFace snapshot path from model repo
 # -----------------------------------------------------------------------------
 _flashchat_detect_model_path() {
@@ -435,7 +581,7 @@ _flashchat_migrate_config() {
                REASONING TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY \
                SERVER_PORT SERVER_HOST SERVER_LOG_PATH SERVER_DEBUG SERVER_HTTP_LOG \
                SYSTEM_PROMPT_CACHE SYSTEM_PROMPT_CACHE_MAX_ENTRIES SYSTEM_PROMPT_CACHE_DIR MTP MTP_BF16 ACTIVE_EXPERTS \
-               SHOW_THINKING COLOR_OUTPUT; do
+               KV_QUANT CONTEXT_WINDOW SHOW_THINKING COLOR_OUTPUT; do
         if ! grep -qE "^${key}=" "$file" 2>/dev/null; then
             printf '%s="%s"\n' "$key" "${!key}" >> "$file"
             added=$((added + 1))
@@ -473,6 +619,8 @@ flashchat_load_config() {
     MTP=""
     MTP_BF16=""
     ACTIVE_EXPERTS=""
+    KV_QUANT=""
+    CONTEXT_WINDOW=""
     COLOR_OUTPUT=""
     SAMPLING_PROFILE=""
     REASONING=""
@@ -516,6 +664,8 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_MTP" ] && MTP="$FLASHCHAT_MTP"
     [ -n "$FLASHCHAT_MTP_BF16" ] && MTP_BF16="$FLASHCHAT_MTP_BF16"
     [ -n "$FLASHCHAT_ACTIVE_EXPERTS" ] && ACTIVE_EXPERTS="$FLASHCHAT_ACTIVE_EXPERTS"
+    [ -n "$FLASHCHAT_KV_QUANT" ] && KV_QUANT="$FLASHCHAT_KV_QUANT"
+    [ -n "$FLASHCHAT_CONTEXT_WINDOW" ] && CONTEXT_WINDOW="$FLASHCHAT_CONTEXT_WINDOW"
     [ -n "$FLASHCHAT_COLOR_OUTPUT" ] && COLOR_OUTPUT="$FLASHCHAT_COLOR_OUTPUT"
     [ -n "$FLASHCHAT_SAMPLING_PROFILE" ] && SAMPLING_PROFILE="$FLASHCHAT_SAMPLING_PROFILE"
     [ -n "$FLASHCHAT_HUGGINGFACE_CACHE_DIR" ] && HUGGINGFACE_CACHE_DIR="$FLASHCHAT_HUGGINGFACE_CACHE_DIR"
@@ -603,6 +753,8 @@ flashchat_load_config() {
     MTP="${MTP:-$FLASHCHAT_DEFAULT_MTP}"
     MTP_BF16="${MTP_BF16:-$FLASHCHAT_DEFAULT_MTP_BF16}"
     ACTIVE_EXPERTS="${ACTIVE_EXPERTS:-$FLASHCHAT_DEFAULT_ACTIVE_EXPERTS}"
+    KV_QUANT="${KV_QUANT:-$FLASHCHAT_DEFAULT_KV_QUANT}"
+    CONTEXT_WINDOW="${CONTEXT_WINDOW:-$FLASHCHAT_DEFAULT_CONTEXT_WINDOW}"
     COLOR_OUTPUT="${COLOR_OUTPUT:-$FLASHCHAT_DEFAULT_COLOR_OUTPUT}"
     REASONING="${REASONING:-$FLASHCHAT_DEFAULT_REASONING}"
     TEMPERATURE="${TEMPERATURE:-$FLASHCHAT_DEFAULT_TEMPERATURE}"
@@ -653,6 +805,8 @@ flashchat_get() {
         MTP) echo "$MTP" ;;
         MTP_BF16) echo "$MTP_BF16" ;;
         ACTIVE_EXPERTS) echo "$ACTIVE_EXPERTS" ;;
+        KV_QUANT) echo "$KV_QUANT" ;;
+        CONTEXT_WINDOW) echo "$CONTEXT_WINDOW" ;;
         COLOR_OUTPUT) echo "$COLOR_OUTPUT" ;;
         SAMPLING_PROFILE) echo "$SAMPLING_PROFILE" ;;
         REASONING) echo "$REASONING" ;;
@@ -715,6 +869,8 @@ SYSTEM_PROMPT_CACHE_DIR="${SYSTEM_PROMPT_CACHE_DIR:-$FLASHCHAT_DEFAULT_SYSTEM_PR
 MTP="${MTP:-$FLASHCHAT_DEFAULT_MTP}"
 MTP_BF16="${MTP_BF16:-$FLASHCHAT_DEFAULT_MTP_BF16}"
 ACTIVE_EXPERTS="${ACTIVE_EXPERTS:-$FLASHCHAT_DEFAULT_ACTIVE_EXPERTS}"
+KV_QUANT="${KV_QUANT:-$FLASHCHAT_DEFAULT_KV_QUANT}"
+CONTEXT_WINDOW="${CONTEXT_WINDOW:-$FLASHCHAT_DEFAULT_CONTEXT_WINDOW}"
 
 # UI Settings
 SHOW_THINKING="${SHOW_THINKING:-$FLASHCHAT_DEFAULT_SHOW_THINKING}"
@@ -792,3 +948,11 @@ export -f flashchat_model_sampling_profile_field
 export -f flashchat_model_sampling_profiles
 export -f flashchat_model_path_for_id
 export -f flashchat_list_models
+export -f _flashchat_kv_cache_health_json
+export -f flashchat_kv_cache_field
+export -f flashchat_kv_cache_quantization
+export -f flashchat_kv_cache_used
+export -f flashchat_kv_cache_max
+export -f flashchat_kv_cache_total_bytes
+export -f flashchat_kv_meter_data
+export -f flashchat_sysprompt_cache_count

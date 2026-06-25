@@ -96,6 +96,10 @@ ModelConfig g_cfg;
 static int g_gpu_kv_seq = DEFAULT_CONTEXT_WINDOW;
 #define GPU_KV_SEQ  g_gpu_kv_seq
 
+// Context length (prompt + generated) of the most recent chat request, for the
+// management-menu usage meter via /health. 0 until the first request completes.
+static int g_last_context_used = 0;
+
 // Model path has NO hardcoded default. It must be supplied explicitly (--model or
 // config); a missing model path is a fatal error, never a silent fallback to some
 // other model's weights (which would load and generate garbage). See main().
@@ -12235,6 +12239,16 @@ static void serve_loop(
         server_logf("[serve]   mtp: disabled\n");
     }
     server_logf("[serve]   gpu_linear_attention: %s\n", gpu_linear_attn_enabled ? "enabled" : "disabled");
+    {
+        size_t kv_total = (size_t)g_cfg.num_full_attn_layers * 2 *
+                          (size_t)GPU_KV_SEQ * kv_token_bytes();
+        const char *kv_q = "fp32";
+        int qb = kv_quant_bits();
+        if (qb == 8) kv_q = "q8";
+        else if (qb == 4) kv_q = "q4";
+        server_logf("[serve]   kv_cache: window=%d quant=%s total_bytes=%.1f MiB\n",
+                    GPU_KV_SEQ, kv_q, (double)kv_total / (1024.0 * 1024.0));
+    }
     server_logf("[serve]   system_prompt_cache: %s max_entries=%d\n",
                 g_system_prompt_cache_enabled ? "enabled" : "disabled",
                 g_system_prompt_cache_max_entries);
@@ -12315,9 +12329,27 @@ static void serve_loop(
         }
 
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            char health_json[256];
+            // context_used = final length (prompt + generated) of the most recent
+            // request; the management menu renders it as a usage meter.
+            // max_context / quantization / total_bytes describe the configured
+            // KV-cache footprint so the menu can render the right-hand end of the
+            // meter and the RAM figure without trusting client-side config (the
+            // server is the only place that knows GPU_KV_SEQ and the chosen
+            // kv_quant mode at runtime). Field names are part of the menu
+            // contract — flashchat's TUI parses them.
+            size_t kv_total = (size_t)g_cfg.num_full_attn_layers * 2 *
+                              (size_t)GPU_KV_SEQ * kv_token_bytes();
+            const char *kv_q = "fp32";
+            int qb = kv_quant_bits();
+            if (qb == 8) kv_q = "q8";
+            else if (qb == 4) kv_q = "q4";
+            char health_json[384];
             snprintf(health_json, sizeof(health_json),
-                     "{\"status\":\"ok\",\"model\":\"%s\",\"ready\":true}\n", g_cfg.model_id);
+                     "{\"status\":\"ok\",\"model\":\"%s\",\"ready\":true,"
+                     "\"context_used\":%d,\"max_context\":%d,"
+                     "\"kv_quantization\":\"%s\",\"kv_total_bytes\":%zu}\n",
+                     g_cfg.model_id, g_last_context_used, GPU_KV_SEQ,
+                     kv_q, kv_total);
             send_json_ok(client_fd, health_json);
             free(reqbuf); close(client_fd);
             continue;
@@ -13181,6 +13213,9 @@ tool_call_checked:
                                              req.reasoning_enabled);
             }
         }
+
+        // Final context length of this request (prompt + generated) for the menu meter.
+        g_last_context_used = pos;
 
         if (mtp_shadow_checks > 0) {
             double acc_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
