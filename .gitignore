@@ -49,3 +49,6 @@ debug/
 
 # Local agent/tooling metadata
 .serena/
+
+# claude-analyzer
+optimizer/
