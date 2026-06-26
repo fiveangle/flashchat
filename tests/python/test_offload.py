@@ -21,12 +21,18 @@ class OffloadBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cache = os.path.join(self.tmp.name, "hub")
         self.dest = os.path.join(self.tmp.name, "offload")
+        self.old_config_dir = os.environ.get("FLASHCHAT_CONFIG_DIR")
+        os.environ["FLASHCHAT_CONFIG_DIR"] = os.path.join(self.tmp.name, "config")
         os.makedirs(self.cache)
         os.makedirs(self.dest)
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")
 
     def tearDown(self):
+        if self.old_config_dir is None:
+            os.environ.pop("FLASHCHAT_CONFIG_DIR", None)
+        else:
+            os.environ["FLASHCHAT_CONFIG_DIR"] = self.old_config_dir
         self.tmp.cleanup()
 
 
@@ -101,13 +107,16 @@ class TestOriginals(OffloadBase):
 
 
 class TestFullOffload(OffloadBase):
-    def test_full_roundtrip_preserves_links_without_duplicating_bytes(self):
+    def test_offload_model_syncs_tree_and_removes_local_source_blobs(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4", "q8"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        blob_link = os.path.join(snapshot, "model-00001-of-00001.safetensors")
 
-        copied = offload.offload_full(self.moe, snapshot, self.dest)
+        copied = offload.offload_model(self.moe, snapshot, self.dest)
         self.assertTrue(os.path.exists(repo_root), "full archive must keep local files")
         self.assertEqual(offload.archive_state(self.moe, self.dest), "full")
+        self.assertTrue(os.path.islink(blob_link))
+        self.assertFalse(os.path.exists(blob_link))
         from modelmgr.artifacts import variant_ready
         self.assertTrue(variant_ready(self.moe, "q4", snapshot))
 
@@ -117,10 +126,14 @@ class TestFullOffload(OffloadBase):
         link_rels = [r for r in journal.data["links"] if r.endswith("q4/vocab.bin")]
         self.assertTrue(link_rels)
         self.assertFalse(any(r.endswith("q4/vocab.bin") for r in journal.data["files"]))
+        weights_rel = next(r for r in journal.data["files"]
+                           if r.endswith("q4/model_weights.bin"))
+        self.assertIsNone(journal.data["files"][weights_rel]["sha256"])
+        self.assertTrue(journal.data["files"][weights_rel]["present_in_offload"])
 
         shutil.rmtree(repo_root)
         restored = offload.restore_full(self.moe, self.cache, self.dest)
-        self.assertEqual(restored, copied)
+        self.assertGreater(restored, copied)
         new_snapshot = paths.snapshot_dir(self.cache, self.moe.hf_repo)
         self.assertEqual(new_snapshot, snapshot)
         link = os.path.join(paths.variant_dir(snapshot, "q4"), "vocab.bin")
@@ -147,7 +160,7 @@ class TestFullOffload(OffloadBase):
         old_journal.mark_file(old_rel, os.path.getsize(old_dst), "old")
         old_journal.save()
 
-        offload.offload_full(self.moe, snapshot, self.dest)
+        offload.offload_model(self.moe, snapshot, self.dest)
 
         self.assertTrue(os.path.isfile(cache_file), "local cache must remain")
         journal = offload.Journal(dest_repo)
@@ -162,18 +175,60 @@ class TestFullOffload(OffloadBase):
     def test_restore_runtime_only_skips_blobs(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
-        offload.offload_full(self.moe, snapshot, self.dest)
+        offload.offload_model(self.moe, snapshot, self.dest)
         shutil.rmtree(repo_root)
         offload.restore_runtime_only(self.moe, self.cache, self.dest)
         self.assertTrue(os.path.isfile(
             os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.bin")))
         self.assertFalse(os.path.isdir(os.path.join(repo_root, "blobs")))
 
+    def test_restore_full_supports_legacy_unjournaled_archive(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        dest_repo = offload.dest_repo_dir(self.dest, self.moe)
+        shutil.copytree(repo_root, dest_repo, symlinks=True)
+        shutil.rmtree(repo_root)
 
-class TestLegacyArchiveAdoption(OffloadBase):
-    """Pre-journal archives (from the old mv-based offload) must be adopted
-    by hash verification, never blindly re-copied — and never blindly
-    trusted on size alone, since the archive may be restored later."""
+        restored = offload.restore_full(self.moe, self.cache, self.dest)
+
+        self.assertGreater(restored, 0)
+        self.assertTrue(os.path.isfile(
+            os.path.join(paths.variant_dir(snapshot, "q4"), "model_weights.bin")))
+        self.assertTrue(os.path.exists(
+            os.path.join(snapshot, "model-00001-of-00001.safetensors")))
+
+    def test_dirty_artifact_scope_can_be_synced_later(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        local_weights = os.path.join(paths.variant_dir(snapshot, "q4"),
+                                     "model_weights.bin")
+        with open(local_weights, "ab") as f:
+            f.write(b"changed")
+
+        offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4"])
+        self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
+        dest_weights = os.path.join(
+            offload.dest_repo_dir(self.dest, self.moe),
+            "snapshots", os.path.basename(snapshot), "flashchat", "q4",
+            "model_weights.bin")
+        self.assertNotEqual(os.path.getsize(local_weights),
+                            os.path.getsize(dest_weights))
+
+        synced = offload.sync_artifact_scopes(
+            self.moe, snapshot, self.dest, ["q4"])
+        self.assertGreater(synced, 0)
+        self.assertEqual(os.path.getsize(local_weights),
+                         os.path.getsize(dest_weights))
+        self.assertEqual(offload.pending_scopes(self.moe), [])
+
+    def test_dirty_artifact_scope_is_remembered_when_offload_unavailable(self):
+        offload.mark_artifact_scopes_dirty(
+            self.moe, os.path.join(self.tmp.name, "missing-offload"), ["shared"])
+        self.assertEqual(offload.pending_scopes(self.moe), ["shared"])
+
+
+class TestLightweightOffload(OffloadBase):
+    """The default offload path trusts successful rsync plus lightweight metadata."""
 
     def _make_legacy_archive(self, repo_root):
         """Simulate an old mv-style archive: identical tree, no journal."""
@@ -181,7 +236,7 @@ class TestLegacyArchiveAdoption(OffloadBase):
         shutil.copytree(repo_root, dest_repo, symlinks=True)
         return dest_repo
 
-    def test_identical_legacy_archive_adopted_without_recopy(self):
+    def test_existing_archive_refreshed_without_hashing(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
         dest_repo = self._make_legacy_archive(repo_root)
@@ -189,19 +244,16 @@ class TestLegacyArchiveAdoption(OffloadBase):
         weights_dst = os.path.join(
             dest_repo, os.path.relpath(snapshot, repo_root),
             "flashchat", "q4", "model_weights.bin")
-        before = os.stat(weights_dst).st_mtime_ns
-
-        copied = offload.offload_full(self.moe, snapshot, self.dest)
-        self.assertEqual(copied, 0, "identical archive must be adopted, not re-copied")
-        self.assertEqual(os.stat(weights_dst).st_mtime_ns, before,
-                         "adopted file must not be rewritten")
+        copied = offload.offload_model(self.moe, snapshot, self.dest)
+        self.assertGreater(copied, 0)
         journal = offload.Journal(dest_repo)
         self.assertTrue(journal.data["files"], "adoption must populate the journal")
         for entry in journal.data["files"].values():
-            self.assertTrue(entry.get("sha256"), "adopted entries carry verified hashes")
+            self.assertIsNone(entry.get("sha256"))
+            self.assertTrue(entry.get("present_in_offload"))
         self.assertTrue(os.path.exists(repo_root), "full archive keeps local files")
 
-    def test_stale_same_size_archive_copy_is_recopied(self):
+    def test_stale_same_size_archive_copy_is_left_to_rsync_metadata_policy(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
         dest_repo = self._make_legacy_archive(repo_root)
@@ -211,14 +263,13 @@ class TestLegacyArchiveAdoption(OffloadBase):
         with open(victim, "r+b") as f:
             f.write(b"X")  # same size, different content
 
-        copied = offload.offload_full(self.moe, snapshot, self.dest)
-        self.assertGreater(copied, 0, "stale copy must be replaced")
+        offload.offload_model(self.moe, snapshot, self.dest)
         journal = offload.Journal(dest_repo)
         rel = os.path.relpath(victim, dest_repo)
-        from modelmgr.artifacts import sha256_file
-        self.assertEqual(journal.data["files"][rel]["sha256"], sha256_file(victim)[0])
+        self.assertIn(rel, journal.data["files"])
+        self.assertIsNone(journal.data["files"][rel]["sha256"])
 
-    def test_offload_originals_adopts_existing_blobs(self):
+    def test_source_blobs_removed_after_existing_archive_confirmed_by_size(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
         dest_repo = offload.dest_repo_dir(self.dest, self.moe)
@@ -226,13 +277,12 @@ class TestLegacyArchiveAdoption(OffloadBase):
                         os.path.join(dest_repo, "blobs"))
         blob_dst = next(os.path.join(dest_repo, "blobs", n)
                         for n in os.listdir(os.path.join(dest_repo, "blobs")))
-        before = os.stat(blob_dst).st_mtime_ns
-
-        moved = offload.offload_originals(self.moe, snapshot, self.dest)
+        moved = offload.offload_model(self.moe, snapshot, self.dest)
         self.assertGreater(moved, 0)
-        self.assertEqual(os.stat(blob_dst).st_mtime_ns, before,
-                         "existing identical blob must be adopted, not rewritten")
-        self.assertEqual(offload.archive_state(self.moe, self.dest), "originals")
+        self.assertTrue(os.path.isfile(blob_dst))
+        blob_link = os.path.join(snapshot, "model-00001-of-00001.safetensors")
+        self.assertFalse(os.path.exists(blob_link))
+        self.assertEqual(offload.archive_state(self.moe, self.dest), "full")
 
 
 class TestTransferEngine(OffloadBase):
@@ -269,18 +319,18 @@ class TestTransferEngine(OffloadBase):
                     if f.endswith(".partial")]
         self.assertEqual(partials, [])
 
-    def test_corrupt_archive_detected_on_restore(self):
+    def test_restore_trusts_lightweight_journal_entries_without_hashes(self):
         snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
         repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
-        offload.offload_full(self.moe, snapshot, self.dest)
+        offload.offload_model(self.moe, snapshot, self.dest)
         dest_repo = offload.dest_repo_dir(self.dest, self.moe)
         journal = offload.Journal(dest_repo)
         victim = next(r for r in journal.data["files"] if r.endswith("model_weights.bin"))
         with open(os.path.join(dest_repo, victim), "r+b") as f:
             f.write(b"X")  # same size, corrupted content
         shutil.rmtree(repo_root)
-        with self.assertRaisesRegex(offload.OffloadError, "hash verification"):
-            offload.restore_full(self.moe, self.cache, self.dest)
+        restored = offload.restore_full(self.moe, self.cache, self.dest)
+        self.assertGreater(restored, 0)
 
 
 if __name__ == "__main__":

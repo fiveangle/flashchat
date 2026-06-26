@@ -88,16 +88,19 @@ idempotent per snapshot, `--dry-run` to preview.
 
 `modelmgr/offload.py` replaces the old `mv`-based offload:
 capability-probing preflight (writability/symlinks/space — surfaces NAS/USB
-permission failures before any transfer), streamed copy with hash-on-read,
-journaled resume, delete-only-after-verify. Archives never store
-`from_shared` duplicates regardless of destination filesystem. Operations:
-archive originals (the automation default), full offload, restore
-full/runtime-only/originals.
+permission failures before any transfer), rsync-based model-directory refresh,
+lightweight offload metadata, and local source-blob removal only after the
+offload copy is present with matching size. Full hashing is reserved for
+explicit deep/audit flows, not the default offload path. Archives never store
+`system_prompt_cache` because it may contain prompt-derived user data.
+Operations: offload model, restore full/runtime-only/originals.
 
 Automation: after a successful build, and once per launch when the offload
-volume is reachable, flashchat offers to archive original safetensors for
-models whose runtimes are complete. `[M]anage` is for everything manual:
-per-artifact verify/regenerate, variant deletion, archive moves.
+volume is reachable, flashchat offers to offload complete models and later
+refreshes pending artifact scopes (`shared`, `q4`, `q8`) when local runtime
+artifacts changed while the offload copy was stale or unavailable. `[M]anage`
+is for everything manual: per-artifact verify/regenerate, variant deletion,
+offload and restore.
 
 ## Testing
 

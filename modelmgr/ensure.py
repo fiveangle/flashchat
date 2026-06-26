@@ -127,6 +127,9 @@ def run(interactive: bool = True) -> bool:
             if new_selection:
                 manifest, variant_name = new_selection
 
+    if ready and interactive:
+        _offer_pending_offload_sync(manifest, snapshot or _selected_snapshot(manifest))
+
     # Keep the engine-facing keys coherent with the selection.
     configfile.update({
         "MODEL": resolved_id(manifest, variant_name),
@@ -137,6 +140,31 @@ def run(interactive: bool = True) -> bool:
     registry.state.save()
     resolved.write(registry)
     return ready
+
+
+def _offer_pending_offload_sync(manifest, snapshot: str | None) -> None:
+    if not snapshot:
+        return
+    od = offload_dir()
+    if not od or offload.archive_state(manifest, od) != "full":
+        return
+    scopes = offload.pending_scopes(manifest)
+    if not scopes:
+        return
+    from .tui import common
+    print(f"\nOffloaded model {manifest.hf_repo} artifacts require updating: "
+          f"{', '.join(scopes)}.")
+    if not common.confirm("Update the offload copy now?", default=False):
+        return
+    progress = common.ProgressLine()
+    try:
+        synced = offload.sync_artifact_scopes(
+            manifest, snapshot, od, scopes, progress=progress)
+        print(common.green(f"updated offload copy ({paths.human_bytes(synced)})"))
+    except offload.OffloadError as e:
+        print(common.red(f"offload update failed: {e}"))
+    finally:
+        progress.finish()
 
 
 def _run_migration(registry: Registry, interactive: bool) -> None:

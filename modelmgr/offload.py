@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 
@@ -31,11 +32,12 @@ from .artifacts import sha256_file
 from .manifest import Manifest
 
 JOURNAL_NAME = ".flashchat_offload.json"
+PENDING_NAME = "offload_pending.json"
 JOURNAL_SCHEMA = 1
 _CHUNK = 8 * 1024 * 1024
 
 # Sidecar files HF puts beside snapshots that are worthless on the archive.
-_SKIP_NAMES = {".DS_Store", ".lock"}
+_SKIP_NAMES = {".DS_Store", ".lock", JOURNAL_NAME}
 _FULL_ARCHIVE_SKIP_DIRS = {"system_prompt_cache"}
 
 
@@ -144,6 +146,9 @@ class Journal:
                 self.data = json.load(f)
         else:
             self.data = {"schema": JOURNAL_SCHEMA, "files": {}, "links": {}}
+        self.data.setdefault("files", {})
+        self.data.setdefault("links", {})
+        self.data.setdefault("dirty_scopes", [])
 
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -156,8 +161,14 @@ class Journal:
         entry = self.data["files"].get(rel)
         return bool(entry and entry.get("done") and entry.get("size") == size)
 
-    def mark_file(self, rel: str, size: int, sha256: str | None) -> None:
-        self.data["files"][rel] = {"size": size, "sha256": sha256, "done": True}
+    def mark_file(self, rel: str, size: int, sha256: str | None,
+                  mtime_ns: int | None = None,
+                  present_in_offload: bool = True) -> None:
+        entry = {"size": size, "sha256": sha256, "done": True,
+                 "present_in_offload": present_in_offload}
+        if mtime_ns is not None:
+            entry["mtime_ns"] = mtime_ns
+        self.data["files"][rel] = entry
 
     def mark_link(self, rel: str, target: str) -> None:
         self.data["links"][rel] = target
@@ -236,6 +247,122 @@ def _prune_archive_dirs(dest_root: str, journal: Journal, skip_dirs) -> None:
 
     if changed:
         journal.save()
+
+
+def _record_archive_tree(dest_root: str, journal: Journal, skip_dirs=None) -> int:
+    total = 0
+    journal.data["files"] = {}
+    journal.data["links"] = {}
+    journal.data["dirty_scopes"] = []
+    for rel, kind in _walk_tree(dest_root, skip_dirs=skip_dirs):
+        full = os.path.join(dest_root, rel)
+        if kind == "link":
+            journal.mark_link(rel, os.readlink(full))
+            continue
+        st = os.stat(full)
+        journal.mark_file(rel, st.st_size, None, st.st_mtime_ns,
+                          present_in_offload=True)
+        total += st.st_size
+    journal.save()
+    return total
+
+
+def _pending_path() -> str:
+    return os.path.join(paths.config_dir(), PENDING_NAME)
+
+
+def _load_pending() -> dict:
+    path = _pending_path()
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_pending(data: dict) -> None:
+    path = _pending_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def pending_scopes(manifest: Manifest) -> list[str]:
+    data = _load_pending()
+    return sorted(set(data.get(manifest.id, [])))
+
+
+def _set_pending_scopes(manifest: Manifest, scopes: list[str]) -> None:
+    data = _load_pending()
+    scopes = sorted(set(scopes))
+    if scopes:
+        data[manifest.id] = scopes
+    elif manifest.id in data:
+        del data[manifest.id]
+    _save_pending(data)
+
+
+def mark_artifact_scopes_dirty(manifest: Manifest, offload_dir: str,
+                               scopes: list[str]) -> None:
+    scopes = sorted(set(scopes))
+    if not scopes:
+        return
+    _set_pending_scopes(manifest, pending_scopes(manifest) + scopes)
+    if not offload_dir or archive_state(manifest, offload_dir) != "full":
+        return
+    dest = dest_repo_dir(offload_dir, manifest)
+    if not os.path.isdir(dest):
+        return
+    journal = Journal(dest)
+    journal.data["dirty_scopes"] = sorted(
+        set(journal.data.get("dirty_scopes", []) + scopes))
+    journal.save()
+
+
+def sync_artifact_scopes(manifest: Manifest, snapshot: str, offload_dir: str,
+                         scopes: list[str], progress=None) -> int:
+    if archive_state(manifest, offload_dir) != "full":
+        raise OffloadError("no full offload archive found for this model")
+    dest = dest_repo_dir(offload_dir, manifest)
+    repo_root = os.path.dirname(os.path.dirname(snapshot))
+    total = 0
+    for scope in sorted(set(scopes)):
+        rel = os.path.join("snapshots", os.path.basename(snapshot),
+                           "flashchat", scope)
+        src = os.path.join(repo_root, rel)
+        dst = os.path.join(dest, rel)
+        if not os.path.isdir(src):
+            continue
+        _rsync_tree(src, dst, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
+                    progress=progress)
+        total += paths.dir_size_bytes(src)
+    journal = Journal(dest)
+    _record_archive_tree(dest, journal, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
+    remaining = [s for s in pending_scopes(manifest) if s not in set(scopes)]
+    _set_pending_scopes(manifest, remaining)
+    journal.data["dirty_scopes"] = remaining
+    journal.save()
+    return total
+
+
+def _rsync_tree(src_root: str, dest_root: str, skip_dirs=None, progress=None) -> None:
+    os.makedirs(dest_root, exist_ok=True)
+    cmd = ["rsync", "-a", "--delete"]
+    for dirname in sorted(set(skip_dirs or ())):
+        cmd.extend(["--exclude", dirname + "/"])
+    cmd.extend([src_root.rstrip("/") + "/", dest_root.rstrip("/") + "/"])
+    if progress:
+        progress("rsync", 0, 0, os.path.basename(src_root.rstrip("/")) or src_root)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as e:
+        raise OffloadError("rsync is required for offload operations") from e
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or "").strip()
+        raise OffloadError(f"rsync failed: {detail or e}") from e
 
 
 def _adopt_existing(src: str, dst: str, rel: str, journal: Journal,
@@ -401,6 +528,46 @@ def offload_originals(manifest: Manifest, snapshot: str, offload_dir: str,
     return moved
 
 
+def offload_model(manifest: Manifest, snapshot: str, offload_dir: str,
+                  progress=None) -> int:
+    """Sync the whole model repo to offload storage, then remove local source blobs."""
+    if not os.path.isdir(snapshot):
+        return 0
+    repo_root = os.path.dirname(os.path.dirname(snapshot))
+    blob_files = list_blob_files(snapshot)
+    needed = 0
+    dest = dest_repo_dir(offload_dir, manifest)
+    for rel, kind in _walk_tree(repo_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS):
+        if kind != "file":
+            continue
+        src = os.path.join(repo_root, rel)
+        dst = os.path.join(dest, rel)
+        size = os.path.getsize(src)
+        if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
+            needed += size
+    report = preflight(offload_dir, needed_bytes=needed)
+    if not report.ok:
+        raise OffloadError("; ".join(report.errors))
+    journal = Journal(dest)
+    _rsync_tree(repo_root, dest, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
+                progress=progress)
+    _prune_archive_dirs(dest, journal, _FULL_ARCHIVE_SKIP_DIRS)
+    archived_bytes = _record_archive_tree(dest, journal,
+                                          skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
+    _set_pending_scopes(manifest, [])
+    removed = 0
+    for _rel, target in blob_files:
+        blob_rel = os.path.join("blobs", os.path.basename(target))
+        blob_dst = os.path.join(dest, blob_rel)
+        if os.path.isfile(blob_dst) and os.path.getsize(blob_dst) == os.path.getsize(target):
+            removed += os.path.getsize(target)
+            os.unlink(target)
+        else:
+            raise OffloadError(
+                f"offload copy missing or incomplete for source blob: {blob_rel}")
+    return archived_bytes if not removed else removed
+
+
 def restore_originals(manifest: Manifest, snapshot: str, offload_dir: str,
                       progress=None) -> int:
     dest = dest_repo_dir(offload_dir, manifest)
@@ -446,9 +613,13 @@ def restore_full(manifest: Manifest, cache_dir: str, offload_dir: str,
                  progress=None) -> int:
     dest = dest_repo_dir(offload_dir, manifest)
     journal = Journal(dest)
-    if not journal.data["files"]:
-        raise OffloadError(f"no archive found under {dest}")
     repo_root = paths.repo_root_dir(os.path.expanduser(cache_dir), manifest.hf_repo)
+    if not journal.data["files"]:
+        if not os.path.isdir(os.path.join(dest, "snapshots")):
+            raise OffloadError(f"no archive found under {dest}")
+        _rsync_tree(dest, repo_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
+                    progress=progress)
+        return paths.dir_size_bytes(repo_root)
     return restore_tree(dest, repo_root, journal, progress=progress)
 
 
@@ -473,6 +644,8 @@ def archive_state(manifest: Manifest, offload_dir: str) -> str:
     if not offload_dir:
         return "none"
     dest = dest_repo_dir(offload_dir, manifest)
+    if os.path.isdir(os.path.join(dest, "snapshots")):
+        return "full"
     if not os.path.isfile(os.path.join(dest, JOURNAL_NAME)):
         # Legacy full-tree offloads (old `mv`-based manage) have no journal.
         if os.path.isdir(os.path.join(dest, "snapshots")):

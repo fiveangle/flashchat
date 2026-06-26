@@ -74,6 +74,10 @@ def _source_blobs_present(manifest: Manifest, snapshot: str) -> bool:
     return False
 
 
+def source_blobs_present(manifest: Manifest, snapshot: str | None) -> bool:
+    return bool(snapshot and _source_blobs_present(manifest, snapshot))
+
+
 def plan(manifest: Manifest, variant_name: str, snapshot: str,
          want_optional: bool = False, want_mtp: bool = False,
          force: bool = False) -> Plan:

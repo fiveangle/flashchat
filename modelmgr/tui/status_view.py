@@ -1,6 +1,6 @@
 """Status rendering: one block per base model with per-variant lines."""
 
-from .. import paths
+from .. import offload, paths
 from ..registry import Registry
 from ..status import ModelStatus, all_statuses, hf_cache_dir, offload_dir, selected_model
 from . import common
@@ -41,6 +41,9 @@ def print_model_block(index: int, status: ModelStatus, current=None) -> None:
         where.append("not downloaded")
     if status.archive != "none":
         where.append(f"archive: {status.archive}")
+    pending = offload.pending_scopes(m)
+    if pending:
+        where.append(f"offload pending: {', '.join(pending)}")
     print(f"     {' | '.join(where)}")
     for vname in m.variants:
         sel = " <- selected" if (current and current[0].id == m.id

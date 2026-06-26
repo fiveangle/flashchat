@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from . import paths, recipes
+from . import configfile, offload, paths, recipes
 from .artifacts import expert_pack_size
 from .manifest import Manifest
 from .steps import StepContext, load_step
@@ -46,26 +46,34 @@ def plan_total_bytes(manifest: Manifest, variant_name: str, plan: recipes.Plan) 
 
 def execute_plan(manifest: Manifest, variant_name: str, snapshot: str,
                  plan: recipes.Plan, progress=None, dry_run: bool = False,
-                 options: dict | None = None) -> None:
+                 options: dict | None = None,
+                 output_snapshot: str | None = None) -> set[str]:
     """Run every planned step in order. Raises on the first failure —
     completed artifacts stay valid (each step commits its own manifest)."""
     if plan.needs_download:
         raise RuntimeError(
             "original model files are not local — download/restore them first")
+    output_snapshot = output_snapshot or snapshot
+    changed_scopes = set()
     for planned in plan.steps:
         ctx = StepContext(
             manifest=manifest,
             variant_name=variant_name if planned.scope != "shared" else
             (variant_name or next(iter(manifest.variants))),
             snapshot=snapshot,
-            shared_dir=paths.shared_dir(snapshot),
-            variant_dir=paths.variant_dir(snapshot, variant_name),
+            shared_dir=paths.shared_dir(output_snapshot),
+            variant_dir=paths.variant_dir(output_snapshot, variant_name),
             progress=progress,
             dry_run=dry_run,
             options=options or {},
         )
         runner = load_step(planned.step)
         runner(ctx, planned)
+        changed_scopes.add("shared" if planned.scope == "shared" else variant_name)
+    if changed_scopes and not dry_run:
+        offload.mark_artifact_scopes_dirty(
+            manifest, configfile.get("OFFLOAD_DIR", ""), sorted(changed_scopes))
+    return changed_scopes
 
 
 def free_space_ok(snapshot: str, needed_bytes: int) -> tuple[bool, int]:
