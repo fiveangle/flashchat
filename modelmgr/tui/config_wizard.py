@@ -385,6 +385,11 @@ def _advanced_settings(manifest) -> dict:
     for key, label, default in (
             ("SERVER_DEBUG", "Server debug logging (0/1)", "0"),
             ("SERVER_HTTP_LOG", "HTTP traffic log (0/1)", "0"),
+            ("PREAD_PROFILE", "Expert-streaming pread timing profile (empty = off; path = write TSV, e.g. debug/pread.tsv)", ""),
+            ("PREAD_PROFILE_CAP", "Max pread records to buffer (pread profile)", "2097152"),
+            ("EXPERT_PIN_MAX_GB", "Expert pin-cache cap in GiB (0 = off; keeps hottest experts RAM-resident on low-RAM machines)", "4"),
+            ("EXPERT_PIN_AUTO_FRAC", "Expert pin-cache: fraction of free RAM to use, capped by the GiB max", "0.5"),
+            ("EXPERT_PIN_MLOCK", "Expert pin-cache: mlock arena against swap (0/1)", "0"),
             ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1"),
             ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "Cache max entries", "2"),
             ("SYSTEM_PROMPT_CACHE_DIR", "External system prompt cache root (- for model directory)", ""),

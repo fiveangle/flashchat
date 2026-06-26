@@ -74,6 +74,9 @@
 #include <compression.h>
 #include <dirent.h>
 #include <libgen.h>
+#include <stdatomic.h>
+#include <pthread/pthread.h>
+#include <mach/mach.h>
 
 #include "model_config.h"
 
@@ -6343,6 +6346,7 @@ typedef struct {
     size_t size;
     ssize_t result;
     const void *mmap_base;  // if non-NULL, memcpy from mmap instead of pread
+    int gid;                // global expert id (layer*num_experts+expert), -1 if N/A
 } InferPreadTask;
 
 typedef struct {
@@ -6351,12 +6355,302 @@ typedef struct {
     int thread_id;
 } InferPreadThreadArg;
 
+// ============================================================================
+// pread profiler (FLASHCHAT_PREAD_PROFILE=<out.tsv>)
+// ----------------------------------------------------------------------------
+// Records per-pread wall time for every expert-streaming read so cache-hit
+// (served from OS page cache / RAM) vs miss (real SSD I/O) behaviour can be
+// analysed offline. One TSV row per pread; classification (hit/miss) is left
+// to the analysis script — the C side just records raw timing. Zero overhead
+// unless the env var is set. Records are buffered in RAM and flushed at clean
+// exit (atexit), so stop the server with SIGINT/SIGTERM, not SIGKILL.
+//   FLASHCHAT_PREAD_PROFILE      output .tsv path (enables profiling)
+//   FLASHCHAT_PREAD_PROFILE_CAP  max records to keep (default 2,097,152)
+// ============================================================================
+typedef struct {
+    uint64_t t_start_ns;   // monotonic, relative to first record
+    uint64_t dur_ns;
+    uint64_t tid;
+    int64_t  offset;
+    int64_t  size;
+    int64_t  result;
+    int32_t  gid;          // global expert id (layer*num_experts+expert), -1 if N/A
+} PreadRec;
+
+static PreadRec      *g_pread_recs = NULL;
+static _Atomic long   g_pread_idx  = 0;
+static long           g_pread_cap  = 0;
+static uint64_t       g_pread_t0_ns = 0;
+static const char    *g_pread_path = NULL;
+static pthread_once_t g_pread_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_pread_flush_mu = PTHREAD_MUTEX_INITIALIZER;
+// Re-write the TSV every this-many preads so the file appears (and stays
+// current) during a long-running server session, not only at exit.
+#define PREAD_FLUSH_EVERY 20000L
+
+static inline uint64_t prof_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// Snapshot all buffered records to the TSV. Idempotent (truncates + rewrites),
+// mutex-guarded so concurrent IO threads can't clobber the file mid-write.
+// Safe to call from the shutdown path, atexit, or periodically during the run.
+static void prof_pread_flush(void) {
+    if (!g_pread_recs || !g_pread_path) return;
+    pthread_mutex_lock(&g_pread_flush_mu);
+    long n = atomic_load(&g_pread_idx);
+    if (n > g_pread_cap) n = g_pread_cap;   // dropped overflow records
+    FILE *f = fopen(g_pread_path, "w");
+    if (!f) {
+        fprintf(stderr, "[pread-profile] cannot open %s: %s\n",
+                g_pread_path, strerror(errno));
+        pthread_mutex_unlock(&g_pread_flush_mu);
+        return;
+    }
+    size_t esz = active_expert_size();
+    // `gid` is the globally-unique expert key (layer*num_experts+expert); use it
+    // for working-set analysis. `expert_idx` is the legacy per-layer-file offset
+    // bucket and collapses layers — kept only for back-compat.
+    fprintf(f, "seq\tt_rel_us\tdur_us\ttid\texpert_idx\toffset\tsize\tresult\tmb_per_s\tgid\n");
+    for (long i = 0; i < n; i++) {
+        PreadRec *r = &g_pread_recs[i];
+        double dur_us = r->dur_ns / 1000.0;
+        double mbps = dur_us > 0.0 ? (r->size / 1048576.0) / (dur_us / 1e6) : 0.0;
+        long eidx = (esz > 0 && r->size == (int64_t)esz) ? (long)(r->offset / (int64_t)esz) : -1;
+        fprintf(f, "%ld\t%.3f\t%.3f\t%llu\t%ld\t%lld\t%lld\t%lld\t%.1f\t%d\n",
+                i, r->t_start_ns / 1000.0, dur_us,
+                (unsigned long long)r->tid, eidx,
+                (long long)r->offset, (long long)r->size, (long long)r->result, mbps,
+                (int)r->gid);
+    }
+    fclose(f);
+    fprintf(stderr, "[pread-profile] wrote %ld records to %s%s\n", n, g_pread_path,
+            atomic_load(&g_pread_idx) > g_pread_cap ? " (cap hit — some records dropped)" : "");
+    pthread_mutex_unlock(&g_pread_flush_mu);
+}
+
+static void prof_pread_init(void) {
+    const char *p = getenv("FLASHCHAT_PREAD_PROFILE");
+    if (!p || !*p) return;
+    const char *cap_env = getenv("FLASHCHAT_PREAD_PROFILE_CAP");
+    // Empty/zero/garbage (e.g. an unset config key bridged as "") -> default.
+    g_pread_cap = (cap_env && atol(cap_env) > 0) ? atol(cap_env) : (1L << 21); // ~2M records
+    g_pread_recs = (PreadRec *)calloc((size_t)g_pread_cap, sizeof(PreadRec));
+    if (!g_pread_recs) {
+        fprintf(stderr, "[pread-profile] alloc of %ld records failed\n", g_pread_cap);
+        return;
+    }
+    g_pread_path = p;
+    g_pread_t0_ns = prof_now_ns();
+    atexit(prof_pread_flush);
+    fprintf(stderr, "[pread-profile] enabled -> %s (cap=%ld, %.1f MB buffer)\n",
+            p, g_pread_cap, g_pread_cap * (double)sizeof(PreadRec) / 1048576.0);
+}
+
+// Timing wrapper around pread() for the expert-streaming task executors. `gid`
+// is the globally-unique expert key (layer*num_experts+expert) when known, else
+// -1; it lets offline analysis avoid collapsing per-layer-file offsets.
+static ssize_t prof_pread(int fd, void *dst, size_t size, off_t offset, int gid) {
+    pthread_once(&g_pread_once, prof_pread_init);
+    if (!g_pread_recs) return pread(fd, dst, size, offset);   // profiling off
+    uint64_t t0 = prof_now_ns();
+    ssize_t res = pread(fd, dst, size, offset);
+    uint64_t t1 = prof_now_ns();
+    long idx = atomic_fetch_add(&g_pread_idx, 1);
+    if (idx < g_pread_cap) {
+        uint64_t tid = 0;
+        pthread_threadid_np(NULL, &tid);
+        PreadRec *r = &g_pread_recs[idx];
+        r->t_start_ns = t0 - g_pread_t0_ns;
+        r->dur_ns     = t1 - t0;
+        r->tid        = tid;
+        r->offset     = (int64_t)offset;
+        r->size       = (int64_t)size;
+        r->result     = (int64_t)res;
+        r->gid        = gid;
+    }
+    // Periodic snapshot so the TSV exists during a running server, not only at
+    // exit (atexit does NOT fire on SIGKILL, and a daemon may never exit).
+    if (idx > 0 && (idx % PREAD_FLUSH_EVERY) == 0) prof_pread_flush();
+    return res;
+}
+
+// ============================================================================
+// Expert pin-cache (FLASHCHAT_EXPERT_PIN_MAX_GB)
+// ----------------------------------------------------------------------------
+// Under memory pressure (low-RAM machines) the OS page cache thrashes and the
+// per-token MoE expert preads turn into real SSD I/O (measured: 43% of pread
+// wall time on an emulated 16 GB box). This keeps the hottest whole experts in
+// a never-evicted RAM arena, keyed by global id (layer*num_experts + expert).
+// Hits memcpy straight into the per-token expert Metal buffer, skipping pread;
+// misses pread as before, then admit (LFU eviction by g_expert_freq).
+//
+// Budget = min(AUTO_FRAC * free RAM at first use, MAX_GB). Disabled when
+// MAX_GB <= 0 (env unset). Sized lazily after the model is resident so the
+// free-RAM read reflects true headroom. Fail-soft: any alloc failure disables
+// the cache and falls back to pure pread (mirrors g_mtp_expert_resident).
+//   FLASHCHAT_EXPERT_PIN_MAX_GB    hard cap, GiB (<=0 disables; default 4 via config)
+//   FLASHCHAT_EXPERT_PIN_AUTO_FRAC fraction of free RAM to use (default 0.5)
+//   FLASHCHAT_EXPERT_PIN_MLOCK     1 = mlock the arena against swap (default 0)
+// ============================================================================
+static unsigned char *g_pin_arena = NULL;   // capacity_slots * esz bytes
+static int   *g_pin_slot_of_gid = NULL;     // gid -> slot, or -1
+static int   *g_pin_gid_of_slot = NULL;     // slot -> gid, or -1
+static long   g_pin_capacity_slots = 0;
+static long   g_pin_used_slots = 0;
+static size_t g_pin_esz = 0;
+static int    g_pin_enabled = -1;           // -1 = uninit, 0 = off, 1 = on
+static _Atomic long g_pin_hits = 0, g_pin_misses = 0, g_pin_evictions = 0;
+static pthread_mutex_t g_pin_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// Free (reclaimable) physical RAM in bytes, via mach VM stats. 0 on failure.
+static size_t host_free_ram_bytes(void) {
+    mach_port_t host = mach_host_self();
+    vm_size_t page = 0;
+    if (host_page_size(host, &page) != KERN_SUCCESS || page == 0) return 0;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS)
+        return 0;
+    // free + inactive: pages the kernel can hand out without going to disk.
+    return (size_t)(vm.free_count + vm.inactive_count) * (size_t)page;
+}
+
+static int expert_pin_enabled(void) { return g_pin_enabled == 1; }
+
+// Lazy one-time init. Call once the model is resident (first expert read).
+// Safe to call repeatedly; only the first call (guarded below) does work. Must
+// be called from the single decode thread, not the IO pool.
+static void expert_pin_init(void) {
+    if (g_pin_enabled != -1) return;
+    g_pin_enabled = 0;
+    if (g_cfg.num_experts <= 0 || g_cfg.num_layers <= 0) return;
+
+    const char *cap_env = getenv("FLASHCHAT_EXPERT_PIN_MAX_GB");
+    double cap_gb = (cap_env && cap_env[0]) ? atof(cap_env) : 0.0;
+    if (cap_gb <= 0.0) return;   // disabled
+
+    const char *frac_env = getenv("FLASHCHAT_EXPERT_PIN_AUTO_FRAC");
+    double frac = (frac_env && frac_env[0]) ? atof(frac_env) : 0.5;
+    if (frac <= 0.0 || frac > 1.0) frac = 0.5;
+
+    size_t esz = active_expert_size();
+    if (esz == 0) return;
+    long total_experts = (long)g_cfg.num_layers * g_cfg.num_experts;
+
+    size_t free_ram = host_free_ram_bytes();
+    size_t auto_budget = (size_t)(frac * (double)free_ram);
+    size_t cap_budget  = (size_t)(cap_gb * (double)(1ULL << 30));
+    size_t budget = auto_budget < cap_budget ? auto_budget : cap_budget;
+
+    long slots = (long)(budget / esz);
+    if (slots > total_experts) slots = total_experts;   // never larger than pool
+    if (slots <= 0) {
+        fprintf(stderr, "[expert-pin] budget %.2f GiB too small for one expert "
+                "(esz %.2f MiB) — disabled\n",
+                budget / (double)(1ULL<<30), esz / (double)(1<<20));
+        return;
+    }
+
+    g_pin_arena = (unsigned char *)malloc((size_t)slots * esz);
+    g_pin_slot_of_gid = (int *)malloc((size_t)total_experts * sizeof(int));
+    g_pin_gid_of_slot = (int *)malloc((size_t)slots * sizeof(int));
+    if (!g_pin_arena || !g_pin_slot_of_gid || !g_pin_gid_of_slot) {
+        fprintf(stderr, "[expert-pin] arena alloc failed — disabled, pure pread\n");
+        free(g_pin_arena); free(g_pin_slot_of_gid); free(g_pin_gid_of_slot);
+        g_pin_arena = NULL; g_pin_slot_of_gid = NULL; g_pin_gid_of_slot = NULL;
+        return;
+    }
+    for (long i = 0; i < total_experts; i++) g_pin_slot_of_gid[i] = -1;
+    for (long i = 0; i < slots; i++) g_pin_gid_of_slot[i] = -1;
+
+    if (getenv("FLASHCHAT_EXPERT_PIN_MLOCK") && atoi(getenv("FLASHCHAT_EXPERT_PIN_MLOCK"))) {
+        if (mlock(g_pin_arena, (size_t)slots * esz) != 0)
+            fprintf(stderr, "[expert-pin] mlock failed (%s) — continuing unlocked\n",
+                    strerror(errno));
+    }
+
+    g_pin_capacity_slots = slots;
+    g_pin_used_slots = 0;
+    g_pin_esz = esz;
+    g_pin_enabled = 1;
+    fprintf(stderr, "[expert-pin] enabled: %ld experts pinnable (%.2f GiB), "
+            "free RAM %.2f GiB, cap %.2f GiB, pool total %ld experts\n",
+            slots, (double)slots * esz / (double)(1ULL<<30),
+            free_ram / (double)(1ULL<<30), cap_gb, total_experts);
+}
+
+static inline int expert_pin_gid(int layer, int expert) {
+    return layer * g_cfg.num_experts + expert;
+}
+
+// Hit: copy the pinned expert into dst (esz bytes) and return 1. Else 0.
+static int expert_pin_lookup(int layer, int expert, void *dst) {
+    if (g_pin_enabled != 1) return 0;
+    int gid = expert_pin_gid(layer, expert);
+    pthread_mutex_lock(&g_pin_mu);
+    int slot = g_pin_slot_of_gid[gid];
+    int hit = 0;
+    if (slot >= 0) {
+        memcpy(dst, g_pin_arena + (size_t)slot * g_pin_esz, g_pin_esz);
+        hit = 1;
+    }
+    pthread_mutex_unlock(&g_pin_mu);
+    atomic_fetch_add(hit ? &g_pin_hits : &g_pin_misses, 1);
+    return hit;
+}
+
+// Admit expert bytes after a miss. Evicts the lowest-frequency pinned expert
+// (by g_expert_freq) only if the incoming expert is at least as hot.
+static void expert_pin_admit(int layer, int expert, const void *src) {
+    if (g_pin_enabled != 1) return;
+    int gid = expert_pin_gid(layer, expert);
+    pthread_mutex_lock(&g_pin_mu);
+    if (g_pin_slot_of_gid[gid] >= 0) { pthread_mutex_unlock(&g_pin_mu); return; }
+
+    long slot = -1;
+    if (g_pin_used_slots < g_pin_capacity_slots) {
+        slot = g_pin_used_slots++;            // free slot available
+    } else {
+        // Find coldest pinned expert; evict iff the newcomer is hotter.
+        int incoming_freq = g_expert_freq[layer][expert];
+        long victim = -1; int victim_freq = 0;
+        for (long s = 0; s < g_pin_capacity_slots; s++) {
+            int vg = g_pin_gid_of_slot[s];
+            int vf = g_expert_freq[vg / g_cfg.num_experts][vg % g_cfg.num_experts];
+            if (victim < 0 || vf < victim_freq) { victim = s; victim_freq = vf; }
+        }
+        if (victim >= 0 && incoming_freq >= victim_freq) {
+            g_pin_slot_of_gid[g_pin_gid_of_slot[victim]] = -1;
+            slot = victim;
+            atomic_fetch_add(&g_pin_evictions, 1);
+        }
+    }
+    if (slot >= 0) {
+        memcpy(g_pin_arena + (size_t)slot * g_pin_esz, src, g_pin_esz);
+        g_pin_gid_of_slot[slot] = gid;
+        g_pin_slot_of_gid[gid] = (int)slot;
+    }
+    pthread_mutex_unlock(&g_pin_mu);
+}
+
+static void expert_pin_log_stats(void) {
+    if (g_pin_enabled != 1) return;
+    long h = atomic_load(&g_pin_hits), m = atomic_load(&g_pin_misses);
+    long tot = h + m;
+    fprintf(stderr, "[expert-pin] hits %ld / %ld (%.1f%%), pinned %ld/%ld, evictions %ld\n",
+            h, tot, tot ? 100.0 * h / tot : 0.0,
+            g_pin_used_slots, g_pin_capacity_slots, atomic_load(&g_pin_evictions));
+}
+
 __attribute__((unused))
 static void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
     for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
         InferPreadTask *t = &ta->tasks[i];
-        t->result = pread(t->fd, t->dst, t->size, t->offset);
+        t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
     }
     return NULL;
 }
@@ -6398,7 +6692,7 @@ static void *io_pool_worker(void *arg) {
         // Process assigned tasks (stride by thread count)
         for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
             InferPreadTask *t = &tasks[i];
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
+            t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
         }
 
         pthread_mutex_lock(&g_io_pool.mutex);
@@ -6449,32 +6743,49 @@ typedef struct {
     int valid[MAX_K];
     dispatch_group_t group;
     int active;
+    int layer;                 // layer for this batch (pin-cache key + admission)
+    int expert_idx[MAX_K];     // routed expert per slot
+    int pinned_hit[MAX_K];     // 1 = served from pin cache (no pread issued)
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
-                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
+                               int layer_idx) {
     (void)mmap_base;
+    expert_pin_init();   // lazy, idempotent; model is resident by first call
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
+    g_async_pread.layer = layer_idx;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
-        g_async_pread.tasks[k].fd = packed_fd;
-        g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
-        g_async_pread.tasks[k].size = esz;
-        g_async_pread.tasks[k].result = 0;
+        InferPreadTask *t = &g_async_pread.tasks[k];
+        t->dst = [dst_bufs[k] contents];
+        g_async_pread.expert_idx[k] = expert_indices[k];
+        // Pin-cache hit: fill the buffer from the resident arena, skip the pread.
+        if (expert_pin_lookup(layer_idx, expert_indices[k], t->dst)) {
+            g_async_pread.pinned_hit[k] = 1;
+            g_async_pread.valid[k] = 1;
+            continue;
+        }
+        g_async_pread.pinned_hit[k] = 0;
+        t->fd = packed_fd;
+        t->offset = (off_t)expert_indices[k] * esz;
+        t->size = esz;
+        t->result = 0;
+        t->gid = expert_pin_gid(layer_idx, expert_indices[k]);
     }
 
-    // Fire off parallel preads on GCD — returns immediately
+    // Fire off parallel preads on GCD for misses only — returns immediately.
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
     for (int k = 0; k < K; k++) {
+        if (g_async_pread.pinned_hit[k]) continue;
         InferPreadTask *t = &g_async_pread.tasks[k];
         dispatch_group_async(g_async_pread.group, io_q, ^{
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
+            t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
         });
     }
 }
@@ -6482,8 +6793,14 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+    size_t esz = active_expert_size();
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+        if (g_async_pread.pinned_hit[k]) { g_async_pread.valid[k] = 1; continue; }
+        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)esz);
+        // Admit freshly-read experts into the pin cache (LFU eviction inside).
+        if (g_async_pread.valid[k])
+            expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
+                             g_async_pread.tasks[k].dst);
     }
     g_async_pread.active = 0;
 }
@@ -6518,6 +6835,7 @@ static int parallel_pread_experts(
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
         tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].gid = -1;
         tasks[k].size = esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
@@ -6557,6 +6875,7 @@ static int parallel_pread_experts_into(
         tasks[k].offset = (off_t)expert_indices[k] * esz;
         tasks[k].size = esz;
         tasks[k].result = 0;
+        tasks[k].gid = -1;
     }
 
     io_pool_dispatch(tasks, K);
@@ -6622,6 +6941,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
             tasks[k].offset = plan->offset[k];
             tasks[k].size = esz;
             tasks[k].result = 0;
+            tasks[k].gid = -1;
         }
 
         io_pool_dispatch(tasks, plan->K);
@@ -8112,7 +8432,9 @@ static void fused_layer_forward(
     cpu_topk(gate_scores, g_cfg.num_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
     if (getenv("MOE_DBG") && layer_idx <= 1) { fprintf(stderr,"[moe-dbg-prod ] L%d hpost0=%.6f experts=[",layer_idx,h_post[0]); for(int k=0;k<K;k++)fprintf(stderr,"%d ",expert_indices[k]); fprintf(stderr,"]\n"); }
-    if (g_freq_tracking) {
+    // Count per-(layer,expert) activations when --freq is on OR the pin cache is
+    // active (its LFU eviction reads g_expert_freq to pick the coldest victim).
+    if (g_freq_tracking || expert_pin_enabled()) {
         for (int k = 0; k < K; k++) {
             g_expert_freq[layer_idx][expert_indices[k]]++;
         }
@@ -8172,7 +8494,7 @@ static void fused_layer_forward(
         {
             // ---- ASYNC parallel pread: start I/O, overlap shared-expert prep ----
             async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base);
+                              g_metal->buf_multi_expert_data, mmap_base, layer_idx);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
@@ -13369,6 +13691,11 @@ tool_call_checked:
 
     if (server_fd >= 0 && g_server_listen_fd == server_fd) close(server_fd);
     g_server_listen_fd = -1;
+
+    // Final pread-profile snapshot on clean shutdown (SIGTERM path), before any
+    // Metal/ARC teardown — more reliable than relying on atexit ordering.
+    prof_pread_flush();
+    expert_pin_log_stats();
 }
 
 // ============================================================================
@@ -14415,6 +14742,7 @@ int main(int argc, char **argv) {
         }
         printf("Config:         K=%d experts, %d layers\n", K, g_cfg.num_layers);
         if (g_freq_tracking) freq_print_analysis(K);
+        expert_pin_log_stats();
         if (g_routing_log) {
             fclose(g_routing_log);
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",

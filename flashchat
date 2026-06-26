@@ -124,7 +124,7 @@ render_context_meter() {
     [[ "$maxctx"   =~ ^[0-9]+$ ]] || maxctx=0
     [[ "$rambytes" =~ ^[0-9]+$ ]] || rambytes=0
 
-    local width=55 fill=0
+    local width=35 fill=0
     if [ "$maxctx" -gt 0 ]; then
         fill=$(( used * width / maxctx ))
         [ "$fill" -gt "$width" ] && fill=$width
@@ -983,6 +983,11 @@ server_runtime_signature() {
         echo "SERVER_LOG_PATH=$(flashchat_get SERVER_LOG_PATH)"
         echo "SERVER_DEBUG=$(flashchat_get SERVER_DEBUG)"
         echo "SERVER_HTTP_LOG=$(flashchat_get SERVER_HTTP_LOG)"
+        echo "PREAD_PROFILE=$(flashchat_get PREAD_PROFILE)"
+        echo "PREAD_PROFILE_CAP=$(flashchat_get PREAD_PROFILE_CAP)"
+        echo "EXPERT_PIN_MAX_GB=$(flashchat_get EXPERT_PIN_MAX_GB)"
+        echo "EXPERT_PIN_AUTO_FRAC=$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
+        echo "EXPERT_PIN_MLOCK=$(flashchat_get EXPERT_PIN_MLOCK)"
         echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
         echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
         echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
@@ -1366,10 +1371,22 @@ cmd_serve() {
     [ -n "${FLASHCHAT_SERVER_LOG}" ]      && _server_log="$FLASHCHAT_SERVER_LOG"           || _server_log="$(flashchat_get SERVER_LOG_PATH)"
     [ -n "${FLASHCHAT_SERVER_DEBUG}" ]    && _server_debug="$FLASHCHAT_SERVER_DEBUG"       || _server_debug="$(flashchat_get SERVER_DEBUG)"
     [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ] && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG" || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
+    local _pread_profile _pread_profile_cap
+    [ -n "${FLASHCHAT_PREAD_PROFILE}" ]     && _pread_profile="$FLASHCHAT_PREAD_PROFILE"         || _pread_profile="$(flashchat_get PREAD_PROFILE)"
+    [ -n "${FLASHCHAT_PREAD_PROFILE_CAP}" ] && _pread_profile_cap="$FLASHCHAT_PREAD_PROFILE_CAP" || _pread_profile_cap="$(flashchat_get PREAD_PROFILE_CAP)"
+    local _pin_max_gb _pin_auto_frac _pin_mlock
+    [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
+    [ -n "${FLASHCHAT_EXPERT_PIN_AUTO_FRAC}" ] && _pin_auto_frac="$FLASHCHAT_EXPERT_PIN_AUTO_FRAC" || _pin_auto_frac="$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
+    [ -n "${FLASHCHAT_EXPERT_PIN_MLOCK}" ]     && _pin_mlock="$FLASHCHAT_EXPERT_PIN_MLOCK"         || _pin_mlock="$(flashchat_get EXPERT_PIN_MLOCK)"
 
     FLASHCHAT_SERVER_LOG="$_server_log" \
     FLASHCHAT_SERVER_DEBUG="$_server_debug" \
     FLASHCHAT_SERVER_HTTP_LOG="$_server_http_log" \
+    FLASHCHAT_PREAD_PROFILE="$_pread_profile" \
+    FLASHCHAT_PREAD_PROFILE_CAP="$_pread_profile_cap" \
+    FLASHCHAT_EXPERT_PIN_MAX_GB="$_pin_max_gb" \
+    FLASHCHAT_EXPERT_PIN_AUTO_FRAC="$_pin_auto_frac" \
+    FLASHCHAT_EXPERT_PIN_MLOCK="$_pin_mlock" \
     FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
     FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
     FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \

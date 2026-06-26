@@ -139,6 +139,45 @@ tiles before TensorOps returns zero results. Do not wire this into production
 until a compact resource layout or tensor-pool strategy is validated at full
 80-group dense dimensions.
 
+## Debug Features Must Be Settable From the Config Menu
+
+**Rule:** every debug/profiling feature added to the engine MUST be exposed as a
+setting in the interactive config menu — not env-var-only. A flag a user can't
+reach without exporting `FLASHCHAT_*` by hand is effectively undiscoverable.
+
+The menu's advanced section is the home for these toggles:
+
+- **Menu UI:** `modelmgr/tui/config_wizard.py` → `_advanced_settings()`
+  ("Configure advanced options (debug, MTP, cache)?"). Add a
+  `(KEY, "label", "default")` tuple here.
+
+A new debug key must be wired through the whole config chain, or it won't reach
+the engine. Use an existing debug flag (e.g. `SERVER_HTTP_LOG`) as the template —
+grep it to find every site:
+
+- **`lib/config.sh`** — eight sites: `FLASHCHAT_DEFAULT_<KEY>` constant, the
+  reset/var declaration (top-level + inside `flashchat_load_config`), the
+  `_flashchat_migrate_config` backfill list, the `FLASHCHAT_<KEY>` env-override
+  apply, the finalize-default line, and the `flashchat_get` getter `case`. Bump
+  `FLASHCHAT_CONFIG_SCHEMA_VERSION` so existing user configs backfill the key.
+- **`flashchat`** — the `cmd_serve` launch block bridges config → environment
+  (`FLASHCHAT_<KEY>="$(flashchat_get <KEY>)" \` on the `infer` exec line);
+  runtime settings are read from the config file/env, not shell args. Also add
+  the key to the `config --show` dump.
+- **`metal_infer/infer.m`** — the engine reads the flag via
+  `getenv("FLASHCHAT_<KEY>")`. Treat empty string as "unset/default" (an unset
+  config key bridges through as `""`), not as a literal value.
+
+Reference implementations — both added across exactly these sites, use either as
+the worked example when adding the next debug feature:
+- **pread timing profiler** — `FLASHCHAT_PREAD_PROFILE` / `FLASHCHAT_PREAD_PROFILE_CAP`
+  (`prof_pread` wrapper in `infer.m`; analyze with `tools/pread_profile_analyze.py`).
+- **expert pin-cache** — `FLASHCHAT_EXPERT_PIN_MAX_GB` (cap GiB, 0=off) /
+  `FLASHCHAT_EXPERT_PIN_AUTO_FRAC` (free-RAM fraction) / `FLASHCHAT_EXPERT_PIN_MLOCK`.
+  Keeps the hottest whole experts RAM-resident (LFU, `expert_pin_*` in `infer.m`)
+  so low-RAM machines don't thrash the page cache re-streaming experts per token.
+  Budget = `min(AUTO_FRAC × free RAM at first use, MAX_GB)`, fail-soft to pure pread.
+
 ## Code Style
 
 ### General Principles
