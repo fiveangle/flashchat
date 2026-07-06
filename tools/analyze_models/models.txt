@@ -1,0 +1,12 @@
+https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B
+https://huggingface.co/deepreinforce-ai/Ornith-1.0-397B
+https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite
+https://huggingface.co/deepseek-ai/DeepSeek-V3
+https://huggingface.co/deepseek-ai/DeepSeek-V4
+https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash
+https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct
+https://huggingface.co/MiniMaxAI/MiniMax-M3
+https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1
+https://huggingface.co/Qwen/Qwen3-Coder-Next
+https://huggingface.co/Qwen/Qwen3.5-397B-A17B
+https://huggingface.co/Qwen/Qwen3.6-35B-A3B

@@ -52,3 +52,6 @@ debug/
 
 # claude-analyzer
 optimizer/
+
+# scratch / WIP working directory (not for production commits)
+/tmp/
