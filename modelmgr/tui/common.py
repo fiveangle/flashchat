@@ -65,10 +65,19 @@ def confirm_exact(expected: str, what: str) -> bool:
 def select_number(count: int, message: str = "Select", default: int | None = None,
                   extras: dict | None = None):
     """Pick 1..count, or one of `extras` keys (single letters). Returns an
-    int index (1-based) or the extra key; None on cancel/empty."""
+    int index (1-based) or the extra key; None on cancel/empty/EOF."""
     default_str = str(default) if default else ""
+    suffix = f" [{default_str}]" if default_str else ""
     while True:
-        reply = prompt(message, default_str)
+        # Read input directly (not via prompt()): prompt() maps EOF to the
+        # default, and if the default is itself out of range this retry loop
+        # would spin forever on closed/exhausted stdin — printing the error
+        # line at CPU speed (2026-07-07: a redirected-stdin test hit exactly
+        # this and allocated 42GB of buffered output before being killed).
+        try:
+            reply = input(f"{message}{suffix}: ").strip() or default_str
+        except EOFError:
+            return None  # closed input is a cancel, never a retry
         if not reply or reply.lower() == "q":
             return None
         low = reply.lower()

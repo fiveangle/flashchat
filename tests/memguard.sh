@@ -12,13 +12,15 @@ set -u
 
 MAX_GROWTH_GB=2
 MIN_FREE_PCT=15
-INTERVAL=5
-while getopts "g:f:i:" opt; do
+MAX_PROC_RSS_GB=8
+INTERVAL=2
+while getopts "g:f:i:r:" opt; do
     case "$opt" in
         g) MAX_GROWTH_GB="$OPTARG" ;;
         f) MIN_FREE_PCT="$OPTARG" ;;
         i) INTERVAL="$OPTARG" ;;
-        *) echo "usage: $0 [-g max_growth_gb] [-f min_free_pct] [-i poll_sec] cmd..." >&2; exit 2 ;;
+        r) MAX_PROC_RSS_GB="$OPTARG" ;;
+        *) echo "usage: $0 [-g max_growth_gb] [-f min_free_pct] [-i poll_sec] [-r max_proc_rss_gb] cmd..." >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -49,6 +51,19 @@ while kill -0 "$CHILD" 2>/dev/null; do
     if [ -n "$FREE" ] && [ "$FREE" -lt "$MIN_FREE_PCT" ]; then
         echo "[memguard] FREE-MEMORY GUARD TRIPPED: ${FREE}% free — killing pgid $CHILD" >&2
         kill -TERM -- -"$CHILD" 2>/dev/null; sleep 3; kill -KILL -- -"$CHILD" 2>/dev/null
+        RC=99; break
+    fi
+    # Per-process RSS tripwire: swap lags reality on macOS (the compressor
+    # silently absorbs ~15GB+ of pressure first), so also catch any single
+    # process ballooning. KILL immediately — a runaway allocator outraces a
+    # TERM grace period (2026-07-07: 42GB python).
+    BIG="$(ps -axo rss=,pid= -r | head -1)"
+    BIG_RSS_MB=$(( $(echo "$BIG" | awk '{print $1}') / 1024 ))
+    if [ "$BIG_RSS_MB" -gt $((MAX_PROC_RSS_GB * 1024)) ]; then
+        BIG_PID="$(echo "$BIG" | awk '{print $2}')"
+        echo "[memguard] PROCESS-RSS GUARD TRIPPED: pid ${BIG_PID} at ${BIG_RSS_MB}MB — killing it and pgid $CHILD" >&2
+        kill -KILL "$BIG_PID" 2>/dev/null
+        kill -KILL -- -"$CHILD" 2>/dev/null
         RC=99; break
     fi
 done
