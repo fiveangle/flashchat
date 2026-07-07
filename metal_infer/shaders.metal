@@ -2300,3 +2300,61 @@ kernel void bf16_matvec(
     }
     out[tid] = sum;
 }
+
+
+// ============================================================================
+// ANE prefill producers (Phase 3): dequantize q4 expert weights to the int8
+// TRANSPOSED layout the fc_ane_mlp tiled-fused MLP consumes.
+// ============================================================================
+//
+// flashchat expert weights are MLX q4: [out_dim, in_dim] row-major, 8 values
+// per uint32 (nibble k = column word*8+k), w = scale[o,g]*nib + bias[o,g] with
+// per-group bf16 scale/bias. The ANE library wants Wg/Wu indexed [h*I + j]
+// ([in_dim, out_dim]) and Wd indexed [j*H + c] (also [in_dim, out_dim]) — i.e.
+// the transpose — as symmetric int8 with a single per-tensor w_qscale.
+kernel void fc_dequant_q4_i8_t(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device char*           OUT_i8_t   [[buffer(3)]],  // [in_dim, out_dim] transposed
+    constant uint&         out_dim    [[buffer(4)]],
+    constant uint&         in_dim     [[buffer(5)]],
+    constant uint&         group_size [[buffer(6)]],
+    constant float&        w_qscale   [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint packed_cols = in_dim / 8;
+    uint total = out_dim * packed_cols;
+    if (tid >= total) return;
+    uint o = tid / packed_cols;
+    uint c = tid % packed_cols;
+    uint g = (c * 8) / group_size;
+    uint32_t packed = W_packed[(size_t)o * packed_cols + c];
+    float scale = bf16_to_f32(scales[(size_t)o * (in_dim / group_size) + g]);
+    float bias  = bf16_to_f32(biases[(size_t)o * (in_dim / group_size) + g]);
+    for (uint k = 0; k < 8; k++) {
+        float w = scale * float((packed >> (k * 4)) & 0xF) + bias;
+        float q = rint(w * w_qscale);
+        q = clamp(q, -128.0f, 127.0f);
+        OUT_i8_t[(size_t)(c * 8 + k) * out_dim + o] = char(q);
+    }
+}
+
+// f32 -> symmetric int8 with fixed x_qscale; rows beyond n_rows are zeroed
+// (ANE batch tile padding).
+kernel void fc_quant_f32_i8(
+    device const float* X       [[buffer(0)]],   // [n_rows, dim]
+    device char*        OUT_i8  [[buffer(1)]],   // [pad_rows, dim]
+    constant uint&      n_rows  [[buffer(2)]],
+    constant uint&      pad_rows [[buffer(3)]],
+    constant uint&      dim     [[buffer(4)]],
+    constant float&     x_qscale [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = pad_rows * dim;
+    if (tid >= total) return;
+    uint r = tid / dim;
+    if (r >= n_rows) { OUT_i8[tid] = 0; return; }
+    float q = rint(X[tid] * x_qscale);
+    OUT_i8[tid] = char(clamp(q, -128.0f, 127.0f));
+}

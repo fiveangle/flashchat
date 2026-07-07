@@ -2633,6 +2633,55 @@ bool fc_ane_mlp_i8w_i8x_tiled_fused_eval(
     }
 }
 
+/* Zero-copy producer support (mode 6). A GPU (or any producer) may write the
+ * int8 operands directly into the ctx's input IOSurfaces — obtained here — and
+ * then evaluate without the per-call write_surface memcpys that otherwise
+ * dominate small-expert eval time. The output is read via lock_output_f16.
+ * Caller owns synchronization: no eval may be in flight while producing. */
+void *fc_ane_mlp_operand_base(fc_ane_mlp_int8w_ctx *ctx, int which, size_t *bytes) {
+    if (!ctx) return NULL;
+    IOSurfaceRef s = NULL; NSUInteger nb = 0;
+    switch (which) {
+        case 0: s = ctx->io_gate; nb = ctx->gate_bytes; break;
+        case 1: s = ctx->io_up;   nb = ctx->gate_bytes; break;
+        case 2: s = ctx->io_down; nb = ctx->down_bytes; break;
+        case 3: s = ctx->io_x;    nb = ctx->x_bytes;    break;
+        default: return NULL;
+    }
+    if (!s) return NULL;
+    if (bytes) *bytes = (size_t)nb;
+    return IOSurfaceGetBaseAddress(s);
+}
+
+size_t fc_ane_mlp_operand_alloc_size(fc_ane_mlp_int8w_ctx *ctx, int which) {
+    if (!ctx) return 0;
+    IOSurfaceRef s = NULL;
+    switch (which) {
+        case 0: s = ctx->io_gate; break;
+        case 1: s = ctx->io_up;   break;
+        case 2: s = ctx->io_down; break;
+        case 3: s = ctx->io_x;    break;
+        default: return 0;
+    }
+    return s ? (size_t)IOSurfaceGetAllocSize(s) : 0;
+}
+
+bool fc_ane_mlp_i8w_i8x_tiled_fused_eval_prewritten(fc_ane_mlp_int8w_ctx *ctx) {
+    if (!ctx || ctx->mode != 6) return false;
+    const bool dbg = ane_int8w_debug_enabled();
+    @autoreleasepool {
+        NSError *e = nil;
+        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+            (__bridge id)ctx->model_r,
+            @selector(evaluateWithQoS:options:request:error:),
+            21, @{}, (__bridge id)ctx->request_r, &e);
+        if (!ok && dbg)
+            fprintf(stderr, "flashchat: ANE tiled fused prewritten evaluate failed: %s\n",
+                    e.localizedDescription ? e.localizedDescription.UTF8String : "unknown");
+        return ok ? true : false;
+    }
+}
+
 bool fc_ane_mlp_i8w_i8x_tiled_fused_routed_eval(
     fc_ane_mlp_int8w_ctx *ctx,
     const int8_t *Wgate_i8,

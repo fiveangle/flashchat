@@ -224,6 +224,15 @@ bool fc_ane_mlp_i8w_i8x_tiled_fused_i8out_eval(
     const int8_t *input_i8,
     int8_t       *output_i8);
 
+/* Zero-copy producer support (mode 6): direct pointers into the ctx's input
+ * IOSurfaces (which: 0=gate 1=up 2=down 3=x) so a GPU kernel can write the
+ * int8 operands in place, plus an eval that skips all operand writes. Output
+ * is read via fc_ane_mlp_int8w_lock_output_f16. Caller synchronizes: never
+ * produce into a ctx whose eval is in flight. */
+void *fc_ane_mlp_operand_base(fc_ane_mlp_int8w_ctx *ctx, int which, size_t *bytes);
+size_t fc_ane_mlp_operand_alloc_size(fc_ane_mlp_int8w_ctx *ctx, int which);
+bool fc_ane_mlp_i8w_i8x_tiled_fused_eval_prewritten(fc_ane_mlp_int8w_ctx *ctx);
+
 bool fc_ane_mlp_i8w_i8x_tiled_fused_eval_to_surface(
     fc_ane_mlp_int8w_ctx *ctx,
     const int8_t *Wgate_i8,

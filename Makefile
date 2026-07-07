@@ -239,10 +239,10 @@ $(SHADER_AIR): $(SHADER_SRC)
 $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
-# Build the inference engine
-$(INFER_TARGET): $(INFER_SRC)
+# Build the inference engine (links the ANE MLP library for batched-prefill offload)
+$(INFER_TARGET): $(INFER_SRC) $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	@$(MAKE) --no-print-directory print-build-config
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) $(INFER_SRC) $(ANE_MLP_SRC) -o $(INFER_TARGET)
 
 # Build the chat client (thin HTTP/SSE client + linenoise line editor)
 $(CHAT_TARGET): $(CHAT_SRC) $(LINENOISE_SRC) $(LINENOISE_HDR)

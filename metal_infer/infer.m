@@ -44,6 +44,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import "fc_ane_mlp.h"
 #import <objc/runtime.h>
 
 #include <stdio.h>
@@ -2551,6 +2552,8 @@ typedef struct {
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
+    id<MTLComputePipelineState> fc_dequant_q4_i8_t;      // ANE producer: q4 -> transposed i8
+    id<MTLComputePipelineState> fc_quant_f32_i8;         // ANE producer: f32 -> i8 (+pad)
     id<MTLComputePipelineState> attn_scores_quant_pipe;  // dequant-on-read q8/q4
     id<MTLComputePipelineState> attn_values_quant_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
@@ -2778,6 +2781,8 @@ static MetalCtx *metal_setup(void) {
     ctx->residual_rms_norm_bf16 = makePipe(@"residual_rms_norm_bf16");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->swiglu_batched = makePipe(@"swiglu_fused_batched");
+    ctx->fc_dequant_q4_i8_t = makePipe(@"fc_dequant_q4_i8_t");
+    ctx->fc_quant_f32_i8    = makePipe(@"fc_quant_f32_i8");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
@@ -5430,6 +5435,145 @@ static int prefill_debug_enabled(void) {
     return v;
 }
 
+// ---- ANE expert-MLP offload (FLASHCHAT_ANE_PREFILL=1) -----------------------
+// Runs each unique expert's routed tokens through the ported ds4 ANE MLP
+// (mode 6 i8w-i8x-tiled-fused) instead of GPU matmulN GEMMs. GPU still
+// produces the int8 operands (q4->i8 transposed weight dequant + x quantize);
+// the ANE consumes them from shared MTLBuffer memory. Not bit-faithful to the
+// GPU path (int8 weights/activations) — opt-in, quality-gated.
+static int ane_prefill_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("FLASHCHAT_ANE_PREFILL"); v = (e && *e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+static int ane_calib_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("FLASHCHAT_ANE_CALIB"); v = (e && *e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+static float ane_env_qscale(const char *name, float dflt) {
+    const char *e = getenv(name);
+    if (e && *e) { float v = strtof(e, NULL); if (v > 0) return v; }
+    return dflt;
+}
+
+// Dual ANE contexts (ping-pong): while ctx[cur] evaluates on the worker
+// thread, the GPU produces the next expert's operands DIRECTLY into
+// ctx[cur^1]'s input IOSurfaces via no-copy MTLBuffer wraps — no CPU memcpys
+// on the eval path at all (they dominated small-expert eval time).
+static fc_ane_mlp_int8w_ctx *g_ane_ctx2[2];
+static id<MTLBuffer> g_ane_op[2][4];           // wrapped gate/up/down/x per ctx
+static int g_ane_B;                            // batch tile (>= prefill chunk)
+static float g_ane_wq, g_ane_xq, g_ane_midq;   // quantization scales (qscale = 1/scale)
+static int g_ane_failed;                       // fail once -> stay on GPU path
+static double g_prof_ane_producer, g_prof_ane_eval;
+// Calibration accumulators (FLASHCHAT_ANE_CALIB=1, GPU path)
+static float g_calib_x_absmax, g_calib_mid_absmax, g_calib_w_absmax;
+
+typedef struct { int set; int ok; } AneEvalJob;
+static pthread_t g_ane_thread;
+static AneEvalJob g_ane_job;
+static void *ane_eval_thread(void *arg) {
+    AneEvalJob *job = (AneEvalJob *)arg;
+    double t0 = now_ms();
+    job->ok = fc_ane_mlp_i8w_i8x_tiled_fused_eval_prewritten(g_ane_ctx2[job->set]) ? 1 : 0;
+    g_prof_ane_eval += now_ms() - t0;
+    return NULL;
+}
+
+static int ane_prefill_ready(int H, int idim, int chunk) {
+    if (g_ane_failed || !g_metal || !g_metal->fc_dequant_q4_i8_t || !g_metal->fc_quant_f32_i8) return 0;
+    if (g_cfg.bits != 4) return 0;                       // producer kernel is q4-only for now
+    if ((H % 256) || (idim % 256)) {                     // fc_ane_mlp tile constraint
+        if (!getenv("FLASHCHAT_ANE_ALLOW_UNTESTED_SHAPE")) return 0;
+    }
+    if (g_ane_ctx2[0]) return 1;
+    int B = (int)ane_env_qscale("FLASHCHAT_ANE_BATCH", 256.0f);
+    (void)chunk;   // experts with refs > B are slabbed across multiple evals
+    // Defaults calibrated on Qwen3.6-35B experts (2026-07-07): W from absmax
+    // (0.65 -> 195); X/MID are CLIP scales (+-7.9) — Qwen activations have
+    // rare outliers to ~55 whose absmax-based scale (2) destroys small-value
+    // fidelity, while clipping them reproduces the GPU path's greedy output
+    // exactly (48/48). ds4's DeepSeek defaults were 512/32/32.
+    g_ane_wq   = ane_env_qscale("FLASHCHAT_ANE_W_QSCALE", 195.0f);
+    g_ane_xq   = ane_env_qscale("FLASHCHAT_ANE_X_QSCALE", 16.0f);
+    g_ane_midq = ane_env_qscale("FLASHCHAT_ANE_MID_QSCALE", 16.0f);
+    double t0 = now_ms();
+    for (int d = 0; d < 2; d++) {
+        g_ane_ctx2[d] = fc_ane_mlp_i8w_i8x_tiled_fused_create(H, idim, B,
+                                                              1.0f / g_ane_wq, 1.0f / g_ane_xq, 1.0f / g_ane_midq);
+        if (!g_ane_ctx2[d]) {
+            fprintf(stderr, "[ane-prefill] MIL compile failed (H=%d I=%d B=%d) — staying on GPU path\n", H, idim, B);
+            g_ane_failed = 1;
+            return 0;
+        }
+        for (int w = 0; w < 4; w++) {
+            size_t alloc = fc_ane_mlp_operand_alloc_size(g_ane_ctx2[d], w);
+            void *base = fc_ane_mlp_operand_base(g_ane_ctx2[d], w, NULL);
+            if (!base || !alloc || ((uintptr_t)base & 0x3FFF)) {   // must be page-aligned for no-copy wrap
+                fprintf(stderr, "[ane-prefill] operand surface %d not wrappable — staying on GPU path\n", w);
+                g_ane_failed = 1;
+                return 0;
+            }
+            g_ane_op[d][w] = [g_metal->device newBufferWithBytesNoCopy:base
+                                                                length:alloc
+                                                               options:MTLResourceStorageModeShared
+                                                           deallocator:nil];
+            if (!g_ane_op[d][w]) { g_ane_failed = 1; return 0; }
+        }
+    }
+    g_ane_B = B;
+    fprintf(stderr, "[ane-prefill] ready: H=%d I=%d B=%d wq=%g xq=%g midq=%g (compile %.0fms)\n",
+            H, idim, B, g_ane_wq, g_ane_xq, g_ane_midq, now_ms() - t0);
+    return 1;
+}
+
+// Encode the int8 producers for one expert (weights in slot_buf at the standard
+// blob offsets; x rows already gathered CSR-contiguous in x_csr at xo).
+static void ane_encode_producer(id<MTLCommandBuffer> cmd, id<MTLBuffer> slot_buf,
+                                id<MTLBuffer> x_csr, NSUInteger xo,
+                                uint32_t refs, uint32_t H, uint32_t idim, uint32_t gsz, int set,
+                                int with_weights) {
+    NSUInteger gw = 0, gs_ = g_cfg.gate_w_size, gb = gs_ + g_cfg.gate_s_size;
+    NSUInteger uw = gb + g_cfg.gate_b_size, us = uw + g_cfg.up_w_size, ub = us + g_cfg.up_s_size;
+    NSUInteger dw = ub + g_cfg.up_b_size,  ds = dw + g_cfg.down_w_size, db = ds + g_cfg.down_s_size;
+    float wq = g_ane_wq, xq = g_ane_xq;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    struct { NSUInteger w, sc, bi; id<MTLBuffer> out; uint32_t od, id_; } jobs[3] = {
+        { gw, gs_, gb, g_ane_op[set][0], idim, H },   // gate: [idim,H] -> i8 [H,idim]
+        { uw, us,  ub, g_ane_op[set][1], idim, H },   // up
+        { dw, ds,  db, g_ane_op[set][2], H, idim },   // down: [H,idim] -> i8 [idim,H]
+    };
+    [enc setComputePipelineState:g_metal->fc_dequant_q4_i8_t];
+    for (int j = 0; with_weights && j < 3; j++) {
+        [enc setBuffer:slot_buf offset:jobs[j].w  atIndex:0];
+        [enc setBuffer:slot_buf offset:jobs[j].sc atIndex:1];
+        [enc setBuffer:slot_buf offset:jobs[j].bi atIndex:2];
+        [enc setBuffer:jobs[j].out offset:0 atIndex:3];
+        [enc setBytes:&jobs[j].od  length:4 atIndex:4];
+        [enc setBytes:&jobs[j].id_ length:4 atIndex:5];
+        [enc setBytes:&gsz length:4 atIndex:6];
+        [enc setBytes:&wq  length:4 atIndex:7];
+        uint32_t total = jobs[j].od * (jobs[j].id_ / 8);
+        [enc dispatchThreadgroups:MTLSizeMake((total + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    {
+        uint32_t padB = (uint32_t)g_ane_B;
+        [enc setComputePipelineState:g_metal->fc_quant_f32_i8];
+        [enc setBuffer:x_csr offset:xo atIndex:0];
+        [enc setBuffer:g_ane_op[set][3] offset:0 atIndex:1];
+        [enc setBytes:&refs length:4 atIndex:2];
+        [enc setBytes:&padB length:4 atIndex:3];
+        [enc setBytes:&H length:4 atIndex:4];
+        [enc setBytes:&xq length:4 atIndex:5];
+        uint32_t total = padB * H;
+        [enc dispatchThreadgroups:MTLSizeMake((total + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    [enc endEncoding];
+}
+
 static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int packed_fd) {
     int H = g_cfg.hidden_dim, K = g_cfg.num_experts_per_tok, SI = g_cfg.shared_intermediate;
     int idim = g_cfg.moe_intermediate, nexp = g_cfg.num_experts, gsz = g_cfg.group_size;
@@ -5518,21 +5662,121 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
     NSUInteger dw = ub + g_cfg.up_b_size,  ds = dw + g_cfg.down_w_size, db = ds + g_cfg.down_s_size;
 
     float *moe = calloc((size_t)N*H, sizeof(float));
+    int use_ane = ane_prefill_enabled() && ane_prefill_ready(H, idim, N);
     for (int w0 = 0; w0 < n_uni; w0 += MAX_K) {
         int wn = n_uni - w0 < MAX_K ? n_uni - w0 : MAX_K;
         int valid[MAX_K] = {0};
+        int done[MAX_K] = {0};
         id<MTLBuffer> __strong bufs[MAX_K] = {nil};
         for (int s = 0; s < wn; s++) bufs[s] = ctx->buf_multi_expert_data[s];
         _t = now_ms();
         parallel_pread_experts_into(packed_fd, uni + w0, wn, bufs, valid);
         g_prof_prefill_io += now_ms() - _t;
 
+        // ---- ANE path: pipelined GPU producer / ANE eval, one job in flight.
+        // Main thread: produce operands for expert s (GPU) -> join the worker
+        // evaluating expert s-1 -> scatter s-1 -> hand s to the worker.
+        if (use_ane) {
+            int pending_s = -1;      // slot whose eval is in flight
+            int pending_row0 = 0;    // CSR row base of the in-flight slab
+            uint32_t pending_r = 0;  // rows in the in-flight slab
+            int cur = 0;             // double-buffer set for the NEXT producer
+            // Unit = one <=B-row slab of one expert. Slab 2+ of a hot expert
+            // must reuse the ctx holding its weights, so the pipeline drains
+            // between slabs of the same expert (rare: avg refs << B).
+            for (int s = 0; s < wn && use_ane; s++) {
+                if (!valid[s]) continue;
+                int e = uni[w0+s];
+                for (uint32_t r0 = 0; r0 < (uint32_t)cnt[e] && use_ane; r0 += (uint32_t)g_ane_B) {
+                uint32_t r = (uint32_t)cnt[e] - r0 < (uint32_t)g_ane_B ? (uint32_t)cnt[e] - r0 : (uint32_t)g_ane_B;
+                int with_weights = (r0 == 0);
+                if (!with_weights && pending_s >= 0) {
+                    // drain: this slab must run on the ctx that has the weights
+                    pthread_join(g_ane_thread, NULL);
+                    if (!g_ane_job.ok) { g_ane_failed = 1; use_ane = 0; break; }
+                    double td = now_ms();
+                    uint64_t oel = 0;
+                    const __fp16 *pof = (const __fp16 *)fc_ane_mlp_int8w_lock_output_f16(g_ane_ctx2[g_ane_job.set], &oel);
+                    if (!pof) { g_ane_failed = 1; use_ane = 0; break; }
+                    int dpe = uni[w0+pending_s];
+                    for (uint32_t j = 0; j < pending_r; j++) {
+                        int row = off[dpe] + pending_row0 + (int)j;
+                        float w = tw[row];
+                        float *dst = moe + (size_t)toks[row]*H;
+                        const __fp16 *src = pof + (size_t)j*H;
+                        for (int d = 0; d < H; d++) dst[d] += w * (float)src[d];
+                    }
+                    fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
+                    g_prof_prefill_scatter += now_ms() - td;
+                    if (pending_s != s) done[pending_s] = 1;
+                    pending_s = -1;
+                    cur = g_ane_job.set;   // weights live here; reuse it
+                }
+                double t0 = now_ms();
+                id<MTLCommandBuffer> pcmd = [ctx->queue commandBuffer];
+                ane_encode_producer(pcmd, bufs[s], x_csr, (size_t)(off[e]+ (int)r0)*H*sizeof(float),
+                                    r, (uint32_t)H, (uint32_t)idim, (uint32_t)gsz, cur, with_weights);
+                [pcmd commit]; [pcmd waitUntilCompleted];
+                g_prof_ane_producer += now_ms() - t0;
+                if (pending_s >= 0) {   // reap previous eval, scatter it
+                    pthread_join(g_ane_thread, NULL);
+                    if (!g_ane_job.ok) { g_ane_failed = 1; use_ane = 0; break; }
+                    t0 = now_ms();
+                    int pe = uni[w0+pending_s];
+                    uint64_t oelems = 0;
+                    const __fp16 *of = (const __fp16 *)fc_ane_mlp_int8w_lock_output_f16(g_ane_ctx2[g_ane_job.set], &oelems);
+                    if (!of) { g_ane_failed = 1; use_ane = 0; break; }
+                    for (uint32_t j = 0; j < pending_r; j++) {
+                        int row = off[pe] + pending_row0 + (int)j;
+                        float w = tw[row];
+                        float *dst = moe + (size_t)toks[row]*H;
+                        const __fp16 *src = of + (size_t)j*H;
+                        for (int d = 0; d < H; d++) dst[d] += w * (float)src[d];
+                    }
+                    fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
+                    g_prof_prefill_scatter += now_ms() - t0;
+                    if (pending_s != s) done[pending_s] = 1;
+                }
+                g_ane_job.set = cur; g_ane_job.ok = 0;
+                pthread_create(&g_ane_thread, NULL, ane_eval_thread, &g_ane_job);
+                pending_s = s; pending_row0 = (int)r0; pending_r = r;
+                cur ^= 1;
+                }
+            }
+            if (pending_s >= 0) {       // drain the last in-flight eval
+                pthread_join(g_ane_thread, NULL);
+                if (g_ane_job.ok) {
+                    double t0 = now_ms();
+                    int pe = uni[w0+pending_s];
+                    uint64_t oelems = 0;
+                    const __fp16 *of = (const __fp16 *)fc_ane_mlp_int8w_lock_output_f16(g_ane_ctx2[g_ane_job.set], &oelems);
+                    if (of) {
+                        for (uint32_t j = 0; j < pending_r; j++) {
+                            int row = off[pe] + pending_row0 + (int)j;
+                            float w = tw[row];
+                            float *dst = moe + (size_t)toks[row]*H;
+                            const __fp16 *src = of + (size_t)j*H;
+                            for (int d = 0; d < H; d++) dst[d] += w * (float)src[d];
+                        }
+                        fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
+                        g_prof_prefill_scatter += now_ms() - t0;
+                        done[pending_s] = 1;
+                    } else { g_ane_failed = 1; use_ane = 0; }
+                } else { g_ane_failed = 1; use_ane = 0; }
+            }
+            if (!use_ane)
+                fprintf(stderr, "[ane-prefill] eval failed — GPU fallback for remaining experts\n");
+            int all_done = 1;
+            for (int s = 0; s < wn; s++) if (valid[s] && !done[s]) all_done = 0;
+            if (all_done) continue;   // wave fully handled on the ANE
+        }
+
         _t = now_ms();
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         { // gate + up for every expert in the wave (independent -> one encoder)
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             for (int s = 0; s < wn; s++) {
-                if (!valid[s]) continue;
+                if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e];
                 NSUInteger xo = (size_t)off[e]*H*sizeof(float), mo = (size_t)off[e]*idim*sizeof(float);
                 gpu_encode_matmulN_io(ctx, enc, bufs[s], gw, bufs[s], gs_, bufs[s], gb, x_csr, xo, g_csr, mo, (uint32_t)idim, (uint32_t)H, (uint32_t)gsz, r);
@@ -5544,7 +5788,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:ctx->swiglu_batched];
             for (int s = 0; s < wn; s++) {
-                if (!valid[s]) continue;
+                if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e], dim = (uint32_t)idim;
                 NSUInteger mo = (size_t)off[e]*idim*sizeof(float);
                 [enc setBuffer:g_csr offset:mo atIndex:0];
@@ -5560,7 +5804,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
         { // down per expert
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             for (int s = 0; s < wn; s++) {
-                if (!valid[s]) continue;
+                if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e];
                 NSUInteger mo = (size_t)off[e]*idim*sizeof(float), oo = (size_t)off[e]*H*sizeof(float);
                 gpu_encode_matmulN_io(ctx, enc, bufs[s], dw, bufs[s], ds, bufs[s], db, a_csr, mo, o_csr, oo, (uint32_t)H, (uint32_t)idim, (uint32_t)gsz, r);
@@ -5570,11 +5814,40 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
         [cmd commit]; [cmd waitUntilCompleted];
         g_prof_prefill_gemm += now_ms() - _t;
 
+        if (ane_calib_enabled()) {
+            // x/mid absmax from the CSR staging; weight absmax from the q4
+            // scale/bias arrays (|s*15+b| or |b| bounds each group's range).
+            for (int s = 0; s < wn; s++) {
+                if (!valid[s] || done[s]) continue;
+                int e = uni[w0+s]; int r = cnt[e];
+                const float *xs = (const float *)[x_csr contents] + (size_t)off[e]*H;
+                for (size_t k = 0; k < (size_t)r*H; k++) { float a = fabsf(xs[k]); if (a > g_calib_x_absmax) g_calib_x_absmax = a; }
+                const float *as = (const float *)[a_csr contents] + (size_t)off[e]*idim;
+                for (size_t k = 0; k < (size_t)r*idim; k++) { float a = fabsf(as[k]); if (a > g_calib_mid_absmax) g_calib_mid_absmax = a; }
+                const uint8_t *blob = (const uint8_t *)[bufs[s] contents];
+                NSUInteger soffs[3] = { g_cfg.gate_w_size,
+                                        g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size + g_cfg.up_w_size,
+                                        g_cfg.gate_w_size + g_cfg.gate_s_size + g_cfg.gate_b_size +
+                                        g_cfg.up_w_size + g_cfg.up_s_size + g_cfg.up_b_size + g_cfg.down_w_size };
+                size_t scnts[3] = { g_cfg.gate_s_size / 2, g_cfg.up_s_size / 2, g_cfg.down_s_size / 2 };
+                for (int t3 = 0; t3 < 3; t3++) {
+                    const uint16_t *sc = (const uint16_t *)(blob + soffs[t3]);
+                    const uint16_t *bi = sc + scnts[t3];
+                    for (size_t k = 0; k < scnts[t3]; k++) {
+                        float scale = bf16_to_f32(sc[k]), bias = bf16_to_f32(bi[k]);
+                        float hi = fabsf(scale * 15.0f + bias), lo = fabsf(bias);
+                        float a = hi > lo ? hi : lo;
+                        if (a > g_calib_w_absmax) g_calib_w_absmax = a;
+                    }
+                }
+            }
+        }
+
         // Scatter-add this wave's outputs with route weights.
         _t = now_ms();
         const float *ostage = (const float *)[o_csr contents];
         for (int s = 0; s < wn; s++) {
-            if (!valid[s]) continue;
+            if (!valid[s] || done[s]) continue;
             int e = uni[w0+s];
             for (int j = 0; j < cnt[e]; j++) {
                 int r = off[e] + j;
@@ -10598,10 +10871,18 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
         *pos_io += n;
         i += n;
         g_prof_prefill_chunks++;
-        if (prefill_debug_enabled())
-            fprintf(stderr, "[prefill] chunk %d tokens (%d/%d) in %.0fms | cum route=%.0f io=%.0f gemm=%.0f scatter=%.0f ms\n",
+        if (prefill_debug_enabled()) {
+            fprintf(stderr, "[prefill] chunk %d tokens (%d/%d) in %.0fms | cum route=%.0f io=%.0f gemm=%.0f scatter=%.0f ane_prod=%.0f ane_eval=%.0f ms\n",
                     n, i, count, now_ms() - t0,
-                    g_prof_prefill_route, g_prof_prefill_io, g_prof_prefill_gemm, g_prof_prefill_scatter);
+                    g_prof_prefill_route, g_prof_prefill_io, g_prof_prefill_gemm, g_prof_prefill_scatter,
+                    g_prof_ane_producer, g_prof_ane_eval);
+            if (ane_calib_enabled() && g_calib_w_absmax > 0)
+                fprintf(stderr, "[ane-calib] absmax w=%.4f x=%.3f mid=%.3f -> W_QSCALE=%.0f (absmax); "
+                        "x/mid absmax is outlier-driven — prefer CLIP scales (e.g. 16 = clip at +-7.9) "
+                        "and verify greedy agreement\n",
+                        g_calib_w_absmax, g_calib_x_absmax, g_calib_mid_absmax,
+                        127.0f / g_calib_w_absmax);
+        }
         if (ka_enabled)
             maybe_sse_send_prefill_keepalive(client_fd, request_id, ka_enabled, ka_next,
                                              ka_phase, i, count);

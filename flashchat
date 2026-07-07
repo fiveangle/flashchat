@@ -986,6 +986,7 @@ server_runtime_signature() {
         echo "BATCH_PREFILL=$(flashchat_get BATCH_PREFILL)"
         echo "PREFILL_CHUNK=$(flashchat_get PREFILL_CHUNK)"
         echo "PREFILL_DEBUG=$(flashchat_get PREFILL_DEBUG)"
+        echo "ANE_PREFILL=$(flashchat_get ANE_PREFILL)"
         echo "PREAD_PROFILE=$(flashchat_get PREAD_PROFILE)"
         echo "PREAD_PROFILE_CAP=$(flashchat_get PREAD_PROFILE_CAP)"
         echo "EXPERT_PIN_MAX_GB=$(flashchat_get EXPERT_PIN_MAX_GB)"
@@ -1381,6 +1382,8 @@ cmd_serve() {
     [ -n "${FLASHCHAT_BATCH_PREFILL}" ] && _batch_prefill="$FLASHCHAT_BATCH_PREFILL" || _batch_prefill="$(flashchat_get BATCH_PREFILL)"
     [ -n "${FLASHCHAT_PREFILL_CHUNK}" ] && _prefill_chunk="$FLASHCHAT_PREFILL_CHUNK" || _prefill_chunk="$(flashchat_get PREFILL_CHUNK)"
     [ -n "${FLASHCHAT_PREFILL_DEBUG}" ] && _prefill_debug="$FLASHCHAT_PREFILL_DEBUG" || _prefill_debug="$(flashchat_get PREFILL_DEBUG)"
+    local _ane_prefill
+    [ -n "${FLASHCHAT_ANE_PREFILL}" ] && _ane_prefill="$FLASHCHAT_ANE_PREFILL" || _ane_prefill="$(flashchat_get ANE_PREFILL)"
     local _pin_max_gb _pin_auto_frac _pin_mlock
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
     [ -n "${FLASHCHAT_EXPERT_PIN_AUTO_FRAC}" ] && _pin_auto_frac="$FLASHCHAT_EXPERT_PIN_AUTO_FRAC" || _pin_auto_frac="$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
@@ -1392,6 +1395,7 @@ cmd_serve() {
     FLASHCHAT_BATCH_PREFILL="$_batch_prefill" \
     FLASHCHAT_PREFILL_CHUNK="$_prefill_chunk" \
     FLASHCHAT_PREFILL_DEBUG="$_prefill_debug" \
+    FLASHCHAT_ANE_PREFILL="$_ane_prefill" \
     FLASHCHAT_PREAD_PROFILE="$_pread_profile" \
     FLASHCHAT_PREAD_PROFILE_CAP="$_pread_profile_cap" \
     FLASHCHAT_EXPERT_PIN_MAX_GB="$_pin_max_gb" \
