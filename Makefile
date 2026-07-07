@@ -111,7 +111,13 @@ LINENOISE_HDR = $(BUILD_DIR)/linenoise.h
 RAM_PRESSURE_TARGET = tools/ram_pressure
 RAM_PRESSURE_SRC = tools/ram_pressure.c
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests
+# ANE MoE-expert MLP library (ported from ds4-ssd) + precision smoke.
+# Uses the private AppleNeuralEngine framework; macOS only.
+ANE_MLP_SRC = $(BUILD_DIR)/fc_ane_mlp.m
+ANE_MLP_HDR = $(BUILD_DIR)/fc_ane_mlp.h
+ANE_SMOKE_TARGET = tests/ane_mlp_smoke
+
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests ane-smoke
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -242,6 +248,17 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) $(LINENOISE_SRC) $(LINENOISE_HDR)
 	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CHAT_CFLAGS) -framework Foundation $(CHAT_SRC) $(LINENOISE_SRC) -o $(CHAT_TARGET)
+
+# ANE MLP precision smoke: full CPU reference at a small shape, then row-0
+# reference at the production expert shapes (full ref is O(B*H^2*I) — too slow
+# at real dims). No model weights needed; safe on any RAM budget.
+$(ANE_SMOKE_TARGET): tests/ane_mlp_smoke.m $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+	$(CC) -fobjc-arc -O2 -I$(BUILD_DIR) -o $@ tests/ane_mlp_smoke.m $(ANE_MLP_SRC) -framework Foundation -framework IOSurface -lpthread
+
+ane-smoke: $(ANE_SMOKE_TARGET)
+	./$(ANE_SMOKE_TARGET)
+	./$(ANE_SMOKE_TARGET) -H 2048 -I 512 -B 256 -row0-ref
+	./$(ANE_SMOKE_TARGET) -H 4096 -I 1024 -B 256 -row0-ref
 
 $(RAM_PRESSURE_TARGET): $(RAM_PRESSURE_SRC)
 	$(CC) -O2 -Wall -Wextra $(RAM_PRESSURE_SRC) -o $(RAM_PRESSURE_TARGET)
