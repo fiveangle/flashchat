@@ -385,6 +385,9 @@ def _advanced_settings(manifest) -> dict:
     for key, label, default in (
             ("SERVER_DEBUG", "Server debug logging (0/1)", "0"),
             ("SERVER_HTTP_LOG", "HTTP traffic log (0/1)", "0"),
+            ("BATCH_PREFILL", "Chunked batched prefill (0/1; ~4x faster prompt processing)", "0"),
+            ("PREFILL_CHUNK", "  ^ tokens per prefill chunk (bigger = more RAM for staging)", "256"),
+            ("PREFILL_DEBUG", "Prefill debug (0=off, 1=chunk timing, 2=+state dump)", "0"),
             ("PREAD_PROFILE", "Expert-streaming pread timing profile (empty = off; path = write TSV, e.g. debug/pread.tsv)", ""),
             ("PREAD_PROFILE_CAP", "  ^ how many disk-read events that profile keeps before it stops recording (default ~2M; only matters if the profile above is on)", "2097152"),
             ("EXPERT_PIN_MAX_GB", "Expert pin-cache cap in GiB (0 = off; keeps hottest experts RAM-resident on low-RAM machines)", "4"),
