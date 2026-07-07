@@ -13289,14 +13289,62 @@ static void serve_loop(
         server_logf("[serve]   kv_cache: window=%d quant=%s total_bytes=%.1f MiB\n",
                     GPU_KV_SEQ, kv_q, (double)kv_total / (1024.0 * 1024.0));
     }
+    if (batch_prefill_enabled()) {
+        server_logf("[serve]   batched_prefill: enabled chunk=%d min_tokens=16\n",
+                    prefill_chunk_tokens());
+        if (ane_prefill_enabled()) {
+            server_logf("[serve]   ane_prefill: enabled batch=%d w_qscale=%g x_qscale=%g mid_qscale=%g\n",
+                        (int)ane_env_qscale("FLASHCHAT_ANE_BATCH", 256.0f),
+                        ane_env_qscale("FLASHCHAT_ANE_W_QSCALE", 195.0f),
+                        ane_env_qscale("FLASHCHAT_ANE_X_QSCALE", 16.0f),
+                        ane_env_qscale("FLASHCHAT_ANE_MID_QSCALE", 16.0f));
+        } else {
+            server_logf("[serve]   ane_prefill: disabled\n");
+        }
+    } else {
+        server_logf("[serve]   batched_prefill: disabled (per-token prefill)\n");
+        if (ane_prefill_enabled())
+            server_logf("[serve]   ane_prefill: requested but INACTIVE — requires batched_prefill\n");
+        else
+            server_logf("[serve]   ane_prefill: disabled\n");
+    }
+    {
+        const char *pin_env = getenv("FLASHCHAT_EXPERT_PIN_MAX_GB");
+        double pin_gb = (pin_env && pin_env[0]) ? atof(pin_env) : 0.0;
+        if (pin_gb > 0.0) {
+            const char *frac_env = getenv("FLASHCHAT_EXPERT_PIN_AUTO_FRAC");
+            double frac = (frac_env && frac_env[0]) ? atof(frac_env) : 0.5;
+            if (frac <= 0.0 || frac > 1.0) frac = 0.5;
+            const char *ml = getenv("FLASHCHAT_EXPERT_PIN_MLOCK");
+            server_logf("[serve]   expert_pin_cache: enabled cap=%.1f GiB auto_frac=%.2f mlock=%s "
+                        "(budget resolves at first expert read)\n",
+                        pin_gb, frac, (ml && ml[0] && atoi(ml)) ? "on" : "off");
+        } else {
+            server_logf("[serve]   expert_pin_cache: disabled\n");
+        }
+    }
+    {
+        const char *pp = getenv("FLASHCHAT_PREAD_PROFILE");
+        if (pp && pp[0]) {
+            const char *cap = getenv("FLASHCHAT_PREAD_PROFILE_CAP");
+            server_logf("[serve]   pread_profile: %s cap=%s events\n",
+                        pp, (cap && cap[0]) ? cap : "2097152");
+        } else {
+            server_logf("[serve]   pread_profile: disabled\n");
+        }
+    }
     server_logf("[serve]   system_prompt_cache: %s max_entries=%d\n",
                 g_system_prompt_cache_enabled ? "enabled" : "disabled",
                 g_system_prompt_cache_max_entries);
     server_logf("[serve]   system_prompt_cache_dir: %s\n",
                 g_system_prompt_cache_dir[0] ? g_system_prompt_cache_dir : "(model directory)");
-    server_logf("[serve]   server_debug: %s http_log: %s\n",
-                g_server_debug_enabled ? "enabled" : "disabled",
-                g_server_http_log_enabled ? "enabled" : "disabled");
+    {
+        const char *pd = getenv("FLASHCHAT_PREFILL_DEBUG");
+        server_logf("[serve]   server_debug: %s http_log: %s prefill_debug: %s\n",
+                    g_server_debug_enabled ? "enabled" : "disabled",
+                    g_server_http_log_enabled ? "enabled" : "disabled",
+                    (pd && pd[0] && atoi(pd)) ? pd : "0");
+    }
     const char *system_prompt = custom_system_prompt_path();
     if (system_prompt && system_prompt[0]) {
         if (g_custom_system_prompt_loaded) {
@@ -13308,9 +13356,6 @@ static void serve_loop(
             server_logf("[serve]   custom_user_system_prompt: %s (not present; using built-in default)\n", system_prompt);
         }
     }
-    server_logf("[serve] Persistent system prompt cache: %s (max entries: %d)\n",
-                g_system_prompt_cache_enabled ? "enabled" : "disabled",
-                g_system_prompt_cache_max_entries);
 
     static uint64_t req_counter = 0;
 

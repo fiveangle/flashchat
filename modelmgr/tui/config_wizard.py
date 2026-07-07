@@ -382,25 +382,38 @@ def _advanced_settings(manifest) -> dict:
         return {}
     out = {}
     mtp_raw = ""
-    for key, label, default in (
-            ("SERVER_DEBUG", "Server debug logging (0/1)", "0"),
-            ("SERVER_HTTP_LOG", "HTTP traffic log (0/1)", "0"),
-            ("BATCH_PREFILL", "Chunked batched prefill (0/1; ~4x faster prompt processing)", "0"),
-            ("PREFILL_CHUNK", "  ^ tokens per prefill chunk (bigger = more RAM for staging)", "256"),
-            ("PREFILL_DEBUG", "Prefill debug (0=off, 1=chunk timing, 2=+state dump)", "0"),
-            ("ANE_PREFILL", "Neural Engine expert-MLP offload during batched prefill (0/1; int8, near-lossless)", "0"),
-            ("PREAD_PROFILE", "Expert-streaming pread timing profile (empty = off; path = write TSV, e.g. debug/pread.tsv)", ""),
-            ("PREAD_PROFILE_CAP", "  ^ how many disk-read events that profile keeps before it stops recording (default ~2M; only matters if the profile above is on)", "2097152"),
-            ("EXPERT_PIN_MAX_GB", "Expert pin-cache cap in GiB (0 = off; keeps hottest experts RAM-resident on low-RAM machines)", "4"),
-            ("EXPERT_PIN_AUTO_FRAC", "Expert pin-cache: fraction of free RAM to use, capped by the GiB max", "0.5"),
-            ("EXPERT_PIN_MLOCK", "Expert pin-cache: mlock arena against swap (0/1)", "0"),
-            ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1"),
-            ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "Cache max entries", "2"),
-            ("SYSTEM_PROMPT_CACHE_DIR", "External system prompt cache root (- for model directory)", ""),
-            ("MTP", "Multi-token prediction (0=off, auto=registry default, N=batch)", "0"),
-            ("MTP_BF16", "Use BF16 MTP predictor weights (0/1)", "0"),
-            ("SHOW_THINKING", "Show thinking tokens (0/1)", "0"),
-            ("COLOR_OUTPUT", "Color output (0/1)", "1")):
+    # Entries: (KEY, prompt label, default, optional ONE-line dim help). The
+    # label carries the value space; help exists only where the label alone
+    # cannot explain the consequence. No headers, no blank lines — the section
+    # reads as a serial choice log.
+    for key, label, default, help_text in (
+            ("SERVER_DEBUG", "Server debug logging to server.log (0/1)", "0", None),
+            ("SERVER_HTTP_LOG", "HTTP request/response log to http.log (0/1)", "0", None),
+            ("BATCH_PREFILL", "Batched prompt processing (0/1)", "0",
+             "~4-6x faster prompt reading; responses unchanged in normal use."),
+            ("PREFILL_CHUNK", "  ^ chunk size in tokens (64-2048)", "256",
+             "Bigger = faster but more working RAM: 256 ~50 MB, 2048 ~400 MB."),
+            ("ANE_PREFILL", "  ^ Neural Engine expert offload (0/1)", "0",
+             "~25% faster on top of batching and frees the GPU; responses unchanged in practice."),
+            ("PREFILL_DEBUG", "  ^ debug (0=off, 1=chunk timings, 2=+state dump, slow)", "0", None),
+            ("PREAD_PROFILE", "Disk-read timing log (empty=off, or a .tsv path)", "",
+             "For diagnosing slow expert streaming; analyze with tools/pread_profile_analyze.py."),
+            ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", "2097152", None),
+            ("EXPERT_PIN_MAX_GB", "Expert RAM cache in GiB (0=off)", "4",
+             "Keeps the hottest experts in RAM instead of re-reading from disk — the main decode speedup when RAM is spare."),
+            ("EXPERT_PIN_AUTO_FRAC", "  ^ also capped to this fraction of free RAM (0.1-0.9)", "0.5", None),
+            ("EXPERT_PIN_MLOCK", "  ^ lock against swap (0/1; keeps RAM from other apps)", "0", None),
+            ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1",
+             "Repeat requests skip re-reading the system prompt — big win for long agent prompts."),
+            ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "  ^ max saved prompts (1-64; entries can be tens of MB)", "2", None),
+            ("SYSTEM_PROMPT_CACHE_DIR", "  ^ cache folder ('-' = beside the model)", "", None),
+            ("MTP", "Multi-token prediction (0=off, auto=model default, 2+=batch size)", "0",
+             "Lossless speculative decoding for models that ship a predictor head."),
+            ("MTP_BF16", "  ^ BF16 predictor weights (0/1; more RAM, slightly better drafts)", "0", None),
+            ("SHOW_THINKING", "Show thinking tokens (0/1)", "0", None),
+            ("COLOR_OUTPUT", "Color output (0/1)", "1", None)):
+        if help_text:
+            print(common.dim(f"  {help_text}"))
         value = common.prompt(label, configfile.get(key, default))
         if key == "MTP":
             mtp_raw = value
