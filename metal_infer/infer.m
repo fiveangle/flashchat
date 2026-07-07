@@ -633,6 +633,7 @@ static void configure_arch_perf(void) {
         if (e && *e) { int v = atoi(e); if (v > 0) win = v; }
         if (win < 512) win = 512;
         if (g_cfg.max_context > 0 && win > g_cfg.max_context) win = g_cfg.max_context;
+        if (win > MAX_SEQ_LEN) win = MAX_SEQ_LEN;  // absolute design guard
         g_gpu_kv_seq = win;
     }
 
@@ -4617,10 +4618,16 @@ typedef struct {
     __fp16 *k_scale; // per-(token, kv_head) K scales [max_seq, num_kv_heads]
     __fp16 *v_scale; // per-(token, kv_head) V scales
     int len;         // current number of cached entries
+    int cap;         // allocated token capacity (appends beyond this fail loud)
 } KVCache;
 
 // Allocate K/V storage for `cap` tokens, honoring the active KV-quant mode.
+// Callers size this by the RUNTIME context window (GPU_KV_SEQ), never by the
+// model's as-trained design max: a 1M-token f32 allocation is 40GB — allocating
+// that on a 32GB machine because the model card says "1M" is how you get a
+// swap storm (2026-07-06). MAX_SEQ_LEN is only the upper guard bound.
 static void kv_cache_alloc_storage(KVCache *c, size_t cap) {
+    c->cap = (int)cap;
     if (kv_quant_bits()) {
         size_t tb = kv_token_bytes();        // packed bytes/token
         size_t sp = kv_scales_per_token();   // scales/token
@@ -4635,9 +4642,85 @@ static void kv_cache_alloc_storage(KVCache *c, size_t cap) {
     }
 }
 
+// ---- Unified KV-cache append -----------------------------------------------
+// The ONLY writer of full-attn KV state. Quantizes (or stores f32) into the
+// CPU-side cache and mirrors into the GPU KV buffers, honoring the active
+// KV-quant mode — so rank/layout decisions live in one place instead of being
+// re-implemented per forward path. Pass fa_idx = -1 to skip the GPU mirror
+// (paths that never dispatch GPU attention, e.g. the CPU reference forward).
+static void kv_append_token(KVCache *kv, int fa_idx, const float *k, const float *v) {
+    int cache_pos = kv->len;
+    if (cache_pos >= kv->cap) {
+        // Fail loud: the cache is sized to the configured context window, and
+        // writing past it would corrupt memory. Raise FLASHCHAT_CONTEXT_WINDOW
+        // if longer contexts are needed.
+        fprintf(stderr, "FATAL: KV append at pos %d exceeds cache capacity %d "
+                "(context window). Raise FLASHCHAT_CONTEXT_WINDOW.\n",
+                cache_pos, kv->cap);
+        abort();
+    }
+    int qb = kv_quant_bits();
+    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+    int gpu_kv_write = (g_metal && g_metal->attn_scores_pipe &&
+                        fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+                        cache_pos < GPU_KV_SEQ);
+    if (qb) {
+        size_t tb = kv_token_bytes();       // packed bytes/token
+        size_t sp = kv_scales_per_token();  // scales/token
+        uint8_t *kq = (uint8_t *)kv->kq + (size_t)cache_pos * tb;
+        uint8_t *vq = (uint8_t *)kv->vq + (size_t)cache_pos * tb;
+        __fp16 *ks = kv->k_scale + (size_t)cache_pos * sp;
+        __fp16 *vs = kv->v_scale + (size_t)cache_pos * sp;
+        kv_quantize_token(k, kq, ks, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+        kv_quantize_token(v, vq, vs, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+        if (gpu_kv_write) {
+            memcpy((uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * tb, kq, tb);
+            memcpy((uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * tb, vq, tb);
+            memcpy((uint8_t *)[g_metal->buf_kv_kscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), ks, sp * sizeof(__fp16));
+            memcpy((uint8_t *)[g_metal->buf_kv_vscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), vs, sp * sizeof(__fp16));
+        }
+    } else {
+        memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, k, kv_dim * sizeof(float));
+        memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, v, kv_dim * sizeof(float));
+        if (gpu_kv_write) {
+            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+                   k, kv_dim * sizeof(float));
+            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+                   v, kv_dim * sizeof(float));
+        }
+    }
+    kv->len++;
+}
+
+// Batched append: n contiguous tokens' K/V vectors [n, kv_dim].
+// (Wired up by the chunked-prefill driver; unused until then.)
+__attribute__((unused))
+static void kv_append_batch(KVCache *kv, int fa_idx, const float *k_all, const float *v_all, int n) {
+    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
+    for (int t = 0; t < n; t++)
+        kv_append_token(kv, fa_idx, k_all + (size_t)t * kv_dim, v_all + (size_t)t * kv_dim);
+}
+
+// Rank-agnostic CPU-side element reads for the CPU attention fallbacks.
+// qb is hoisted by the caller (kv_quant_bits() per element would be wasteful).
+static inline float kv_k_elem(const KVCache *kv, int pos, int kv_h, int d, int qb) {
+    if (qb) return kv_dequant_elem(kv->kq, kv->k_scale, pos, kv_h, d,
+                                   g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+    return kv->k_cache[(size_t)pos * g_cfg.num_kv_heads * g_cfg.head_dim +
+                       (size_t)kv_h * g_cfg.head_dim + d];
+}
+static inline float kv_v_elem(const KVCache *kv, int pos, int kv_h, int d, int qb) {
+    if (qb) return kv_dequant_elem(kv->vq, kv->v_scale, pos, kv_h, d,
+                                   g_cfg.num_kv_heads, g_cfg.head_dim, qb);
+    return kv->v_cache[(size_t)pos * g_cfg.num_kv_heads * g_cfg.head_dim +
+                       (size_t)kv_h * g_cfg.head_dim + d];
+}
+
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    kv_cache_alloc_storage(c, (size_t)MAX_SEQ_LEN);
+    // Size by the user-configured context window (already clamped to the model
+    // max and MAX_SEQ_LEN in configure_arch_perf), NOT the design max.
+    kv_cache_alloc_storage(c, (size_t)GPU_KV_SEQ);
     c->len = 0;
     return c;
 }
@@ -4828,16 +4911,16 @@ static void full_attention_forward(
     apply_rotary_emb(q, k, pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
 
     // ---- Update KV cache ----
-    int cache_pos = kv->len;
-    memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
-    kv->len++;
+    // fa_idx -1: this CPU reference path never dispatches GPU attention, so
+    // skip the GPU mirror (matches the pre-unification behavior).
+    kv_append_token(kv, -1, k, v);
 
     // ---- Scaled dot-product attention ----
     // GQA: g_cfg.num_attn_heads=32 heads, g_cfg.num_kv_heads=2 kv heads
     // Each group of 16 query heads shares 1 kv head
     int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
     float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    int kvq_bits = kv_quant_bits();
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
@@ -4848,10 +4931,9 @@ static void full_attention_forward(
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
         for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * g_cfg.head_dim;
             float dot = 0.0f;
             for (int d = 0; d < g_cfg.head_dim; d++) {
-                dot += qh[d] * kp[d];
+                dot += qh[d] * kv_k_elem(kv, p, kv_h, d, kvq_bits);
             }
             scores[p] = dot * scale;
         }
@@ -4862,9 +4944,8 @@ static void full_attention_forward(
         // Weighted sum of values
         float *oh = attn_out + h * g_cfg.head_dim;
         for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * g_cfg.head_dim;
             for (int d = 0; d < g_cfg.head_dim; d++) {
-                oh[d] += scores[p] * vp[d];
+                oh[d] += scores[p] * kv_v_elem(kv, p, kv_h, d, kvq_bits);
             }
         }
         free(scores);
@@ -4983,20 +5064,25 @@ static void gpu_full_attention_batch(int fa_idx, int n, int base_len,
     float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
     memcpy([ctx->buf_attn_q_batch contents], q_all, (size_t)n * qdim * sizeof(float));
     memcpy([ctx->buf_attn_gate_batch contents], gate_all, (size_t)n * qdim * sizeof(float));
+    uint32_t qbits = (uint32_t)kv_quant_bits();
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
     for (int t = 0; t < n; t++) {
         uint32_t sl = (uint32_t)(base_len + t + 1);          // causal length for this query
         NSUInteger qoff = (NSUInteger)((size_t)t * qdim * sizeof(float));
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_scores_pipe];
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:qbits ? ctx->attn_scores_quant_pipe : ctx->attn_scores_pipe];
           [e setBuffer:ctx->buf_attn_q_batch offset:qoff atIndex:0]; [e setBuffer:ctx->buf_kv_k[fa_idx] offset:0 atIndex:1]; [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
           [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&scale length:4 atIndex:7];[e setBytes:&hpkv length:4 atIndex:8];[e setBytes:&sl length:4 atIndex:9];
+          if (qbits) { [e setBuffer:ctx->buf_kv_kscale[fa_idx] offset:0 atIndex:10]; [e setBytes:&qbits length:4 atIndex:11]; }
           [e dispatchThreadgroups:MTLSizeMake(sl*g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
         { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_softmax_pipe];
           [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBytes:&sl length:4 atIndex:1];[e setBytes:&seq_stride length:4 atIndex:2];
           [e dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->attn_values_pipe];
+        { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+          [e setComputePipelineState:qbits ? ctx->attn_values_quant_pipe : ctx->attn_values_pipe];
           [e setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];[e setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];[e setBuffer:ctx->buf_attn_out_batch offset:qoff atIndex:2];
           [e setBytes:&hd length:4 atIndex:3];[e setBytes:&kvd length:4 atIndex:4];[e setBytes:&sl length:4 atIndex:5];[e setBytes:&seq_stride length:4 atIndex:6];[e setBytes:&hpkv length:4 atIndex:7];
+          if (qbits) { [e setBuffer:ctx->buf_kv_vscale[fa_idx] offset:0 atIndex:8]; [e setBytes:&qbits length:4 atIndex:9]; }
           uint32_t tt=qdim; [e dispatchThreadgroups:MTLSizeMake((tt+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
         { id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:ctx->sigmoid_gate_pipe];
           [e setBuffer:ctx->buf_attn_out_batch offset:qoff atIndex:0];[e setBuffer:ctx->buf_attn_gate_batch offset:qoff atIndex:1];[e setBytes:&qdim length:4 atIndex:2];
@@ -5043,12 +5129,7 @@ static void batched_layer_forward_N(WeightFile *wf, int layer, float *hs, int N,
             for(int h=0;h<g_cfg.num_attn_heads;h++){ float*qh=q+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=qh[i]*qh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)qh[i]=qh[i]*iv*bf16_to_f32(qn[i]);}
             for(int h=0;h<g_cfg.num_kv_heads;h++){ float*kh=kt+h*g_cfg.head_dim,ss=0; for(int i=0;i<g_cfg.head_dim;i++)ss+=kh[i]*kh[i]; float iv=1.f/sqrtf(ss/g_cfg.head_dim+eps); for(int i=0;i<g_cfg.head_dim;i++)kh[i]=kh[i]*iv*bf16_to_f32(kn[i]);}
             apply_rotary_emb(q,kt,pos[t],g_cfg.num_attn_heads,g_cfg.num_kv_heads,g_cfg.head_dim,g_cfg.rotary_dim);
-            int cp=kv->len; memcpy(kv->k_cache+(size_t)cp*kvd,kt,kvd*4); memcpy(kv->v_cache+(size_t)cp*kvd,vt,kvd*4);
-            if (dgpu && cp < GPU_KV_SEQ) {
-                memcpy((float*)[g_metal->buf_kv_k[fa_idx] contents]+(size_t)cp*kvd, kt, (size_t)kvd*4);
-                memcpy((float*)[g_metal->buf_kv_v[fa_idx] contents]+(size_t)cp*kvd, vt, (size_t)kvd*4);
-            }
-            kv->len++;
+            kv_append_token(kv, dgpu ? fa_idx : -1, kt, vt);  // unified append (quant-aware)
         }
         if (dgpu && (base_len+N)<=GPU_KV_SEQ) {
             // One command buffer for the whole chunk's attention (token t -> base_len+t+1 keys).
@@ -5056,13 +5137,14 @@ static void batched_layer_forward_N(WeightFile *wf, int layer, float *hs, int N,
             // (baseline) and the batched verify, so all paths agree bit-for-bit.
             gpu_full_attention_batch(fa_idx, N, base_len, q_all, qg_all, ao);
         } else {
+            int qb=kv_quant_bits();
             for (int t=0;t<N;t++){
                 float *q=q_all+(size_t)t*qd, *qg=qg_all+(size_t)t*qd, *aot=ao+(size_t)t*qd;
                 int len_t = base_len + t + 1;   // causal length for token t (NOT kv->len, which is base+N now)
                 for(int h=0;h<g_cfg.num_attn_heads;h++){ int kvh=h/hpk; float*qh=q+h*g_cfg.head_dim; float*sc=malloc(len_t*4);
-                    for(int p=0;p<len_t;p++){float*kp=kv->k_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kp[d]; sc[p]=dt*ascale;}
+                    for(int p=0;p<len_t;p++){float dt=0; for(int d=0;d<g_cfg.head_dim;d++)dt+=qh[d]*kv_k_elem(kv,p,kvh,d,qb); sc[p]=dt*ascale;}
                     cpu_softmax(sc,len_t); float*oh=aot+h*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]=0;
-                    for(int p=0;p<len_t;p++){float*vp=kv->v_cache+(size_t)p*kvd+kvh*g_cfg.head_dim; for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*vp[d];} free(sc);}
+                    for(int p=0;p<len_t;p++){for(int d=0;d<g_cfg.head_dim;d++)oh[d]+=sc[p]*kv_v_elem(kv,p,kvh,d,qb);} free(sc);}
                 for(int i=0;i<qd;i++)aot[i]*=cpu_sigmoid(qg[i]);
             }
         }
@@ -7838,39 +7920,9 @@ static void fused_layer_forward(
             gpu_rope_upload_freq(g_metal, pos);
         }
 
-        // Update KV cache (CPU + GPU mirror)
-        int cache_pos = kv->len;
+        // Update KV cache (CPU + GPU mirror) via the unified append
         int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
-        int qb = kv_quant_bits();
-        int gpu_kv_write = (g_metal && g_metal->attn_scores_pipe &&
-                            fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
-                            cache_pos < GPU_KV_SEQ);
-        if (qb) {
-            size_t tb = kv_token_bytes();       // packed bytes/token
-            size_t sp = kv_scales_per_token();  // scales/token
-            uint8_t *kq = (uint8_t *)kv->kq + (size_t)cache_pos * tb;
-            uint8_t *vq = (uint8_t *)kv->vq + (size_t)cache_pos * tb;
-            __fp16 *ks = kv->k_scale + (size_t)cache_pos * sp;
-            __fp16 *vs = kv->v_scale + (size_t)cache_pos * sp;
-            kv_quantize_token(k_out, kq, ks, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
-            kv_quantize_token(v_out, vq, vs, g_cfg.num_kv_heads, g_cfg.head_dim, qb);
-            if (gpu_kv_write) {
-                memcpy((uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * tb, kq, tb);
-                memcpy((uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * tb, vq, tb);
-                memcpy((uint8_t *)[g_metal->buf_kv_kscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), ks, sp * sizeof(__fp16));
-                memcpy((uint8_t *)[g_metal->buf_kv_vscale[fa_idx] contents] + (size_t)cache_pos * sp * sizeof(__fp16), vs, sp * sizeof(__fp16));
-            }
-        } else {
-            memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-            memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
-            if (gpu_kv_write) {
-                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                       k_out, kv_dim * sizeof(float));
-                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                       v_out, kv_dim * sizeof(float));
-            }
-        }
-        kv->len++;
+        kv_append_token(kv, fa_idx, k_out, v_out);
 
         // Scaled dot-product attention (GQA) — GPU or CPU
         int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
@@ -11021,14 +11073,14 @@ static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
 
 __attribute__((unused))
 static void clear_runtime_state_serve(void **layer_states, KVCache **kv_caches) {
-    size_t kv_dim = g_cfg.num_kv_heads * g_cfg.head_dim;
     size_t conv_state_size = (g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
     size_t ssm_state_size = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
     for (int i = 0; i < g_cfg.num_layers; i++) {
         if (kv_caches[i]) {
+            // len = 0 is the reset: every reader is len-gated (the quant path
+            // has always relied on exactly this). Memsetting the full window
+            // here dirtied GiBs of pages per reset for nothing.
             kv_caches[i]->len = 0;
-            if (kv_caches[i]->k_cache) memset(kv_caches[i]->k_cache, 0, (size_t)GPU_KV_SEQ * kv_dim * sizeof(float));
-            if (kv_caches[i]->v_cache) memset(kv_caches[i]->v_cache, 0, (size_t)GPU_KV_SEQ * kv_dim * sizeof(float));
         }
         if (layer_states[i]) {
             LinearAttnState *s = (LinearAttnState *)layer_states[i];
@@ -11535,17 +11587,30 @@ static void fingerprint_runtime_state(int token_count,
                                       RuntimeFingerprint *fp) {
     memset(fp, 0, sizeof(*fp));
     fp->token_count = token_count;
+    int qb = kv_quant_bits();
     size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
-    size_t kv_sz = (size_t)token_count * kv_dim * sizeof(float);
+    // Rank-aware sizes: kv_token_bytes() already returns the packed (quant) or
+    // fp32 per-token size for the active mode.
+    size_t kv_sz = (size_t)token_count * kv_token_bytes();
+    size_t scale_sz = (size_t)token_count * kv_scales_per_token() * sizeof(__fp16);
     size_t conv_state_size = (size_t)(g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
     size_t ssm_state_size = (size_t)g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
     size_t gpu_tokens = token_count < GPU_KV_SEQ ? (size_t)token_count : (size_t)GPU_KV_SEQ;
-    size_t gpu_kv_sz = gpu_tokens * kv_dim * sizeof(float);
+    size_t gpu_kv_sz = gpu_tokens * kv_token_bytes();
+    (void)kv_dim;
 
     for (int i = 0; i < g_cfg.num_layers; i++) {
         if (kv_caches[i]) {
-            fp->fp_kv_k_cpu[i] = fnv1a64(kv_caches[i]->k_cache, kv_sz);
-            fp->fp_kv_v_cpu[i] = fnv1a64(kv_caches[i]->v_cache, kv_sz);
+            if (qb) {
+                // Fold packed K/V and their scales into one hash per side.
+                uint64_t hk = fnv1a64(kv_caches[i]->kq, kv_sz);
+                uint64_t hv = fnv1a64(kv_caches[i]->vq, kv_sz);
+                fp->fp_kv_k_cpu[i] = hk ^ (fnv1a64(kv_caches[i]->k_scale, scale_sz) * 0x9E3779B97F4A7C15ULL);
+                fp->fp_kv_v_cpu[i] = hv ^ (fnv1a64(kv_caches[i]->v_scale, scale_sz) * 0x9E3779B97F4A7C15ULL);
+            } else {
+                fp->fp_kv_k_cpu[i] = fnv1a64(kv_caches[i]->k_cache, kv_sz);
+                fp->fp_kv_v_cpu[i] = fnv1a64(kv_caches[i]->v_cache, kv_sz);
+            }
             fp->kv_len[i] = kv_caches[i]->len;
             if (g_metal) {
                 int fa_idx = (i + 1) / g_cfg.full_attn_interval - 1;
@@ -12195,8 +12260,11 @@ static int cache_roundtrip_test(void) {
     // realistic prefills are 7000+. Compression and roundtrip semantics are
     // unaffected by token count.
     int token_count = 128;
-    size_t kv_dim = (size_t)g_cfg.num_kv_heads * g_cfg.head_dim;
-    size_t kv_sz = (size_t)token_count * kv_dim * sizeof(float);
+    int rt_qb = kv_quant_bits();
+    // Rank-aware: snapshots roundtrip in the runtime KV representation
+    // (fp32, or packed q8/q4 + per-(token,head) scales).
+    size_t kv_sz = (size_t)token_count * kv_token_bytes();
+    size_t scale_sz = (size_t)token_count * kv_scales_per_token() * sizeof(__fp16);
     size_t conv_state_size = (size_t)(g_cfg.linear_conv_kernel_dim - 1) * g_cfg.linear_conv_dim * sizeof(float);
     size_t ssm_state_size = (size_t)g_cfg.linear_num_v_heads * g_cfg.linear_value_dim * g_cfg.linear_key_dim * sizeof(float);
 
@@ -12221,12 +12289,31 @@ static int cache_roundtrip_test(void) {
             kv_orig[i].v_snapshot = malloc(kv_sz);
             if (!kv_orig[i].k_snapshot || !kv_orig[i].v_snapshot) { failures++; goto cleanup; }
             kv_orig[i].len = token_count;
-            float *k = kv_orig[i].k_snapshot;
-            float *v = kv_orig[i].v_snapshot;
-            size_t n = kv_sz / sizeof(float);
-            for (size_t j = 0; j < n; j++) {
-                k[j] = sinf((float)(i * 7919u + j * 31u) * 1e-4f);
-                v[j] = cosf((float)(i * 7919u + j * 31u) * 1e-4f) + 0.5f;
+            if (rt_qb) {
+                // Quant runtime: packed-byte payload + fp16 scales. The
+                // roundtrip is byte-level, so any deterministic pattern works.
+                uint8_t *kb = (uint8_t *)kv_orig[i].k_snapshot;
+                uint8_t *vb = (uint8_t *)kv_orig[i].v_snapshot;
+                for (size_t j = 0; j < kv_sz; j++) {
+                    kb[j] = (uint8_t)((i * 131u + j * 29u) & 0xFF);
+                    vb[j] = (uint8_t)((i * 173u + j * 37u + 7u) & 0xFF);
+                }
+                kv_orig[i].k_scale = malloc(scale_sz);
+                kv_orig[i].v_scale = malloc(scale_sz);
+                if (!kv_orig[i].k_scale || !kv_orig[i].v_scale) { failures++; goto cleanup; }
+                size_t ns = scale_sz / sizeof(__fp16);
+                for (size_t j = 0; j < ns; j++) {
+                    kv_orig[i].k_scale[j] = (__fp16)(0.001f + 0.0001f * (float)((i + j) % 97));
+                    kv_orig[i].v_scale[j] = (__fp16)(0.002f + 0.0001f * (float)((i + j) % 89));
+                }
+            } else {
+                float *k = kv_orig[i].k_snapshot;
+                float *v = kv_orig[i].v_snapshot;
+                size_t n = kv_sz / sizeof(float);
+                for (size_t j = 0; j < n; j++) {
+                    k[j] = sinf((float)(i * 7919u + j * 31u) * 1e-4f);
+                    v[j] = cosf((float)(i * 7919u + j * 31u) * 1e-4f) + 0.5f;
+                }
             }
         } else {
             conv_orig[i] = malloc(conv_state_size);
@@ -12301,6 +12388,16 @@ static int cache_roundtrip_test(void) {
             if (kv_load[i].len != kv_orig[i].len) {
                 fprintf(stderr, "[cache-roundtrip] FAIL layer=%d KVSnapshot.len orig=%d load=%d\n", i, kv_orig[i].len, kv_load[i].len);
                 kv_diffs++;
+            }
+            if (rt_qb) {
+                if (!kv_load[i].k_scale || memcmp(kv_orig[i].k_scale, kv_load[i].k_scale, scale_sz) != 0) {
+                    fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=KV_K_SCALE missing or diverges\n", i);
+                    kv_diffs++;
+                }
+                if (!kv_load[i].v_scale || memcmp(kv_orig[i].v_scale, kv_load[i].v_scale, scale_sz) != 0) {
+                    fprintf(stderr, "[cache-roundtrip] FAIL layer=%d kind=KV_V_SCALE missing or diverges\n", i);
+                    kv_diffs++;
+                }
             }
         } else {
             if (memcmp(conv_orig[i], conv_load[i], conv_state_size) != 0) {

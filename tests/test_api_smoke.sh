@@ -483,6 +483,11 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
     preflight_model_artifacts
     (
         cd "${REPO_ROOT}/metal_infer"
+        # Smoke-sized runtime: a throwaway test server must not allocate a
+        # full-window KV cache or a pin arena (2026-07-06 swap storm). Callers
+        # can still override via the environment.
+        export FLASHCHAT_CONTEXT_WINDOW="${FLASHCHAT_CONTEXT_WINDOW:-4096}"
+        export FLASHCHAT_EXPERT_PIN_MAX_GB="${FLASHCHAT_EXPERT_PIN_MAX_GB:-0}"
         ./infer --serve "${PORT}" --model-id "${MODEL_ID}" --model "${MODEL_PATH}" >"${TMPDIR}/server.log" 2>&1
     ) &
     SERVER_PID="$!"
