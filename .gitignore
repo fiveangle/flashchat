@@ -55,3 +55,4 @@ optimizer/
 
 # scratch / WIP working directory (not for production commits)
 /tmp/
+tests/ane_mlp_smoke
