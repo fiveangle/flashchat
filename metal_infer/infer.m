@@ -13610,8 +13610,8 @@ static void serve_loop(
 
         if (g_system_prompt_cache_enabled && cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
             // Cache hit: restore snapshot
-            server_log_errorf("[serve] %s sys_prompt_cache hit hash=%llu tokens=%d\n",
-                              request_id, req_sys_hash, cached_sys_token_count);
+            server_log_errorf("[serve] %s sys_prompt_cache hit hash=%016llx tokens=%d\n",
+                              request_id, (unsigned long long)req_sys_hash, cached_sys_token_count);
             restore_system_prompt_snapshots(cached_sys_token_count,
                                             kv_snapshots,
                                             la_conv_snapshots,
@@ -13658,8 +13658,8 @@ static void serve_loop(
                                             gpu_conv_snapshots,
                                             layer_states,
                                             kv_caches);
-            server_log_errorf("[serve] %s sys_prompt_cache disk hit hash=%llu tokens=%d\n",
-                              request_id, cached_sys_hash, cached_sys_token_count);
+            server_log_errorf("[serve] %s sys_prompt_cache disk hit hash=%016llx tokens=%d\n",
+                              request_id, (unsigned long long)cached_sys_hash, cached_sys_token_count);
             pos = cached_sys_token_count;
             snapshot_restored = 1;
             req.used_snapshot = 1;
@@ -13676,11 +13676,11 @@ static void serve_loop(
             }
             if (g_system_prompt_cache_enabled) {
                 if (cached_sys_hash != 0) {
-                    server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%llu new_hash=%llu\n",
-                                      request_id, cached_sys_hash, req_sys_hash);
+                    server_log_errorf("[serve] %s sys_prompt_cache miss old_hash=%016llx new_hash=%016llx\n",
+                                      request_id, (unsigned long long)cached_sys_hash, (unsigned long long)req_sys_hash);
                 } else {
-                    server_log_errorf("[serve] %s sys_prompt_cache miss new_hash=%llu tokens=%d\n",
-                                      request_id, req_sys_hash, sys_prompt_token_count);
+                    server_log_errorf("[serve] %s sys_prompt_cache miss new_hash=%016llx tokens=%d\n",
+                                      request_id, (unsigned long long)req_sys_hash, sys_prompt_token_count);
                 }
             }
             clear_runtime_state_serve(layer_states, kv_caches);
@@ -13808,8 +13808,8 @@ static void serve_loop(
             if (snapshot_saved) {
                 cached_sys_hash = req_sys_hash;
                 cached_sys_token_count = sys_token_end;
-                server_log_errorf("[serve] %s sys_prompt_cache saved hash=%llu tokens=%d\n",
-                                  request_id, cached_sys_hash, cached_sys_token_count);
+                server_log_errorf("[serve] %s sys_prompt_cache saved hash=%016llx tokens=%d\n",
+                                  request_id, (unsigned long long)cached_sys_hash, cached_sys_token_count);
                 if (cache_fingerprint_enabled()) {
                     fingerprint_runtime_state(sys_token_end, kv_caches, layer_states, &g_fp_post_cold);
                     server_log_errorf("[cache-fp] captured live runtime fingerprint after cold prefill (request=%s tokens=%d)\n",
