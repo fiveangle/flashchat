@@ -40,6 +40,26 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
+    def test_has_config_changes_false_for_same_values(self):
+        with open(self.config_path, "a") as f:
+            f.write('CONFIG_SCHEMA_VERSION="7"\n')
+        changes = {
+            "SAMPLING_PROFILE": "custom",
+            "TEMPERATURE": "0.1",
+            "TOP_P": "0.8",
+            "TOP_K": "20",
+            "MIN_P": "0.0",
+            "PRESENCE_PENALTY": "1.5",
+            "REPETITION_PENALTY": "1.0",
+            "REASONING": "0",
+            "CONFIG_SCHEMA_VERSION": "7",
+        }
+
+        self.assertFalse(config_wizard._has_config_changes(changes))
+
+    def test_has_config_changes_true_for_missing_key(self):
+        self.assertTrue(config_wizard._has_config_changes({"MODEL": "Qwen-Qwen36-35B-A3B"}))
+
     def test_custom_profile_prompts_k_with_model_default(self):
         manifest = self.registry.get("qwen3.6-35b-a3b")
         replies = "\n".join(["4", "0.7", "0.8", "20", "0.0", "1.5", "1.0", "1", ""]) + "\n"

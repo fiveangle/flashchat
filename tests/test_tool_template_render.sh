@@ -150,6 +150,40 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
+INSTRUCT_CONFIG="${TMPDIR}/instruct_config"
+INSTRUCT_RENDER_DIR="${TMPDIR}/instruct_rendered"
+cat >"$INSTRUCT_CONFIG" <<'EOF'
+REASONING="0"
+EOF
+"$INFER" --config "$INSTRUCT_CONFIG" --model-id Qwen-Qwen36-35B-A3B --render-request "$REQUEST_JSON" --render-output "$INSTRUCT_RENDER_DIR" >/dev/null 2>&1
+if tail -n 6 "${INSTRUCT_RENDER_DIR}/assembled_prompt.txt" | grep -q "</think>"; then
+    assert_pass "tool request respects non-thinking server default"
+else
+    assert_fail "tool request respects non-thinking server default" \
+        "expected empty think block in assembled_prompt.txt"
+fi
+
+EXPLICIT_REASONING_JSON="${TMPDIR}/explicit_reasoning_request.json"
+EXPLICIT_REASONING_DIR="${TMPDIR}/explicit_reasoning_rendered"
+python3 - "$REQUEST_JSON" "$EXPLICIT_REASONING_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    request = json.load(f)
+request["reasoning"] = True
+with open(sys.argv[2], "w") as f:
+    json.dump(request, f)
+PY
+"$INFER" --config "$INSTRUCT_CONFIG" --model-id Qwen-Qwen36-35B-A3B --render-request "$EXPLICIT_REASONING_JSON" --render-output "$EXPLICIT_REASONING_DIR" >/dev/null 2>&1
+if tail -n 6 "${EXPLICIT_REASONING_DIR}/assembled_prompt.txt" | grep -q "<think>" \
+    && ! tail -n 6 "${EXPLICIT_REASONING_DIR}/assembled_prompt.txt" | grep -q "</think>"; then
+    assert_pass "explicit reasoning request overrides non-thinking server default"
+else
+    assert_fail "explicit reasoning request overrides non-thinking server default" \
+        "expected open think block in assembled_prompt.txt"
+fi
+
 NO_TOOLS_JSON="${TMPDIR}/no_tools_request.json"
 NO_TOOLS_DIR="${TMPDIR}/no_tools_rendered"
 python3 - "$NO_TOOLS_JSON" <<'PY'

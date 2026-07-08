@@ -47,6 +47,8 @@ class TestBuildFlow(unittest.TestCase):
                     build.ensure_variant_built(
                         self.registry, self.moe, "q4", assume_yes=True))
         finally:
+            common.confirm = old_confirm
+            common.prompt = old_prompt
             build.paths.snapshot_dir = old_snapshot_dir
             build.download_snapshot = old_download_snapshot
             build.hf_cache_dir = old_hf_cache_dir
@@ -97,6 +99,7 @@ class TestBuildFlow(unittest.TestCase):
             build.hf_cache_dir = old_hf_cache_dir
             build.offload_dir = old_offload_dir
             common.confirm = old_confirm
+            common.prompt = old_prompt
 
     def test_download_to_offload_returns_offload_snapshot(self):
         offload_root = os.path.join(self.tmp.name, "offload")

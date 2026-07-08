@@ -181,12 +181,12 @@ the worked example when adding the next debug feature:
 ## Code Style
 
 ### General Principles
-- **No comments unless explicitly requested** (per project convention)
 - Write self-documenting code with clear naming
+- No comments unless required for the complexity (comments are never for historical context)
 - Prefer early returns for error conditions
 - Keep functions focused and single-purpose
 - **Configuration policy:** shipped model metadata belongs in `assets/model_configs.json`; user settings belong in `~/.config/flashchat/config` and should select models by `MODEL` ID; generated per-model runtime artifacts belong in `<model>/flashchat/` so entire model snapshots can be moved or restored as a unit. Model offload storage is one global `OFFLOAD_DIR`, never a per-model config path.
-- **User/app state policy:** Flashchat-owned user state belongs under `~/.config/flashchat/`, including sessions, prompt history, server logs, pid files, and optional `system.md`.
+- **User/app state policy:** Flashchat-owned user state belongs under `~/.config/flashchat/`, including sessions, prompt history, default server logs, pid files, and optional `system.md`.
 - **Do not add implicit config fallbacks.** Use `--config FILE` only as an explicit override, otherwise use `~/.config/flashchat/config`, environment overrides, and defaults derived from the bundled model registry.
 - **Do not rely on current working directory for model registry lookup.** Shell, Python, and C/Objective-C callers should resolve the registry via `FLASHCHAT_MODEL_CONFIG` or the repo-root `assets/model_configs.json` path.
 - **Only the registry-backed production expert format is supported in active code.** Old low-precision experiments may remain in historical results/paper artifacts, but do not reintroduce alternate runtime paths, setup scripts, config settings, or user-facing UX.
@@ -199,13 +199,13 @@ the worked example when adding the next debug feature:
 - **Never assume the user has knowledge of the system, commands, or syntax. Always provide instruction that is atomic and self-explanatory.**
 - **Use user-friendly terminology, not technical precision.** For example, use "context window" instead of "max tokens" since that's what users expect in modern LLM interfaces, even though the technical term is different.
 - **When making user-facing changes (especially output/UX), look for similar patterns elsewhere in the project.** For example, if you consolidate section headers in one command, check other commands for the same issue and apply the same fix.
-- **Never ask the user to perform manual steps that can be automated.** If something needs testing, write a script to do it automatically rather than asking the user to do it manually.
+- **Don't ask the user to perform manual steps that can be automated.** If something needs testing, write a script to do it automatically rather than asking the user to do it manually.
 - **When changing the HTTP/API surface, add or update an automated smoke test whenever feasible.** Prefer a lightweight script that exercises the live endpoints the same way frontend harnesses will.
 - **Tool-calling changes should validate rendering before live agent testing.** Use `metal_infer/infer --render-request ... --render-output ...` and `make tool-template-smoke` to verify native Qwen tool-template rendering and XML parser behavior before comparing nanocode/opencode live logs.
 - **Shell helpers should preserve the caller's working directory unless changing directories is the explicit purpose of the helper.** Save and restore `pwd` inside build/setup helpers that `cd` internally.
 - **Always verify the environment state before and after making changes.** Check that config files, model caches, and other state are preserved or properly restored. Test that changes don't inadvertently delete or corrupt user data.
 - **Server-side debug visibility matters.** Changes to `infer --serve` should preserve persistent logging so background server runs remain debuggable without requiring an interactive launch.
-- **Persistent system prompt caches belong with the model runtime artifacts.** Store them under `<model>/flashchat/system_prompt_cache/`, validate model dimensions and prompt hash before reuse, write atomically, and keep cache counts bounded to avoid unnecessary SSD churn.
+- **Persistent system prompt caches belong with the model runtime artifacts.** Store them under `<model>/flashchat/system_prompt_cache/` unless set to an alternate path via the user config. validate model dimensions and prompt hash before reuse, write atomically, and keep cache counts bounded to avoid unnecessary SSD churn.
 - **Running server state must be invalidated when runtime inputs change.** If model selection, model registry contents, server-affecting config, or infer source/binary state changes, Flashchat-owned servers should be treated as stale and restarted before reuse.
 - **When runtime behavior does not match expectations, anchor debugging in captured logs, request dumps, build stamps, and reproducible evidence.** Do not default to assuming the user launched an old binary or made a procedural mistake unless the evidence specifically points there.
 - **Server control commands must verify reality, not assume it.** Start/stop helpers should confirm health or actual process exit before reporting success or removing pid/state files.

@@ -9495,7 +9495,6 @@ typedef struct {
     float presence_penalty;
     float repetition_penalty;
     int reasoning_enabled;
-    int reasoning_explicit;
     ToolChoiceMode tool_choice_mode;
     char forced_tool_name[MAX_TOOL_NAME];
     ToolDef tools[MAX_TOOLS];
@@ -10069,21 +10068,10 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
     if (reasoning && reasoning != [NSNull null] && g_cfg.thinking_capable) {
-        req->reasoning_explicit = 1;
         req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
     }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
-    // Native Qwen3 tool calls are far more format-compliant when the assistant
-    // turn opens with `<think>\n` (matching chat_template's enable_thinking=true).
-    // Without thinking, a long client system prompt (e.g. nanocoder's 11kB prose)
-    // dominates the format primer and the model emits Python-style or partial
-    // XML. With thinking, the model commits to tool-calling mode during the
-    // think block and reliably produces correct `<tool_call>` XML. Enable by
-    // default when tools are active and the client did not pin reasoning.
-    if (req->tool_count > 0 && !req->reasoning_explicit) {
-        req->reasoning_enabled = 1;
-    }
     NSString *session_id = root[@"session_id"];
     if ([session_id length] > 0) strncpy(req->session_id, [session_id UTF8String], sizeof(req->session_id) - 1);
 
@@ -10162,7 +10150,6 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
         // strip the tag before the model ever sees it.
         int toggle = extract_think_toggle(content_buf);
         if (toggle != 0) {
-            req->reasoning_explicit = 1;
             req->reasoning_enabled = (toggle > 0) ? 1 : 0;
         }
         NSString *content = [content_buf stringByTrimmingCharactersInSet:ws];
@@ -10308,16 +10295,10 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     if (repetition_penalty) req->repetition_penalty = [repetition_penalty floatValue];
     id reasoning = root[@"reasoning"];
     if (reasoning && reasoning != [NSNull null] && g_cfg.thinking_capable) {
-        req->reasoning_explicit = 1;
         req->reasoning_enabled = parse_reasoning_value(reasoning, req->reasoning_enabled);
     }
     parse_tool_defs(root[@"tools"], req);
     parse_tool_choice(root[@"tool_choice"], req);
-    // Mirror chat-completions: tools active without explicit reasoning enables
-    // thinking, which dramatically improves native XML format adherence.
-    if (req->tool_count > 0 && !req->reasoning_explicit) {
-        req->reasoning_enabled = 1;
-    }
 
     NSMutableArray *messages = [NSMutableArray array];
     id input = root[@"input"];
@@ -10370,7 +10351,6 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
         @"min_p": @(req->min_p),
         @"presence_penalty": @(req->presence_penalty),
         @"repetition_penalty": @(req->repetition_penalty),
-        @"reasoning": @(req->reasoning_enabled),
         @"tools": root[@"tools"] ?: @[],
         @"tool_choice": root[@"tool_choice"] ?: @"auto"
     }, req, err_msg);

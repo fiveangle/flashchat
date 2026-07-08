@@ -35,6 +35,13 @@ def _runtime_max_active_experts() -> int:
     return 16
 
 
+def _has_config_changes(changes: dict) -> bool:
+    previous = configfile.load()
+    missing = object()
+    return any(previous.get(key, missing) != str(value)
+               for key, value in changes.items())
+
+
 def run(registry: Registry) -> None:
     # Summary-first: `flashchat config` doubles as "show my settings";
     # nothing is touched unless the user opts into the wizard.
@@ -52,7 +59,7 @@ def run(registry: Registry) -> None:
         "MODEL": resolved_id(manifest, variant_name),
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
-        "CONFIG_SCHEMA_VERSION": "3",
+        "CONFIG_SCHEMA_VERSION": "7",
     })
     registry.state.enabled[manifest.id] = True
     registry.state.save()
@@ -72,9 +79,13 @@ def run(registry: Registry) -> None:
     changes.update(_storage_settings())
     changes.update(_advanced_settings(manifest))
 
+    changed = _has_config_changes(changes)
     configfile.update(changes)
     resolved.write(registry)
-    print(common.green("\nConfiguration saved."))
+    if changed:
+        print(common.green("\nConfiguration saved."))
+    else:
+        print(common.green("\nNo configuration changes."))
 
     from ..server import is_server_running
     if is_server_running():
