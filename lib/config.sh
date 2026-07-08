@@ -29,7 +29,7 @@ FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG:-${FLASHCHAT_REPO_ROOT}/assets/
 # Config schema version. Bump when a new persistent key is added so existing user
 # configs get the new key backfilled on next load (see _flashchat_migrate_config).
 # Because the engine now reads the config file directly, the file must be complete.
-FLASHCHAT_CONFIG_SCHEMA_VERSION="7"
+FLASHCHAT_CONFIG_SCHEMA_VERSION="8"
 
 # Default configuration values
 FLASHCHAT_DEFAULT_MODEL="Qwen-Qwen36-35B-A3B"
@@ -40,10 +40,10 @@ FLASHCHAT_DEFAULT_SERVER_LOG_PATH="${FLASHCHAT_CONFIG_DIR}/logs/server.log"
 FLASHCHAT_DEFAULT_SHOW_THINKING="0"
 FLASHCHAT_DEFAULT_SERVER_DEBUG="0"
 FLASHCHAT_DEFAULT_SERVER_HTTP_LOG="0"
-FLASHCHAT_DEFAULT_BATCH_PREFILL="0"
-FLASHCHAT_DEFAULT_PREFILL_CHUNK="256"
+FLASHCHAT_DEFAULT_BATCH_PREFILL="1"
+FLASHCHAT_DEFAULT_PREFILL_CHUNK="1024"
 FLASHCHAT_DEFAULT_PREFILL_DEBUG="0"
-FLASHCHAT_DEFAULT_ANE_PREFILL="0"
+FLASHCHAT_DEFAULT_ANE_PREFILL="1"
 FLASHCHAT_DEFAULT_PREAD_PROFILE=""
 FLASHCHAT_DEFAULT_PREAD_PROFILE_CAP="2097152"
 FLASHCHAT_DEFAULT_EXPERT_PIN_MAX_GB="4"
@@ -596,6 +596,23 @@ _flashchat_migrate_config() {
     local file_version
     file_version=$(sed -n 's/^CONFIG_SCHEMA_VERSION="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$file" 2>/dev/null | head -1)
     [ "$file_version" = "$FLASHCHAT_CONFIG_SCHEMA_VERSION" ] && return 0
+
+    # v8: batched prefill became the default (1 / chunk 1024). Earlier schema
+    # migrations backfilled the then-experimental defaults (0 / 256) into every
+    # config, so those exact values mean "never chose" — re-default only them.
+    if [ -n "$file_version" ] && [ "$file_version" -lt 8 ] 2>/dev/null; then
+        if grep -qE '^BATCH_PREFILL="?0"?$' "$file" 2>/dev/null; then
+            sed -i '' 's/^BATCH_PREFILL="\{0,1\}0"\{0,1\}$/BATCH_PREFILL="1"/' "$file" 2>/dev/null || true
+            echo "Config migrated: batched prompt processing is now on by default (BATCH_PREFILL=1)" >&2
+        fi
+        if grep -qE '^PREFILL_CHUNK="?256"?$' "$file" 2>/dev/null; then
+            sed -i '' 's/^PREFILL_CHUNK="\{0,1\}256"\{0,1\}$/PREFILL_CHUNK="1024"/' "$file" 2>/dev/null || true
+        fi
+        if grep -qE '^ANE_PREFILL="?0"?$' "$file" 2>/dev/null; then
+            sed -i '' 's/^ANE_PREFILL="\{0,1\}0"\{0,1\}$/ANE_PREFILL="1"/' "$file" 2>/dev/null || true
+            echo "Config migrated: Neural Engine prompt offload is now on by default (ANE_PREFILL=1; auto-falls back to GPU on unsupported hardware)" >&2
+        fi
+    fi
 
     local key added=0
     for key in MODEL HUGGINGFACE_CACHE_DIR OFFLOAD_DIR MAX_TOKENS SAMPLING_PROFILE \

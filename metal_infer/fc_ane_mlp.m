@@ -332,6 +332,9 @@ static int ane_mlp_test_mode(void) {
 
 static void resolve_classes(void) {
     dispatch_once(&g_classes_once, ^{
+        // Test hook: simulate hardware without a usable Neural Engine (classes
+        // stay nil -> create returns NULL -> callers take their GPU fallback).
+        if (getenv("FLASHCHAT_ANE_UNAVAILABLE")) return;
         dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine",
                RTLD_NOW);
         g_DescCls  = NSClassFromString(@"_ANEInMemoryModelDescriptor");

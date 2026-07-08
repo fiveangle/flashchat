@@ -2507,20 +2507,38 @@ static void cpu_conv1d_step(
 #define MAX_BATCH_SLOTS 8
 #define MAX_DELTA_BATCH_SLOTS 8
 
+// FLASHCHAT_BATCH_PREFILL (default on) processes prompt tokens in chunks of
+// FLASHCHAT_PREFILL_CHUNK through batched_layer_forward_N (KV-quant-native
+// since the unified append) instead of one decode-path forward per token.
+static int batch_prefill_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("FLASHCHAT_BATCH_PREFILL"); v = (e && *e) ? (atoi(e) ? 1 : 0) : 1; }
+    return v;
+}
+
 // Batched-prefill chunk size (positions per batched forward). Sizes the
 // attention/delta-net batch staging buffers, so it is resolved once before
-// metal_setup. MTP verify (N<=8) shares these buffers and always fits.
+// metal_setup. Default 1024 balances speed (5x per-token prefill on the 35B)
+// against staging RAM (~170MB); 2048/4096 buy a few percent more on machines
+// with headroom.
 static int g_prefill_chunk = 0;
 static inline int prefill_chunk_tokens(void) {
     if (g_prefill_chunk <= 0) {
-        int v = 256;
+        int v = 1024;
         const char *e = getenv("FLASHCHAT_PREFILL_CHUNK");
         if (e && *e) { int x = atoi(e); if (x > 0) v = x; }
         if (v < MAX_DELTA_BATCH_SLOTS) v = MAX_DELTA_BATCH_SLOTS;
-        if (v > 2048) v = 2048;
+        if (v > 4096) v = 4096;
         g_prefill_chunk = v;
     }
     return g_prefill_chunk;
+}
+
+// Slots the chunk-scaled staging buffers must hold. With batched prefill off,
+// only the MTP verify path (N<=8) uses them — don't make batch-off users pay
+// chunk-sized allocations they never touch.
+static inline int batch_staging_slots(void) {
+    return batch_prefill_enabled() ? prefill_chunk_tokens() : MAX_DELTA_BATCH_SLOTS;
 }
 
 typedef struct {
@@ -2823,7 +2841,7 @@ static MetalCtx *metal_setup(void) {
     size_t max_out = g_cfg.vocab_size * sizeof(float);  // lm_head is largest single
     // Batched prefill projects a whole chunk through the delta-net out_proj
     // into buf_output ([chunk, hidden]); size for whichever is bigger.
-    size_t chunk_out = (size_t)prefill_chunk_tokens() * g_cfg.hidden_dim * sizeof(float);
+    size_t chunk_out = (size_t)batch_staging_slots() * g_cfg.hidden_dim * sizeof(float);
     if (chunk_out > max_out) max_out = chunk_out;
     size_t max_in = g_cfg.linear_total_value * sizeof(float);  // 8192 floats (linear_attn out_proj)
     if (max_in < (size_t)(g_cfg.num_attn_heads * g_cfg.head_dim) * sizeof(float)) {
@@ -2974,9 +2992,9 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
         ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        // Batch staging sized by the prefill chunk (>= MAX_DELTA_BATCH_SLOTS,
-        // so the MTP verify path always fits). ~30-50MB at chunk=256.
-        size_t bslots = (size_t)prefill_chunk_tokens();
+        // Batch staging sized by the prefill chunk when batched prefill is on
+        // (~170MB at chunk=1024), or by the MTP verify need (8 slots) when off.
+        size_t bslots = (size_t)batch_staging_slots();
         ctx->buf_delta_qkv_batch   = [ctx->device newBufferWithLength:bslots * g_cfg.linear_conv_dim      * sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_delta_z_batch     = [ctx->device newBufferWithLength:bslots * g_cfg.linear_total_value   * sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_delta_beta_batch  = [ctx->device newBufferWithLength:bslots * g_cfg.linear_num_v_heads   * sizeof(float) options:MTLResourceStorageModeShared];
@@ -3046,7 +3064,7 @@ static int gpu_linear_delta_dispatch_batch(
         if (!_warned++ && getenv("FLASHCHAT_PREFILL_DEBUG")) \
             fprintf(stderr, "[delta-batch] dispatch rejected: %s (n=%d)\n", tag, n); \
         return 0; } while (0)
-    if (!ctx || !delta_dispatch_batch_enabled() || n <= 0 || n > prefill_chunk_tokens()) DDB_FAIL("enable/n");
+    if (!ctx || !delta_dispatch_batch_enabled() || n <= 0 || n > batch_staging_slots()) DDB_FAIL("enable/n");
     if (linear_layer_idx < 0 || linear_layer_idx >= g_cfg.num_linear_layers) DDB_FAIL("layer idx");
     if (!qkv || !z || !beta || !alpha || !conv_w || !A_log || !dt_bias || !gated_norm_w) return 0;
     if (!gated && !out_projected) return 0;
@@ -5441,9 +5459,12 @@ static int prefill_debug_enabled(void) {
 // produces the int8 operands (q4->i8 transposed weight dequant + x quantize);
 // the ANE consumes them from shared MTLBuffer memory. Not bit-faithful to the
 // GPU path (int8 weights/activations) — opt-in, quality-gated.
+// Default on: ane_prefill_ready() probes the Neural Engine at first use and
+// falls back to the GPU path permanently (one log line) when the hardware,
+// private framework, or shape isn't usable — enabled config != usable ANE.
 static int ane_prefill_enabled(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("FLASHCHAT_ANE_PREFILL"); v = (e && *e && atoi(e)) ? 1 : 0; }
+    if (v < 0) { const char *e = getenv("FLASHCHAT_ANE_PREFILL"); v = (e && *e) ? (atoi(e) ? 1 : 0) : 1; }
     return v;
 }
 static int ane_calib_enabled(void) {
@@ -5469,6 +5490,14 @@ static int g_ane_failed;                       // fail once -> stay on GPU path
 static double g_prof_ane_producer, g_prof_ane_eval;
 // Calibration accumulators (FLASHCHAT_ANE_CALIB=1, GPU path)
 static float g_calib_x_absmax, g_calib_mid_absmax, g_calib_w_absmax;
+
+// One-shot permanent fallback: first failure logs once, everything after
+// runs the GPU prefill path (correctness never depends on the ANE).
+static void ane_fail_permanently(const char *why) {
+    if (!g_ane_failed)
+        fprintf(stderr, "[ane-prefill] %s — using GPU for prompt processing\n", why);
+    g_ane_failed = 1;
+}
 
 typedef struct { int set; int ok; } AneEvalJob;
 static pthread_t g_ane_thread;
@@ -5503,7 +5532,8 @@ static int ane_prefill_ready(int H, int idim, int chunk) {
         g_ane_ctx2[d] = fc_ane_mlp_i8w_i8x_tiled_fused_create(H, idim, B,
                                                               1.0f / g_ane_wq, 1.0f / g_ane_xq, 1.0f / g_ane_midq);
         if (!g_ane_ctx2[d]) {
-            fprintf(stderr, "[ane-prefill] MIL compile failed (H=%d I=%d B=%d) — staying on GPU path\n", H, idim, B);
+            fprintf(stderr, "[ane-prefill] Neural Engine unavailable on this system "
+                    "(H=%d I=%d B=%d) — using GPU for prompt processing\n", H, idim, B);
             g_ane_failed = 1;
             return 0;
         }
@@ -5693,11 +5723,11 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 if (!with_weights && pending_s >= 0) {
                     // drain: this slab must run on the ctx that has the weights
                     pthread_join(g_ane_thread, NULL);
-                    if (!g_ane_job.ok) { g_ane_failed = 1; use_ane = 0; break; }
+                    if (!g_ane_job.ok) { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; break; }
                     double td = now_ms();
                     uint64_t oel = 0;
                     const __fp16 *pof = (const __fp16 *)fc_ane_mlp_int8w_lock_output_f16(g_ane_ctx2[g_ane_job.set], &oel);
-                    if (!pof) { g_ane_failed = 1; use_ane = 0; break; }
+                    if (!pof) { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; break; }
                     int dpe = uni[w0+pending_s];
                     for (uint32_t j = 0; j < pending_r; j++) {
                         int row = off[dpe] + pending_row0 + (int)j;
@@ -5720,12 +5750,12 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 g_prof_ane_producer += now_ms() - t0;
                 if (pending_s >= 0) {   // reap previous eval, scatter it
                     pthread_join(g_ane_thread, NULL);
-                    if (!g_ane_job.ok) { g_ane_failed = 1; use_ane = 0; break; }
+                    if (!g_ane_job.ok) { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; break; }
                     t0 = now_ms();
                     int pe = uni[w0+pending_s];
                     uint64_t oelems = 0;
                     const __fp16 *of = (const __fp16 *)fc_ane_mlp_int8w_lock_output_f16(g_ane_ctx2[g_ane_job.set], &oelems);
-                    if (!of) { g_ane_failed = 1; use_ane = 0; break; }
+                    if (!of) { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; break; }
                     for (uint32_t j = 0; j < pending_r; j++) {
                         int row = off[pe] + pending_row0 + (int)j;
                         float w = tw[row];
@@ -5761,8 +5791,8 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                         fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
                         g_prof_prefill_scatter += now_ms() - t0;
                         done[pending_s] = 1;
-                    } else { g_ane_failed = 1; use_ane = 0; }
-                } else { g_ane_failed = 1; use_ane = 0; }
+                    } else { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; }
+                } else { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; }
             }
             if (!use_ane)
                 fprintf(stderr, "[ane-prefill] eval failed — GPU fallback for remaining experts\n");
@@ -10801,15 +10831,6 @@ static void prefill_debug_dump_state(KVCache **kv_caches) {
 }
 
 // ---- Batched prefill driver -------------------------------------------------
-// FLASHCHAT_BATCH_PREFILL=1 processes prompt tokens in chunks of
-// FLASHCHAT_PREFILL_CHUNK through batched_layer_forward_N (KV-quant-native
-// since the unified append) instead of one decode-path forward per token.
-static int batch_prefill_enabled(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("FLASHCHAT_BATCH_PREFILL"); v = (e && *e && atoi(e)) ? 1 : 0; }
-    return v;
-}
-
 // Prefill tokens [start, count-1) in chunks. Deliberately leaves the final
 // token (and any tail shorter than min_tokens) for the caller's per-token
 // loop, which owns the deferred-expert bookkeeping and the final hidden
@@ -13273,7 +13294,7 @@ static void serve_loop(
         server_logf("[serve]   batched_prefill: enabled chunk=%d min_tokens=16\n",
                     prefill_chunk_tokens());
         if (ane_prefill_enabled()) {
-            server_logf("[serve]   ane_prefill: enabled batch=%d w_qscale=%g x_qscale=%g mid_qscale=%g\n",
+            server_logf("[serve]   ane_prefill: enabled (falls back to GPU if Neural Engine unavailable) batch=%d w_qscale=%g x_qscale=%g mid_qscale=%g\n",
                         (int)ane_env_qscale("FLASHCHAT_ANE_BATCH", 256.0f),
                         ane_env_qscale("FLASHCHAT_ANE_W_QSCALE", 195.0f),
                         ane_env_qscale("FLASHCHAT_ANE_X_QSCALE", 16.0f),
