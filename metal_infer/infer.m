@@ -10756,7 +10756,7 @@ static int sse_send_initial_role_chunk(int fd, const char *request_id) {
     return (wr <= 0) ? -1 : 0;
 }
 
-static int sse_send_prefill_keepalive(int fd, const char *phase, int done, int total) {
+static int write_prefill_keepalive(int fd, const char *phase, int done, int total) {
     char chunk[160];
     int n = snprintf(chunk, sizeof(chunk),
         ": flashchat prefill phase=%s tokens=%d/%d\n\n",
@@ -10765,13 +10765,17 @@ static int sse_send_prefill_keepalive(int fd, const char *phase, int done, int t
     return (wr <= 0) ? -1 : 0;
 }
 
-static void maybe_sse_send_prefill_keepalive(int fd, const char *request_id,
+// Per-token prefill keepalive: heartbeat frame to the streaming client plus a
+// server-log line. Self-throttling (per interval, streaming only), so it is
+// safe to call in the token loop. The batched path uses report_prefill_progress
+// instead, which also carries chunk/layer position.
+static void report_prefill_keepalive(int fd, const char *request_id,
                                              int *enabled, double *next_ms,
                                              const char *phase, int done, int total) {
     if (!enabled || !*enabled || !next_ms) return;
     double t = now_ms();
     if (t < *next_ms) return;
-    if (sse_send_prefill_keepalive(fd, phase, done, total) < 0) {
+    if (write_prefill_keepalive(fd, phase, done, total) < 0) {
         *enabled = 0;
         server_log_errorf("[serve] %s client disconnected during prefill keepalive\n", request_id);
         return;
@@ -13714,7 +13718,7 @@ static void serve_loop(
         double t_prefill = now_ms();
         int prefill_keepalive_enabled = req.stream;
         double next_prefill_keepalive_ms = t_prefill;
-        maybe_sse_send_prefill_keepalive(client_fd, request_id,
+        report_prefill_keepalive(client_fd, request_id,
                                          &prefill_keepalive_enabled,
                                          &next_prefill_keepalive_ms,
                                          "start", 0, pt->count);
@@ -13723,7 +13727,7 @@ static void serve_loop(
             serve_embed_batch = malloc((size_t)pt->count * g_cfg.hidden_dim * sizeof(float));
             for (int i = 0; i < pt->count; i++) {
                 embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * g_cfg.hidden_dim);
-                maybe_sse_send_prefill_keepalive(client_fd, request_id,
+                report_prefill_keepalive(client_fd, request_id,
                                                  &prefill_keepalive_enabled,
                                                  &next_prefill_keepalive_ms,
                                                  "embed", i + 1, pt->count);
@@ -13758,7 +13762,7 @@ static void serve_loop(
                 if (i == pt->count - 1) complete_deferred_experts();
                 else discard_deferred_experts();
                 pos++;
-                maybe_sse_send_prefill_keepalive(client_fd, request_id,
+                report_prefill_keepalive(client_fd, request_id,
                                                  &prefill_keepalive_enabled,
                                                  &next_prefill_keepalive_ms,
                                                  "system", i + 1, pt->count);
@@ -13842,7 +13846,7 @@ static void serve_loop(
             if (i == pt->count - 1) complete_deferred_experts();
             else discard_deferred_experts();
             pos++;
-            maybe_sse_send_prefill_keepalive(client_fd, request_id,
+            report_prefill_keepalive(client_fd, request_id,
                                              &prefill_keepalive_enabled,
                                              &next_prefill_keepalive_ms,
                                              "conversation", i + 1, pt->count);
