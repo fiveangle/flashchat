@@ -488,7 +488,9 @@ if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
         # can still override via the environment.
         export FLASHCHAT_CONTEXT_WINDOW="${FLASHCHAT_CONTEXT_WINDOW:-4096}"
         export FLASHCHAT_EXPERT_PIN_MAX_GB="${FLASHCHAT_EXPERT_PIN_MAX_GB:-0}"
-        ./infer --serve "${PORT}" --model-id "${MODEL_ID}" --model "${MODEL_PATH}" >"${TMPDIR}/server.log" 2>&1
+        # exec: the recorded pid must be infer itself, not this subshell —
+        # killing the subshell orphaned the server (leak found 2026-07-08).
+        exec ./infer --serve "${PORT}" --model-id "${MODEL_ID}" --model "${MODEL_PATH}" >"${TMPDIR}/server.log" 2>&1
     ) &
     SERVER_PID="$!"
     STARTED_SERVER=1

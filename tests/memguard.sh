@@ -73,7 +73,7 @@ fi
 # Post-run: verify nothing from the tree is still alive.
 if pgrep -g "$CHILD" >/dev/null 2>&1; then
     echo "[memguard] WARNING: survivors in pgid $CHILD after exit" >&2
-    pgrep -gl "$CHILD" >&2
+    pgrep -l -g "$CHILD" >&2
 fi
 echo "[memguard] done rc=$RC swap now $(swap_used_mb)MB (baseline ${BASE_SWAP}MB)" >&2
 exit "$RC"

@@ -236,7 +236,7 @@ run_test_contains "status basic" "Flashchat Show Status" "$FLASHCHAT"  status
 run_test_contains "status server info" "Server:" "$FLASHCHAT"  status
 run_test_contains "status model info" "Model:" "$FLASHCHAT"  status
 run_test_contains "status quantization info" "Quantization: 4-bit" "$FLASHCHAT"  status
-run_test_contains "main menu quantization info" "Quantization: 4-bit" bash -c "printf q | $FLASHCHAT"
+run_test_contains "main menu quantization info" "Quantization (model/kv-cache): q4" bash -c "printf q | $FLASHCHAT"
 
 # ---------------------------------------------------------------------------
 # Models command

@@ -150,7 +150,7 @@ start_server() {
     ( cd "${REPO_ROOT}/metal_infer"
       FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG}" FLASHCHAT_MODEL="${id}" \
       FLASHCHAT_MODEL_PATH="${MP}" FLASHCHAT_WEIGHTS_DIR="${WD}" FLASHCHAT_EXPERTS_DIR="${ED}" \
-        ./infer --serve "${PORT}" --model-id "${id}" --model "${MP}" >"${TMPDIR}/server.log" 2>&1 ) &
+        exec ./infer --serve "${PORT}" --model-id "${id}" --model "${MP}" >"${TMPDIR}/server.log" 2>&1 ) &
     SERVER_PID="$!"
     local tries=0
     while [[ $tries -lt 120 ]]; do
