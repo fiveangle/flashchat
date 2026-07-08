@@ -123,9 +123,6 @@
         "bits": 8,
         "group_size": 64
       },
-      "legacy_ids": [
-        "Qwen-Qwen36-35B-A3B-8bit"
-      ],
       "artifacts": {
         "model_weights.bin": {
           "step": "compile_native:non_experts",

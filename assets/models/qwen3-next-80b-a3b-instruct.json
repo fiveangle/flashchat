@@ -122,9 +122,6 @@
         "bits": 8,
         "group_size": 64
       },
-      "legacy_ids": [
-        "Qwen-Qwen3-Next-80B-A3B-Instruct-8bit"
-      ],
       "artifacts": {
         "model_weights.bin": {
           "step": "compile_native:non_experts",

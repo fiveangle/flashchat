@@ -12,6 +12,7 @@ sys.path.insert(0, REPO_ROOT)
 from modelmgr import paths
 from modelmgr.artifacts import template_supports_thinking
 from modelmgr.manifest import ManifestError, parse_manifest
+from modelmgr.registry import resolved_id
 
 
 def load_shipped():
@@ -33,17 +34,20 @@ class TestShippedManifests(unittest.TestCase):
 
     def test_legacy_ids_globally_unique(self):
         seen = {}
+        resolved = set()
         for path, data in load_shipped().items():
             m = parse_manifest(data, source_path=path)
-            for variant in m.variants.values():
+            for vname, variant in m.variants.items():
                 for lid in variant.legacy_ids:
                     self.assertNotIn(lid, seen, f"legacy id {lid} duplicated in {path} and {seen.get(lid)}")
                     seen[lid] = path
-        # All shipped registry ids must be claimed somewhere.
+                resolved.add(resolved_id(m, vname))
+        # Every shipped registry id — whether a retained legacy alias or the
+        # -q<bits> default — must appear in the golden fixture, and vice versa.
         legacy = paths.read_json(
             os.path.join(os.path.dirname(__file__), "fixtures", "model_configs_legacy.json")
         )
-        self.assertEqual(set(seen), set(legacy["models"]))
+        self.assertEqual(resolved, set(legacy["models"]))
 
     def test_exactly_one_suggested_default(self):
         suggested = [

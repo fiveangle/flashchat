@@ -78,7 +78,7 @@
       "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     },
-    "Qwen-Qwen3-Next-80B-A3B-Instruct-8bit": {
+    "Qwen-Qwen3-Next-80B-A3B-Instruct-q8": {
       "name": "Qwen3-Next-80B-A3B-Instruct (q8)",
       "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct",
       "hidden_size": 2048,
@@ -384,7 +384,7 @@
       "mtp_default_predictions": 0,
       "mtp_num_hidden_layers": 1
     },
-    "Qwen-Qwen36-35B-A3B-8bit": {
+    "Qwen-Qwen36-35B-A3B-q8": {
       "name": "Qwen3.6-35B-A3B (q8)",
       "hf_repo": "Qwen/Qwen3.6-35B-A3B",
       "hidden_size": 2048,

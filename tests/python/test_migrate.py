@@ -104,13 +104,21 @@ class TestAdoption(MigrateBase):
 
 class TestConfigAndState(MigrateBase):
     def test_legacy_model_id_maps_to_base_and_variant(self):
-        configfile.update({"MODEL": "Qwen-Qwen36-35B-A3B-8bit", "SERVER_PORT": "9999"})
+        configfile.update({"MODEL": "Qwen-Qwen36-35B-A3B", "SERVER_PORT": "9999"})
         changes = migrate.migrate_user_config(self.registry)
         self.assertEqual(changes["MODEL_BASE"], "qwen3.6-35b-a3b")
-        self.assertEqual(changes["MODEL_VARIANT"], "q8")
+        self.assertEqual(changes["MODEL_VARIANT"], "q4")
         values = configfile.load()
-        self.assertEqual(values["MODEL"], "Qwen-Qwen36-35B-A3B-8bit")  # untouched
+        self.assertEqual(values["MODEL"], "Qwen-Qwen36-35B-A3B")  # untouched
         self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "3")
+
+    def test_retired_8bit_id_no_longer_resolves(self):
+        # The "-8bit" resolved id was retired; variants now use -q<bits>
+        # (Qwen-Qwen36-35B-A3B-q8). Old configs pointing at "-8bit" no longer
+        # map, so the launcher warns and falls back at load. Documented in
+        # docs/UPGRADE_NOTES.md.
+        self.assertIsNone(self.registry.lookup_legacy("Qwen-Qwen36-35B-A3B-8bit"))
+        self.assertIsNotNone(self.registry.lookup_legacy("Qwen-Qwen36-35B-A3B-q8"))
 
     def test_config_migration_is_idempotent(self):
         configfile.update({"MODEL": "Qwen-Qwen36-35B-A3B"})

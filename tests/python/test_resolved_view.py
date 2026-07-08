@@ -144,9 +144,9 @@ class TestStrstrScoping(unittest.TestCase):
     def test_thinking_capable_not_inherited_across_entries(self):
         # The regression the C parser comments warn about: a 35B entry must
         # not pick up Qwen3-Next's thinking_capable=false.
-        for rid in ("Qwen-Qwen36-35B-A3B", "Qwen-Qwen36-35B-A3B-8bit"):
+        for rid in ("Qwen-Qwen36-35B-A3B", "Qwen-Qwen36-35B-A3B-q8"):
             self.assertIsNone(self.parser.scoped_value(rid, "thinking_capable"), rid)
-        for rid in ("Qwen-Qwen3-Next-80B-A3B-Instruct", "Qwen-Qwen3-Next-80B-A3B-Instruct-8bit"):
+        for rid in ("Qwen-Qwen3-Next-80B-A3B-Instruct", "Qwen-Qwen3-Next-80B-A3B-Instruct-q8"):
             self.assertEqual(self.parser.scoped_value(rid, "thinking_capable"), "false", rid)
 
 
