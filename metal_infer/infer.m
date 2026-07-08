@@ -10783,6 +10783,37 @@ static void maybe_sse_send_prefill_keepalive(int fd, const char *request_id,
     *next_ms = t + 2000.0;
 }
 
+// Report batched-prefill progress: writes a heartbeat frame to the streaming
+// client and a server-log line. Safe to call every layer — it self-throttles,
+// doing nothing unless streaming is enabled and the interval since the last
+// report has elapsed. Unlike the per-token path, `done` doesn't advance within
+// a chunk (a whole chunk clears at once — ~15s at chunk=1024), so a bare
+// tokens=0/N reads as a stall until the chunk lands; reporting the in-flight
+// chunk and its layer sweep shows forward motion the whole time.
+static void report_prefill_progress(
+        int fd, const char *request_id, int *enabled, double *next_ms,
+        const char *phase, int done, int total,
+        int chunk_idx, int chunk_total, int chunk_tokens, int layer, int num_layers) {
+    if (!enabled || !*enabled || !next_ms) return;
+    double t = now_ms();
+    if (t < *next_ms) return;
+    char buf[224];
+    int n = snprintf(buf, sizeof(buf),
+        ": flashchat prefill phase=%s tokens=%d/%d chunk=%d/%d layer=%d/%d\n\n",
+        phase ? phase : "prompt", done, total, chunk_idx, chunk_total, layer, num_layers);
+    if (write(fd, buf, n) <= 0) {
+        *enabled = 0;
+        server_log_errorf("[serve] %s client disconnected during prefill keepalive\n", request_id);
+        return;
+    }
+    if (g_server_debug_enabled) {
+        server_log_errorf("[serve] %s prefill_keepalive phase=%s tokens=%d/%d chunk=%d/%d (%d tok) layer=%d/%d\n",
+                          request_id, phase ? phase : "prompt", done, total,
+                          chunk_idx, chunk_total, chunk_tokens, layer, num_layers);
+    }
+    *next_ms = t + 2000.0;
+}
+
 // Post-prefill state dump (FLASHCHAT_PREFILL_DEBUG=2): per full-attn layer,
 // tolerance-comparable dequantized K/V sums (cross-run diffing) and an exact
 // GPU-mirror-vs-CPU consistency check (within-run invariant).
@@ -10847,9 +10878,15 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
     int chunk_max = prefill_chunk_tokens();
     int i = start;
     int limit = count - 1;
+    // Chunks this driver will process (the sub-min_tokens tail finishes in the
+    // caller's per-token loop). Only a keepalive progress hint, so approximate.
+    int chunk_total = (limit - start + chunk_max - 1) / chunk_max;
+    if (chunk_total < 1) chunk_total = 1;
+    int chunk_idx = 0;
     while (limit - i >= min_tokens) {
         int n = limit - i < chunk_max ? limit - i : chunk_max;
         if (*pos_io + n > GPU_KV_SEQ) break;   // window edge: finish per-token
+        chunk_idx++;
         double t0 = now_ms();
         float *hs = malloc((size_t)n * H * sizeof(float));
         int *posv = malloc((size_t)n * sizeof(int));
@@ -10865,8 +10902,9 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
                                     is_full ? kv_caches[layer] : NULL,
                                     posv, layer_fds ? layer_fds[layer] : -1);
             if (ka_enabled)
-                maybe_sse_send_prefill_keepalive(client_fd, request_id, ka_enabled, ka_next,
-                                                 ka_phase, i, count);
+                report_prefill_progress(client_fd, request_id, ka_enabled, ka_next,
+                                                         ka_phase, i, count, chunk_idx, chunk_total,
+                                                         n, layer + 1, g_cfg.num_layers);
         }
         free(hs); free(posv);
         *pos_io += n;
@@ -10885,8 +10923,9 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
                         127.0f / g_calib_w_absmax);
         }
         if (ka_enabled)
-            maybe_sse_send_prefill_keepalive(client_fd, request_id, ka_enabled, ka_next,
-                                             ka_phase, i, count);
+            report_prefill_progress(client_fd, request_id, ka_enabled, ka_next,
+                                                     ka_phase, i, count, chunk_idx, chunk_total,
+                                                     n, g_cfg.num_layers, g_cfg.num_layers);
     }
     return i;
 }
