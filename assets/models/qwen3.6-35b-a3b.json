@@ -84,7 +84,6 @@
   },
   "variants": {
     "q4": {
-      "display_name": "Qwen3.6-35B-A3B-4bit",
       "quantization": {
         "bits": 4,
         "group_size": 64
@@ -120,7 +119,6 @@
       }
     },
     "q8": {
-      "display_name": "Qwen3.6-35B-A3B-8bit",
       "quantization": {
         "bits": 8,
         "group_size": 64

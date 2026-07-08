@@ -66,7 +66,12 @@ _SCRIPTS = {
 
 def flat_entry(manifest: Manifest, variant_name: str) -> dict:
     variant = manifest.variant(variant_name)
-    entry: dict = {"name": variant.display_name or manifest.name}
+    # Display name = base model name + parenthetical quant, uniformly across
+    # variants (Qwen3.6-35B-A3B (q4) / (q8)). The quant is an annotation, not
+    # part of the name: a bare "-4bit" suffix can be a real HF repo id and would
+    # read as a distinct model. Uniqueness lives in the resolved id (the map
+    # key), never in this display string.
+    entry: dict = {"name": f"{manifest.name} ({variant_name})"}
 
     benchmark = manifest.benchmark if variant.benchmark is None else variant.benchmark
     if not benchmark:

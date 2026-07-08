@@ -1,7 +1,7 @@
 {
   "models": {
     "Qwen-Qwen3-Next-80B-A3B-Instruct": {
-      "name": "Qwen3-Next-80B-A3B-Instruct-4bit",
+      "name": "Qwen3-Next-80B-A3B-Instruct (q4)",
       "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct",
       "hidden_size": 2048,
       "num_hidden_layers": 48,
@@ -79,7 +79,7 @@
       "mtp_num_hidden_layers": 1
     },
     "Qwen-Qwen3-Next-80B-A3B-Instruct-8bit": {
-      "name": "Qwen3-Next-80B-A3B-Instruct-8bit",
+      "name": "Qwen3-Next-80B-A3B-Instruct (q8)",
       "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct",
       "hidden_size": 2048,
       "num_hidden_layers": 48,
@@ -157,7 +157,7 @@
       "mtp_num_hidden_layers": 1
     },
     "mlx-community-Qwen35-397B-A17B-4bit": {
-      "name": "Qwen3.5-397B-A17B",
+      "name": "Qwen3.5-397B-A17B (q4)",
       "benchmark": false,
       "hf_repo": "mlx-community/Qwen3.5-397B-A17B-4bit",
       "hidden_size": 4096,
@@ -233,7 +233,7 @@
       "mtp_default_predictions": 0
     },
     "unsloth-Qwen36-35B-A3B-UD-MLX-4bit": {
-      "name": "Qwen3.6-35B-A3B-UD-MLX-4bit",
+      "name": "Qwen3.6-35B-A3B-UD-MLX-4bit (q4)",
       "hf_repo": "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
       "hidden_size": 2048,
       "num_hidden_layers": 40,
@@ -308,7 +308,7 @@
       "mtp_default_predictions": 0
     },
     "Qwen-Qwen36-35B-A3B": {
-      "name": "Qwen3.6-35B-A3B-4bit",
+      "name": "Qwen3.6-35B-A3B (q4)",
       "hf_repo": "Qwen/Qwen3.6-35B-A3B",
       "hidden_size": 2048,
       "num_hidden_layers": 40,
@@ -385,7 +385,7 @@
       "mtp_num_hidden_layers": 1
     },
     "Qwen-Qwen36-35B-A3B-8bit": {
-      "name": "Qwen3.6-35B-A3B-8bit",
+      "name": "Qwen3.6-35B-A3B (q8)",
       "hf_repo": "Qwen/Qwen3.6-35B-A3B",
       "hidden_size": 2048,
       "num_hidden_layers": 40,

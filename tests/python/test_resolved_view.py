@@ -139,7 +139,7 @@ class TestStrstrScoping(unittest.TestCase):
                 bits = self.parser.scoped_value(rid, "bits")
                 self.assertEqual(int(bits), variant.bits, f"{rid}: bits mis-scoped")
                 name = self.parser.scoped_value(rid, "name")
-                self.assertEqual(name, variant.display_name or m.name, f"{rid}: name mis-scoped")
+                self.assertEqual(name, f"{m.name} ({vname})", f"{rid}: name mis-scoped")
 
     def test_thinking_capable_not_inherited_across_entries(self):
         # The regression the C parser comments warn about: a 35B entry must

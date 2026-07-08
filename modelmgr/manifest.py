@@ -68,7 +68,6 @@ class Variant:
     group_size: int
     artifacts: dict  # relpath -> ArtifactSpec
     legacy_ids: list = field(default_factory=list)
-    display_name: str | None = None
     benchmark: bool | None = None  # None -> inherit model-level
 
 
@@ -233,7 +232,6 @@ def parse_manifest(data: dict, source_path: str | None = None, user_defined: boo
             group_size=int(quant["group_size"]),
             artifacts=artifacts,
             legacy_ids=list(vraw.get("legacy_ids", [])),
-            display_name=vraw.get("display_name"),
             benchmark=vraw.get("benchmark"),
         )
 
