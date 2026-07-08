@@ -59,7 +59,7 @@ def run(registry: Registry) -> None:
         "MODEL": resolved_id(manifest, variant_name),
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
-        "CONFIG_SCHEMA_VERSION": "7",
+        "CONFIG_SCHEMA_VERSION": "9",
     })
     registry.state.enabled[manifest.id] = True
     registry.state.save()
@@ -77,7 +77,7 @@ def run(registry: Registry) -> None:
     changes.update(_select_sampling_profile(manifest))
     changes.update(_server_settings())
     changes.update(_storage_settings())
-    changes.update(_advanced_settings(manifest))
+    changes.update(_advanced_settings(manifest, variant_name, changes.get("ACTIVE_EXPERTS", "")))
 
     changed = _has_config_changes(changes)
     configfile.update(changes)
@@ -388,7 +388,70 @@ def _storage_settings() -> dict:
     return out
 
 
-def _advanced_settings(manifest) -> dict:
+def _estimated_packed_expert_size(manifest, variant_name: str) -> int:
+    arch = manifest.architecture
+    hidden = int(arch.get("hidden_size", 0) or 0)
+    intermediate = int(arch.get("moe_intermediate_size", 0) or 0)
+    if hidden <= 0 or intermediate <= 0:
+        return 0
+    variant = manifest.variant(variant_name)
+    bits = int(variant.bits or 0)
+    group = int(variant.group_size or 0)
+    if bits <= 0 or group <= 0:
+        return 0
+
+    def matrix_bytes(out_dim: int, in_dim: int) -> int:
+        packed_weight = out_dim * in_dim * bits // 8
+        groups = (in_dim + group - 1) // group
+        scale_bias = out_dim * groups * 2 * 2
+        return packed_weight + scale_bias
+
+    return (matrix_bytes(intermediate, hidden) +
+            matrix_bytes(intermediate, hidden) +
+            matrix_bytes(hidden, intermediate))
+
+
+def _expert_pin_guidance(manifest, variant_name: str, active_experts: str) -> None:
+    k = manifest.num_experts_per_tok
+    if not active_experts:
+        active_experts = configfile.get("ACTIVE_EXPERTS", "")
+    if active_experts and active_experts.isdigit():
+        k = int(active_experts)
+    layers = int(manifest.architecture.get("num_hidden_layers")
+                 or manifest.architecture.get("num_layers") or 0)
+    total_experts = int(manifest.architecture.get("num_experts", 0) or 0)
+
+    if k <= 0 or layers <= 0:
+        print(common.dim("  Set this as the number of complete experts to keep in RAM."))
+        return
+
+    slots_per_decode_pass = layers * k
+    pool_slots = layers * total_experts if total_experts > 0 else 0
+    expert_size = _estimated_packed_expert_size(manifest, variant_name)
+    small = slots_per_decode_pass
+    recommended = slots_per_decode_pass * 2
+    large = slots_per_decode_pass * 4
+    if expert_size > 0:
+        print(common.dim(
+            f"  Recommended: {recommended} experts ({paths.human_bytes(recommended * expert_size)}), "
+            f"enough for about two generated tokens worth of K={k} expert choices."))
+        print(common.dim(
+            f"  Smaller: {small} experts ({paths.human_bytes(small * expert_size)}); "
+            f"larger: {large} experts ({paths.human_bytes(large * expert_size)})."))
+    else:
+        print(common.dim(
+            f"  Recommended: {recommended} experts, enough for about two generated tokens worth of K={k} expert choices."))
+        print(common.dim(f"  Smaller: {small} experts; larger: {large} experts."))
+    if pool_slots > 0:
+        if expert_size > 0:
+            print(common.dim(
+                f"  Maximum useful value for this model: {pool_slots} experts "
+                f"({paths.human_bytes(pool_slots * expert_size)})."))
+        else:
+            print(common.dim(f"  Maximum useful value for this model: {pool_slots} experts."))
+
+
+def _advanced_settings(manifest, variant_name: str, active_experts: str = "") -> dict:
     if not common.confirm("Configure advanced options (debug, MTP, cache)?", default=False):
         return {}
     out = {}
@@ -410,8 +473,10 @@ def _advanced_settings(manifest) -> dict:
             ("PREAD_PROFILE", "Disk-read timing log (empty=off, or a .tsv path)", "",
              "For diagnosing slow expert streaming; analyze with tools/pread_profile_analyze.py."),
             ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", "2097152", None),
-            ("EXPERT_PIN_MAX_GB", "Expert RAM cache in GiB (0=off)", "4",
-             "Keeps the hottest experts in RAM instead of re-reading from disk — the main decode speedup when RAM is spare."),
+            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (empty=use GiB cap)", "",
+             None),
+            ("EXPERT_PIN_MAX_GB", "  ^ maximum GiB cache limit (0 disables cache)", "4",
+             None),
             ("EXPERT_PIN_AUTO_FRAC", "  ^ also capped to this fraction of free RAM (0.1-0.9)", "0.5", None),
             ("EXPERT_PIN_MLOCK", "  ^ lock against swap (0/1; keeps RAM from other apps)", "0", None),
             ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1",
@@ -425,6 +490,8 @@ def _advanced_settings(manifest) -> dict:
             ("COLOR_OUTPUT", "Color output (0/1)", "1", None)):
         if help_text:
             print(common.dim(f"  {help_text}"))
+        if key == "EXPERT_PIN_MAX_EXPERTS":
+            _expert_pin_guidance(manifest, variant_name, active_experts)
         value = common.prompt(label, configfile.get(key, default))
         if key == "MTP":
             mtp_raw = value

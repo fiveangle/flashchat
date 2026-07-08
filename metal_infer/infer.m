@@ -118,6 +118,14 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+static size_t process_resident_bytes(void) {
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                 (task_info_t)&info, &count);
+    return kr == KERN_SUCCESS ? (size_t)info.resident_size : 0;
+}
+
 static void server_log_timestamp(FILE *f) {
     time_t now = time(NULL);
     struct tm tm_now;
@@ -2693,6 +2701,124 @@ static void mtp_gpu_bf16_dispatch(const uint16_t *W, const float *x, float *out,
 static void gpu_dequant_matmulN(MetalCtx *ctx, const void *W_packed, const void *scales,
                                 const void *biases, const float *X, float *OUT,
                                 uint32_t out_dim, uint32_t in_dim, uint32_t group_size, uint32_t N);
+static int prefill_debug_enabled(void);
+static size_t host_free_ram_bytes(void);
+
+static id<MTLBuffer> g_matmulN_xbuf = nil;
+static id<MTLBuffer> g_matmulN_obuf = nil;
+static id<MTLBuffer> g_matmulN_batch_xbufs[8] = {nil};
+static id<MTLBuffer> g_matmulN_batch_obufs[8] = {nil};
+static id<MTLBuffer> g_prefill_csr_x = nil;
+static id<MTLBuffer> g_prefill_csr_gate = nil;
+static id<MTLBuffer> g_prefill_csr_up = nil;
+static id<MTLBuffer> g_prefill_csr_act = nil;
+static id<MTLBuffer> g_prefill_csr_out = nil;
+
+static size_t mtl_buffer_len(id<MTLBuffer> b) {
+    return b ? (size_t)[b length] : 0;
+}
+
+static size_t prefill_transient_buffer_bytes(MetalCtx *ctx) {
+    size_t bytes = 0;
+    bytes += mtl_buffer_len(g_matmulN_xbuf) + mtl_buffer_len(g_matmulN_obuf);
+    for (int i = 0; i < 8; i++) {
+        bytes += mtl_buffer_len(g_matmulN_batch_xbufs[i]);
+        bytes += mtl_buffer_len(g_matmulN_batch_obufs[i]);
+    }
+    bytes += mtl_buffer_len(g_prefill_csr_x);
+    bytes += mtl_buffer_len(g_prefill_csr_gate);
+    bytes += mtl_buffer_len(g_prefill_csr_up);
+    bytes += mtl_buffer_len(g_prefill_csr_act);
+    bytes += mtl_buffer_len(g_prefill_csr_out);
+    if (ctx) {
+        bytes += mtl_buffer_len(ctx->buf_delta_qkv_batch);
+        bytes += mtl_buffer_len(ctx->buf_delta_z_batch);
+        bytes += mtl_buffer_len(ctx->buf_delta_beta_batch);
+        bytes += mtl_buffer_len(ctx->buf_delta_alpha_batch);
+        bytes += mtl_buffer_len(ctx->buf_delta_gated_batch);
+        bytes += mtl_buffer_len(ctx->buf_attn_q_batch);
+        bytes += mtl_buffer_len(ctx->buf_attn_gate_batch);
+        bytes += mtl_buffer_len(ctx->buf_attn_out_batch);
+        size_t decode_output_bytes = (size_t)g_cfg.vocab_size * sizeof(float);
+        size_t output_len = mtl_buffer_len(ctx->buf_output);
+        if (output_len > decode_output_bytes) bytes += output_len - decode_output_bytes;
+    }
+    return bytes;
+}
+
+static void prefill_log_memory(const char *label) {
+    if (!prefill_debug_enabled()) return;
+    size_t rss = process_resident_bytes();
+    size_t free_ram = host_free_ram_bytes();
+    fprintf(stderr, "[prefill-mem] %s rss=%.2f GiB free_reclaimable=%.2f GiB transient=%.2f MiB\n",
+            label ? label : "state",
+            rss / (double)(1ULL << 30),
+            free_ram / (double)(1ULL << 30),
+            prefill_transient_buffer_bytes(g_metal) / (1024.0 * 1024.0));
+}
+
+static void prefill_release_transient_buffers(void) {
+    if (!g_metal || !batch_prefill_enabled()) return;
+    const char *release_env = getenv("FLASHCHAT_PREFILL_RELEASE");
+    if (release_env && release_env[0] &&
+        (!strcmp(release_env, "0") || !strcmp(release_env, "off") || !strcmp(release_env, "false"))) {
+        if (prefill_debug_enabled())
+            fprintf(stderr, "[prefill-mem] transient release disabled by FLASHCHAT_PREFILL_RELEASE=%s\n",
+                    release_env);
+        return;
+    }
+    if (g_mtp_predictions > 0) {
+        if (prefill_debug_enabled())
+            fprintf(stderr, "[prefill-mem] transient release skipped while MTP is active\n");
+        return;
+    }
+
+    @autoreleasepool {
+        size_t before = prefill_transient_buffer_bytes(g_metal);
+        size_t rss_before = process_resident_bytes();
+        size_t free_before = host_free_ram_bytes();
+        if (before == 0) return;
+
+        g_matmulN_xbuf = nil;
+        g_matmulN_obuf = nil;
+        for (int i = 0; i < 8; i++) {
+            g_matmulN_batch_xbufs[i] = nil;
+            g_matmulN_batch_obufs[i] = nil;
+        }
+        g_prefill_csr_x = nil;
+        g_prefill_csr_gate = nil;
+        g_prefill_csr_up = nil;
+        g_prefill_csr_act = nil;
+        g_prefill_csr_out = nil;
+
+        g_metal->buf_delta_qkv_batch = nil;
+        g_metal->buf_delta_z_batch = nil;
+        g_metal->buf_delta_beta_batch = nil;
+        g_metal->buf_delta_alpha_batch = nil;
+        g_metal->buf_delta_gated_batch = nil;
+        g_metal->buf_attn_q_batch = nil;
+        g_metal->buf_attn_gate_batch = nil;
+        g_metal->buf_attn_out_batch = nil;
+
+        size_t decode_output_bytes = (size_t)g_cfg.vocab_size * sizeof(float);
+        if (mtl_buffer_len(g_metal->buf_output) > decode_output_bytes) {
+            g_metal->buf_output = [g_metal->device newBufferWithLength:decode_output_bytes
+                                                                options:MTLResourceStorageModeShared];
+        }
+
+        if (prefill_debug_enabled()) {
+            size_t rss_after = process_resident_bytes();
+            size_t free_after = host_free_ram_bytes();
+            fprintf(stderr,
+                    "[prefill-mem] released %.2f MiB of transient buffers | rss %.2f -> %.2f GiB | free_reclaimable %.2f -> %.2f GiB\n",
+                    before / (1024.0 * 1024.0),
+                    rss_before / (double)(1ULL << 30),
+                    rss_after / (double)(1ULL << 30),
+                    free_before / (double)(1ULL << 30),
+                    free_after / (double)(1ULL << 30));
+        }
+    }
+}
 
 static void mtp_gpu_8bit_dispatch(const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
                                     const float *x, float *out, int out_dim, int in_dim, int group_size) {
@@ -3562,12 +3688,13 @@ static void gpu_dequant_matmulN(
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size, uint32_t N
 ) {
     double _t_mm = now_ms();
-    static id<MTLBuffer> xbuf = nil, obuf = nil;
     size_t xs = (size_t)N * in_dim * sizeof(float);
     size_t os = (size_t)N * out_dim * sizeof(float);
-    if (!xbuf || (size_t)[xbuf length] < xs) xbuf = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
-    if (!obuf || (size_t)[obuf length] < os) obuf = [ctx->device newBufferWithLength:os options:MTLResourceStorageModeShared];
-    memcpy([xbuf contents], X, xs);
+    if (!g_matmulN_xbuf || (size_t)[g_matmulN_xbuf length] < xs)
+        g_matmulN_xbuf = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
+    if (!g_matmulN_obuf || (size_t)[g_matmulN_obuf length] < os)
+        g_matmulN_obuf = [ctx->device newBufferWithLength:os options:MTLResourceStorageModeShared];
+    memcpy([g_matmulN_xbuf contents], X, xs);
 
     int values_per_word = (g_cfg.bits == 8) ? 4 : 8;
     size_t w_bytes = (size_t)out_dim * (in_dim / values_per_word) * sizeof(uint32_t);
@@ -3586,11 +3713,11 @@ static void gpu_dequant_matmulN(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     gpu_encode_matmulN_io(ctx, enc, w_buf, w_off, s_buf, s_off, b_buf, b_off,
-                          xbuf, 0, obuf, 0, out_dim, in_dim, group_size, N);
+                          g_matmulN_xbuf, 0, g_matmulN_obuf, 0, out_dim, in_dim, group_size, N);
     [enc endEncoding];
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
-    memcpy(OUT, [obuf contents], os);
+    memcpy(OUT, [g_matmulN_obuf contents], os);
     g_prof_matmulN += now_ms() - _t_mm;
 }
 
@@ -3653,15 +3780,16 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
         return;
     }
     double _t_mm = now_ms();
-    static id<MTLBuffer> xbufs[MAX_BATCH] = {nil}, obufs[MAX_BATCH] = {nil};
 
     // Grow/allocate per-slot in/out buffers and copy inputs in.
     for (int j = 0; j < nj; j++) {
         size_t xs = (size_t)jobs[j].N * jobs[j].in_dim * sizeof(float);
         size_t osz = (size_t)jobs[j].N * jobs[j].out_dim * sizeof(float);
-        if (!xbufs[j] || (size_t)[xbufs[j] length] < xs) xbufs[j] = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
-        if (!obufs[j] || (size_t)[obufs[j] length] < osz) obufs[j] = [ctx->device newBufferWithLength:osz options:MTLResourceStorageModeShared];
-        memcpy([xbufs[j] contents], jobs[j].X, xs);
+        if (!g_matmulN_batch_xbufs[j] || (size_t)[g_matmulN_batch_xbufs[j] length] < xs)
+            g_matmulN_batch_xbufs[j] = [ctx->device newBufferWithLength:xs options:MTLResourceStorageModeShared];
+        if (!g_matmulN_batch_obufs[j] || (size_t)[g_matmulN_batch_obufs[j] length] < osz)
+            g_matmulN_batch_obufs[j] = [ctx->device newBufferWithLength:osz options:MTLResourceStorageModeShared];
+        memcpy([g_matmulN_batch_xbufs[j] contents], jobs[j].X, xs);
     }
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
@@ -3679,7 +3807,7 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
             [cmdbuf commit];
             [cmdbuf waitUntilCompleted];
             for (int k = 0; k < j; k++)
-                memcpy(jobs[k].OUT, [obufs[k] contents], (size_t)jobs[k].N * jobs[k].out_dim * sizeof(float));
+                memcpy(jobs[k].OUT, [g_matmulN_batch_obufs[k] contents], (size_t)jobs[k].N * jobs[k].out_dim * sizeof(float));
             for (int k = j; k < nj; k++)
                 for (uint32_t n = 0; n < jobs[k].N; n++)
                     cpu_dequant_matvec(jobs[k].W, jobs[k].S, jobs[k].B,
@@ -3690,14 +3818,14 @@ static void gpu_dequant_matmulN_batch(MetalCtx *ctx, MMJob *jobs, int nj) {
             return;
         }
         gpu_encode_matmulN_io(ctx, enc, w_buf, w_off, s_buf, s_off, b_buf, b_off,
-                              xbufs[j], 0, obufs[j], 0,
+                              g_matmulN_batch_xbufs[j], 0, g_matmulN_batch_obufs[j], 0,
                               jobs[j].out_dim, jobs[j].in_dim, jobs[j].group_size, jobs[j].N);
     }
     [enc endEncoding];
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
     for (int j = 0; j < nj; j++)
-        memcpy(jobs[j].OUT, [obufs[j] contents], (size_t)jobs[j].N * jobs[j].out_dim * sizeof(float));
+        memcpy(jobs[j].OUT, [g_matmulN_batch_obufs[j] contents], (size_t)jobs[j].N * jobs[j].out_dim * sizeof(float));
     g_prof_matmulN += now_ms() - _t_mm;
 }
 
@@ -5670,18 +5798,22 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
     g_moe_last_union = n_uni;
 
     // CSR staging buffers (grow-on-demand; ~44MB at chunk=256/K=8).
-    static id<MTLBuffer> x_csr, g_csr, u_csr, a_csr, o_csr;
     size_t xsz = (size_t)total_rows * H * sizeof(float);
     size_t msz = (size_t)total_rows * idim * sizeof(float);
-    if (!x_csr || (size_t)[x_csr length] < xsz) x_csr = [ctx->device newBufferWithLength:xsz options:MTLResourceStorageModeShared];
-    if (!g_csr || (size_t)[g_csr length] < msz) g_csr = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
-    if (!u_csr || (size_t)[u_csr length] < msz) u_csr = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
-    if (!a_csr || (size_t)[a_csr length] < msz) a_csr = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
-    if (!o_csr || (size_t)[o_csr length] < xsz) o_csr = [ctx->device newBufferWithLength:xsz options:MTLResourceStorageModeShared];
+    if (!g_prefill_csr_x || (size_t)[g_prefill_csr_x length] < xsz)
+        g_prefill_csr_x = [ctx->device newBufferWithLength:xsz options:MTLResourceStorageModeShared];
+    if (!g_prefill_csr_gate || (size_t)[g_prefill_csr_gate length] < msz)
+        g_prefill_csr_gate = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
+    if (!g_prefill_csr_up || (size_t)[g_prefill_csr_up length] < msz)
+        g_prefill_csr_up = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
+    if (!g_prefill_csr_act || (size_t)[g_prefill_csr_act length] < msz)
+        g_prefill_csr_act = [ctx->device newBufferWithLength:msz options:MTLResourceStorageModeShared];
+    if (!g_prefill_csr_out || (size_t)[g_prefill_csr_out length] < xsz)
+        g_prefill_csr_out = [ctx->device newBufferWithLength:xsz options:MTLResourceStorageModeShared];
 
     // Gather all routed rows into CSR order once (source rows are hp).
     _t = now_ms();
-    float *xstage = (float *)[x_csr contents];
+    float *xstage = (float *)[g_prefill_csr_x contents];
     for (int r = 0; r < total_rows; r++)
         memcpy(xstage + (size_t)r*H, hp + (size_t)toks[r]*H, (size_t)H*sizeof(float));
     g_prof_prefill_scatter += now_ms() - _t;
@@ -5744,7 +5876,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 }
                 double t0 = now_ms();
                 id<MTLCommandBuffer> pcmd = [ctx->queue commandBuffer];
-                ane_encode_producer(pcmd, bufs[s], x_csr, (size_t)(off[e]+ (int)r0)*H*sizeof(float),
+                ane_encode_producer(pcmd, bufs[s], g_prefill_csr_x, (size_t)(off[e]+ (int)r0)*H*sizeof(float),
                                     r, (uint32_t)H, (uint32_t)idim, (uint32_t)gsz, cur, with_weights);
                 [pcmd commit]; [pcmd waitUntilCompleted];
                 g_prof_ane_producer += now_ms() - t0;
@@ -5809,8 +5941,8 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e];
                 NSUInteger xo = (size_t)off[e]*H*sizeof(float), mo = (size_t)off[e]*idim*sizeof(float);
-                gpu_encode_matmulN_io(ctx, enc, bufs[s], gw, bufs[s], gs_, bufs[s], gb, x_csr, xo, g_csr, mo, (uint32_t)idim, (uint32_t)H, (uint32_t)gsz, r);
-                gpu_encode_matmulN_io(ctx, enc, bufs[s], uw, bufs[s], us, bufs[s], ub, x_csr, xo, u_csr, mo, (uint32_t)idim, (uint32_t)H, (uint32_t)gsz, r);
+                gpu_encode_matmulN_io(ctx, enc, bufs[s], gw, bufs[s], gs_, bufs[s], gb, g_prefill_csr_x, xo, g_prefill_csr_gate, mo, (uint32_t)idim, (uint32_t)H, (uint32_t)gsz, r);
+                gpu_encode_matmulN_io(ctx, enc, bufs[s], uw, bufs[s], us, bufs[s], ub, g_prefill_csr_x, xo, g_prefill_csr_up, mo, (uint32_t)idim, (uint32_t)H, (uint32_t)gsz, r);
             }
             [enc endEncoding];
         }
@@ -5821,9 +5953,9 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e], dim = (uint32_t)idim;
                 NSUInteger mo = (size_t)off[e]*idim*sizeof(float);
-                [enc setBuffer:g_csr offset:mo atIndex:0];
-                [enc setBuffer:u_csr offset:mo atIndex:1];
-                [enc setBuffer:a_csr offset:mo atIndex:2];
+                [enc setBuffer:g_prefill_csr_gate offset:mo atIndex:0];
+                [enc setBuffer:g_prefill_csr_up offset:mo atIndex:1];
+                [enc setBuffer:g_prefill_csr_act offset:mo atIndex:2];
                 [enc setBytes:&dim length:4 atIndex:3];
                 [enc setBytes:&r   length:4 atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(((size_t)r*idim + 255)/256, 1, 1)
@@ -5837,7 +5969,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                 if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; uint32_t r = (uint32_t)cnt[e];
                 NSUInteger mo = (size_t)off[e]*idim*sizeof(float), oo = (size_t)off[e]*H*sizeof(float);
-                gpu_encode_matmulN_io(ctx, enc, bufs[s], dw, bufs[s], ds, bufs[s], db, a_csr, mo, o_csr, oo, (uint32_t)H, (uint32_t)idim, (uint32_t)gsz, r);
+                gpu_encode_matmulN_io(ctx, enc, bufs[s], dw, bufs[s], ds, bufs[s], db, g_prefill_csr_act, mo, g_prefill_csr_out, oo, (uint32_t)H, (uint32_t)idim, (uint32_t)gsz, r);
             }
             [enc endEncoding];
         }
@@ -5850,9 +5982,9 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
             for (int s = 0; s < wn; s++) {
                 if (!valid[s] || done[s]) continue;
                 int e = uni[w0+s]; int r = cnt[e];
-                const float *xs = (const float *)[x_csr contents] + (size_t)off[e]*H;
+                const float *xs = (const float *)[g_prefill_csr_x contents] + (size_t)off[e]*H;
                 for (size_t k = 0; k < (size_t)r*H; k++) { float a = fabsf(xs[k]); if (a > g_calib_x_absmax) g_calib_x_absmax = a; }
-                const float *as = (const float *)[a_csr contents] + (size_t)off[e]*idim;
+                const float *as = (const float *)[g_prefill_csr_act contents] + (size_t)off[e]*idim;
                 for (size_t k = 0; k < (size_t)r*idim; k++) { float a = fabsf(as[k]); if (a > g_calib_mid_absmax) g_calib_mid_absmax = a; }
                 const uint8_t *blob = (const uint8_t *)[bufs[s] contents];
                 NSUInteger soffs[3] = { g_cfg.gate_w_size,
@@ -5875,7 +6007,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
 
         // Scatter-add this wave's outputs with route weights.
         _t = now_ms();
-        const float *ostage = (const float *)[o_csr contents];
+        const float *ostage = (const float *)[g_prefill_csr_out contents];
         for (int s = 0; s < wn; s++) {
             if (!valid[s] || done[s]) continue;
             int e = uni[w0+s];
@@ -7094,7 +7226,7 @@ static ssize_t prof_pread(int fd, void *dst, size_t size, off_t offset, int gid)
 }
 
 // ============================================================================
-// Expert pin-cache (FLASHCHAT_EXPERT_PIN_MAX_GB)
+// Expert pin-cache (FLASHCHAT_EXPERT_PIN_MAX_EXPERTS / MAX_GB)
 // ----------------------------------------------------------------------------
 // Under memory pressure (low-RAM machines) the OS page cache thrashes and the
 // per-token MoE expert preads turn into real SSD I/O (measured: 43% of pread
@@ -7103,13 +7235,15 @@ static ssize_t prof_pread(int fd, void *dst, size_t size, off_t offset, int gid)
 // Hits memcpy straight into the per-token expert Metal buffer, skipping pread;
 // misses pread as before, then admit (LFU eviction by g_expert_freq).
 //
-// Budget = min(AUTO_FRAC * free RAM at first use, MAX_GB). Disabled when
-// MAX_GB <= 0 (env unset). Sized lazily after the model is resident so the
-// free-RAM read reflects true headroom. Fail-soft: any alloc failure disables
-// the cache and falls back to pure pread (mirrors g_mtp_expert_resident).
-//   FLASHCHAT_EXPERT_PIN_MAX_GB    hard cap, GiB (<=0 disables; default 4 via config)
-//   FLASHCHAT_EXPERT_PIN_AUTO_FRAC fraction of free RAM to use (default 0.5)
-//   FLASHCHAT_EXPERT_PIN_MLOCK     1 = mlock the arena against swap (default 0)
+// Capacity is expressed internally as complete expert slots. The user-facing
+// slot cap is preferred when set, while the GiB cap remains a hard memory
+// ceiling and off switch. Sized lazily after the model is resident so the free-RAM read
+// reflects true headroom. Fail-soft: any alloc failure disables the cache and
+// falls back to pure pread (mirrors g_mtp_expert_resident).
+//   FLASHCHAT_EXPERT_PIN_MAX_EXPERTS target cap in complete experts (empty = derive from GiB cap)
+//   FLASHCHAT_EXPERT_PIN_MAX_GB      hard memory cap, GiB (<=0 disables)
+//   FLASHCHAT_EXPERT_PIN_AUTO_FRAC   fraction of free RAM to use (default 0.5)
+//   FLASHCHAT_EXPERT_PIN_MLOCK       1 = mlock the arena against swap (default 0)
 // ============================================================================
 static unsigned char *g_pin_arena = NULL;   // capacity_slots * esz bytes
 static int   *g_pin_slot_of_gid = NULL;     // gid -> slot, or -1
@@ -7144,6 +7278,18 @@ static void expert_pin_init(void) {
     g_pin_enabled = 0;
     if (g_cfg.num_experts <= 0 || g_cfg.num_layers <= 0) return;
 
+    size_t esz = active_expert_size();
+    if (esz == 0) return;
+    long total_experts = (long)g_cfg.num_layers * g_cfg.num_experts;
+
+    const char *slot_env = getenv("FLASHCHAT_EXPERT_PIN_MAX_EXPERTS");
+    long slot_cap = 0;
+    if (slot_env && slot_env[0]) {
+        char *end = NULL;
+        long parsed = strtol(slot_env, &end, 10);
+        if (end && end != slot_env && parsed > 0) slot_cap = parsed;
+    }
+
     const char *cap_env = getenv("FLASHCHAT_EXPERT_PIN_MAX_GB");
     double cap_gb = (cap_env && cap_env[0]) ? atof(cap_env) : 0.0;
     if (cap_gb <= 0.0) return;   // disabled
@@ -7152,21 +7298,17 @@ static void expert_pin_init(void) {
     double frac = (frac_env && frac_env[0]) ? atof(frac_env) : 0.5;
     if (frac <= 0.0 || frac > 1.0) frac = 0.5;
 
-    size_t esz = active_expert_size();
-    if (esz == 0) return;
-    long total_experts = (long)g_cfg.num_layers * g_cfg.num_experts;
-
     size_t free_ram = host_free_ram_bytes();
-    size_t auto_budget = (size_t)(frac * (double)free_ram);
-    size_t cap_budget  = (size_t)(cap_gb * (double)(1ULL << 30));
-    size_t budget = auto_budget < cap_budget ? auto_budget : cap_budget;
-
-    long slots = (long)(budget / esz);
+    long free_slots = (long)((size_t)(frac * (double)free_ram) / esz);
+    long gb_slots = (long)((size_t)(cap_gb * (double)(1ULL << 30)) / esz);
+    long slots = slot_cap > 0 ? slot_cap : gb_slots;
+    if (slots > gb_slots) slots = gb_slots;
+    if (slots > free_slots) slots = free_slots;
     if (slots > total_experts) slots = total_experts;   // never larger than pool
     if (slots <= 0) {
-        fprintf(stderr, "[expert-pin] budget %.2f GiB too small for one expert "
-                "(esz %.2f MiB) — disabled\n",
-                budget / (double)(1ULL<<30), esz / (double)(1<<20));
+        fprintf(stderr, "[expert-pin] budget too small for one expert "
+                "(expert %.2f MiB, free cap %ld slots, GB-derived cap %ld slots, requested %ld slots) — disabled\n",
+                esz / (double)(1<<20), free_slots, gb_slots, slot_cap);
         return;
     }
 
@@ -7192,10 +7334,11 @@ static void expert_pin_init(void) {
     g_pin_used_slots = 0;
     g_pin_esz = esz;
     g_pin_enabled = 1;
-    fprintf(stderr, "[expert-pin] enabled: %ld experts pinnable (%.2f GiB), "
-            "free RAM %.2f GiB, cap %.2f GiB, pool total %ld experts\n",
-            slots, (double)slots * esz / (double)(1ULL<<30),
-            free_ram / (double)(1ULL<<30), cap_gb, total_experts);
+    fprintf(stderr, "[expert-pin] enabled: %ld experts pinnable (%.2f MiB, %.2f GiB), "
+            "free RAM %.2f GiB, GB cap %.2f GiB, requested %ld experts, pool total %ld experts\n",
+            slots, (double)slots * esz / (double)(1ULL<<20),
+            (double)slots * esz / (double)(1ULL<<30),
+            free_ram / (double)(1ULL<<30), cap_gb, slot_cap, total_experts);
 }
 
 static inline int expert_pin_gid(int layer, int expert) {
@@ -13872,6 +14015,8 @@ static void serve_loop(
                                              "conversation", i + 1, pt->count);
         }
         free(serve_embed_batch);
+        prefill_log_memory("before transient release");
+        prefill_release_transient_buffers();
         free(req_sys_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
 
@@ -15408,6 +15553,8 @@ int main(int argc, char **argv) {
         prefill_debug_dump_state(kv_caches);
 
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
+        prefill_log_memory("before transient release");
+        prefill_release_transient_buffers();
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
         int mtp_shadow_available = mtp_can_shadow_draft();

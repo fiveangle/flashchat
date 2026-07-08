@@ -659,7 +659,9 @@ cmd_config_interactive() {
     unset FLASHCHAT_REASONING FLASHCHAT_TEMPERATURE FLASHCHAT_TOP_P \
           FLASHCHAT_TOP_K FLASHCHAT_MIN_P FLASHCHAT_PRESENCE_PENALTY \
           FLASHCHAT_REPETITION_PENALTY FLASHCHAT_MODEL_PATH \
-          FLASHCHAT_WEIGHTS_DIR FLASHCHAT_EXPERTS_DIR
+          FLASHCHAT_WEIGHTS_DIR FLASHCHAT_EXPERTS_DIR \
+          FLASHCHAT_EXPERT_PIN_MAX_GB FLASHCHAT_EXPERT_PIN_MAX_EXPERTS \
+          FLASHCHAT_EXPERT_PIN_AUTO_FRAC FLASHCHAT_EXPERT_PIN_MLOCK
     cmd_config "$@"
 }
 
@@ -990,6 +992,7 @@ server_runtime_signature() {
         echo "PREAD_PROFILE=$(flashchat_get PREAD_PROFILE)"
         echo "PREAD_PROFILE_CAP=$(flashchat_get PREAD_PROFILE_CAP)"
         echo "EXPERT_PIN_MAX_GB=$(flashchat_get EXPERT_PIN_MAX_GB)"
+        echo "EXPERT_PIN_MAX_EXPERTS=$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
         echo "EXPERT_PIN_AUTO_FRAC=$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
         echo "EXPERT_PIN_MLOCK=$(flashchat_get EXPERT_PIN_MLOCK)"
         echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
@@ -1378,14 +1381,16 @@ cmd_serve() {
     local _pread_profile _pread_profile_cap
     [ -n "${FLASHCHAT_PREAD_PROFILE}" ]     && _pread_profile="$FLASHCHAT_PREAD_PROFILE"         || _pread_profile="$(flashchat_get PREAD_PROFILE)"
     [ -n "${FLASHCHAT_PREAD_PROFILE_CAP}" ] && _pread_profile_cap="$FLASHCHAT_PREAD_PROFILE_CAP" || _pread_profile_cap="$(flashchat_get PREAD_PROFILE_CAP)"
-    local _batch_prefill _prefill_chunk _prefill_debug
+    local _batch_prefill _prefill_chunk _prefill_debug _prefill_release
     [ -n "${FLASHCHAT_BATCH_PREFILL}" ] && _batch_prefill="$FLASHCHAT_BATCH_PREFILL" || _batch_prefill="$(flashchat_get BATCH_PREFILL)"
     [ -n "${FLASHCHAT_PREFILL_CHUNK}" ] && _prefill_chunk="$FLASHCHAT_PREFILL_CHUNK" || _prefill_chunk="$(flashchat_get PREFILL_CHUNK)"
     [ -n "${FLASHCHAT_PREFILL_DEBUG}" ] && _prefill_debug="$FLASHCHAT_PREFILL_DEBUG" || _prefill_debug="$(flashchat_get PREFILL_DEBUG)"
+    [ -n "${FLASHCHAT_PREFILL_RELEASE}" ] && _prefill_release="$FLASHCHAT_PREFILL_RELEASE"
     local _ane_prefill
     [ -n "${FLASHCHAT_ANE_PREFILL}" ] && _ane_prefill="$FLASHCHAT_ANE_PREFILL" || _ane_prefill="$(flashchat_get ANE_PREFILL)"
-    local _pin_max_gb _pin_auto_frac _pin_mlock
+    local _pin_max_gb _pin_max_experts _pin_auto_frac _pin_mlock
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
+    [ -n "${FLASHCHAT_EXPERT_PIN_MAX_EXPERTS}" ] && _pin_max_experts="$FLASHCHAT_EXPERT_PIN_MAX_EXPERTS" || _pin_max_experts="$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
     [ -n "${FLASHCHAT_EXPERT_PIN_AUTO_FRAC}" ] && _pin_auto_frac="$FLASHCHAT_EXPERT_PIN_AUTO_FRAC" || _pin_auto_frac="$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
     [ -n "${FLASHCHAT_EXPERT_PIN_MLOCK}" ]     && _pin_mlock="$FLASHCHAT_EXPERT_PIN_MLOCK"         || _pin_mlock="$(flashchat_get EXPERT_PIN_MLOCK)"
 
@@ -1395,10 +1400,12 @@ cmd_serve() {
     FLASHCHAT_BATCH_PREFILL="$_batch_prefill" \
     FLASHCHAT_PREFILL_CHUNK="$_prefill_chunk" \
     FLASHCHAT_PREFILL_DEBUG="$_prefill_debug" \
+    FLASHCHAT_PREFILL_RELEASE="$_prefill_release" \
     FLASHCHAT_ANE_PREFILL="$_ane_prefill" \
     FLASHCHAT_PREAD_PROFILE="$_pread_profile" \
     FLASHCHAT_PREAD_PROFILE_CAP="$_pread_profile_cap" \
     FLASHCHAT_EXPERT_PIN_MAX_GB="$_pin_max_gb" \
+    FLASHCHAT_EXPERT_PIN_MAX_EXPERTS="$_pin_max_experts" \
     FLASHCHAT_EXPERT_PIN_AUTO_FRAC="$_pin_auto_frac" \
     FLASHCHAT_EXPERT_PIN_MLOCK="$_pin_mlock" \
     FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \

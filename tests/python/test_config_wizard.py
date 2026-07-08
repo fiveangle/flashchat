@@ -42,7 +42,7 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
 
     def test_has_config_changes_false_for_same_values(self):
         with open(self.config_path, "a") as f:
-            f.write('CONFIG_SCHEMA_VERSION="7"\n')
+            f.write('CONFIG_SCHEMA_VERSION="9"\n')
         changes = {
             "SAMPLING_PROFILE": "custom",
             "TEMPERATURE": "0.1",
@@ -52,7 +52,7 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
             "PRESENCE_PENALTY": "1.5",
             "REPETITION_PENALTY": "1.0",
             "REASONING": "0",
-            "CONFIG_SCHEMA_VERSION": "7",
+            "CONFIG_SCHEMA_VERSION": "9",
         }
 
         self.assertFalse(config_wizard._has_config_changes(changes))
