@@ -284,15 +284,21 @@ flashchat_model_num_experts() {
 }
 
 # Number of system-prompt cache entries (.fcache files) on disk for a model.
-# Mirrors the engine's cache-dir resolution: custom dir -> <dir>/<model>/q<bits>/
+# Mirrors the engine's cache-dir resolution: custom dir -> <dir>/<base>/q<bits>/
 # system_prompt_cache, else <model_path>/flashchat/q<bits>/system_prompt_cache.
+# <base> is the quant-independent model id (hf_repo with '/'->'-' and dots
+# dropped) so q4/q8 of one model share a dir — matches model_base_component() in
+# infer.m; keep the two in sync.
 flashchat_sysprompt_cache_count() {
-    local model_id="$1" bits custom dir model_path
+    local model_id="$1" bits custom dir model_path repo base
     [ -n "$model_id" ] || { echo 0; return; }
     bits=$(flashchat_model_quant_bits "$model_id"); bits="${bits:-4}"
     custom=$(flashchat_get SYSTEM_PROMPT_CACHE_DIR)
     if [ -n "$custom" ]; then
-        dir="${custom}/${model_id}/q${bits}/system_prompt_cache"
+        repo=$(flashchat_model_repo "$model_id")
+        base="${repo//\//-}"; base="${base//./}"
+        [ -n "$base" ] || base="$model_id"
+        dir="${custom}/${base}/q${bits}/system_prompt_cache"
     else
         model_path=$(flashchat_model_path_for_id "$model_id" 2>/dev/null)
         [ -n "$model_path" ] || { echo 0; return; }

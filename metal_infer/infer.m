@@ -11921,12 +11921,32 @@ static void expand_config_path(const char *src, char *dst, size_t dst_sz) {
     snprintf(dst, dst_sz, "%s", src);
 }
 
+// Quant-independent directory component for a model: the base id shared by all
+// of its quant variants. Derived from the HF repo the same way the registry
+// derives the base model id (slash -> dash, drop dots), so q4 and q8 of one
+// model share a cache dir differentiated only by the q<bits> subdir — mirroring
+// the weights layout instead of baking a variant "-8bit" suffix into the path.
+// Falls back to the (possibly variant-suffixed) model_id when no repo is set.
+static void model_base_component(char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    const char *src = g_cfg.hf_repo[0] ? g_cfg.hf_repo : g_cfg.model_id;
+    if (!src || !src[0]) src = "model";
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_sz; i++) {
+        char c = src[i];
+        if (c == '/') dst[j++] = '-';
+        else if (c == '.') continue;      // 3.6 -> 36, matching the registry id
+        else dst[j++] = c;
+    }
+    dst[j] = '\0';
+}
+
 static int system_prompt_cache_dir(const char *model_path, char *out, size_t out_sz) {
     if (!model_path || !model_path[0] || !out || out_sz == 0) return -1;
     int bits = g_cfg.bits > 0 ? g_cfg.bits : 4;
     if (g_system_prompt_cache_dir[0]) {
         char model_component[256];
-        sanitize_path_component(g_cfg.model_id, model_component, sizeof(model_component));
+        model_base_component(model_component, sizeof(model_component));
         snprintf(out, out_sz, "%s/%s/q%d/system_prompt_cache",
                  g_system_prompt_cache_dir, model_component, bits);
         return 0;
