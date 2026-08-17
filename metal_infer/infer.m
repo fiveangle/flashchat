@@ -7242,8 +7242,15 @@ static ssize_t prof_pread(int fd, void *dst, size_t size, off_t offset, int gid)
 // per-token MoE expert preads turn into real SSD I/O (measured: 43% of pread
 // wall time on an emulated 16 GB box). This keeps the hottest whole experts in
 // a never-evicted RAM arena, keyed by global id (layer*num_experts + expert).
-// Hits memcpy straight into the per-token expert Metal buffer, skipping pread;
-// misses pread as before, then admit (LFU eviction by g_expert_freq).
+// ZERO-COPY MODE: the arena is page-aligned and each slot is wrapped once in a
+// persistent no-copy MTLBuffer; a hit binds the slot buffer directly as the
+// GPU expert source (no memcpy on the hit path at all). Misses pread into the
+// standard expert pool buffers as before, then admit (LFU eviction by
+// g_expert_freq) — the admit memcpy lands in the arena slot.
+// Eviction-while-in-flight is safe: admits/evictions only run from
+// async_pread_wait (layer L+1), strictly after CMD3(L) completed (the serial
+// GPU queue + CMD1(L+1) waitUntilCompleted ordering guarantees it), so no
+// slot bound by an in-flight command buffer can be overwritten.
 //
 // Capacity is expressed internally as complete expert slots. The user-facing
 // slot cap is preferred when set, while the GiB cap remains a hard memory
@@ -7255,12 +7262,14 @@ static ssize_t prof_pread(int fd, void *dst, size_t size, off_t offset, int gid)
 //   FLASHCHAT_EXPERT_PIN_AUTO_FRAC   fraction of free RAM to use (default 0.5)
 //   FLASHCHAT_EXPERT_PIN_MLOCK       1 = mlock the arena against swap (default 0)
 // ============================================================================
-static unsigned char *g_pin_arena = NULL;   // capacity_slots * esz bytes
+static unsigned char *g_pin_arena = NULL;   // capacity_slots * stride bytes, page-aligned
 static int   *g_pin_slot_of_gid = NULL;     // gid -> slot, or -1
 static int   *g_pin_gid_of_slot = NULL;     // slot -> gid, or -1
+static id<MTLBuffer> __strong *g_pin_slot_bufs = NULL; // slot -> no-copy MTLBuffer
 static long   g_pin_capacity_slots = 0;
 static long   g_pin_used_slots = 0;
 static size_t g_pin_esz = 0;
+static size_t g_pin_stride = 0;             // esz rounded up to page multiple
 static int    g_pin_enabled = -1;           // -1 = uninit, 0 = off, 1 = on
 static _Atomic long g_pin_hits = 0, g_pin_misses = 0, g_pin_evictions = 0;
 static pthread_mutex_t g_pin_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -7308,9 +7317,16 @@ static void expert_pin_init(void) {
     double frac = (frac_env && frac_env[0]) ? atof(frac_env) : 0.5;
     if (frac <= 0.0 || frac > 1.0) frac = 0.5;
 
+    // Zero-copy mode requires the GPU: slot buffers are bound directly as
+    // expert sources. Without Metal there is no consumer for the arena.
+    if (!g_metal || !g_metal->device) return;
+
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t stride = (esz + page - 1) & ~(page - 1);
+
     size_t free_ram = host_free_ram_bytes();
-    long free_slots = (long)((size_t)(frac * (double)free_ram) / esz);
-    long gb_slots = (long)((size_t)(cap_gb * (double)(1ULL << 30)) / esz);
+    long free_slots = (long)((size_t)(frac * (double)free_ram) / stride);
+    long gb_slots = (long)((size_t)(cap_gb * (double)(1ULL << 30)) / stride);
     long slots = slot_cap > 0 ? slot_cap : gb_slots;
     if (slots > gb_slots) slots = gb_slots;
     if (slots > free_slots) slots = free_slots;
@@ -7322,20 +7338,47 @@ static void expert_pin_init(void) {
         return;
     }
 
-    g_pin_arena = (unsigned char *)malloc((size_t)slots * esz);
-    g_pin_slot_of_gid = (int *)malloc((size_t)total_experts * sizeof(int));
-    g_pin_gid_of_slot = (int *)malloc((size_t)slots * sizeof(int));
-    if (!g_pin_arena || !g_pin_slot_of_gid || !g_pin_gid_of_slot) {
+    // Page-aligned arena so every slot can be wrapped by a no-copy MTLBuffer.
+    void *arena = NULL;
+    if (posix_memalign(&arena, page, (size_t)slots * stride) != 0 || !arena) {
         fprintf(stderr, "[expert-pin] arena alloc failed — disabled, pure pread\n");
-        free(g_pin_arena); free(g_pin_slot_of_gid); free(g_pin_gid_of_slot);
-        g_pin_arena = NULL; g_pin_slot_of_gid = NULL; g_pin_gid_of_slot = NULL;
         return;
     }
+    g_pin_slot_of_gid = (int *)malloc((size_t)total_experts * sizeof(int));
+    g_pin_gid_of_slot = (int *)malloc((size_t)slots * sizeof(int));
+    g_pin_slot_bufs = (id<MTLBuffer> __strong *)calloc((size_t)slots, sizeof(id<MTLBuffer>));
+    if (!g_pin_slot_of_gid || !g_pin_gid_of_slot || !g_pin_slot_bufs) {
+        fprintf(stderr, "[expert-pin] bookkeeping alloc failed — disabled, pure pread\n");
+        free(arena); free(g_pin_slot_of_gid); free(g_pin_gid_of_slot);
+        free(g_pin_slot_bufs);
+        g_pin_arena = NULL; g_pin_slot_of_gid = NULL; g_pin_gid_of_slot = NULL; g_pin_slot_bufs = NULL;
+        return;
+    }
+    g_pin_arena = (unsigned char *)arena;
+
+    // Wrap each slot once. The buffer does not own the memory (deallocator
+    // NULL); the arena outlives every command buffer that reads it.
+    for (long s = 0; s < slots; s++) {
+        g_pin_slot_bufs[s] = [g_metal->device
+            newBufferWithBytesNoCopy:g_pin_arena + (size_t)s * stride
+                              length:stride
+                              options:MTLResourceStorageModeShared
+                          deallocator:nil];
+        if (!g_pin_slot_bufs[s]) {
+            fprintf(stderr, "[expert-pin] slot buffer wrap failed (slot %ld) — disabled, pure pread\n", s);
+            for (long i = 0; i < slots; i++) g_pin_slot_bufs[i] = nil;
+            free(g_pin_arena); free(g_pin_slot_of_gid); free(g_pin_gid_of_slot);
+            free(g_pin_slot_bufs);
+            g_pin_arena = NULL; g_pin_slot_of_gid = NULL; g_pin_gid_of_slot = NULL; g_pin_slot_bufs = NULL;
+            return;
+        }
+    }
+
     for (long i = 0; i < total_experts; i++) g_pin_slot_of_gid[i] = -1;
     for (long i = 0; i < slots; i++) g_pin_gid_of_slot[i] = -1;
 
     if (getenv("FLASHCHAT_EXPERT_PIN_MLOCK") && atoi(getenv("FLASHCHAT_EXPERT_PIN_MLOCK"))) {
-        if (mlock(g_pin_arena, (size_t)slots * esz) != 0)
+        if (mlock(g_pin_arena, (size_t)slots * stride) != 0)
             fprintf(stderr, "[expert-pin] mlock failed (%s) — continuing unlocked\n",
                     strerror(errno));
     }
@@ -7343,11 +7386,12 @@ static void expert_pin_init(void) {
     g_pin_capacity_slots = slots;
     g_pin_used_slots = 0;
     g_pin_esz = esz;
+    g_pin_stride = stride;
     g_pin_enabled = 1;
-    fprintf(stderr, "[expert-pin] enabled: %ld experts pinnable (%.2f MiB, %.2f GiB), "
+    fprintf(stderr, "[expert-pin] enabled (zero-copy): %ld experts pinnable (%.2f MiB, %.2f GiB), "
             "free RAM %.2f GiB, GB cap %.2f GiB, requested %ld experts, pool total %ld experts\n",
-            slots, (double)slots * esz / (double)(1ULL<<20),
-            (double)slots * esz / (double)(1ULL<<30),
+            slots, (double)slots * stride / (double)(1ULL<<20),
+            (double)slots * stride / (double)(1ULL<<30),
             free_ram / (double)(1ULL<<30), cap_gb, slot_cap, total_experts);
 }
 
@@ -7355,20 +7399,19 @@ static inline int expert_pin_gid(int layer, int expert) {
     return layer * g_cfg.num_experts + expert;
 }
 
-// Hit: copy the pinned expert into dst (esz bytes) and return 1. Else 0.
-static int expert_pin_lookup(int layer, int expert, void *dst) {
-    if (g_pin_enabled != 1) return 0;
+// Hit: return the slot's persistent MTLBuffer for direct GPU binding (zero
+// copy). The caller must keep the buffer referenced for the lifetime of any
+// command buffer that binds it (decode-thread discipline guarantees no slot
+// is evicted between binding and deferred completion). Else NULL (miss).
+static id<MTLBuffer> expert_pin_slot_buffer(int layer, int expert) {
+    if (g_pin_enabled != 1) return nil;
     int gid = expert_pin_gid(layer, expert);
     pthread_mutex_lock(&g_pin_mu);
     int slot = g_pin_slot_of_gid[gid];
-    int hit = 0;
-    if (slot >= 0) {
-        memcpy(dst, g_pin_arena + (size_t)slot * g_pin_esz, g_pin_esz);
-        hit = 1;
-    }
+    id<MTLBuffer> buf = (slot >= 0) ? g_pin_slot_bufs[slot] : nil;
     pthread_mutex_unlock(&g_pin_mu);
-    atomic_fetch_add(hit ? &g_pin_hits : &g_pin_misses, 1);
-    return hit;
+    atomic_fetch_add(buf ? &g_pin_hits : &g_pin_misses, 1);
+    return buf;
 }
 
 // Admit expert bytes after a miss. Evicts the lowest-frequency pinned expert
@@ -7398,7 +7441,7 @@ static void expert_pin_admit(int layer, int expert, const void *src) {
         }
     }
     if (slot >= 0) {
-        memcpy(g_pin_arena + (size_t)slot * g_pin_esz, src, g_pin_esz);
+        memcpy(g_pin_arena + (size_t)slot * g_pin_stride, src, g_pin_esz);
         g_pin_gid_of_slot[slot] = gid;
         g_pin_slot_of_gid[gid] = (int)slot;
     }
@@ -7518,6 +7561,10 @@ typedef struct {
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
 
+// dst_bufs is also the OUT source-buffer array: entries for pin hits are
+// replaced by the slot's zero-copy MTLBuffer; misses keep the pool buffer
+// (which the background pread fills). The caller dispatches experts from
+// whichever buffer ends up in each slot.
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
                                int layer_idx) {
@@ -7533,8 +7580,10 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         InferPreadTask *t = &g_async_pread.tasks[k];
         t->dst = [dst_bufs[k] contents];
         g_async_pread.expert_idx[k] = expert_indices[k];
-        // Pin-cache hit: fill the buffer from the resident arena, skip the pread.
-        if (expert_pin_lookup(layer_idx, expert_indices[k], t->dst)) {
+        // Pin-cache hit: bind the slot buffer directly — zero copies, no pread.
+        id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k]);
+        if (slot_buf) {
+            dst_bufs[k] = slot_buf;
             g_async_pread.pinned_hit[k] = 1;
             g_async_pread.valid[k] = 1;
             continue;
@@ -9232,11 +9281,13 @@ static void fused_layer_forward(
 
         {
             // ---- ASYNC parallel pread: start I/O, overlap shared-expert prep ----
-            async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base, layer_idx);
+            // expert_bufs is initialized to the pool buffers, then async_pread_start
+            // replaces pin-hit entries with zero-copy slot buffers.
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
+            async_pread_start(packed_fd, expert_indices, actual_K,
+                              expert_bufs, mmap_base, layer_idx);
         }
 
         // Shared expert prep (doesn't need expert data — can overlap with async pread)
