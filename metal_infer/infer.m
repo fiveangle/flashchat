@@ -767,6 +767,15 @@ static inline size_t active_expert_size(void) {
     return g_cfg.expert_size;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+static int g_fuse_linear_enabled = -1;  // CMD1+CMD2 fuse on GPU-linear layers
+
+static inline int fuse_linear_enabled(void) {
+    if (g_fuse_linear_enabled < 0) {
+        const char *e = getenv("FLASHCHAT_FUSE_LINEAR");
+        g_fuse_linear_enabled = (e && e[0] && strcmp(e, "0") && strcmp(e, "off")) ? 1 : 0;
+    }
+    return g_fuse_linear_enabled;
+}
 
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
@@ -8253,6 +8262,43 @@ static void fused_layer_forward(
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
 
+    // ---- Pre-lookup all phase-2/3 weight pointers (needed early for the ----
+    // ---- CMD1+CMD2 fuse decision; pure cache lookups, no dependencies). ----
+    float *attn_projected = s_attn_proj;
+    memset(attn_projected, 0, g_cfg.hidden_dim * sizeof(float));
+
+    uint32_t *oproj_w = NULL;
+    uint16_t *oproj_s = NULL, *oproj_b = NULL;
+    int oproj_in_dim = 0;
+
+    if (is_full) {
+        oproj_w = lc->o_w; oproj_s = lc->o_s; oproj_b = lc->o_b;
+        oproj_in_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
+    } else if (!linear_attn_bypass) {
+        oproj_w = lc->out_proj_w; oproj_s = lc->out_proj_s; oproj_b = lc->out_proj_b;
+        oproj_in_dim = g_cfg.linear_total_value;
+    }
+
+    uint32_t *gate_w = lc->gate_w; uint16_t *gate_s = lc->gate_s, *gate_b = lc->gate_b;
+    uint32_t *sgw = lc->sg_w;     uint16_t *sgs = lc->sg_s,       *sgb = lc->sg_b;
+    uint32_t *suw = lc->su_w;     uint16_t *sus = lc->su_s,       *sub = lc->su_b;
+    uint32_t *seg_w = lc->seg_w;  uint16_t *seg_s = lc->seg_s,   *seg_b = lc->seg_b;
+    uint32_t *sdw = lc->sd_w;     uint16_t *sds = lc->sd_s,       *sdb = lc->sd_b;
+
+    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
+                            suw && sus && sub && seg_w && seg_s && seg_b);
+
+    // CMD1+CMD2 fuse (linear layers only): when the previous CMD3 was
+    // GPU-combined and this layer's whole attention runs on GPU, nothing on
+    // the CPU is needed between CMD1 and CMD2 — append CMD2's encoders to
+    // CMD1's command buffer and do a single commit+wait. Saves one GPU round
+    // trip + the per-layer finalize readback per linear layer.
+    int gpu_linear_attn_will_run = (can_gpu_linear && num_attn_specs == 4);
+    int fuse_cmd12 = (fuse_linear_enabled() && prev_gpu_combined && gpu_linear_attn_will_run &&
+                      oproj_w && oproj_s && oproj_b &&
+                      have_moe_weights && g_metal->wf_buf &&
+                      g_metal->residual_rms_norm_bf16 && lc->post_attn_norm_w);
+
     if (prev_gpu_combined && g_metal && metal_weights_ready(g_metal) && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
         // buf_input already has the normalized hidden state from CMD3(N-1).
@@ -8350,25 +8396,34 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
-        [cmd1 commit];
+        if (!fuse_cmd12) {
+            [cmd1 commit];
 
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
-        // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
-        if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
-            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
+            if (g_timing_enabled) { t0 = now_ms(); }
+            [cmd1 waitUntilCompleted];
+            if (!gpu_linear_attn) {
+                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            }
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+
+            // Now CMD3(N-1) is done. Read back hidden state from GPU.
+            if (g_timing_enabled) { t0 = now_ms(); }
+            finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+
+            // Set up residual for CMD2 (residual = hidden before this layer's attention)
+            cpu_vec_copy(residual, hidden, g_cfg.hidden_dim);
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+        } else {
+            // FUSED: cmd1 stays uncommitted; PHASE 3 appends CMD2's encoders to
+            // it and does one commit+wait. The finalize readback and residual
+            // copy are skipped — CMD2's residual kernel reads buf_moe_hidden
+            // (written by CMD3(N-1), queue-ordered before this buffer), which
+            // holds byte-identical data to the uploaded residual.
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
         }
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
-
-        // Now CMD3(N-1) is done. Read back hidden state from GPU.
-        if (g_timing_enabled) { t0 = now_ms(); }
-        finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
-
-        // Set up residual for CMD2 (residual = hidden before this layer's attention)
-        cpu_vec_copy(residual, hidden, g_cfg.hidden_dim);
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
 
         // No input_norm needed — CMD3 already computed it into buf_input;
         // skip the readback to avoid unnecessary overhead.
@@ -8510,29 +8565,8 @@ static void fused_layer_forward(
 
     if (g_timing_enabled) { t0 = now_ms(); }
 
-    float *attn_projected = s_attn_proj;
-    memset(attn_projected, 0, g_cfg.hidden_dim * sizeof(float));
-
-    // Pre-lookup o_proj / out_proj weights (used after attention compute)
-    // These are looked up NOW to avoid repeated snprintf later.
-    uint32_t *oproj_w = NULL;
-    uint16_t *oproj_s = NULL, *oproj_b = NULL;
-    int oproj_in_dim = 0;
-
-    if (is_full) {
-        oproj_w = lc->o_w; oproj_s = lc->o_s; oproj_b = lc->o_b;
-        oproj_in_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
-    } else if (!linear_attn_bypass) {
-        oproj_w = lc->out_proj_w; oproj_s = lc->out_proj_s; oproj_b = lc->out_proj_b;
-        oproj_in_dim = g_cfg.linear_total_value;
-    }
-
-    // All MoE weight pointers from cache (zero snprintf overhead)
-    uint32_t *gate_w = lc->gate_w; uint16_t *gate_s = lc->gate_s, *gate_b = lc->gate_b;
-    uint32_t *sgw = lc->sg_w;     uint16_t *sgs = lc->sg_s,       *sgb = lc->sg_b;
-    uint32_t *suw = lc->su_w;     uint16_t *sus = lc->su_s,       *sub = lc->su_b;
-    uint32_t *seg_w = lc->seg_w;  uint16_t *seg_s = lc->seg_s,   *seg_b = lc->seg_b;
-    uint32_t *sdw = lc->sd_w;     uint16_t *sds = lc->sd_s,       *sdb = lc->sd_b;
+    // (attn_projected, oproj/moe weight pointers, have_moe_weights hoisted
+    // above the fast-path block for the fuse decision)
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
@@ -8860,8 +8894,7 @@ static void fused_layer_forward(
     memset(shared_up, 0, g_cfg.shared_intermediate * sizeof(float));
     float shared_gate_score = 0.0f;
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    // (have_moe_weights hoisted above the fast-path block)
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
@@ -8899,12 +8932,23 @@ static void fused_layer_forward(
                    oproj_in_dim * sizeof(float));
         }
         // gpu_linear_attn: batch_out[6] already has the result from CMD1 gated_rms_norm
-        // Copy residual into GPU buffer for residual_add kernel
-        memcpy([g_metal->buf_residual contents], residual, g_cfg.hidden_dim * sizeof(float));
+        // Residual source: when the previous layer's CMD3 was GPU-combined,
+        // buf_moe_hidden already holds byte-identical data to `residual` (it is
+        // exactly what finalize_deferred_experts would have copied out and the
+        // upload would have copied in) — bind it directly and skip the round
+        // trip. Only the non-fast paths need the CPU upload.
+        id<MTLBuffer> resid_buf = g_metal->buf_residual;
+        if (!prev_gpu_combined) {
+            memcpy([g_metal->buf_residual contents], residual, g_cfg.hidden_dim * sizeof(float));
+        } else {
+            resid_buf = g_metal->buf_moe_hidden;
+        }
 
         attn_out_for_oproj = NULL;
 
-        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
+        // Fused linear layers: CMD2's encoders append to CMD1's (still
+        // uncommitted) command buffer — one commit+wait for both phases.
+        id<MTLCommandBuffer> cmd_fused = fuse_cmd12 ? cmd1 : [g_metal->queue commandBuffer];
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
@@ -9090,7 +9134,7 @@ static void fused_layer_forward(
             uint32_t dim = g_cfg.hidden_dim;
             float eps = g_cfg.rms_norm_eps;
             [enc setComputePipelineState:g_metal->residual_rms_norm_bf16];
-            [enc setBuffer:g_metal->buf_residual offset:0       atIndex:0];  // a = residual
+            [enc setBuffer:resid_buf        offset:0       atIndex:0];  // a = residual (buf_moe_hidden when GPU-chained)
             [enc setBuffer:g_metal->buf_output   offset:0       atIndex:1];  // b = o_proj result
             [enc setBuffer:g_metal->wf_buf       offset:norm_off atIndex:2]; // weight (bf16)
             [enc setBuffer:g_metal->buf_input    offset:0       atIndex:3];  // out = h_post (normed)
