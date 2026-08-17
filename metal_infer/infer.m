@@ -771,14 +771,37 @@ static int g_fuse_linear_enabled = -1;  // CMD1+CMD2 fuse on GPU-linear layers
 
 static inline int fuse_linear_enabled(void) {
     if (g_fuse_linear_enabled < 0) {
+        // Empty/unset = shipped default ON (config keys bridge as "" when
+        // absent); explicit 0/off/false disables.
         const char *e = getenv("FLASHCHAT_FUSE_LINEAR");
-        g_fuse_linear_enabled = (e && e[0] && strcmp(e, "0") && strcmp(e, "off")) ? 1 : 0;
+        int off = (e && e[0] && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")));
+        g_fuse_linear_enabled = off ? 0 : 1;
     }
     return g_fuse_linear_enabled;
 }
 
 static long g_adaptive_k_sum = 0;    // sum of K actually used (adaptive-K)
 static long g_adaptive_k_tokens = 0; // layers routed with adaptive-K active
+
+// FLASHCHAT_ADAPTIVE_K_MASS routing-mass threshold (0 = off; valid 0.5..<1.0).
+static float adaptive_k_mass_value(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char *m = getenv("FLASHCHAT_ADAPTIVE_K_MASS");
+        v = (m && m[0]) ? strtof(m, NULL) : 0.0f;
+        if (!isfinite(v) || v < 0.5f || v >= 1.0f) v = 0.0f;
+    }
+    return v;
+}
+
+static int adaptive_k_min_value(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *mn = getenv("FLASHCHAT_ADAPTIVE_K_MIN");
+        v = (mn && mn[0] && atoi(mn) > 0) ? atoi(mn) : 6;
+    }
+    return v;
+}
 
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
@@ -9291,16 +9314,8 @@ static void fused_layer_forward(
     // threshold, keeping at least ADAPTIVE_K_MIN. Weights renormalize, so the
     // combine is mathematically a truncated (and rescaled) MoE sum.
     {
-        static float s_adapt_mass = -1.0f;
-        static int s_adapt_min = -1;
-        if (s_adapt_mass < 0.0f) {
-            const char *m = getenv("FLASHCHAT_ADAPTIVE_K_MASS");
-            s_adapt_mass = (m && m[0]) ? strtof(m, NULL) : 0.0f;
-            if (!isfinite(s_adapt_mass) || s_adapt_mass < 0.5f || s_adapt_mass >= 1.0f)
-                s_adapt_mass = 0.0f;
-            const char *mn = getenv("FLASHCHAT_ADAPTIVE_K_MIN");
-            s_adapt_min = (mn && mn[0] && atoi(mn) > 0) ? atoi(mn) : 6;
-        }
+        float s_adapt_mass = adaptive_k_mass_value();
+        int s_adapt_min = adaptive_k_min_value();
         if (s_adapt_mass > 0.0f && K > 1) {
             // insertion-sort top-K by weight descending (K<=16, trivial)
             for (int a = 1; a < K; a++) {
@@ -13671,6 +13686,11 @@ static void serve_loop(
         server_logf("[serve]   mtp: disabled\n");
     }
     server_logf("[serve]   gpu_linear_attention: %s\n", gpu_linear_attn_enabled ? "enabled" : "disabled");
+    if (adaptive_k_mass_value() > 0.0f) {
+        server_logf("[serve]   adaptive_k: mass=%.2f min=%d\n",
+                    adaptive_k_mass_value(), adaptive_k_min_value());
+    }
+    server_logf("[serve]   cmd_fuse_linear: %s\n", fuse_linear_enabled() ? "enabled" : "disabled");
     {
         size_t kv_total = (size_t)g_cfg.num_full_attn_layers * 2 *
                           (size_t)GPU_KV_SEQ * kv_token_bytes();

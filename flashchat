@@ -536,6 +536,9 @@ cmd_status() {
         echo "Active experts (K): ${_ae_eff} (from model registry num_experts_per_tok)"
     fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
+    echo "Fused GPU scheduling: $(flashchat_get FUSE_LINEAR)"
+    _akm="$(flashchat_get ADAPTIVE_K_MASS)"
+    echo "Adaptive expert routing: ${_akm:-off}"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "System prompt cache dir: $(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
     echo "Multi-token prediction: $(mtp_label "$MTP")"
@@ -985,6 +988,8 @@ server_runtime_signature() {
         echo "SERVER_LOG_PATH=$(flashchat_get SERVER_LOG_PATH)"
         echo "SERVER_DEBUG=$(flashchat_get SERVER_DEBUG)"
         echo "SERVER_HTTP_LOG=$(flashchat_get SERVER_HTTP_LOG)"
+        echo "FUSE_LINEAR=$(flashchat_get FUSE_LINEAR)"
+        echo "ADAPTIVE_K_MASS=$(flashchat_get ADAPTIVE_K_MASS)"
         echo "BATCH_PREFILL=$(flashchat_get BATCH_PREFILL)"
         echo "PREFILL_CHUNK=$(flashchat_get PREFILL_CHUNK)"
         echo "PREFILL_DEBUG=$(flashchat_get PREFILL_DEBUG)"
@@ -1378,6 +1383,9 @@ cmd_serve() {
     [ -n "${FLASHCHAT_SERVER_LOG}" ]      && _server_log="$FLASHCHAT_SERVER_LOG"           || _server_log="$(flashchat_get SERVER_LOG_PATH)"
     [ -n "${FLASHCHAT_SERVER_DEBUG}" ]    && _server_debug="$FLASHCHAT_SERVER_DEBUG"       || _server_debug="$(flashchat_get SERVER_DEBUG)"
     [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ] && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG" || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
+    local _fuse_linear _adaptive_k_mass
+    [ -n "${FLASHCHAT_FUSE_LINEAR}" ]     && _fuse_linear="$FLASHCHAT_FUSE_LINEAR"           || _fuse_linear="$(flashchat_get FUSE_LINEAR)"
+    [ -n "${FLASHCHAT_ADAPTIVE_K_MASS}" ] && _adaptive_k_mass="$FLASHCHAT_ADAPTIVE_K_MASS"   || _adaptive_k_mass="$(flashchat_get ADAPTIVE_K_MASS)"
     local _pread_profile _pread_profile_cap
     [ -n "${FLASHCHAT_PREAD_PROFILE}" ]     && _pread_profile="$FLASHCHAT_PREAD_PROFILE"         || _pread_profile="$(flashchat_get PREAD_PROFILE)"
     [ -n "${FLASHCHAT_PREAD_PROFILE_CAP}" ] && _pread_profile_cap="$FLASHCHAT_PREAD_PROFILE_CAP" || _pread_profile_cap="$(flashchat_get PREAD_PROFILE_CAP)"
@@ -1397,6 +1405,8 @@ cmd_serve() {
     FLASHCHAT_SERVER_LOG="$_server_log" \
     FLASHCHAT_SERVER_DEBUG="$_server_debug" \
     FLASHCHAT_SERVER_HTTP_LOG="$_server_http_log" \
+    FLASHCHAT_FUSE_LINEAR="$_fuse_linear" \
+    FLASHCHAT_ADAPTIVE_K_MASS="$_adaptive_k_mass" \
     FLASHCHAT_BATCH_PREFILL="$_batch_prefill" \
     FLASHCHAT_PREFILL_CHUNK="$_prefill_chunk" \
     FLASHCHAT_PREFILL_DEBUG="$_prefill_debug" \
