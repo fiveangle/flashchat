@@ -777,11 +777,19 @@ static inline int fuse_linear_enabled(void) {
     return g_fuse_linear_enabled;
 }
 
+static long g_adaptive_k_sum = 0;    // sum of K actually used (adaptive-K)
+static long g_adaptive_k_tokens = 0; // layers routed with adaptive-K active
+
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
 }
 
 static void timing_print(void) {
+    if (g_adaptive_k_tokens > 0) {
+        fprintf(stderr, "[adaptive-k] avg K = %.3f over %ld routed layers\n",
+                (double)g_adaptive_k_sum / (double)g_adaptive_k_tokens,
+                g_adaptive_k_tokens);
+    }
     if (g_timing.count == 0) return;
     int n = g_timing.count;
     fprintf(stderr, "\n[timing] Per-layer breakdown (avg of %d layers, ms):\n", n);
@@ -9279,6 +9287,47 @@ static void fused_layer_forward(
     float expert_weights[64];
     cpu_topk(gate_scores, g_cfg.num_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    // Adaptive-K: drop tail experts whose combined routed mass is below the
+    // threshold, keeping at least ADAPTIVE_K_MIN. Weights renormalize, so the
+    // combine is mathematically a truncated (and rescaled) MoE sum.
+    {
+        static float s_adapt_mass = -1.0f;
+        static int s_adapt_min = -1;
+        if (s_adapt_mass < 0.0f) {
+            const char *m = getenv("FLASHCHAT_ADAPTIVE_K_MASS");
+            s_adapt_mass = (m && m[0]) ? strtof(m, NULL) : 0.0f;
+            if (!isfinite(s_adapt_mass) || s_adapt_mass < 0.5f || s_adapt_mass >= 1.0f)
+                s_adapt_mass = 0.0f;
+            const char *mn = getenv("FLASHCHAT_ADAPTIVE_K_MIN");
+            s_adapt_min = (mn && mn[0] && atoi(mn) > 0) ? atoi(mn) : 6;
+        }
+        if (s_adapt_mass > 0.0f && K > 1) {
+            // insertion-sort top-K by weight descending (K<=16, trivial)
+            for (int a = 1; a < K; a++) {
+                int ei = expert_indices[a]; float ew = expert_weights[a];
+                int b = a - 1;
+                while (b >= 0 && expert_weights[b] < ew) {
+                    expert_weights[b + 1] = expert_weights[b];
+                    expert_indices[b + 1] = expert_indices[b];
+                    b--;
+                }
+                expert_weights[b + 1] = ew;
+                expert_indices[b + 1] = ei;
+            }
+            int k_min = s_adapt_min < K ? s_adapt_min : K;
+            float cum = 0.0f; int k_act = K;
+            for (int k = 0; k < K; k++) {
+                cum += expert_weights[k];
+                if (k + 1 >= k_min && cum >= s_adapt_mass) { k_act = k + 1; break; }
+            }
+            if (k_act < K) {
+                cpu_normalize_weights(expert_weights, k_act);
+                K = k_act;
+                g_adaptive_k_sum += k_act;
+                g_adaptive_k_tokens++;
+            }
+        }
+    }
     if (getenv("MOE_DBG") && layer_idx <= 1) { fprintf(stderr,"[moe-dbg-prod ] L%d hpost0=%.6f experts=[",layer_idx,h_post[0]); for(int k=0;k<K;k++)fprintf(stderr,"%d ",expert_indices[k]); fprintf(stderr,"]\n"); }
     // Count per-(layer,expert) activations when --freq is on OR the pin cache is
     // active (its LFU eviction reads g_expert_freq to pick the coldest victim).
