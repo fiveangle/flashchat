@@ -29,7 +29,26 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 | 03 | exp/03-adaptive-k | routing-mass K truncation | done, opt-in | +4.6%; router flat (K 6.92 @0.90) |
 | 07 | exp/07-cmd-fuse-linear | single commit+wait on linear layers | done, KEEP | +11.7% A/B; bench +14-24% decode, no prefill cost; combo w/ pin up to +80% short-ctx |
 | 02 | exp/02-ram-discipline | F_NOCACHE + decode-aware admission + post-prefill pin growth | next | pin steals page cache -> prefill -26% @8GB; fix sizing/phase |
-| 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | pending | biggest 16GB lever |
+| 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | probed, PARKED | works, 76% acceptance, but 0.76x net at B=2; needs skip-spec gate + B>=3 + 16GB hw |
+
+## 16GB emulation result (ram_pressure 17GiB on the 32GB dev box)
+
+100-token decode: base 15.69 -> fuse 18.28 -> fuse+pin3GB **21.59 tok/s
+(+37.6%)**. Absolute numbers are flattered by this machine's faster
+SSD/RAM vs a base M4; the multipliers are the signal. Extrapolated to the
+user-reported 7-9 tok/s base on a real 16GB M4: fuse ~+16%, pin ~+18%,
+adaptive-K ~+5% -> roughly 10-13 tok/s without MTP; MTP (once fixed) is
+the remaining lever to cross 15.
+
+## Session state (2026-08-17)
+
+- main: serve segfault fixed (d507059), bench-api resurrected, baseline rows.
+- exp/07 branch contains: exp/01 (merged) + stages A/B. Recommended merge
+  order to main: exp/07 (contains 01), then rebase exp/03 (opt-in knob).
+  Both byte-identical; fuse-only shows no prefill cost in durable rows.
+- Before shipping defaults: wire FLASHCHAT_FUSE_LINEAR / pin sizing through
+  the config chain (menu + config.sh sites + schema bump) per AGENTS.md.
+
 | 05 | exp/05-matvec-occupancy | kernel remap | deprioritized | v3 kernel already 8x8; cost is dispatch/RTT not occupancy |
 | 06 | exp/06-io-threads-prefill | NUM_IO_THREADS 4->8 | pending | prefill TTFT |
 | 08 | exp/08-expert-read-split | gate+up wave, down overlapped | pending | |
