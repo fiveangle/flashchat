@@ -5251,8 +5251,18 @@ static void gpu_full_attention_batch(int fa_idx, int n, int base_len,
     uint32_t seq_stride = GPU_KV_SEQ, hpkv = (uint32_t)(g_cfg.num_attn_heads / g_cfg.num_kv_heads);
     uint32_t qdim = (uint32_t)(g_cfg.num_attn_heads * g_cfg.head_dim);
     float scale = 1.0f / sqrtf((float)g_cfg.head_dim);
-    memcpy([ctx->buf_attn_q_batch contents], q_all, (size_t)n * qdim * sizeof(float));
-    memcpy([ctx->buf_attn_gate_batch contents], gate_all, (size_t)n * qdim * sizeof(float));
+    // Grow-on-demand: prefill_release_transient_buffers() nils these between
+    // requests; re-create before use (messaging nil yields length 0, so the
+    // guard also covers the never-allocated case).
+    size_t qbatch_bytes = (size_t)n * qdim * sizeof(float);
+    if ((size_t)[ctx->buf_attn_q_batch length] < qbatch_bytes)
+        ctx->buf_attn_q_batch = [ctx->device newBufferWithLength:qbatch_bytes options:MTLResourceStorageModeShared];
+    if ((size_t)[ctx->buf_attn_gate_batch length] < qbatch_bytes)
+        ctx->buf_attn_gate_batch = [ctx->device newBufferWithLength:qbatch_bytes options:MTLResourceStorageModeShared];
+    if ((size_t)[ctx->buf_attn_out_batch length] < qbatch_bytes)
+        ctx->buf_attn_out_batch = [ctx->device newBufferWithLength:qbatch_bytes options:MTLResourceStorageModeShared];
+    memcpy([ctx->buf_attn_q_batch contents], q_all, qbatch_bytes);
+    memcpy([ctx->buf_attn_gate_batch contents], gate_all, qbatch_bytes);
     uint32_t qbits = (uint32_t)kv_quant_bits();
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
     for (int t = 0; t < n; t++) {
