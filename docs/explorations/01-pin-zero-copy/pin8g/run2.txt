@@ -1,0 +1,240 @@
+[perf] experts=256 | delta_batch=1 verify_gpu_attn=0 matmulN=v5 kv_quant=off fused_attn=1 gpu_rope=1 kv_window=65536 | mtp=lossless draft/verify when MTP artifacts present
+[init] K=8 active experts (from config num_experts_per_tok)
+[mtp] artifacts detected but disabled; using existing decode path
+bpe_load: 248044 vocab, 247587 merges, 26 added tokens
+Tokens (30): [814, 20139, 1204, 264, 81787, 9197, 12, 4559, 13094, 6326, 6000, 4138, 11, 17661, 279, 72632, 11, 279, 29712, 7911, ...]
+[ane-prefill] ready: H=2048 I=512 B=256 wq=195 xq=16 midq=16 (compile 154ms)
+[expert-pin] enabled (zero-copy): 4854 experts pinnable (8191.12 MiB, 8.00 GiB), free RAM 17.62 GiB, GB cap 8.00 GiB, requested 0 experts, pool total 10240 experts
+[debug] Top 5 logits (next_token=271):
+  token 198 ("
+") logit=16.6296
+  token 21708 (" Additionally") logit=16.7304
+  token 7054 (" Also") logit=17.4415
+  token 38256 (" Provide") logit=16.8557
+  token 271 ("
+
+") logit=20.9309
+[debug] hidden rms after final_norm=2.4760, logits rms=2.8075
+[config] Loaded model: Qwen3.6-35B-A3B (q4) (Qwen-Qwen36-35B-A3B)
+[config]  hidden_dim=2048, layers=40, experts=256, vocab=248320
+[config]  expert_size=1769472 bytes
+[metal] Device: Apple M5
+[metal] Shader compile: 1 ms
+[metal] GPU attention buffers: 10 KV caches (134.2 MB each), scores buf 67.1 MB
+[metal] Delta-net GPU buffers: 30 layers (130.3 MB state + 0.2 MB scratch)
+[metal] Inference pipelines ready (multi-expert[16] + shared buffers allocated)
+=== Qwen3.6-35B-A3B (q4) Metal Inference Engine ===
+Model:    /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/
+Weights:  /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.bin
+Manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.json
+Vocab:    /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/vocab.bin
+K:        8 experts/layer
+Experts:  1769472 bytes each
+Linear:   fused GPU delta-net
+MTP:      disabled
+Tokens:   150
+[manifest] Loaded 1414 tensors from /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.json
+[weights] mmap'd 1.46 GB from /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.bin
+[metal] Weight file wrapped as Metal buffer (1.46 GB)
+[vocab] Loaded 248078 tokens
+[prompt] 30 tokens: 814 20139 1204 264 81787 9197 12 4559 13094 6326 6000 4138 11 17661 279 72632 11 279 29712 7911
+[experts] 40/40 packed layer files available (mmap'd)
+[warmup] Page cache hint: 1.9 ms
+[init] Setup: 81.9 ms
+
+--- Generating 150 tokens ---
+  [prefill] batch embed 30 tokens: 0.1 ms
+  [prefill] chunked-batched 29/30 tokens: 2305 ms
+  [prefill] 29/30 tokens: 2305 ms (first: 0 ms, rest avg: 82 ms)
+[cache] Pre-computed weight pointers for 40 layers
+[ttft] 3027 ms (prefill 30 tokens + lm_head 4 ms)
+
+--- Output ---
+
+
+  [gen 1/150] token_id=248068 (83 ms, 12.08 tok/s)
+
+  [gen 2/150] token_id=198 (104 ms, 9.61 tok/s)
+Here  [gen 3/150] token_id=8160 (64 ms, 15.71 tok/s)
+'s  [gen 4/150] token_id=579 (64 ms, 15.60 tok/s)
+ a  [gen 5/150] token_id=264 (71 ms, 14.08 tok/s)
+ thinking  [gen 6/150] token_id=7047 (78 ms, 12.80 tok/s)
+ process  [gen 7/150] token_id=1817 (72 ms, 13.87 tok/s)
+:  [gen 8/150] token_id=25 (60 ms, 16.73 tok/s)
+
+
+  [gen 9/150] token_id=271 (59 ms, 16.81 tok/s)
+1  [gen 10/150] token_id=16 (50 ms, 20.02 tok/s)
+.  [gen 11/150] token_id=13 (60 ms, 16.67 tok/s)
+   [gen 12/150] token_id=220 (67 ms, 14.98 tok/s)
+ **  [gen 13/150] token_id=2972 (61 ms, 16.31 tok/s)
+Under  [gen 14/150] token_id=15771 (66 ms, 15.13 tok/s)
+stand  [gen 15/150] token_id=2598 (75 ms, 13.36 tok/s)
+ User  [gen 16/150] token_id=2570 (61 ms, 16.37 tok/s)
+ Request  [gen 17/150] token_id=5952 (75 ms, 13.31 tok/s)
+:**  [gen 18/150] token_id=64700 (60 ms, 16.70 tok/s)
+
+  [gen 19/150] token_id=198 (50 ms, 20.18 tok/s)
+    [gen 20/150] token_id=256 (46 ms, 21.56 tok/s)
+ -  [gen 21/150] token_id=471 (54 ms, 18.61 tok/s)
+ Topic  [gen 22/150] token_id=31819 (54 ms, 18.36 tok/s)
+:  [gen 23/150] token_id=25 (59 ms, 17.01 tok/s)
+ G  [gen 24/150] token_id=469 (57 ms, 17.67 tok/s)
+ated  [gen 25/150] token_id=639 (73 ms, 13.62 tok/s)
+ Delta  [gen 26/150] token_id=24167 (57 ms, 17.43 tok/s)
+-  [gen 27/150] token_id=12 (62 ms, 16.25 tok/s)
+Net  [gen 28/150] token_id=6738 (56 ms, 18.01 tok/s)
+ Linear  [gen 29/150] token_id=27345 (49 ms, 20.26 tok/s)
+ Attention  [gen 30/150] token_id=59930 (49 ms, 20.39 tok/s)
+ Layer  [gen 31/150] token_id=22028 (51 ms, 19.73 tok/s)
+
+  [gen 32/150] token_id=198 (56 ms, 17.87 tok/s)
+    [gen 33/150] token_id=256 (56 ms, 17.88 tok/s)
+ -  [gen 34/150] token_id=471 (52 ms, 19.39 tok/s)
+ Key  [gen 35/150] token_id=5141 (53 ms, 18.71 tok/s)
+ aspects  [gen 36/150] token_id=13173 (59 ms, 16.86 tok/s)
+ to  [gen 37/150] token_id=310 (60 ms, 16.59 tok/s)
+ cover  [gen 38/150] token_id=3311 (68 ms, 14.67 tok/s)
+:  [gen 39/150] token_id=25 (57 ms, 17.45 tok/s)
+ Rec  [gen 40/150] token_id=3931 (49 ms, 20.61 tok/s)
+urrence  [gen 41/150] token_id=19934 (58 ms, 17.14 tok/s)
+,  [gen 42/150] token_id=11 (49 ms, 20.38 tok/s)
+ Decay  [gen 43/150] token_id=93932 (57 ms, 17.63 tok/s)
+ Factor  [gen 44/150] token_id=36480 (51 ms, 19.51 tok/s)
+,  [gen 45/150] token_id=11 (52 ms, 19.10 tok/s)
+ Difference  [gen 46/150] token_id=53230 (55 ms, 18.20 tok/s)
+ from  [gen 47/150] token_id=494 (55 ms, 18.17 tok/s)
+ Full  [gen 48/150] token_id=8363 (60 ms, 16.76 tok/s)
+ Soft  [gen 49/150] token_id=23325 (49 ms, 20.48 tok/s)
+max  [gen 50/150] token_id=2721 (53 ms, 18.70 tok/s)
+ Attention  [gen 51/150] token_id=59930 (49 ms, 20.26 tok/s)
+
+  [gen 52/150] token_id=198 (52 ms, 19.14 tok/s)
+    [gen 53/150] token_id=256 (45 ms, 22.24 tok/s)
+ -  [gen 54/150] token_id=471 (42 ms, 23.57 tok/s)
+ Goal  [gen 55/150] token_id=38622 (50 ms, 20.05 tok/s)
+:  [gen 56/150] token_id=25 (50 ms, 19.80 tok/s)
+ Explain  [gen 57/150] token_id=79091 (42 ms, 23.55 tok/s)
+ clearly  [gen 58/150] token_id=9077 (49 ms, 20.28 tok/s)
+ and  [gen 59/150] token_id=321 (59 ms, 16.86 tok/s)
+ technically  [gen 60/150] token_id=30515 (55 ms, 18.27 tok/s)
+ accurate  [gen 61/150] token_id=12995 (49 ms, 20.58 tok/s)
+
+
+  [gen 62/150] token_id=271 (51 ms, 19.49 tok/s)
+2  [gen 63/150] token_id=17 (42 ms, 23.74 tok/s)
+.  [gen 64/150] token_id=13 (46 ms, 21.69 tok/s)
+   [gen 65/150] token_id=220 (53 ms, 18.90 tok/s)
+ **  [gen 66/150] token_id=2972 (52 ms, 19.18 tok/s)
+De  [gen 67/150] token_id=1847 (45 ms, 22.26 tok/s)
+construct  [gen 68/150] token_id=7355 (56 ms, 17.98 tok/s)
+ the  [gen 69/150] token_id=279 (46 ms, 21.94 tok/s)
+ Topic  [gen 70/150] token_id=31819 (55 ms, 18.15 tok/s)
+:**  [gen 71/150] token_id=64700 (48 ms, 20.91 tok/s)
+
+  [gen 72/150] token_id=198 (48 ms, 20.96 tok/s)
+    [gen 73/150] token_id=256 (41 ms, 24.11 tok/s)
+ -  [gen 74/150] token_id=471 (48 ms, 20.98 tok/s)
+ *  [gen 75/150] token_id=348 (41 ms, 24.50 tok/s)
+What  [gen 76/150] token_id=3710 (48 ms, 20.89 tok/s)
+ is  [gen 77/150] token_id=369 (58 ms, 17.28 tok/s)
+ Linear  [gen 78/150] token_id=27345 (58 ms, 17.22 tok/s)
+ Attention  [gen 79/150] token_id=59930 (48 ms, 20.75 tok/s)
+?*  [gen 80/150] token_id=174548 (48 ms, 20.69 tok/s)
+ It  [gen 81/150] token_id=1049 (49 ms, 20.40 tok/s)
+'s  [gen 82/150] token_id=579 (60 ms, 16.72 tok/s)
+ an  [gen 83/150] token_id=449 (53 ms, 18.76 tok/s)
+ approximation  [gen 84/150] token_id=54315 (50 ms, 19.94 tok/s)
+ of  [gen 85/150] token_id=314 (46 ms, 21.94 tok/s)
+ standard  [gen 86/150] token_id=5129 (49 ms, 20.24 tok/s)
+ softmax  [gen 87/150] token_id=73756 (49 ms, 20.30 tok/s)
+ attention  [gen 88/150] token_id=6326 (49 ms, 20.35 tok/s)
+ that  [gen 89/150] token_id=421 (46 ms, 21.77 tok/s)
+ reduces  [gen 90/150] token_id=24469 (53 ms, 18.70 tok/s)
+ complexity  [gen 91/150] token_id=22373 (51 ms, 19.44 tok/s)
+ from  [gen 92/150] token_id=494 (48 ms, 20.79 tok/s)
+ O  [gen 93/150] token_id=496 (58 ms, 17.22 tok/s)
+(N  [gen 94/150] token_id=7947 (70 ms, 14.32 tok/s)
+²  [gen 95/150] token_id=28495 (73 ms, 13.70 tok/s)
+)  [gen 96/150] token_id=8 (68 ms, 14.78 tok/s)
+ to  [gen 97/150] token_id=310 (60 ms, 16.76 tok/s)
+ O  [gen 98/150] token_id=496 (52 ms, 19.18 tok/s)
+(N  [gen 99/150] token_id=7947 (54 ms, 18.48 tok/s)
+)  [gen 100/150] token_id=8 (50 ms, 19.89 tok/s)
+ by  [gen 101/150] token_id=539 (51 ms, 19.44 tok/s)
+ removing  [gen 102/150] token_id=17068 (46 ms, 21.54 tok/s)
+ the  [gen 103/150] token_id=279 (46 ms, 21.84 tok/s)
+ softmax  [gen 104/150] token_id=73756 (51 ms, 19.78 tok/s)
+ normalization  [gen 105/150] token_id=47096 (44 ms, 22.90 tok/s)
+ and  [gen 106/150] token_id=321 (42 ms, 23.70 tok/s)
+ using  [gen 107/150] token_id=1608 (48 ms, 21.04 tok/s)
+ linear  [gen 108/150] token_id=13094 (44 ms, 22.82 tok/s)
+ operations  [gen 109/150] token_id=7289 (45 ms, 22.43 tok/s)
+.  [gen 110/150] token_id=13 (46 ms, 21.57 tok/s)
+
+  [gen 111/150] token_id=198 (55 ms, 18.25 tok/s)
+    [gen 112/150] token_id=256 (51 ms, 19.64 tok/s)
+ -  [gen 113/150] token_id=471 (49 ms, 20.26 tok/s)
+ *  [gen 114/150] token_id=348 (55 ms, 18.20 tok/s)
+What  [gen 115/150] token_id=3710 (46 ms, 21.98 tok/s)
+ is  [gen 116/150] token_id=369 (45 ms, 22.28 tok/s)
+ Delta  [gen 117/150] token_id=24167 (51 ms, 19.75 tok/s)
+-  [gen 118/150] token_id=12 (44 ms, 22.78 tok/s)
+Net  [gen 119/150] token_id=6738 (47 ms, 21.43 tok/s)
+?*  [gen 120/150] token_id=174548 (44 ms, 22.72 tok/s)
+ A  [gen 121/150] token_id=357 (44 ms, 22.58 tok/s)
+ specific  [gen 122/150] token_id=3050 (46 ms, 21.96 tok/s)
+ architecture  [gen 123/150] token_id=17120 (45 ms, 22.30 tok/s)
+/method  [gen 124/150] token_id=88670 (43 ms, 23.36 tok/s)
+ that  [gen 125/150] token_id=421 (44 ms, 22.88 tok/s)
+ uses  [gen 126/150] token_id=5533 (44 ms, 22.77 tok/s)
+ linear  [gen 127/150] token_id=13094 (42 ms, 24.10 tok/s)
+ attention  [gen 128/150] token_id=6326 (41 ms, 24.68 tok/s)
+ with  [gen 129/150] token_id=440 (42 ms, 23.99 tok/s)
+ a  [gen 130/150] token_id=264 (41 ms, 24.36 tok/s)
+ recurrence  [gen 131/150] token_id=72632 (45 ms, 22.44 tok/s)
+ formulation  [gen 132/150] token_id=53041 (43 ms, 23.15 tok/s)
+,  [gen 133/150] token_id=11 (42 ms, 24.01 tok/s)
+ often  [gen 134/150] token_id=3428 (43 ms, 23.24 tok/s)
+ involving  [gen 135/150] token_id=15394 (50 ms, 19.82 tok/s)
+ a  [gen 136/150] token_id=264 (41 ms, 24.51 tok/s)
+ state  [gen 137/150] token_id=1528 (43 ms, 22.99 tok/s)
+ update  [gen 138/150] token_id=2560 (42 ms, 23.63 tok/s)
+ mechanism  [gen 139/150] token_id=16456 (44 ms, 22.49 tok/s)
+.  [gen 140/150] token_id=13 (45 ms, 22.02 tok/s)
+ It  [gen 141/150] token_id=1049 (44 ms, 22.48 tok/s)
+'s  [gen 142/150] token_id=579 (44 ms, 22.93 tok/s)
+ related  [gen 143/150] token_id=5265 (46 ms, 21.86 tok/s)
+ to  [gen 144/150] token_id=310 (41 ms, 24.49 tok/s)
+ state  [gen 145/150] token_id=1528 (51 ms, 19.61 tok/s)
+ space  [gen 146/150] token_id=3433 (43 ms, 23.23 tok/s)
+ models  [gen 147/150] token_id=3983 (43 ms, 23.46 tok/s)
+ (  [gen 148/150] token_id=318 (46 ms, 21.69 tok/s)
+SS  [gen 149/150] token_id=1178 (49 ms, 20.35 tok/s)
+
+[timing] Per-layer breakdown (avg of 5960 layers, ms):
+  deferred_wait:   0.000
+  deferred_cpu:    0.001
+  input_norm:      0.000
+  cmd1_submit:     0.007
+  cmd1_wait:       0.595
+  cpu_attn:        0.002
+  cmd2_encode:     0.007
+  cmd2_wait:       0.324
+  routing_cpu:     0.002
+  expert_io:       0.268
+  cmd3_encode:     0.019
+  total_layer:     1.227
+  sum_phases:      1.227
+  cmd_buffers:    17880 (3 per layer: CMD1+CMD2+CMD3)
+  sync_waits:     11920 (2 per layer: CMD1+CMD2, CMD3 deferred)
+  gpu_encoders:   ~22 per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)
+[expert-pin] hits 42331 / 48000 (88.2%), pinned 4854/4854, evictions 815
+
+
+--- Statistics ---
+Total time:     10.8 s
+TTFT:           3027 ms
+Tokens:         150 generated
+Generation:     7.8 s (19.14 tok/s)
+Config:         K=8 experts, 40 layers

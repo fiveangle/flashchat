@@ -1,36 +1,46 @@
 # 01 — Zero-copy expert pin cache
 
-Branch: `exp/01-pin-zero-copy` (from main @ 9fd7c83)
+Branch: `exp/01-pin-zero-copy` (rebased on main@d507059, the serve-segfault fix)
 
 ## Hypothesis
 
-The pin cache's hit path is self-defeating: `expert_pin_lookup` memcpy's the
-whole expert (1.69 MiB) into the Metal pool buffer **while holding g_pin_mu**,
-serially on the decode thread, before the miss preads are even dispatched.
-Eight hits/layer ≈ 13 MB of serial memcpy per layer ≈ 0.7ms — the same order
-as the pread it avoids. So even with a large pin cache the win is capped.
-
-If instead each pin slot is a page-aligned arena region wrapped once in a
-persistent `newBufferWithBytesNoCopy` MTLBuffer, a hit binds the slot buffer
-directly as the expert source for `gpu_encode_experts_batched` — **zero
-copies**. Lookup becomes a mutex + array read. Expert I/O phase should
-collapse toward 0 for hit fractions of ~50%.
-
-GPU-safety argument for eviction-while-in-flight: admits/evictions only run
-in `async_pread_wait` (layer L+1 expert phase), which is strictly after
-`finalize_deferred_experts` completed CMD3(L) (CMD1(L+1) waitUntilCompleted
-implies queue-serialized CMD3(L) done). No slot bound by CMD3(L) can be
-evicted while the GPU still reads it.
+The pin cache's hit path was self-defeating: `expert_pin_lookup` memcpy'd the
+whole expert (1.69 MiB) into the Metal pool buffer while holding `g_pin_mu`,
+serially on the decode thread. Zero-copy: page-aligned arena, each slot
+wrapped once in a persistent `newBufferWithBytesNoCopy` MTLBuffer, hit binds
+the slot buffer directly as the GPU expert source. See top of NOTES for the
+eviction-while-in-flight safety argument (decode-thread phase ordering).
 
 ## Method
 
-- A/B with `tools/quick_decode_bench.sh`, PIN off vs PIN_GB=8 on 32GB warm.
-- Watch `expert_io` phase and `[expert-pin]` hit stats.
+- `tools/quick_decode_bench.sh <dir> 150 3` per pin size; PIN off baseline
+  = 17.33 tok/s median (00-BASELINE).
+- Correctness: temp-0 fixed prompts, output text compared PIN vs NOPIN.
 
 ## Observations
 
-(to be filled after measurement)
+| config | hit rate | decode tok/s (median) |
+|---|---|---|
+| off (baseline) | — | 17.33 |
+| 4 GB (2,427 slots) | 75.3% | 19.18 |
+| 8 GB (4,854 slots) | 88.2% | 18.98 |
+| 12 GB | 88.7% | 18.77 |
+| 16 GB | 88.7% | 18.48 |
+
+- 8GB run layer phases: expert_io 0.375 -> 0.268 ms, total_layer 1.364 ->
+  1.227 ms.
+- Hit-rate curve saturates ~88%: the residual misses are the cold tail of the
+  routing distribution (LFU can't hold them all); on 32GB those misses are
+  page-cache-warm anyway, so bigger arenas buy nothing and cost RAM.
+- Sizes 4-16GB are within run noise of each other on 32GB warm (~19 tok/s);
+  +10% vs off. On 16GB (misses = real SSD reads) the same hit rates are worth
+  much more — recommended size there: whatever fits after OS + non-expert
+  weights, ~3-4 GB.
+- Correctness: PIN vs NOPIN temp-0 outputs **byte-identical** (weights are
+  the same bytes, only the source buffer differs). Coherent text.
 
 ## Verdict
 
-(pending)
+KEEP. +10% decode on 32GB (17.33 -> ~19 tok/s) with a 4 GB arena, zero-copy
+on hits, no quality change. Recommend default pin sizing stays configurable;
+measure 16GB on hardware when available.
