@@ -4429,12 +4429,13 @@ static void gpu_encode_expert_forward_slot_buf(
 // Each expert gets its own encoder pair for GPU parallelism across experts.
 // Within each encoder, gate+up (or SwiGLU+down) are serialized but share
 // encoder creation overhead. Net win: fewer encoders, same parallelism.
-static void gpu_encode_experts_batched(
+static void gpu_encode_experts_batched_from(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int K,                       // number of experts to encode
     const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+    id<MTLBuffer> __strong *expert_bufs,   // per-expert weight data buffers [MAX_K]
+    id<MTLBuffer> expert_input             // routed input [hidden_dim]
 ) {
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
     NSUInteger up_w_off, up_s_off, up_b_off;
@@ -4474,7 +4475,7 @@ static void gpu_encode_experts_batched(
             [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
+            [enc setBuffer:expert_input                   offset:0           atIndex:3];
             [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
             [enc setBytes:&gate_up_out length:4 atIndex:5];
             [enc setBytes:&gate_up_in  length:4 atIndex:6];
@@ -4517,6 +4518,18 @@ static void gpu_encode_experts_batched(
             [enc endEncoding];
         }
     }
+}
+
+// Compatibility wrapper: routed input staged in buf_multi_expert_input.
+static void gpu_encode_experts_batched(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs
+) {
+    gpu_encode_experts_batched_from(ctx, cmdbuf, K, valid, expert_bufs,
+                                    ctx->buf_multi_expert_input);
 }
 
 // Encode one expert forward (gate+up+swiglu+down) into cmdbuf.
@@ -8885,6 +8898,7 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t0 = now_ms(); }
 
     float *h_post = s_h_post;
+    int h_post_gpu_resident = 0;  // fused CMD2 ran: buf_input/batch_out[1]/[2] hold h_post + shared gate/up
     float *h_mid = s_h_mid;
     float *gate_scores = s_gate_scores;
     memset(gate_scores, 0, g_cfg.num_experts * sizeof(float));
@@ -9167,10 +9181,12 @@ static void fused_layer_forward(
         gpu_flush_batch_results(g_metal, moe_specs, 4);
         // Read h_mid from GPU buffer (needed for final combine)
         memcpy(h_mid, [g_metal->buf_h_mid contents], g_cfg.hidden_dim * sizeof(float));
-        // Read h_post from buf_input (needed for expert input)
+        // Read h_post from buf_input (needed by the CPU-expert fallback path;
+        // the GPU expert path binds buf_input directly)
         memcpy(h_post, [g_metal->buf_input contents], g_cfg.hidden_dim * sizeof(float));
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, g_cfg.hidden_dim * sizeof(float));
+        h_post_gpu_resident = 1;
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
 
     } else {
@@ -9283,12 +9299,26 @@ static void fused_layer_forward(
             }
         }
 
-        // Shared expert prep (doesn't need expert data — can overlap with async pread)
-        memcpy([g_metal->buf_multi_expert_input contents], h_post, g_cfg.hidden_dim * sizeof(float));
-        memcpy([g_metal->buf_shared_gate contents], shared_gate,
-               g_cfg.shared_intermediate * sizeof(float));
-        memcpy([g_metal->buf_shared_up contents], shared_up,
-               g_cfg.shared_intermediate * sizeof(float));
+        // Shared expert prep (doesn't need expert data — can overlap with async pread).
+        // GPU-chained path: h_post already lives in buf_input (CMD2's residual_rms_norm
+        // wrote it) and shared_gate/up in batch_out[1]/[2] (CMD2's routing matvecs) —
+        // bind them directly instead of round-tripping through CPU arrays.
+        id<MTLBuffer> expert_input_buf;
+        id<MTLBuffer> shared_gate_buf, shared_up_buf;
+        if (h_post_gpu_resident) {
+            expert_input_buf = g_metal->buf_input;
+            shared_gate_buf = g_metal->batch_out[1];
+            shared_up_buf = g_metal->batch_out[2];
+        } else {
+            expert_input_buf = g_metal->buf_multi_expert_input;
+            shared_gate_buf = g_metal->buf_shared_gate;
+            shared_up_buf = g_metal->buf_shared_up;
+            memcpy([g_metal->buf_multi_expert_input contents], h_post, g_cfg.hidden_dim * sizeof(float));
+            memcpy([g_metal->buf_shared_gate contents], shared_gate,
+                   g_cfg.shared_intermediate * sizeof(float));
+            memcpy([g_metal->buf_shared_up contents], shared_up,
+                   g_cfg.shared_intermediate * sizeof(float));
+        }
 
         // Wait for the async pread to complete
         if (g_async_pread.active) {
@@ -9307,17 +9337,18 @@ static void fused_layer_forward(
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        gpu_encode_experts_batched_from(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                        expert_input_buf);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
-        // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
+        // Note: gate/up sources bound above (GPU-resident or staged)
 
         // SwiGLU dispatch
         {
             id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
             [enc setComputePipelineState:g_metal->swiglu];
-            [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+            [enc setBuffer:shared_gate_buf offset:0 atIndex:0];
+            [enc setBuffer:shared_up_buf   offset:0 atIndex:1];
             [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
             uint32_t dim = g_cfg.shared_intermediate;
             [enc setBytes:&dim length:4 atIndex:3];
