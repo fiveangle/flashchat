@@ -23,16 +23,24 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 
 | # | Branch | Hypothesis | Status | Result |
 |---|--------|-----------|--------|--------|
-| 00 | main | baseline capture | done | 12.4 tok/s @32GB |
-| 01 | exp/01-pin-zero-copy | bind pin-cache slots as GPU buffers (no memcpy on hit) | | |
-| 02 | exp/02-ram-discipline | F_NOCACHE expert streams + decode-aware pin admission + post-prefill pin growth | | |
-| 03 | exp/03-adaptive-k | route by weight mass (~98%), not fixed K=8 | | |
-| 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default MTP mode | | |
-| 05 | exp/05-matvec-occupancy | column-parallel dequant GEMV kernels (32/256 lanes active today) | | |
-| 06 | exp/06-io-threads-prefill | NUM_IO_THREADS 4→8 (prefill waves of MAX_K=16) | | |
-| 07 | exp/07-cmd-fuse-linear | single commit+wait for CMD1+CMD2 on linear layers | | |
-| 08 | exp/08-expert-read-split | gate+up pread wave, down wave overlapped with GPU gate/up | | |
-| 09 | exp/09-expert-prefetch-spec | pre-gated expert prefetch from routing signal | | |
+| 00 | main | baseline capture | done | 17.3 tok/s quick / 15.2-16.0 bench @32GB |
+| — | main d507059 | serve segfault fix (blocking bench since 86c8846) | done | bench resurrected |
+| 01 | exp/01-pin-zero-copy | zero-copy pin slot buffers | done, KEEP | +10% quick A/B; 88% hits @8GB; byte-identical |
+| 03 | exp/03-adaptive-k | routing-mass K truncation | done, opt-in | +4.6%; router flat (K 6.92 @0.90) |
+| 07 | exp/07-cmd-fuse-linear | single commit+wait on linear layers | done, KEEP | +11.7% A/B; bench +14-24% decode, no prefill cost; combo w/ pin up to +80% short-ctx |
+| 02 | exp/02-ram-discipline | F_NOCACHE + decode-aware admission + post-prefill pin growth | next | pin steals page cache -> prefill -26% @8GB; fix sizing/phase |
+| 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | pending | biggest 16GB lever |
+| 05 | exp/05-matvec-occupancy | kernel remap | deprioritized | v3 kernel already 8x8; cost is dispatch/RTT not occupancy |
+| 06 | exp/06-io-threads-prefill | NUM_IO_THREADS 4->8 | pending | prefill TTFT |
+| 08 | exp/08-expert-read-split | gate+up wave, down overlapped | pending | |
+| 09 | exp/09-expert-prefetch-spec | pre-gated expert prefetch | pending | |
+
+Measurement protocol notes: ambient machine drift is +-6% across this
+session — ALWAYS interleave A/B runs; never compare across hours. The
+durable bench (tests/bench_api.sh) uses short contexts for technical/
+creative, so its decode numbers run higher than the 150-token quick
+harness at long context; compare like with like.
+
 
 Merge policy: experiments land on their branch with measurements; merges to
 main only after bench_api sign-off; each merge re-baselines the next path.
