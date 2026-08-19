@@ -7416,6 +7416,31 @@ static size_t host_free_ram_bytes(void) {
 
 static int expert_pin_enabled(void) { return g_pin_enabled == 1; }
 
+// RAM-discipline knobs (exp/02):
+// FLASHCHAT_EXPERT_NOCACHE=1 — packed-expert preads bypass the page cache
+// (applied at fd open in serve; see the layer_fds setup). Protects the hot
+// non-expert mmap/KV from miss-stream eviction on low-RAM machines.
+static int expert_nocache_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("FLASHCHAT_EXPERT_NOCACHE");
+        v = (e && e[0] && atoi(e)) ? 1 : 0;
+    }
+    return v;
+}
+
+// FLASHCHAT_PIN_DECODE_DECAY=1 — halve g_expert_freq when generation begins,
+// so LFU admission/eviction trained on a long prompt gives way to decode-hot
+// experts instead of pinning prompt-only experts for the whole response.
+static int pin_decode_decay_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("FLASHCHAT_PIN_DECODE_DECAY");
+        v = (e && e[0] && atoi(e)) ? 1 : 0;
+    }
+    return v;
+}
+
 // Lazy one-time init. Call once the model is resident (first expert read).
 // Safe to call repeatedly; only the first call (guarded below) does work. Must
 // be called from the single decode thread, not the IO pool.
@@ -14420,6 +14445,15 @@ static void serve_loop(
                           (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
 
         g_overlap_in_decode = 1;
+        // RAM discipline: decay prefill-trained expert frequencies so decode
+        // activations dominate pin-cache admission/eviction from here on.
+        if (pin_decode_decay_enabled() && expert_pin_enabled()) {
+            for (int l = 0; l < g_cfg.num_layers && l < MAX_NUM_LAYERS; l++)
+                for (int e = 0; e < g_cfg.num_experts && e < MAX_NUM_EXPERTS; e++)
+                    g_expert_freq[l][e] >>= 1;
+            server_log_errorf("[serve] %s expert-pin: decode phase — freq counters decayed\n",
+                              request_id);
+        }
 
         char *gen_response = calloc(1, 262144);
         int gen_resp_len = 0;
@@ -15681,6 +15715,16 @@ int main(int argc, char **argv) {
                 // Disable readahead: expert reads are random (different offsets per token).
                 // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
+                // RAM discipline (FLASHCHAT_EXPERT_NOCACHE=1): the expert miss
+                // stream flows through the page cache and evicts the hot
+                // non-expert weight mmap + KV state that decode faults every
+                // token. F_NOCACHE makes expert preads bypass the cache so the
+                // stream does no displacement damage; the explicit pin cache
+                // becomes the only expert retention layer. Low-RAM strategy:
+                // on RAM-plentiful machines this forces cache-warm misses to
+                // real SSD reads, so keep it off there.
+                if (expert_nocache_enabled())
+                    fcntl(layer_fds[i], F_NOCACHE, 1);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
