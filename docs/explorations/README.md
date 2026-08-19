@@ -30,6 +30,7 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 | 07 | exp/07-cmd-fuse-linear | single commit+wait on linear layers | done, KEEP | +11.7% A/B; bench +14-24% decode, no prefill cost; combo w/ pin up to +80% short-ctx |
 | 02 | exp/02-ram-discipline | F_NOCACHE + decode-aware admission + post-prefill pin growth | next | pin steals page cache -> prefill -26% @8GB; fix sizing/phase |
 | 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | probed, PARKED | works, 76% acceptance, but 0.76x net at B=2; needs skip-spec gate + B>=3 + 16GB hw |
+| 10 | main | prefill "regression" vs Jul-8 fast rows | done, NO REGRESSION | fast rows were a dirty WIP tree; no clean commit reproduces them; ANE fully engaged; see 10 NOTES |
 
 ## 16GB emulation result (ram_pressure 17GiB on the 32GB dev box)
 

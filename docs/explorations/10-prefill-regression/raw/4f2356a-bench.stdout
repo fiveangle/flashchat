@@ -1,0 +1,17 @@
+=== Flashchat API performance benchmark ===
+machine: fiveangle.lan Mac17,2 32.0GB (4p 6e 10g)
+commit:  HEAD@4f2356a  | repeats=2 warmup=1 max_tokens=128
+log:     /tmp/fc-bisect/4f2356a/assets/api_perf_log.tsv
+
+[0;32mbench[0m Qwen-Qwen36-35B-A3B  experts=256 bits=4
+      weights=/Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4
+      [perf] experts=256 | delta_batch=1 verify_gpu_attn=0 matmulN=v5 kv_quant=off fused_attn=1 gpu_rope=1 kv_window=65536 | mtp=lossless draft/verify when MTP artifacts present
+    chat_stream:technical  decode= 15.75 tok/s (min 15.71)  prefill=2424 ms
+    responses_stream:technical decode= 15.70 tok/s (min 15.68)  prefill=2420 ms
+    chat_stream:creative   decode= 15.62 tok/s (min 15.61)  prefill=2146 ms
+    responses_stream:creative decode= 15.64 tok/s (min 15.62)  prefill=2135 ms
+    chat_stream:worstcase  decode= 15.38 tok/s (min 15.36)  prefill=2849 ms
+    responses_stream:worstcase decode= 15.08 tok/s (min 14.75)  prefill=2944 ms
+    tool_call              3210 ms (pass)
+
+=== done: 1 model(s) benchmarked, 0 skipped ===

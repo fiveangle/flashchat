@@ -40,9 +40,10 @@ Durable bench-api (env FUSE=1 [+PIN for combo]), commit 281dfd4:
   8GB in the quick harness (19.18 vs 18.98) — recommend 4GB class sizing on
   32GB; on 16GB the trade is far more favorable (decode hits >> prefill cache
   loss since prefill is SSD-bound there anyway).
-- Note: main prefill (2.4s) is still ~2.2x slower than the Jul-8 ane-prefill
-  branch rows (~1.1s) — pre-existing main regression vs ane branch, unrelated
-  to this work. Follow-up candidate.
+- Note (CORRECTED 2026-08-18, see 10-prefill-regression): the Jul-8
+  ane-prefill rows (~1.1s prefill) that made main's ~2.4s look like a
+  regression came from an unrecoverable dirty WIP tree — no clean commit
+  reproduces them. Main's prefill is the true baseline; discount those rows.
 
 ## Verdict
 
