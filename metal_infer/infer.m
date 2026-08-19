@@ -5638,6 +5638,19 @@ static double g_prof_prefill_route, g_prof_prefill_io, g_prof_prefill_gemm,
               g_prof_prefill_scatter;
 static long   g_prof_prefill_chunks;
 
+// ANE engagement counters — per-request accounting of how much prefill MoE
+// work actually ran on the Neural Engine vs the GPU fallback (or why not).
+// Reset by ane_prefill_engagement_reset() at request-prefill start; printed by
+// ane_prefill_engagement_log() at the serve prefill-complete line. "Enabled"
+// in the startup banner is a config statement, NOT an engagement statement —
+// these counters are the ground truth that the ANE path engaged.
+static long g_ane_pf_chunks;        // moe_block_chunk invocations total
+static long g_ane_pf_chunks_ane;    // chunks that started on the ANE path
+static long g_ane_pf_experts_ane;   // experts whose first slab was submitted to ANE
+static long g_ane_pf_experts_gpu;   // experts evaluated by the GPU fallback
+static long g_ane_pf_rows_ane;      // CSR rows (token-expert pairs) scattered from ANE output
+static long g_ane_pf_rows_gpu;      // CSR rows evaluated by the GPU fallback
+
 static int prefill_debug_enabled(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("FLASHCHAT_PREFILL_DEBUG"); v = (e && *e && atoi(e)) ? 1 : 0; }
@@ -5688,6 +5701,42 @@ static void ane_fail_permanently(const char *why) {
     if (!g_ane_failed)
         fprintf(stderr, "[ane-prefill] %s — using GPU for prompt processing\n", why);
     g_ane_failed = 1;
+}
+
+// Per-request engagement accounting (see counter block above for rationale).
+// Call reset() when request prefill begins, log() when it completes.
+static void ane_prefill_engagement_reset(void) {
+    g_ane_pf_chunks = 0; g_ane_pf_chunks_ane = 0;
+    g_ane_pf_experts_ane = 0; g_ane_pf_experts_gpu = 0;
+    g_ane_pf_rows_ane = 0; g_ane_pf_rows_gpu = 0;
+}
+
+static void ane_prefill_engagement_log(const char *request_id) {
+    if (g_ane_pf_chunks == 0) return;   // no batched MoE prefill ran (cache hit / non-MoE)
+    // g_prof_* are cumulative across requests — report per-request deltas.
+    static double p_route, p_io, p_gemm, p_scatter, p_prod, p_eval;
+    double d_route = g_prof_prefill_route - p_route, d_io = g_prof_prefill_io - p_io,
+           d_gemm = g_prof_prefill_gemm - p_gemm, d_scatter = g_prof_prefill_scatter - p_scatter,
+           d_prod = g_prof_ane_producer - p_prod, d_eval = g_prof_ane_eval - p_eval;
+    p_route = g_prof_prefill_route; p_io = g_prof_prefill_io; p_gemm = g_prof_prefill_gemm;
+    p_scatter = g_prof_prefill_scatter; p_prod = g_prof_ane_producer; p_eval = g_prof_ane_eval;
+
+    const char *status;
+    if (g_ane_failed) status = "FAILED->GPU";
+    else if (g_ane_pf_chunks_ane == 0)
+        status = ane_prefill_enabled() ? "ready-not-used" : "disabled";
+    else status = "engaged";
+
+    long rows = g_ane_pf_rows_ane + g_ane_pf_rows_gpu;
+    double pct = rows > 0 ? 100.0 * (double)g_ane_pf_rows_ane / (double)rows : 0.0;
+    server_log_errorf("[ane-prefill] %s engagement: %s | chunks %ld/%ld ANE | "
+                      "experts %ld ANE / %ld GPU | rows %ld ANE (%.1f%%) / %ld GPU | "
+                      "ane producer=%.0fms eval=%.0fms scatter=%.0fms | gpu gemm=%.0fms io=%.0fms route=%.0fms\n",
+                      request_id ? request_id : "-", status,
+                      g_ane_pf_chunks_ane, g_ane_pf_chunks,
+                      g_ane_pf_experts_ane, g_ane_pf_experts_gpu,
+                      g_ane_pf_rows_ane, pct, g_ane_pf_rows_gpu,
+                      d_prod, d_eval, d_scatter, d_gemm, d_io, d_route);
 }
 
 typedef struct { int set; int ok; } AneEvalJob;
@@ -5888,6 +5937,8 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
 
     float *moe = calloc((size_t)N*H, sizeof(float));
     int use_ane = ane_prefill_enabled() && ane_prefill_ready(H, idim, N);
+    g_ane_pf_chunks++;
+    if (use_ane) g_ane_pf_chunks_ane++;
     for (int w0 = 0; w0 < n_uni; w0 += MAX_K) {
         int wn = n_uni - w0 < MAX_K ? n_uni - w0 : MAX_K;
         int valid[MAX_K] = {0};
@@ -5933,6 +5984,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                     }
                     fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
                     g_prof_prefill_scatter += now_ms() - td;
+                    g_ane_pf_rows_ane += (long)pending_r;
                     if (pending_s != s) done[pending_s] = 1;
                     pending_s = -1;
                     cur = g_ane_job.set;   // weights live here; reuse it
@@ -5960,11 +6012,13 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                     }
                     fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
                     g_prof_prefill_scatter += now_ms() - t0;
+                    g_ane_pf_rows_ane += (long)pending_r;
                     if (pending_s != s) done[pending_s] = 1;
                 }
                 g_ane_job.set = cur; g_ane_job.ok = 0;
                 pthread_create(&g_ane_thread, NULL, ane_eval_thread, &g_ane_job);
                 pending_s = s; pending_row0 = (int)r0; pending_r = r;
+                if (r0 == 0) g_ane_pf_experts_ane++;   // first slab of this expert
                 cur ^= 1;
                 }
             }
@@ -5985,6 +6039,7 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
                         }
                         fc_ane_mlp_int8w_unlock_output(g_ane_ctx2[g_ane_job.set]);
                         g_prof_prefill_scatter += now_ms() - t0;
+                        g_ane_pf_rows_ane += (long)pending_r;
                         done[pending_s] = 1;
                     } else { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; }
                 } else { ane_fail_permanently("Neural Engine evaluation failed"); use_ane = 0; }
@@ -5996,6 +6051,11 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
             if (all_done) continue;   // wave fully handled on the ANE
         }
 
+        for (int s = 0; s < wn; s++) {
+            if (!valid[s] || done[s]) continue;
+            g_ane_pf_experts_gpu++;
+            g_ane_pf_rows_gpu += cnt[uni[w0+s]];
+        }
         _t = now_ms();
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         { // gate + up for every expert in the wave (independent -> one encoder)
@@ -14084,6 +14144,7 @@ static void serve_loop(
         }
 
         double t_prefill = now_ms();
+        ane_prefill_engagement_reset();
         int prefill_keepalive_enabled = req.stream;
         double next_prefill_keepalive_ms = t_prefill;
         report_prefill_keepalive(client_fd, request_id,
@@ -14224,6 +14285,7 @@ static void serve_loop(
         prefill_release_transient_buffers();
         free(req_sys_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
+        ane_prefill_engagement_log(request_id);
 
         // Generation-side state. Declared up here (instead of further down where
         // it used to live) so the very first sampler call can honor the
