@@ -736,6 +736,12 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 // FLASHCHAT_MTP_OVERLAP=1. Decode-phase only (gated on g_overlap_in_decode).
 // ----------------------------------------------------------------------------
 static int  g_mtp_overlap_enabled = 0;
+// Prefetch-ceiling instrumentation (FLASHCHAT_MTP_OVERLAP=1): per pin-MISS
+// fetch, was that expert in the previous token's set at the same layer?
+// That fraction is the hit-rate ceiling for a prev-token prefetcher.
+static long g_pf_miss_total = 0;      // pin misses (or all fetches when pin off)
+static long g_pf_miss_predictable = 0; // of those, present in prev-token same-layer set
+static int  g_pf_in_prev[MAX_K];      // per-current-expert prev-set membership (scratch)
 static int  g_overlap_in_decode = 0;             // 1 during auto-regressive decode (not prefill)
 static int  g_overlap_prev[MAX_NUM_LAYERS][16];  // previous decode step's experts per layer
 static int  g_overlap_prev_k[MAX_NUM_LAYERS];    // count per layer (0 = no previous step yet)
@@ -1936,6 +1942,14 @@ static void mtp_overlap_report(int shadow_hits, int shadow_checks) {
     server_log_errorf("[mtp] expert overlap: layer-pairs=%d mean_active=%.2f/layer "
                     "overlap=%.1f%% batched_io_vs_separate=%.3f\n",
             g_overlap_layer_pairs, mean_single, 100.0 * overlap_frac, io_ratio);
+
+    if (g_pf_miss_total > 0) {
+        server_log_errorf("[prefetch] prev-token predictor ceiling: misses=%ld "
+                        "predictable=%ld (%.1f%%) — fraction of pin-miss expert fetches "
+                        "present in the previous token's set at the same layer\n",
+                g_pf_miss_total, g_pf_miss_predictable,
+                100.0 * (double)g_pf_miss_predictable / (double)g_pf_miss_total);
+    }
 
     if (shadow_checks > 0) {
         double A = (double)shadow_hits / (double)shadow_checks;
@@ -9443,15 +9457,20 @@ static void fused_layer_forward(
         if (pk > 0) {
             int inter = 0;
             for (int i = 0; i < ck; i++) {
+                int in_prev = 0;
                 for (int j = 0; j < pk; j++) {
-                    if (expert_indices[i] == g_overlap_prev[layer_idx][j]) { inter++; break; }
+                    if (expert_indices[i] == g_overlap_prev[layer_idx][j]) { in_prev = 1; break; }
                 }
+                inter += in_prev;
+                g_pf_in_prev[i] = in_prev;
             }
             g_overlap_intersect_sum += inter;
             g_overlap_single_sum   += ck;
             g_overlap_separate_sum += ck + pk;
             g_overlap_union_sum    += ck + pk - inter;
             g_overlap_layer_pairs++;
+        } else {
+            for (int i = 0; i < actual_K; i++) g_pf_in_prev[i] = 0;
         }
         for (int i = 0; i < ck; i++) g_overlap_prev[layer_idx][i] = expert_indices[i];
         g_overlap_prev_k[layer_idx] = ck;
@@ -9500,6 +9519,16 @@ static void fused_layer_forward(
             async_pread_wait();
             for (int k = 0; k < actual_K; k++) {
                 valid[k] = g_async_pread.valid[k];
+            }
+            if (g_mtp_overlap_enabled && g_overlap_in_decode) {
+                for (int k = 0; k < actual_K; k++) {
+                    // Pin off -> every fetch counts as a miss (all-fetch ceiling);
+                    // pin on -> only real misses count (the prefetch target pool).
+                    if (!g_async_pread.pinned_hit[k]) {
+                        g_pf_miss_total++;
+                        if (k < MAX_K && g_pf_in_prev[k]) g_pf_miss_predictable++;
+                    }
+                }
             }
         }
 
