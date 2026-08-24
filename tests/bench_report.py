@@ -43,11 +43,15 @@ def main():
 
     hw = None if args.all_hw else this_hw_model()
     rows = []
+    excluded = 0
     with open(args.log) as f:
         for r in csv.DictReader(f, delimiter="\t"):
             if r.get("server_mode") != "bench":
                 continue          # only the canonical benchmark, not ad-hoc smoke rows
             if hw and r.get("hw_model") != hw:
+                continue
+            if r.get("status") != "pass":
+                excluded += 1
                 continue
             rows.append(r)
 
@@ -67,6 +71,8 @@ def main():
 
     print(f"# Flashchat perf report  ({'all hardware' if not hw else hw})")
     print(f"# threshold ±{args.threshold:.0f}%   (▲ better, ▼ worse, = flat)\n")
+    if excluded:
+        print(f"# excluded {excluded} non-pass/confounded row(s)\n")
 
     regressions = 0
     last_model = None

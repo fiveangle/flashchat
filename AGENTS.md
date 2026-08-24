@@ -117,6 +117,13 @@ measured. Coverage is now structural, not manual — **but two things still requ
 hot path, kernels, attention, or speculative decoding, and confirm `make bench-report`
 shows no regression before committing.** Ad-hoc `--mtp-generate-*` numbers are for
 inner-loop iteration, not regression sign-off.
+Canonical benchmarks must pass the system-health preflight. Active Time Machine,
+thermal/performance warnings, another inference process, or sustained CPU/GPU pressure
+make latency and throughput results invalid. The harness records the sampled state on
+every row and refuses to run under known contention by default. `--allow-busy-system`
+exists only for diagnostic reproduction: every row it emits must be marked `confounded`
+and excluded from regression reports. Unexpectedly low results are a stop condition;
+isolate MTP, runtime settings, system state, and a known-good binary before proceeding.
 
 ### Dense Prefill TensorOps Direction
 

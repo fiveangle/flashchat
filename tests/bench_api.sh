@@ -13,6 +13,7 @@
 #
 # Usage: tests/bench_api.sh [--port N] [--repeats N] [--max-tokens N]
 #                           [--model-id ID] [--no-perf-log] [--perf-log FILE]
+#                           [--allow-busy-system]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +30,7 @@ ONLY_MODEL=""
 PERF_LOG_ENABLED=1
 PERF_LOG_PATH="${REPO_ROOT}/assets/api_perf_log.tsv"
 SERVER_MODE="bench"
+ALLOW_BUSY_SYSTEM=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --model-id) ONLY_MODEL="$2"; shift 2 ;;
         --no-perf-log) PERF_LOG_ENABLED=0; shift ;;
         --perf-log) PERF_LOG_PATH="$2"; shift 2 ;;
+        --allow-busy-system) ALLOW_BUSY_SYSTEM=1; shift ;;
         -h|--help)
             grep '^# ' "$0" | sed 's/^# //'; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
@@ -51,6 +54,9 @@ TMPDIR="$(mktemp -d)"
 SERVER_PID=""
 HOSTNAME_VALUE=""; HW_MODEL_VALUE=""; RAM_GIB_VALUE=""; CPU_SUMMARY_VALUE=""
 CASES_RUN=0; CASES_SKIPPED=0
+SYSTEM_NOTES=""
+SYSTEM_CONFOUNDED=0
+SYSTEM_REASONS=()
 
 cleanup() { stop_server; rm -rf "${TMPDIR}"; }
 trap cleanup EXIT
@@ -86,6 +92,68 @@ populate_machine_metadata() {
     HOSTNAME_VALUE="$(detect_hostname)"; HW_MODEL_VALUE="$(detect_hw_model)"
     RAM_GIB_VALUE="$(detect_ram_gib)"; CPU_SUMMARY_VALUE="$(detect_cpu_summary)"
 }
+sample_system_health() {
+    local top_output tm_output therm_output infer_pids
+    local cpu_idle="unknown" gpu_util="unknown" load1="unknown"
+    local mem_free="unknown" swap_mb="unknown" tm_running="unknown" thermal="unknown"
+
+    top_output="$(top -l 2 -s 1 -n 0 2>/dev/null || true)"
+    cpu_idle="$(printf '%s\n' "$top_output" | awk '/CPU usage/{gsub("%", "", $7); idle=$7} END{print idle}')"
+    [[ -z "$cpu_idle" ]] && cpu_idle="unknown"
+    gpu_util="$(ioreg -r -d 1 -w 0 -c AGXAccelerator 2>/dev/null \
+        | sed -n 's/.*"Device Utilization %"=\([0-9][0-9]*\).*/\1/p' | head -1)"
+    [[ -z "$gpu_util" ]] && gpu_util="unknown"
+    load1="$(safe_sysctl vm.loadavg | awk '{print $2}')"
+    [[ -z "$load1" ]] && load1="unknown"
+    mem_free="$(memory_pressure -Q 2>/dev/null \
+        | awk '/System-wide memory free percentage:/{gsub("%", "", $5); print $5}')"
+    [[ -z "$mem_free" ]] && mem_free="unknown"
+    swap_mb="$(safe_sysctl vm.swapusage | sed -n 's/.*used = \([0-9.]*\)M.*/\1/p')"
+    [[ -z "$swap_mb" ]] && swap_mb="unknown"
+
+    tm_output="$(tmutil status 2>/dev/null || true)"
+    tm_running="$(printf '%s\n' "$tm_output" \
+        | sed -n 's/.*Running = \([01]\).*/\1/p' | head -1)"
+    [[ -z "$tm_running" ]] && tm_running="unknown"
+    therm_output="$(pmset -g therm 2>/dev/null || true)"
+    if printf '%s\n' "$therm_output" | grep -q 'No thermal warning level' \
+        && printf '%s\n' "$therm_output" | grep -q 'No performance warning level'; then
+        thermal="ok"
+    elif [[ -n "$therm_output" ]]; then
+        thermal="warning"
+    fi
+
+    infer_pids="$(pgrep -f '[/]metal_infer/infer|[/]infer --serve' 2>/dev/null || true)"
+    [[ "$tm_running" == "1" ]] && SYSTEM_REASONS+=("Time Machine backup is active")
+    [[ "$thermal" == "warning" ]] && SYSTEM_REASONS+=("macOS reports thermal or performance pressure")
+    [[ -n "$infer_pids" ]] && SYSTEM_REASONS+=("another inference process is running: ${infer_pids//$'\n'/,}")
+    if [[ "$cpu_idle" != "unknown" ]] && awk -v idle="$cpu_idle" 'BEGIN{exit !(idle < 50.0)}'; then
+        SYSTEM_REASONS+=("CPU idle is only ${cpu_idle}%")
+    fi
+    if [[ "$gpu_util" != "unknown" ]] && awk -v util="$gpu_util" 'BEGIN{exit !(util >= 70.0)}'; then
+        SYSTEM_REASONS+=("GPU utilization is already ${gpu_util}%")
+    fi
+
+    SYSTEM_NOTES="env_cpu_idle=${cpu_idle}%;env_gpu_util=${gpu_util}%;env_load1=${load1};env_mem_free=${mem_free}%;env_swap_mb=${swap_mb};env_time_machine=${tm_running};env_thermal=${thermal}"
+    echo "system:  cpu_idle=${cpu_idle}% gpu_util=${gpu_util}% load1=${load1} mem_free=${mem_free}% swap=${swap_mb}MB time_machine=${tm_running} thermal=${thermal}"
+
+    if [[ ${#SYSTEM_REASONS[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo -e "${RED}Benchmark preflight found invalidating system contention:${NC}" >&2
+    local reason
+    for reason in "${SYSTEM_REASONS[@]}"; do
+        echo "  - $reason" >&2
+    done
+    if [[ $ALLOW_BUSY_SYSTEM -eq 0 ]]; then
+        echo "Wait for the machine to become idle, then rerun." >&2
+        echo "For diagnostic reproduction only, pass --allow-busy-system; its rows are marked confounded." >&2
+        return 1
+    fi
+    SYSTEM_CONFOUNDED=1
+    echo -e "${YELLOW}Continuing only because --allow-busy-system was supplied; rows will be marked confounded.${NC}" >&2
+    return 0
+}
 PERF_HEADER="timestamp	branch	commit	hostname	hw_model	ram_gib	cpu_summary	model	server_mode	scenario	endpoint	stream	tool_mode	reasoning	temperature	top_p	top_k	min_p	presence_penalty	repetition_penalty	duration_ms	metric_type	metric_value	tok_per_sec	status	notes"
 ensure_perf_log_header() {
     [[ $PERF_LOG_ENABLED -ne 1 ]] && return 0
@@ -97,10 +165,16 @@ ensure_perf_log_header() {
 # log_perf_row <model> <scenario> <endpoint> <duration_ms> <metric_type> <metric_value> <tok_per_sec> <status> <notes>
 log_perf_row() {
     [[ $PERF_LOG_ENABLED -ne 1 ]] && return 0
+    local status="$8" notes="$9"
+    if [[ $SYSTEM_CONFOUNDED -eq 1 ]]; then
+        status="confounded"
+    fi
+    [[ -n "$notes" ]] && notes="${notes};"
+    notes="${notes}${SYSTEM_NOTES}"
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$(timestamp_iso)" "$(git_branch)" "$(git_commit)" "${HOSTNAME_VALUE}" "${HW_MODEL_VALUE}" \
         "${RAM_GIB_VALUE}" "${CPU_SUMMARY_VALUE}" "$1" "${SERVER_MODE}" "$2" "$3" "true" "none" "0" "0" \
-        "1" "0" "0" "0" "1.0" "$4" "$5" "$6" "$7" "$8" "$9" >> "${PERF_LOG_PATH}"
+        "1" "0" "0" "0" "1.0" "$4" "$5" "$6" "$7" "$status" "$notes" >> "${PERF_LOG_PATH}"
 }
 
 # ---------------------------------------------------------------------------
@@ -336,8 +410,9 @@ JSON
 # ---------------------------------------------------------------------------
 echo "=== Flashchat API performance benchmark ==="
 populate_machine_metadata
-ensure_perf_log_header
 echo "machine: ${HOSTNAME_VALUE} ${HW_MODEL_VALUE} ${RAM_GIB_VALUE}GB (${CPU_SUMMARY_VALUE})"
+sample_system_health || exit 3
+ensure_perf_log_header
 echo "commit:  $(git_branch)@$(git_commit)  | repeats=${REPEATS} warmup=${WARMUP} max_tokens=${BENCH_MAX_TOK}"
 echo "log:     ${PERF_LOG_PATH}"
 echo
