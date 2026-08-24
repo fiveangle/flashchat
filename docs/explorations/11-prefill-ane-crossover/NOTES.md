@@ -1,6 +1,7 @@
 # 11 — Hybrid ANE/GPU prefill (sparse-slab crossover)
 
-Branch: `exp/11-prefill-ane-crossover` (from main @ 05f9884). Started because
+Branch: `exp/11-prefill-ane-crossover` (from exp/02-ram-discipline @ bcf1e03;
+stacks on exp/09's instrumentation commit 05f9884). Started because
 exp/10's phase data showed the ANE pipeline paying huge fixed costs on sparse
 chunks — and prompted by the correction that prefill matters at EVERY prompt
 length (each conversation turn re-prefills the whole history; only the system
