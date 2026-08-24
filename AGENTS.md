@@ -177,6 +177,11 @@ the worked example when adding the next debug feature:
   Keeps the hottest whole experts RAM-resident (LFU, `expert_pin_*` in `infer.m`)
   so low-RAM machines don't thrash the page cache re-streaming experts per token.
   Budget = `min(AUTO_FRAC × free RAM at first use, MAX_GB)`, fail-soft to pure pread.
+  A cache slot returned as a hit remains live until the current batch has finished
+  consuming it. Admission may evict only slots that are neither loading nor referenced
+  by any active batch item; otherwise a later miss can overwrite bytes still queued for
+  GPU upload. Exercise forced-eviction tests with a cache much smaller than one batch's
+  working set, and compare generated output byte-for-byte with the cache disabled.
 
 ## Code Style
 

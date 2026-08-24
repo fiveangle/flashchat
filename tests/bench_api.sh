@@ -146,11 +146,70 @@ resolve_model() {
 }
 
 start_server() {
-    local id="$1"
-    ( cd "${REPO_ROOT}/metal_infer"
-      FLASHCHAT_MODEL_CONFIG="${FLASHCHAT_MODEL_CONFIG}" FLASHCHAT_MODEL="${id}" \
-      FLASHCHAT_MODEL_PATH="${MP}" FLASHCHAT_WEIGHTS_DIR="${WD}" FLASHCHAT_EXPERTS_DIR="${ED}" \
-        exec ./infer --serve "${PORT}" --model-id "${id}" --model "${MP}" >"${TMPDIR}/server.log" 2>&1 ) &
+    local id="$1" bench_home="${TMPDIR}/home-${id}" model_config="$FLASHCHAT_MODEL_CONFIG"
+    mkdir -p "$bench_home"
+    (
+        export HOME="$bench_home"
+        # A benchmark measures product defaults, not the invoking shell's overrides.
+        # Model artifact paths are restored explicitly after clearing persistent keys.
+        local key
+        for key in \
+            MODEL MODEL_PATH WEIGHTS_DIR EXPERTS_DIR MAX_TOKENS SAMPLING_PROFILE \
+            REASONING TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY \
+            SERVER_PORT SERVER_HOST SERVER_LOG SERVER_DEBUG SERVER_HTTP_LOG \
+            FUSE_LINEAR ADAPTIVE_K_MASS BATCH_PREFILL PREFILL_CHUNK PREFILL_DEBUG PREFILL_RELEASE \
+            ANE_PREFILL ANE_MIN_CHUNK PREAD_PROFILE PREAD_PROFILE_CAP \
+            EXPERT_PIN_MAX_GB EXPERT_PIN_MAX_EXPERTS EXPERT_PIN_AUTO_FRAC EXPERT_PIN_MLOCK \
+            SYSTEM_PROMPT_CACHE SYSTEM_PROMPT_CACHE_MAX_ENTRIES SYSTEM_PROMPT_CACHE_DIR \
+            MTP MTP_BF16 ACTIVE_EXPERTS KV_QUANT CONTEXT_WINDOW; do
+            unset "FLASHCHAT_${key}"
+        done
+        unset FLASHCHAT_CONFIG_FILE_OVERRIDE CONFIG_FILE
+        export FLASHCHAT_MODEL_CONFIG="$model_config"
+        export FLASHCHAT_MODEL="$id"
+        export FLASHCHAT_MODEL_PATH="$MP"
+        export FLASHCHAT_WEIGHTS_DIR="$WD"
+        export FLASHCHAT_EXPERTS_DIR="$ED"
+
+        # Re-source after changing HOME so config paths and defaults are isolated.
+        set +u
+        source "${REPO_ROOT}/lib/config.sh"
+        MODEL="$id"
+        flashchat_create_default_config >/dev/null
+        flashchat_load_config >/dev/null
+        set -u
+
+        local config_file
+        config_file="$(flashchat_get CONFIG_FILE)"
+        printf '[bench-config] model=%s fuse=%s adaptive_k=%s pin_gb=%s pin_experts=%s pin_auto=%s pin_mlock=%s batch_prefill=%s ane_prefill=%s kv_quant=%s config=%s\n' \
+            "$id" "$(flashchat_get FUSE_LINEAR)" "$(flashchat_get ADAPTIVE_K_MASS)" \
+            "$(flashchat_get EXPERT_PIN_MAX_GB)" "$(flashchat_get EXPERT_PIN_MAX_EXPERTS)" \
+            "$(flashchat_get EXPERT_PIN_AUTO_FRAC)" "$(flashchat_get EXPERT_PIN_MLOCK)" \
+            "$(flashchat_get BATCH_PREFILL)" "$(flashchat_get ANE_PREFILL)" \
+            "$(flashchat_get KV_QUANT)" "$config_file"
+
+        cd "${REPO_ROOT}/metal_infer"
+        FLASHCHAT_FUSE_LINEAR="$(flashchat_get FUSE_LINEAR)" \
+        FLASHCHAT_ADAPTIVE_K_MASS="$(flashchat_get ADAPTIVE_K_MASS)" \
+        FLASHCHAT_BATCH_PREFILL="$(flashchat_get BATCH_PREFILL)" \
+        FLASHCHAT_PREFILL_CHUNK="$(flashchat_get PREFILL_CHUNK)" \
+        FLASHCHAT_PREFILL_DEBUG="$(flashchat_get PREFILL_DEBUG)" \
+        FLASHCHAT_ANE_PREFILL="$(flashchat_get ANE_PREFILL)" \
+        FLASHCHAT_ANE_MIN_CHUNK="$(flashchat_get ANE_MIN_CHUNK)" \
+        FLASHCHAT_PREAD_PROFILE="$(flashchat_get PREAD_PROFILE)" \
+        FLASHCHAT_PREAD_PROFILE_CAP="$(flashchat_get PREAD_PROFILE_CAP)" \
+        FLASHCHAT_EXPERT_PIN_MAX_GB="$(flashchat_get EXPERT_PIN_MAX_GB)" \
+        FLASHCHAT_EXPERT_PIN_MAX_EXPERTS="$(flashchat_get EXPERT_PIN_MAX_EXPERTS)" \
+        FLASHCHAT_EXPERT_PIN_AUTO_FRAC="$(flashchat_get EXPERT_PIN_AUTO_FRAC)" \
+        FLASHCHAT_EXPERT_PIN_MLOCK="$(flashchat_get EXPERT_PIN_MLOCK)" \
+        FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)" \
+        FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
+        FLASHCHAT_ACTIVE_EXPERTS="$(flashchat_get ACTIVE_EXPERTS)" \
+        FLASHCHAT_CONTEXT_WINDOW="$(flashchat_get CONTEXT_WINDOW)" \
+        FLASHCHAT_KV_QUANT="$(flashchat_get KV_QUANT)" \
+            exec ./infer --serve "$PORT" --config "$config_file" \
+                --model-id "$id" --model "$MP"
+    ) >"${TMPDIR}/server.log" 2>&1 &
     SERVER_PID="$!"
     local tries=0
     while [[ $tries -lt 120 ]]; do
@@ -158,6 +217,7 @@ start_server() {
         kill -0 "${SERVER_PID}" 2>/dev/null || return 1
         sleep 1; tries=$((tries+1))
     done
+    cat "${TMPDIR}/server.log" >&2
     return 1
 }
 stop_server() {
@@ -303,7 +363,8 @@ for id in $MODEL_IDS; do
         [[ -f "${TMPDIR}/server.log" ]] && tail -5 "${TMPDIR}/server.log" >&2
         stop_server; CASES_SKIPPED=$((CASES_SKIPPED+1)); continue
     fi
-    grep -m1 '^\[perf\]' "${TMPDIR}/server.log" 2>/dev/null | sed 's/^/      /' || true
+    grep -E -m3 '^\[(bench-config|perf)\]|^\[serve\]   expert_pin_cache:' \
+        "${TMPDIR}/server.log" 2>/dev/null | sed 's/^/      /' || true
     for i in "${!PROMPT_NAMES[@]}"; do
         for ep in chat responses; do
             bench_case "$id" "$ep" "${PROMPT_NAMES[$i]}" "${PROMPT_TEXTS[$i]}"
