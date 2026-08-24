@@ -62,6 +62,44 @@ token); the hybrid's prefill win (~400ms on those very requests) is real
 but partially masked. The user-visible win is first-turn cold starts
 (−40% TTFT at short prompts) and every long-prompt turn.
 
+## Knee-point analysis: why 512, and is a smarter choice possible?
+
+512 is NOT arbitrary — it is the midpoint of the measured bracket
+[285 GPU-wins, 725 ANE-wins]. A post-hoc sweep of the bracket interior
+(single runs per point, ambient noise ±5-7%):
+
+| tokens | GPU ms | ANE ms | ANE−GPU | reading |
+|---|---|---|---|---|
+| 65   | 1,573  | 2,592  | +65%  | GPU (signal >> noise) |
+| 285  | 5,952  | 6,722  | +13%  | GPU (signal > noise) |
+| 373  | 10,163 | 9,593  | −5.6% | wash |
+| 461  | 12,122 | 12,145 | +0.2% | wash |
+| 549  | 14,206 | 14,071 | −1.0% | wash |
+| 637  | 14,659 | 15,677 | +6.9% | wash (non-monotonic!) |
+| 725  | 15,678 | 14,860 | −5.2% | ANE (signal ~ noise) |
+| 1,429| 32,596 | 30,492 | −6.5% | ANE |
+
+**The "knee" is a broad flat valley (≈370–700), not a point.** The interior
+deltas (±1–7%) are non-monotonic and within the noise floor — the choice
+barely matters there, and no threshold inside the valley can be wrong by
+more than ~6%. Why no sharp knee exists analytically: the expert phase
+itself NEVER crosses over (GPU GEMM < ANE producer+eval at every length);
+the ANE win emerges from producer(GPU)/eval(ANE) overlap freeing the GPU
+for attention/delta work that grows with length — a system-level effect,
+not a per-row cost crossover. Consequences:
+
+- 512 stays the default: middle of the indifferent valley = maximally
+  robust to hardware variation and noise. Precision is provably worthless
+  here.
+- A runtime-adaptive router (EMA of gemm-vs-pipeline phase times per
+  length bucket from the engagement counters) is feasible but bounded at
+  ~3-6% of prefill in a narrow band — not worth the complexity unless 16GB
+  hardware shows a shifted/sharper valley.
+- Threshold scope reminder: for prompts >1024 tokens only the tail chunk
+  (T mod 1024) is decided by the gate; full 1024-token chunks always go
+  ANE. The gate matters most for single-chunk prompts (T ≤ 1024), which
+  covers typical chat turns.
+
 ## Follow-ups (not blocking)
 
 - 16GB-hardware validation of the 512 threshold (crossover could shift with
