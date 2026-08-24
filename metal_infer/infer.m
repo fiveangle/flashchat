@@ -7575,20 +7575,22 @@ static inline int expert_pin_gid(int layer, int expert) {
 // copy). The caller must keep the buffer referenced for the lifetime of any
 // command buffer that binds it (decode-thread discipline guarantees no slot
 // is evicted between binding and deferred completion). Else NULL (miss).
-static id<MTLBuffer> expert_pin_slot_buffer(int layer, int expert) {
+static id<MTLBuffer> expert_pin_slot_buffer(int layer, int expert, int *out_slot) {
     if (g_pin_enabled != 1) return nil;
     int gid = expert_pin_gid(layer, expert);
     pthread_mutex_lock(&g_pin_mu);
     int slot = g_pin_slot_of_gid[gid];
     id<MTLBuffer> buf = (slot >= 0) ? g_pin_slot_bufs[slot] : nil;
     pthread_mutex_unlock(&g_pin_mu);
+    if (out_slot) *out_slot = slot;
     atomic_fetch_add(buf ? &g_pin_hits : &g_pin_misses, 1);
     return buf;
 }
 
 // Admit expert bytes after a miss. Evicts the lowest-frequency pinned expert
 // (by g_expert_freq) only if the incoming expert is at least as hot.
-static void expert_pin_admit(int layer, int expert, const void *src) {
+static void expert_pin_admit(int layer, int expert, const void *src,
+                             const int *protected_slots, int num_protected_slots) {
     if (g_pin_enabled != 1) return;
     int gid = expert_pin_gid(layer, expert);
     pthread_mutex_lock(&g_pin_mu);
@@ -7602,6 +7604,11 @@ static void expert_pin_admit(int layer, int expert, const void *src) {
         int incoming_freq = g_expert_freq[layer][expert];
         long victim = -1; int victim_freq = 0;
         for (long s = 0; s < g_pin_capacity_slots; s++) {
+            int protected = 0;
+            for (int i = 0; i < num_protected_slots; i++) {
+                if (protected_slots[i] == s) { protected = 1; break; }
+            }
+            if (protected) continue;
             int vg = g_pin_gid_of_slot[s];
             int vf = g_expert_freq[vg / g_cfg.num_experts][vg % g_cfg.num_experts];
             if (victim < 0 || vf < victim_freq) { victim = s; victim_freq = vf; }
@@ -7730,6 +7737,7 @@ typedef struct {
     int layer;                 // layer for this batch (pin-cache key + admission)
     int expert_idx[MAX_K];     // routed expert per slot
     int pinned_hit[MAX_K];     // 1 = served from pin cache (no pread issued)
+    int pin_slot[MAX_K];       // arena slot for each hit; protected until dispatch
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
 
@@ -7753,14 +7761,17 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         t->dst = [dst_bufs[k] contents];
         g_async_pread.expert_idx[k] = expert_indices[k];
         // Pin-cache hit: bind the slot buffer directly — zero copies, no pread.
-        id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k]);
+        int pin_slot = -1;
+        id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k], &pin_slot);
         if (slot_buf) {
             dst_bufs[k] = slot_buf;
             g_async_pread.pinned_hit[k] = 1;
+            g_async_pread.pin_slot[k] = pin_slot;
             g_async_pread.valid[k] = 1;
             continue;
         }
         g_async_pread.pinned_hit[k] = 0;
+        g_async_pread.pin_slot[k] = -1;
         t->fd = packed_fd;
         t->offset = (off_t)expert_indices[k] * esz;
         t->size = esz;
@@ -7784,13 +7795,20 @@ static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
     size_t esz = active_expert_size();
+    int protected_slots[MAX_K];
+    int num_protected_slots = 0;
+    for (int k = 0; k < g_async_pread.num_tasks; k++) {
+        if (g_async_pread.pinned_hit[k] && g_async_pread.pin_slot[k] >= 0)
+            protected_slots[num_protected_slots++] = g_async_pread.pin_slot[k];
+    }
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
         if (g_async_pread.pinned_hit[k]) { g_async_pread.valid[k] = 1; continue; }
         g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)esz);
         // Admit freshly-read experts into the pin cache (LFU eviction inside).
         if (g_async_pread.valid[k])
             expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
-                             g_async_pread.tasks[k].dst);
+                             g_async_pread.tasks[k].dst,
+                             protected_slots, num_protected_slots);
     }
     g_async_pread.active = 0;
 }
