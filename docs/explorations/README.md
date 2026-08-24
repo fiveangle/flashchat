@@ -31,6 +31,7 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 | 02 | exp/02-ram-discipline | F_NOCACHE + decode-aware admission + post-prefill pin growth | done | MLOCK=+15-24% under pressure, +6% warm; NOCACHE + DECAY dead (measured); post-prefill growth already satisfied by lazy init |
 | 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | probed, PARKED | works, 76% acceptance, but 0.76x net at B=2; needs skip-spec gate + B>=3 + 16GB hw |
 | 10 | main | prefill "regression" vs Jul-8 fast rows | done, NO REGRESSION | fast rows were a dirty WIP tree; no clean commit reproduces them; ANE fully engaged; see 10 NOTES |
+| 11 | exp/11-prefill-ane-crossover | hybrid ANE/GPU prefill by chunk size | done, KEEP | GPU path below 512-token chunks: -37% short cold prefill, bit-faithful; ANE keeps long-chunk overlap win |
 
 ## 16GB emulation result (ram_pressure 17GiB on the 32GB dev box)
 

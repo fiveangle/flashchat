@@ -537,6 +537,7 @@ cmd_status() {
     fi
     echo "Show thinking: $(flashchat_get SHOW_THINKING)"
     echo "Fused GPU scheduling: $(flashchat_get FUSE_LINEAR)"
+    echo "Neural Engine prefill: $(flashchat_get ANE_PREFILL) (GPU below $(flashchat_get ANE_MIN_CHUNK)-token chunks)"
     _akm="$(flashchat_get ADAPTIVE_K_MASS)"
     echo "Adaptive expert routing: ${_akm:-off}"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
@@ -994,6 +995,7 @@ server_runtime_signature() {
         echo "PREFILL_CHUNK=$(flashchat_get PREFILL_CHUNK)"
         echo "PREFILL_DEBUG=$(flashchat_get PREFILL_DEBUG)"
         echo "ANE_PREFILL=$(flashchat_get ANE_PREFILL)"
+        echo "ANE_MIN_CHUNK=$(flashchat_get ANE_MIN_CHUNK)"
         echo "PREAD_PROFILE=$(flashchat_get PREAD_PROFILE)"
         echo "PREAD_PROFILE_CAP=$(flashchat_get PREAD_PROFILE_CAP)"
         echo "EXPERT_PIN_MAX_GB=$(flashchat_get EXPERT_PIN_MAX_GB)"
@@ -1396,6 +1398,8 @@ cmd_serve() {
     [ -n "${FLASHCHAT_PREFILL_RELEASE}" ] && _prefill_release="$FLASHCHAT_PREFILL_RELEASE"
     local _ane_prefill
     [ -n "${FLASHCHAT_ANE_PREFILL}" ] && _ane_prefill="$FLASHCHAT_ANE_PREFILL" || _ane_prefill="$(flashchat_get ANE_PREFILL)"
+    local _ane_min_chunk
+    [ -n "${FLASHCHAT_ANE_MIN_CHUNK}" ] && _ane_min_chunk="$FLASHCHAT_ANE_MIN_CHUNK" || _ane_min_chunk="$(flashchat_get ANE_MIN_CHUNK)"
     local _pin_max_gb _pin_max_experts _pin_auto_frac _pin_mlock
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_EXPERTS}" ] && _pin_max_experts="$FLASHCHAT_EXPERT_PIN_MAX_EXPERTS" || _pin_max_experts="$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
@@ -1412,6 +1416,7 @@ cmd_serve() {
     FLASHCHAT_PREFILL_DEBUG="$_prefill_debug" \
     FLASHCHAT_PREFILL_RELEASE="$_prefill_release" \
     FLASHCHAT_ANE_PREFILL="$_ane_prefill" \
+    FLASHCHAT_ANE_MIN_CHUNK="$_ane_min_chunk" \
     FLASHCHAT_PREAD_PROFILE="$_pread_profile" \
     FLASHCHAT_PREAD_PROFILE_CAP="$_pread_profile_cap" \
     FLASHCHAT_EXPERT_PIN_MAX_GB="$_pin_max_gb" \

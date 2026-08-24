@@ -134,6 +134,8 @@ def _print_summary(registry: Registry) -> None:
     print(f"Context window: {win} tokens{max_label}")
     print(f"KV cache quantization: {configfile.get('KV_QUANT', '') or 'off'}")
     print(f"Fused GPU scheduling: {configfile.get('FUSE_LINEAR', '1') or '1'}")
+    print(f"Neural Engine prefill: {configfile.get('ANE_PREFILL', '1') or '1'} "
+          f"(GPU below {configfile.get('ANE_MIN_CHUNK', '512') or '512'}-token chunks)")
     print(f"Adaptive expert routing: {configfile.get('ADAPTIVE_K_MASS', '') or 'off'}")
     print()
 
@@ -470,7 +472,9 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
             ("PREFILL_CHUNK", "  ^ chunk size in tokens (8-4096)", "1024",
              "Bigger = faster but more working RAM: 1024 ~170 MB, 2048 ~340 MB."),
             ("ANE_PREFILL", "  ^ Neural Engine expert offload (0/1)", "1",
-             "~25% faster on top of batching; auto-falls back to GPU if the hardware lacks a Neural Engine."),
+             "Faster prompt reading on long prompts; auto-falls back to GPU if the hardware lacks a Neural Engine."),
+            ("ANE_MIN_CHUNK", "  ^ GPU below this prompt length in tokens (0=always Neural Engine)", "512",
+             "Short prompts run the exact GPU path (measured faster AND bit-faithful); long prompts keep the Neural Engine overlap."),
             ("FUSE_LINEAR", "Fused GPU scheduling for linear-attention layers (0/1)", "1",
              "~12% faster generation with byte-identical outputs; disable only for A/B comparisons."),
             ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (empty=off, or 0.85-0.99)", "",

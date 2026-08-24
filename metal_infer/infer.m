@@ -5690,6 +5690,22 @@ static int ane_calib_enabled(void) {
     if (v < 0) { const char *e = getenv("FLASHCHAT_ANE_CALIB"); v = (e && *e && atoi(e)) ? 1 : 0; }
     return v;
 }
+// Hybrid ANE/GPU prefill (exp/11): the ANE pipeline pays a fixed per-expert
+// cost (producer round-trip + full-slab eval) that dominates when a chunk's
+// routed rows per expert are sparse. Measured crossover on Qwen3.6-35B q4
+// (32GB Mac17,2, 2026-08-18): GPU wins <= ~285-token chunks (-11..-37%),
+// ANE wins >= ~725 (-5..-6.5%, producer/eval chip overlap). Chunks below
+// this token count run the bit-faithful GPU path; larger chunks keep the
+// ANE. 0 disables the gate (always ANE when enabled = pre-hybrid behavior).
+static int ane_min_chunk(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("FLASHCHAT_ANE_MIN_CHUNK");
+        v = (e && *e) ? atoi(e) : 512;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
 static float ane_env_qscale(const char *name, float dflt) {
     const char *e = getenv(name);
     if (e && *e) { float v = strtof(e, NULL); if (v > 0) return v; }
@@ -5738,7 +5754,8 @@ static void ane_prefill_engagement_log(const char *request_id) {
     const char *status;
     if (g_ane_failed) status = "FAILED->GPU";
     else if (g_ane_pf_chunks_ane == 0)
-        status = ane_prefill_enabled() ? "ready-not-used" : "disabled";
+        status = !ane_prefill_enabled() ? "disabled"
+               : (g_ane_ctx2[0] ? "ready-not-used" : "short-chunk-gpu");
     else status = "engaged";
 
     long rows = g_ane_pf_rows_ane + g_ane_pf_rows_gpu;
@@ -5950,7 +5967,10 @@ static void moe_block_chunk(WeightFile *wf, int layer, float *hs, int N, int pac
     NSUInteger dw = ub + g_cfg.up_b_size,  ds = dw + g_cfg.down_w_size, db = ds + g_cfg.down_s_size;
 
     float *moe = calloc((size_t)N*H, sizeof(float));
-    int use_ane = ane_prefill_enabled() && ane_prefill_ready(H, idim, N);
+    // Hybrid: gate on chunk size BEFORE ane_prefill_ready() so short-prompt
+    // sessions never compile ANE contexts at all (lazy init stays lazy).
+    int use_ane = (ane_min_chunk() == 0 || N >= ane_min_chunk()) &&
+                  ane_prefill_enabled() && ane_prefill_ready(H, idim, N);
     g_ane_pf_chunks++;
     if (use_ane) g_ane_pf_chunks_ane++;
     for (int w0 = 0; w0 < n_uni; w0 += MAX_K) {
@@ -13824,6 +13844,9 @@ static void serve_loop(
                         ane_env_qscale("FLASHCHAT_ANE_W_QSCALE", 195.0f),
                         ane_env_qscale("FLASHCHAT_ANE_X_QSCALE", 16.0f),
                         ane_env_qscale("FLASHCHAT_ANE_MID_QSCALE", 16.0f));
+            if (ane_min_chunk() > 0)
+                server_logf("[serve]   ane_prefill: hybrid — chunks < %d tokens run the GPU path (measured crossover; also bit-faithful)\n",
+                            ane_min_chunk());
         } else {
             server_logf("[serve]   ane_prefill: disabled\n");
         }
