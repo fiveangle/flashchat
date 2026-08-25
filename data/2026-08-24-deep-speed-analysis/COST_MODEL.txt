@@ -1,0 +1,25 @@
+Qwen3.6-35B-A3B q4 cost model (2026-08-24)
+
+layers=40  experts/layer=256  K=8
+expert_size=1769472 B (1.6875 MiB)
+  gate+up prefix = 1179648 B (66.7%)
+  down suffix    =  589824 B (33.3%)
+experts/token    = 320
+expert_bytes/tok = 566083840 B (~540 MiB)
+lm_head_bytes    = 286064640 B (~286 MiB)
+
+Cold sequential I/O ceilings (experts + lm_head only):
+  3 GB/s -> 3.52 tok/s
+  5 GB/s -> 5.87 tok/s
+  7 GB/s -> 8.21 tok/s
+
+Expert-only @5 GB/s vs pin hit rate:
+  hit  0% -> 8.8 tok/s
+  hit 50% -> 17.7
+  hit 70% -> 29.4
+  hit 88% -> 73.6
+
+Warm 32GB baseline (exp/00, pin off): 17.33 tok/s median
+  layer 1.36 ms = cmd1_wait 0.62 + cmd2_wait 0.33 + expert_io 0.38 (+misc)
+
+User config footgun: EXPERT_PIN_MAX_GB=0 disables pin despite MAX_EXPERTS=2560.
