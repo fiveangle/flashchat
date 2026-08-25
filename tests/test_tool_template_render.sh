@@ -473,6 +473,201 @@ else
     assert_fail "native XML parser preserves multiline and typed params"
 fi
 
+# Validate native calls against the exact schema supplied by the client. This is
+# file-only: it exercises the production parser and validator without loading a
+# model or relying on a particular model's generation behavior.
+VALIDATION_REQUEST="${TMPDIR}/validation_request.json"
+INVALID_TASK_CALL="${TMPDIR}/invalid_task_call.txt"
+VALID_TASK_CALL="${TMPDIR}/valid_task_call.txt"
+
+python3 - "$VALIDATION_REQUEST" <<'PY'
+import json, sys
+request = {
+    "model": "test",
+    "messages": [{"role": "user", "content": "delegate this"}],
+    "tools": [{"type": "function", "function": {
+        "name": "task",
+        "description": "Launch a task.",
+        "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+                "subagent_type": {"type": "string"}
+            },
+            "required": ["description", "prompt", "subagent_type"]
+        }
+    }}]
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+cat > "$INVALID_TASK_CALL" <<'EOF'
+<tool_call>
+<function=task>
+<parameter=prompt>
+Analyze the repository.
+</parameter>
+<parameter=subagent_type>
+general
+</parameter>
+</function>
+</tool_call>
+EOF
+
+set +e
+invalid_validation=$("$INFER" --model-id Qwen-Qwen36-35B-A3B \
+    --parse-tool-call "$INVALID_TASK_CALL" \
+    --validate-tool-call-request "$VALIDATION_REQUEST" | tail -1)
+invalid_status=${PIPESTATUS[0]}
+set -e
+if [[ "$invalid_status" -eq 2 ]] && python3 - "$invalid_validation" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["valid"] is False
+assert result["action"] == "reject"
+assert any(i["keyword"] == "required" and "description" in i["message"]
+           for i in result["errors"])
+PY
+then
+    assert_pass "client schema rejects OpenCode-style missing task description"
+else
+    assert_fail "client schema rejects OpenCode-style missing task description" \
+        "status=$invalid_status output=$invalid_validation"
+fi
+
+cat > "$VALID_TASK_CALL" <<'EOF'
+<tool_call>
+<function=task>
+<parameter=description>
+Analyze optimization history
+</parameter>
+<parameter=prompt>
+Analyze the repository.
+</parameter>
+<parameter=subagent_type>
+general
+</parameter>
+</function>
+</tool_call>
+EOF
+
+valid_validation=$("$INFER" --model-id Qwen-Qwen36-35B-A3B \
+    --parse-tool-call "$VALID_TASK_CALL" \
+    --validate-tool-call-request "$VALIDATION_REQUEST" | tail -1)
+if python3 - "$valid_validation" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["valid"] is True
+assert result["errors"] == []
+PY
+then
+    assert_pass "client schema accepts complete task arguments"
+else
+    assert_fail "client schema accepts complete task arguments" "$valid_validation"
+fi
+
+GENERIC_SCHEMA_REQUEST="${TMPDIR}/generic_schema_request.json"
+GENERIC_INVALID_CALL="${TMPDIR}/generic_invalid_call.txt"
+python3 - "$GENERIC_SCHEMA_REQUEST" <<'PY'
+import json, sys
+request = {
+    "messages": [{"role": "user", "content": "exercise nested validation"}],
+    "tools": [{"type": "function", "function": {
+        "name": "plan",
+        "description": "Create a plan.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "header": {"type": "string"},
+                        "options": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "description": {"type": "string"}
+                            },
+                            "required": ["label", "description"],
+                            "additionalProperties": False
+                        }}
+                    },
+                    "required": ["header", "options"]
+                }},
+                "priority": {"type": "string", "enum": ["low", "high"]},
+                "count": {"type": "integer", "exclusiveMinimum": 0},
+                "enabled": {"type": "boolean"}
+            },
+            "required": ["questions", "priority", "count", "enabled"],
+            "additionalProperties": False
+        }
+    }}]
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(request, f)
+PY
+
+cat > "$GENERIC_INVALID_CALL" <<'EOF'
+<tool_call>
+<function=plan>
+<parameters>{"questions":[{"header":"Choice","options":[{"label":"A","extra":true}]}],"priority":"urgent","count":0,"enabled":"yes","surprise":true}</parameters>
+</function>
+</tool_call>
+EOF
+
+set +e
+generic_validation=$("$INFER" --model-id Qwen-Qwen36-35B-A3B \
+    --parse-tool-call "$GENERIC_INVALID_CALL" \
+    --validate-tool-call-request "$GENERIC_SCHEMA_REQUEST" | tail -1)
+generic_status=${PIPESTATUS[0]}
+set -e
+if [[ "$generic_status" -eq 2 ]] && python3 - "$generic_validation" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+keywords = {item["keyword"] for item in result["errors"]}
+paths = {item["instance_path"] for item in result["errors"]}
+assert {"required", "additionalProperties", "enum", "exclusiveMinimum", "type"} <= keywords
+assert "$.questions[0].options[0]" in paths
+assert "$.questions[0].options[0].extra" in paths
+assert "$.surprise" in paths
+PY
+then
+    assert_pass "generic validator reports nested and unrelated schema violations"
+else
+    assert_fail "generic validator reports nested and unrelated schema violations" \
+        "status=$generic_status output=$generic_validation"
+fi
+
+UNSUPPORTED_REQUEST="${TMPDIR}/unsupported_schema_request.json"
+python3 - "$VALIDATION_REQUEST" "$UNSUPPORTED_REQUEST" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    request = json.load(f)
+request["tools"][0]["function"]["parameters"]["oneOf"] = [
+    {"required": ["prompt"]}, {"required": ["description"]}
+]
+with open(sys.argv[2], "w") as f:
+    json.dump(request, f)
+PY
+unsupported_validation=$("$INFER" --model-id Qwen-Qwen36-35B-A3B \
+    --parse-tool-call "$VALID_TASK_CALL" \
+    --validate-tool-call-request "$UNSUPPORTED_REQUEST" | tail -1)
+if python3 - "$unsupported_validation" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["valid"] is True
+assert any(i["keyword"] == "oneOf" for i in result["unsupported"])
+PY
+then
+    assert_pass "unsupported schema keywords log incomplete validation without false rejection"
+else
+    assert_fail "unsupported schema keywords log incomplete validation without false rejection" \
+        "$unsupported_validation"
+fi
+
 # qwen3_coder dialect: a single <parameters>{json}</parameters> block, closed with
 # </function> and no </tool_call> (as some Qwen3.6 quants emit under greedy). The parser
 # must extract it just like the xml form.

@@ -10557,6 +10557,443 @@ static int request_has_tool_named(ApiRequest *req, const char *name) {
     return 0;
 }
 
+#define MAX_TOOL_VALIDATION_ISSUES 16
+
+typedef struct {
+    char keyword[48];
+    char instance_path[384];
+    char schema_path[384];
+    char message[384];
+} ToolValidationIssue;
+
+typedef struct {
+    ToolValidationIssue errors[MAX_TOOL_VALIDATION_ISSUES];
+    ToolValidationIssue unsupported[MAX_TOOL_VALIDATION_ISSUES];
+    int error_count;
+    int unsupported_count;
+} ToolValidationResult;
+
+static ToolDef *request_tool_named(ApiRequest *req, const char *name) {
+    if (!req || !name || !name[0]) return NULL;
+    for (int i = 0; i < req->tool_count && i < MAX_TOOLS; i++) {
+        if (strcmp(req->tools[i].name, name) == 0) return &req->tools[i];
+    }
+    return NULL;
+}
+
+static void tool_validation_add(ToolValidationIssue *issues, int *count,
+                                const char *keyword, const char *instance_path,
+                                const char *schema_path, const char *format, ...) {
+    if (!issues || !count || *count >= MAX_TOOL_VALIDATION_ISSUES) return;
+    ToolValidationIssue *issue = &issues[(*count)++];
+    snprintf(issue->keyword, sizeof(issue->keyword), "%s", keyword ?: "unknown");
+    snprintf(issue->instance_path, sizeof(issue->instance_path), "%s", instance_path ?: "$");
+    snprintf(issue->schema_path, sizeof(issue->schema_path), "%s", schema_path ?: "$");
+    va_list args;
+    va_start(args, format);
+    vsnprintf(issue->message, sizeof(issue->message), format, args);
+    va_end(args);
+}
+
+static void tool_validation_error(ToolValidationResult *result,
+                                  const char *keyword, const char *instance_path,
+                                  const char *schema_path, const char *format, ...) {
+    if (!result || result->error_count >= MAX_TOOL_VALIDATION_ISSUES) return;
+    ToolValidationIssue *issue = &result->errors[result->error_count++];
+    snprintf(issue->keyword, sizeof(issue->keyword), "%s", keyword ?: "unknown");
+    snprintf(issue->instance_path, sizeof(issue->instance_path), "%s", instance_path ?: "$");
+    snprintf(issue->schema_path, sizeof(issue->schema_path), "%s", schema_path ?: "$");
+    va_list args;
+    va_start(args, format);
+    vsnprintf(issue->message, sizeof(issue->message), format, args);
+    va_end(args);
+}
+
+static void tool_validation_unsupported(ToolValidationResult *result,
+                                        const char *keyword, const char *instance_path,
+                                        const char *schema_path) {
+    if (!result) return;
+    tool_validation_add(result->unsupported, &result->unsupported_count,
+                        keyword, instance_path, schema_path,
+                        "schema keyword '%s' is not evaluated", keyword ?: "unknown");
+}
+
+static int json_number_is_bool(NSNumber *number) {
+    if (!number) return 0;
+    return CFGetTypeID((__bridge CFTypeRef)number) == CFBooleanGetTypeID();
+}
+
+static const char *json_value_type_name(id value) {
+    if (!value || value == [NSNull null]) return "null";
+    if ([value isKindOfClass:[NSDictionary class]]) return "object";
+    if ([value isKindOfClass:[NSArray class]]) return "array";
+    if ([value isKindOfClass:[NSString class]]) return "string";
+    if ([value isKindOfClass:[NSNumber class]]) {
+        if (json_number_is_bool(value)) return "boolean";
+        double d = [value doubleValue];
+        return floor(d) == d ? "integer" : "number";
+    }
+    return "unknown";
+}
+
+static int json_value_matches_type(id value, NSString *type) {
+    if (![type isKindOfClass:[NSString class]]) return 0;
+    if ([type isEqualToString:@"null"]) return !value || value == [NSNull null];
+    if ([type isEqualToString:@"object"]) return [value isKindOfClass:[NSDictionary class]];
+    if ([type isEqualToString:@"array"]) return [value isKindOfClass:[NSArray class]];
+    if ([type isEqualToString:@"string"]) return [value isKindOfClass:[NSString class]];
+    if ([type isEqualToString:@"boolean"]) {
+        return [value isKindOfClass:[NSNumber class]] && json_number_is_bool(value);
+    }
+    if ([type isEqualToString:@"number"]) {
+        return [value isKindOfClass:[NSNumber class]] && !json_number_is_bool(value);
+    }
+    if ([type isEqualToString:@"integer"]) {
+        if (![value isKindOfClass:[NSNumber class]] || json_number_is_bool(value)) return 0;
+        double d = [value doubleValue];
+        return isfinite(d) && floor(d) == d;
+    }
+    return 0;
+}
+
+static int json_values_equal(id left, id right) {
+    if ([left isKindOfClass:[NSNumber class]] && [right isKindOfClass:[NSNumber class]] &&
+        json_number_is_bool(left) != json_number_is_bool(right)) {
+        return 0;
+    }
+    return left == right || [left isEqual:right];
+}
+
+static void tool_schema_path(char *dst, size_t dst_size,
+                             const char *base, const char *component) {
+    snprintf(dst, dst_size, "%s.%s", base && base[0] ? base : "$", component ?: "");
+}
+
+static void tool_instance_path(char *dst, size_t dst_size,
+                               const char *base, NSString *component) {
+    snprintf(dst, dst_size, "%s.%s", base && base[0] ? base : "$",
+             component ? [component UTF8String] : "");
+}
+
+static void validate_json_schema_value(id value, id schema,
+                                       const char *instance_path, const char *schema_path,
+                                       ToolValidationResult *result);
+
+static void validate_schema_keywords(NSDictionary *schema,
+                                     const char *instance_path, const char *schema_path,
+                                     ToolValidationResult *result) {
+    static NSSet<NSString *> *known = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        known = [NSSet setWithArray:@[
+            @"$schema", @"$id", @"title", @"description", @"default", @"examples",
+            @"deprecated", @"readOnly", @"writeOnly", @"type", @"enum", @"const",
+            @"properties", @"required", @"additionalProperties", @"items",
+            @"minimum", @"maximum", @"exclusiveMinimum", @"exclusiveMaximum",
+            @"minLength", @"maxLength", @"minItems", @"maxItems",
+            @"minProperties", @"maxProperties"
+        ]];
+    });
+    for (NSString *key in schema) {
+        if (![known containsObject:key]) {
+            char key_path[384];
+            tool_schema_path(key_path, sizeof(key_path), schema_path, [key UTF8String]);
+            tool_validation_unsupported(result, [key UTF8String], instance_path, key_path);
+        }
+    }
+}
+
+static void validate_json_schema_value(id value, id raw_schema,
+                                       const char *instance_path, const char *schema_path,
+                                       ToolValidationResult *result) {
+    if ([raw_schema isKindOfClass:[NSNumber class]] && json_number_is_bool(raw_schema)) {
+        if (![raw_schema boolValue]) {
+            tool_validation_error(result, "false_schema", instance_path, schema_path,
+                                  "value is rejected by a false schema");
+        }
+        return;
+    }
+    if (![raw_schema isKindOfClass:[NSDictionary class]]) {
+        tool_validation_unsupported(result, "schema", instance_path, schema_path);
+        return;
+    }
+    NSDictionary *schema = raw_schema;
+    validate_schema_keywords(schema, instance_path, schema_path, result);
+
+    id expected_type = schema[@"type"];
+    int type_matches = 1;
+    if ([expected_type isKindOfClass:[NSString class]]) {
+        type_matches = json_value_matches_type(value, expected_type);
+    } else if ([expected_type isKindOfClass:[NSArray class]]) {
+        type_matches = 0;
+        for (id candidate in expected_type) {
+            if (json_value_matches_type(value, candidate)) {
+                type_matches = 1;
+                break;
+            }
+        }
+    } else if (expected_type) {
+        char type_path[384];
+        tool_schema_path(type_path, sizeof(type_path), schema_path, "type");
+        tool_validation_unsupported(result, "type", instance_path, type_path);
+    }
+    if (!type_matches) {
+        char type_path[384];
+        tool_schema_path(type_path, sizeof(type_path), schema_path, "type");
+        NSString *expected = [expected_type isKindOfClass:[NSArray class]]
+            ? [expected_type componentsJoinedByString:@"|"] : expected_type;
+        tool_validation_error(result, "type", instance_path, type_path,
+                              "expected %s, got %s", [expected UTF8String],
+                              json_value_type_name(value));
+        return;
+    }
+
+    if (schema[@"const"] && !json_values_equal(schema[@"const"], value)) {
+        char path[384]; tool_schema_path(path, sizeof(path), schema_path, "const");
+        tool_validation_error(result, "const", instance_path, path,
+                              "value does not match the required constant");
+    }
+    NSArray *allowed = schema[@"enum"];
+    if ([allowed isKindOfClass:[NSArray class]]) {
+        int found = 0;
+        for (id candidate in allowed) {
+            if (json_values_equal(candidate, value)) { found = 1; break; }
+        }
+        if (!found) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "enum");
+            tool_validation_error(result, "enum", instance_path, path,
+                                  "value is not one of the allowed enum values");
+        }
+    }
+
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *object = value;
+        NSDictionary *properties = schema[@"properties"];
+        NSArray *required = schema[@"required"];
+        if ([required isKindOfClass:[NSArray class]]) {
+            for (id raw_key in required) {
+                if (![raw_key isKindOfClass:[NSString class]]) continue;
+                if (!object[raw_key]) {
+                    char path[384]; tool_schema_path(path, sizeof(path), schema_path, "required");
+                    tool_validation_error(result, "required", instance_path, path,
+                                          "missing required property '%s'", [raw_key UTF8String]);
+                }
+            }
+        }
+        if ([properties isKindOfClass:[NSDictionary class]]) {
+            for (NSString *key in properties) {
+                id child = object[key];
+                if (!child) continue;
+                char child_instance[384], child_schema[384], property_schema[384];
+                tool_instance_path(child_instance, sizeof(child_instance), instance_path, key);
+                tool_schema_path(property_schema, sizeof(property_schema), schema_path, "properties");
+                tool_schema_path(child_schema, sizeof(child_schema), property_schema, [key UTF8String]);
+                validate_json_schema_value(child, properties[key], child_instance, child_schema, result);
+            }
+        }
+        id additional = schema[@"additionalProperties"];
+        if ([additional isKindOfClass:[NSNumber class]] &&
+            ![additional boolValue] && [properties isKindOfClass:[NSDictionary class]]) {
+            for (NSString *key in object) {
+                if (!properties[key]) {
+                    char child_instance[384], path[384];
+                    tool_instance_path(child_instance, sizeof(child_instance), instance_path, key);
+                    tool_schema_path(path, sizeof(path), schema_path, "additionalProperties");
+                    tool_validation_error(result, "additionalProperties", child_instance, path,
+                                          "unexpected property '%s'", [key UTF8String]);
+                }
+            }
+        } else if ([additional isKindOfClass:[NSDictionary class]] &&
+                   [properties isKindOfClass:[NSDictionary class]]) {
+            char additional_schema[384];
+            tool_schema_path(additional_schema, sizeof(additional_schema),
+                             schema_path, "additionalProperties");
+            for (NSString *key in object) {
+                if (properties[key]) continue;
+                char child_instance[384];
+                tool_instance_path(child_instance, sizeof(child_instance), instance_path, key);
+                validate_json_schema_value(object[key], additional,
+                                           child_instance, additional_schema, result);
+            }
+        } else if (additional && ![additional isKindOfClass:[NSNumber class]]) {
+            char path[384];
+            tool_schema_path(path, sizeof(path), schema_path, "additionalProperties");
+            tool_validation_unsupported(result, "additionalProperties", instance_path, path);
+        }
+        NSNumber *min = schema[@"minProperties"], *max = schema[@"maxProperties"];
+        if ([min isKindOfClass:[NSNumber class]] && [object count] < [min unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "minProperties");
+            tool_validation_error(result, "minProperties", instance_path, path,
+                                  "object has fewer than %lu properties", (unsigned long)[min unsignedIntegerValue]);
+        }
+        if ([max isKindOfClass:[NSNumber class]] && [object count] > [max unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "maxProperties");
+            tool_validation_error(result, "maxProperties", instance_path, path,
+                                  "object has more than %lu properties", (unsigned long)[max unsignedIntegerValue]);
+        }
+    }
+
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSArray *array = value;
+        id items = schema[@"items"];
+        if (items) {
+            char items_schema[384]; tool_schema_path(items_schema, sizeof(items_schema), schema_path, "items");
+            for (NSUInteger i = 0; i < [array count]; i++) {
+                char child_instance[384];
+                snprintf(child_instance, sizeof(child_instance), "%s[%lu]", instance_path,
+                         (unsigned long)i);
+                validate_json_schema_value(array[i], items, child_instance, items_schema, result);
+            }
+        }
+        NSNumber *min = schema[@"minItems"], *max = schema[@"maxItems"];
+        if ([min isKindOfClass:[NSNumber class]] && [array count] < [min unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "minItems");
+            tool_validation_error(result, "minItems", instance_path, path,
+                                  "array has fewer than %lu items", (unsigned long)[min unsignedIntegerValue]);
+        }
+        if ([max isKindOfClass:[NSNumber class]] && [array count] > [max unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "maxItems");
+            tool_validation_error(result, "maxItems", instance_path, path,
+                                  "array has more than %lu items", (unsigned long)[max unsignedIntegerValue]);
+        }
+    }
+
+    if ([value isKindOfClass:[NSString class]]) {
+        NSUInteger length = [value length];
+        NSNumber *min = schema[@"minLength"], *max = schema[@"maxLength"];
+        if ([min isKindOfClass:[NSNumber class]] && length < [min unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "minLength");
+            tool_validation_error(result, "minLength", instance_path, path,
+                                  "string is shorter than %lu characters", (unsigned long)[min unsignedIntegerValue]);
+        }
+        if ([max isKindOfClass:[NSNumber class]] && length > [max unsignedIntegerValue]) {
+            char path[384]; tool_schema_path(path, sizeof(path), schema_path, "maxLength");
+            tool_validation_error(result, "maxLength", instance_path, path,
+                                  "string is longer than %lu characters", (unsigned long)[max unsignedIntegerValue]);
+        }
+    }
+
+    if ([value isKindOfClass:[NSNumber class]] && !json_number_is_bool(value)) {
+        double number = [value doubleValue];
+        struct { NSString *key; int inclusive; int lower; } bounds[] = {
+            {@"minimum", 1, 1}, {@"maximum", 1, 0},
+            {@"exclusiveMinimum", 0, 1}, {@"exclusiveMaximum", 0, 0},
+        };
+        for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+            NSNumber *limit = schema[bounds[i].key];
+            if (![limit isKindOfClass:[NSNumber class]]) continue;
+            double edge = [limit doubleValue];
+            int ok = bounds[i].lower
+                ? (bounds[i].inclusive ? number >= edge : number > edge)
+                : (bounds[i].inclusive ? number <= edge : number < edge);
+            if (!ok) {
+                char path[384];
+                tool_schema_path(path, sizeof(path), schema_path, [bounds[i].key UTF8String]);
+                tool_validation_error(result, [bounds[i].key UTF8String], instance_path, path,
+                                      "numeric value violates %s", [bounds[i].key UTF8String]);
+            }
+        }
+    }
+}
+
+static int validate_parsed_tool_call(ApiRequest *req, const ParsedToolCall *tool_call,
+                                     ToolValidationResult *result) {
+    if (!result) return -1;
+    memset(result, 0, sizeof(*result));
+    ToolDef *tool = request_tool_named(req, tool_call ? tool_call->name : NULL);
+    if (!tool) {
+        tool_validation_error(result, "tool", "$", "$",
+                              "tool is not available in this request");
+        return -1;
+    }
+    if (!tool->has_parameters || !tool->parameters || !tool->parameters[0]) return 0;
+
+    NSData *schema_data = [NSData dataWithBytes:tool->parameters length:strlen(tool->parameters)];
+    NSError *schema_error = nil;
+    id schema = [NSJSONSerialization JSONObjectWithData:schema_data
+                                                options:NSJSONReadingFragmentsAllowed
+                                                  error:&schema_error];
+    if (!schema) {
+        tool_validation_unsupported(result, "schema", "$", "$");
+        return 0;
+    }
+
+    const char *arguments = tool_call && tool_call->arguments ? tool_call->arguments : "{}";
+    NSData *arguments_data = [NSData dataWithBytes:arguments length:strlen(arguments)];
+    NSError *arguments_error = nil;
+    id value = [NSJSONSerialization JSONObjectWithData:arguments_data
+                                               options:NSJSONReadingFragmentsAllowed
+                                                 error:&arguments_error];
+    if (!value) {
+        tool_validation_error(result, "json", "$", "$",
+                              "tool arguments are not valid JSON");
+        return -1;
+    }
+    validate_json_schema_value(value, schema, "$", "$", result);
+    return result->error_count == 0 ? 0 : -1;
+}
+
+static NSString *tool_validation_json(const char *request_id, const char *tool_name,
+                                      const ToolValidationResult *result, const char *action) {
+    NSMutableArray *errors = [NSMutableArray array];
+    NSMutableArray *unsupported = [NSMutableArray array];
+    for (int i = 0; result && i < result->error_count; i++) {
+        const ToolValidationIssue *issue = &result->errors[i];
+        [errors addObject:@{
+            @"keyword": [NSString stringWithUTF8String:issue->keyword],
+            @"instance_path": [NSString stringWithUTF8String:issue->instance_path],
+            @"schema_path": [NSString stringWithUTF8String:issue->schema_path],
+            @"message": [NSString stringWithUTF8String:issue->message],
+        }];
+    }
+    for (int i = 0; result && i < result->unsupported_count; i++) {
+        const ToolValidationIssue *issue = &result->unsupported[i];
+        [unsupported addObject:@{
+            @"keyword": [NSString stringWithUTF8String:issue->keyword],
+            @"instance_path": [NSString stringWithUTF8String:issue->instance_path],
+            @"schema_path": [NSString stringWithUTF8String:issue->schema_path],
+            @"message": [NSString stringWithUTF8String:issue->message],
+        }];
+    }
+    NSDictionary *payload = @{
+        @"request_id": [NSString stringWithUTF8String:request_id ?: ""],
+        @"tool": [NSString stringWithUTF8String:tool_name ?: ""],
+        @"action": [NSString stringWithUTF8String:action ?: "validate"],
+        @"valid": [NSNumber numberWithBool:(!result || result->error_count == 0)],
+        @"errors": errors,
+        @"unsupported": unsupported,
+    };
+    return json_stringify_obj(payload);
+}
+
+static void log_tool_validation(const char *request_id, const char *tool_name,
+                                const ToolValidationResult *result, const char *action,
+                                const char *raw_tool_call, int attempt) {
+    if (!result) return;
+    for (int i = 0; i < result->error_count; i++) {
+        const ToolValidationIssue *issue = &result->errors[i];
+        server_log_errorf("[serve] %s invalid tool_call name=%s attempt=%d keyword=%s instance=%s schema=%s action=%s detail=%s\n",
+                          request_id, tool_name, attempt, issue->keyword,
+                          issue->instance_path, issue->schema_path, action, issue->message);
+    }
+    for (int i = 0; i < result->unsupported_count; i++) {
+        const ToolValidationIssue *issue = &result->unsupported[i];
+        server_log_errorf("[serve] %s tool_call validation_incomplete name=%s keyword=%s schema=%s action=%s\n",
+                          request_id, tool_name, issue->keyword, issue->schema_path, action);
+    }
+    NSString *json = tool_validation_json(request_id, tool_name, result, action);
+    server_http_log_block(request_id, "internal", "tool_call.validation", [json UTF8String]);
+    if (g_server_debug_enabled) {
+        char suffix[96];
+        snprintf(suffix, sizeof(suffix), "tool_call_validation_%d.json", attempt);
+        server_debug_write_text(request_id, suffix, [json UTF8String]);
+        if (result->error_count > 0 && raw_tool_call) {
+            snprintf(suffix, sizeof(suffix), "tool_call_invalid_%d.txt", attempt);
+            server_debug_write_text(request_id, suffix, raw_tool_call);
+        }
+    }
+}
+
 static int parse_reasoning_value(id value, int fallback) {
     if (!value || value == [NSNull null]) return fallback;
     if ([value isKindOfClass:[NSNumber class]]) return [value boolValue] ? 1 : 0;
@@ -11986,6 +12423,91 @@ static int parse_tool_call_from_buffer(const char *tool_call_buf, ParsedToolCall
     return 1;
 }
 
+static char *build_tool_validation_retry_turn(const char *tool_name,
+                                              const ToolValidationResult *result,
+                                              int reasoning_enabled,
+                                              int force_tool) {
+    NSMutableString *turn = [NSMutableString stringWithFormat:
+        @"<|im_end|>\n<|im_start|>user\n<tool_response>\n"
+         "The generated call to '%s' was rejected before execution because its arguments did not match the supplied schema.\n"
+         "Correct every validation error and call the function again. Do not repeat the invalid call.\n",
+        tool_name ?: "unknown"];
+    for (int i = 0; result && i < result->error_count; i++) {
+        const ToolValidationIssue *issue = &result->errors[i];
+        [turn appendFormat:@"- %s at %s: %s\n",
+                           issue->keyword, issue->instance_path, issue->message];
+    }
+    [turn appendString:@"</tool_response><|im_end|>\n<|im_start|>assistant\n"];
+    if (g_cfg.thinking_capable) {
+        if (force_tool) {
+            [turn appendString:@"<think>\n\n</think>\n\n"];
+        } else if (reasoning_enabled) {
+            [turn appendString:
+                @"<think>\nThe previous tool call failed local schema validation. I need to correct the listed arguments before calling it again.\n"];
+        } else {
+            [turn appendString:@"<think>\n\n</think>\n\n"];
+        }
+    }
+    if (force_tool) {
+        [turn appendFormat:@"<tool_call>\n<function=%s>\n", tool_name ?: "unknown"];
+    }
+    return dup_nsstring(turn);
+}
+
+static int append_tool_validation_retry_context(WeightFile *wf,
+                                                const char *tool_name,
+                                                const ToolValidationResult *result,
+                                                int reasoning_enabled,
+                                                int force_tool,
+                                                int current_token,
+                                                int *pos_io,
+                                                float *hidden,
+                                                float *logits,
+                                                KVCache **kv_caches,
+                                                void **layer_states,
+                                                int *layer_fds,
+                                                void **layer_mmaps,
+                                                int K) {
+    if (!wf || !result || !pos_io || !hidden || !logits) return -1;
+    char *turn = build_tool_validation_retry_turn(tool_name, result, reasoning_enabled, force_tool);
+    if (!turn) return -1;
+    PromptTokens *retry = encode_prompt_text_to_tokens(turn);
+    free(turn);
+    if (!retry) return -1;
+    if (*pos_io + retry->count + 1 > GPU_KV_SEQ) {
+        free(retry->ids);
+        free(retry);
+        return -1;
+    }
+
+    embed_lookup(wf, current_token, hidden);
+    prod_forward_1(wf, hidden, *pos_io, kv_caches,
+                   (LinearAttnState **)layer_states, layer_fds, layer_mmaps, K, logits);
+    (*pos_io)++;
+    for (int i = 0; i < retry->count; i++) {
+        embed_lookup(wf, retry->ids[i], hidden);
+        prod_forward_1(wf, hidden, *pos_io, kv_caches,
+                       (LinearAttnState **)layer_states, layer_fds, layer_mmaps, K, logits);
+        (*pos_io)++;
+    }
+    free(retry->ids);
+    free(retry);
+    return 0;
+}
+
+static NSString *tool_validation_terminal_message(const char *tool_name,
+                                                  const ToolValidationResult *result) {
+    if (!result || result->error_count == 0) {
+        return [NSString stringWithFormat:
+            @"I could not produce valid arguments for the '%s' tool after one correction attempt.",
+            tool_name ?: "requested"];
+    }
+    const ToolValidationIssue *issue = &result->errors[0];
+    return [NSString stringWithFormat:
+        @"I could not produce valid arguments for the '%s' tool after one correction attempt: %s.",
+        tool_name ?: "requested", issue->message];
+}
+
 static char *read_text_file_alloc(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -12134,7 +12656,7 @@ static int render_request_debug(const char *request_path, const char *output_dir
     return 0;
 }
 
-static int parse_tool_call_debug(const char *path) {
+static int parse_tool_call_debug(const char *path, const char *request_path) {
     char *buf = read_text_file_alloc(path);
     if (!buf) {
         fprintf(stderr, "ERROR: cannot read tool-call text: %s\n", path);
@@ -12147,6 +12669,52 @@ static int parse_tool_call_debug(const char *path) {
         free(buf);
         return 1;
     }
+    if (request_path) {
+        char *body = read_text_file_alloc(request_path);
+        if (!body) {
+            fprintf(stderr, "ERROR: cannot read tool schema request: %s\n", request_path);
+            parsed_tool_call_free(&parsed);
+            free(buf);
+            return 1;
+        }
+        NSError *json_error = nil;
+        NSDictionary *root = parse_json_body(body, &json_error);
+        if (!root) {
+            fprintf(stderr, "ERROR: invalid tool schema request JSON: %s\n",
+                    json_error ? [[json_error localizedDescription] UTF8String] : "invalid JSON");
+            free(body);
+            parsed_tool_call_free(&parsed);
+            free(buf);
+            return 1;
+        }
+        ApiRequest req;
+        api_request_init(&req, root[@"messages"] ? API_KIND_CHAT : API_KIND_RESPONSES);
+        char *request_error = NULL;
+        int parse_rc = root[@"messages"]
+            ? fill_request_from_chat_json(root, &req, &request_error)
+            : fill_request_from_responses_json(root, &req, &request_error);
+        if (parse_rc < 0) {
+            fprintf(stderr, "ERROR: cannot parse tool schema request: %s\n",
+                    request_error ?: "invalid request");
+            free(request_error);
+            api_request_free(&req);
+            free(body);
+            parsed_tool_call_free(&parsed);
+            free(buf);
+            return 1;
+        }
+        ToolValidationResult validation;
+        int validation_rc = validate_parsed_tool_call(&req, &parsed, &validation);
+        NSString *json = tool_validation_json("debug", parsed.name, &validation,
+                                              validation_rc == 0 ? "emit" : "reject");
+        printf("%s\n", [json UTF8String]);
+        api_request_free(&req);
+        free(body);
+        parsed_tool_call_free(&parsed);
+        free(buf);
+        return validation_rc == 0 ? 0 : 2;
+    }
+
     char escaped_name[256];
     char *escaped_args = json_escape_alloc(parsed.arguments ?: "{}");
     if (!escaped_args) {
@@ -14706,7 +15274,15 @@ static void serve_loop(
         }
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
-        int mtp_shadow_available = mtp_can_shadow_draft();  // MTP enabled AND artifacts present (load-time resolved)
+        int mtp_requested_for_decode = mtp_can_shadow_draft();
+        // A schema-repair turn is appended directly to the live KV/state after a
+        // rejected call. Speculative decode may already have committed tokens beyond
+        // the call currently being emitted, so tool-bearing requests use the faithful
+        // one-token path until speculative rollback spans the complete runtime state.
+        int mtp_shadow_available = mtp_requested_for_decode && !active_tools;
+        if (mtp_requested_for_decode && active_tools) {
+            server_log_errorf("[mtp] %s inactive for schema-safe tool decode\n", request_id);
+        }
         int mtp_shadow_hits = 0;     // drafts accepted (real speculative decode)
         int mtp_shadow_checks = 0;   // drafts verified
         int mtp_pos_checks[8] = {0}; // per-position: how many times we checked that position
@@ -14811,6 +15387,8 @@ static void serve_loop(
         int gen_token_count = 0;
         ParsedToolCall parsed_tool_call;
         memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
+        int tool_validation_attempts = 0;
+        int tool_validation_terminal = 0;
         int gen_count = 0;
         int response_tokens = 0;
         double t_gen = t_first_token;
@@ -14923,6 +15501,89 @@ static void serve_loop(
                             if (tool_call_buf) tool_call_buf[0] = '\0';
                             saw_tool_call_start = 0;
                             goto tool_call_checked;
+                        }
+                        ToolValidationResult validation;
+                        int validation_rc = validate_parsed_tool_call(&req, &parsed_tool_call, &validation);
+                        if (validation_rc < 0) {
+                            int attempt = tool_validation_attempts + 1;
+                            const char *action = tool_validation_attempts == 0 ? "retry" : "stop";
+                            log_tool_validation(request_id, parsed_tool_call.name, &validation,
+                                                action, tool_call_buf, attempt);
+                            if (tool_validation_attempts == 0) {
+                                char retry_tool_name[MAX_TOOL_NAME];
+                                snprintf(retry_tool_name, sizeof(retry_tool_name), "%s", parsed_tool_call.name);
+                                tool_validation_attempts++;
+                                gen_count++;
+                                int force_retry_tool =
+                                    req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0];
+                                if (append_tool_validation_retry_context(
+                                        wf, retry_tool_name, &validation, req.reasoning_enabled,
+                                        force_retry_tool,
+                                        next_token, &pos, hidden, logits, kv_caches, layer_states,
+                                        layer_fds, layer_mmaps, K) == 0) {
+                                    parsed_tool_call_free(&parsed_tool_call);
+                                    memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
+                                    tool_call_len = 0;
+                                    if (tool_call_buf) tool_call_buf[0] = '\0';
+                                    saw_tool_call_start = 0;
+                                    if (force_retry_tool) {
+                                        char prefix[256];
+                                        int prefix_len = snprintf(prefix, sizeof(prefix),
+                                            "<tool_call>\n<function=%s>\n", retry_tool_name);
+                                        append_bytes(&tool_call_buf, &tool_call_len,
+                                                     &tool_call_cap, prefix, (size_t)prefix_len);
+                                        saw_tool_call_start = 1;
+                                    }
+                                    gen_resp_len = 0;
+                                    gen_response[0] = '\0';
+                                    gen_reasoning_len = 0;
+                                    gen_reasoning[0] = '\0';
+                                    gen_token_count = 0;
+                                    response_tokens = 0;
+                                    think_tokens = 0;
+                                    think_budget_hit = 0;
+                                    t_first_response = 0.0;
+                                    in_think = g_cfg.thinking_capable && req.reasoning_enabled &&
+                                               !force_retry_tool;
+                                    float retry_temperature =
+                                        (g_tool_call_greedy_enabled && saw_tool_call_start)
+                                        ? 0.0f : req.temperature;
+                                    next_token = pick_next_token(
+                                        logits, g_cfg.vocab_size, retry_temperature, req.top_p,
+                                        req.top_k, req.min_p, effective_presence_penalty,
+                                        effective_repetition_penalty, token_counts,
+                                        req.reasoning_enabled);
+                                    server_log_errorf("[serve] %s tool_call correction retry name=%s pos=%d\n",
+                                                      request_id, retry_tool_name, pos);
+                                    continue;
+                                }
+                                server_log_errorf("[serve] %s tool_call correction context failed name=%s action=stop\n",
+                                                  request_id, retry_tool_name);
+                            }
+
+                            NSString *terminal = tool_validation_terminal_message(parsed_tool_call.name, &validation);
+                            const char *terminal_utf8 = [terminal UTF8String];
+                            snprintf(gen_response, 262144, "%s", terminal_utf8 ?: "Tool call validation failed.");
+                            gen_resp_len = (int)strlen(gen_response);
+                            gen_reasoning_len = 0;
+                            gen_reasoning[0] = '\0';
+                            parsed_tool_call_free(&parsed_tool_call);
+                            memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
+                            tool_validation_terminal = 1;
+                            if (req.stream) {
+                                int rc = is_chat
+                                    ? sse_send_delta(client_fd, request_id, gen_response)
+                                    : sse_send_response_text_delta(client_fd, request_id, gen_response);
+                                if (rc < 0) {
+                                    server_log_errorf("[serve] %s client disconnected during tool validation failure\n",
+                                                      request_id);
+                                }
+                            }
+                            break;
+                        }
+                        if (validation.unsupported_count > 0) {
+                            log_tool_validation(request_id, parsed_tool_call.name, &validation,
+                                                "emit", tool_call_buf, tool_validation_attempts + 1);
                         }
                         static int tool_call_counter = 0;
                         snprintf(parsed_tool_call.id, sizeof(parsed_tool_call.id), "call_%d", ++tool_call_counter);
@@ -15229,6 +15890,11 @@ tool_call_checked:
             server_debug_write_text(request_id, "tool_probe_buf.txt", tool_call_buf);
         }
 
+        if (tool_validation_terminal) {
+            server_log_errorf("[serve] %s tool_call validation exhausted after %d correction attempt\n",
+                              request_id, tool_validation_attempts);
+        }
+
         char *final_json = is_chat
             ? build_chat_completion_json(request_id, req.model, gen_response, gen_reasoning, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL)
             : build_responses_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL);
@@ -15359,6 +16025,7 @@ enum {
     OPT_RENDER_OUTPUT,
     OPT_RENDER_KIND,
     OPT_PARSE_TOOL_CALL,
+    OPT_VALIDATE_TOOL_CALL_REQUEST,
     OPT_CACHE_ROUNDTRIP_TEST,
     OPT_MTP,
     OPT_NO_MTP,
@@ -15397,6 +16064,7 @@ static void print_usage(const char *prog) {
     printf("  --render-output DIR  Directory for --render-request debug files\n");
     printf("  --render-kind KIND   Render kind: auto, chat, responses (default: auto)\n");
     printf("  --parse-tool-call F  Parse native XML tool-call text and exit\n");
+    printf("  --validate-tool-call-request F  Validate --parse-tool-call against request schemas\n");
     printf("  --cache-roundtrip-test  Run synthetic disk-cache save/load roundtrip self-test and exit\n");
     printf("  --mtp                Enable experimental multi-token prediction artifact path\n");
     printf("  --no-mtp             Disable experimental multi-token prediction (default)\n");
@@ -15427,6 +16095,7 @@ int main(int argc, char **argv) {
         const char *render_output_dir = NULL;
         const char *render_kind = "auto";
         const char *parse_tool_call_path = NULL;
+        const char *validate_tool_call_request_path = NULL;
         int cache_roundtrip_test_requested = 0;
         int mtp_preflight_requested = 0;
         int mtp_bench_matmul_requested = 0;
@@ -15650,6 +16319,7 @@ int main(int argc, char **argv) {
             {"render-output",  required_argument, 0, OPT_RENDER_OUTPUT},
             {"render-kind",    required_argument, 0, OPT_RENDER_KIND},
             {"parse-tool-call", required_argument, 0, OPT_PARSE_TOOL_CALL},
+            {"validate-tool-call-request", required_argument, 0, OPT_VALIDATE_TOOL_CALL_REQUEST},
             {"cache-roundtrip-test", no_argument,  0, OPT_CACHE_ROUNDTRIP_TEST},
             {"mtp",           no_argument,       0, OPT_MTP},
             {"no-mtp",        no_argument,       0, OPT_NO_MTP},
@@ -15698,6 +16368,7 @@ int main(int argc, char **argv) {
                 case OPT_RENDER_OUTPUT: render_output_dir = optarg; break;
                 case OPT_RENDER_KIND: render_kind = optarg; break;
                 case OPT_PARSE_TOOL_CALL: parse_tool_call_path = optarg; break;
+                case OPT_VALIDATE_TOOL_CALL_REQUEST: validate_tool_call_request_path = optarg; break;
                 case OPT_CACHE_ROUNDTRIP_TEST: cache_roundtrip_test_requested = 1; break;
                 case OPT_MTP: g_mtp_predictions = 1; break;
                 case OPT_NO_MTP: g_mtp_predictions = 0; break;
@@ -15849,7 +16520,7 @@ int main(int argc, char **argv) {
         }
 
         if (parse_tool_call_path) {
-            return parse_tool_call_debug(parse_tool_call_path);
+            return parse_tool_call_debug(parse_tool_call_path, validate_tool_call_request_path);
         }
         if (render_request_path) {
             return render_request_debug(render_request_path, render_output_dir, render_kind);
