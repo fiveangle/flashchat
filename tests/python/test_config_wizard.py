@@ -13,7 +13,21 @@ sys.path.insert(0, REPO_ROOT)
 
 from modelmgr import configfile
 from modelmgr.registry import Registry
-from modelmgr.tui import config_wizard
+from modelmgr.tui import common, config_wizard
+
+
+class TestClearablePrompt(unittest.TestCase):
+    def test_return_keeps_current_value(self):
+        with patch("builtins.input", return_value=""):
+            self.assertEqual(common.prompt_clearable("Optional", "0.95"), "0.95")
+
+    def test_off_clears_current_value(self):
+        with patch("builtins.input", return_value="off"):
+            self.assertEqual(common.prompt_clearable("Optional", "0.95"), "")
+
+    def test_off_is_case_insensitive(self):
+        with patch("builtins.input", return_value="OFF"):
+            self.assertEqual(common.prompt_clearable("Optional", "0.95"), "")
 
 
 class TestConfigWizardCustomProfile(unittest.TestCase):
@@ -118,6 +132,31 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
         self.assertIn("saved K=32 exceeds runtime max 16; using 16", out.getvalue())
         self.assertIn("Active experts (K, default 8, max 16) [16]:", out.getvalue())
         self.assertEqual(changes["ACTIVE_EXPERTS"], "16")
+
+    def test_advanced_optional_values_can_be_cleared(self):
+        with open(self.config_path, "a") as f:
+            f.write('ADAPTIVE_K_MASS="0.95"\n')
+            f.write('PREAD_PROFILE="/tmp/pread.tsv"\n')
+            f.write('EXPERT_PIN_MAX_EXPERTS="2560"\n')
+        manifest = self.registry.get("qwen3.6-35b-a3b")
+
+        def reply(message, default=""):
+            if message.startswith("Adaptive expert count"):
+                return "off"
+            if message.startswith("Disk-read timing log"):
+                return "off"
+            if message.startswith("Expert RAM cache target"):
+                return "auto"
+            return default
+
+        with patch.object(config_wizard.common, "confirm", return_value=True), \
+                patch.object(config_wizard.common, "prompt", side_effect=reply), \
+                redirect_stdout(io.StringIO()):
+            changes = config_wizard._advanced_settings(manifest, "q4")
+
+        self.assertEqual(changes["ADAPTIVE_K_MASS"], "")
+        self.assertEqual(changes["PREAD_PROFILE"], "")
+        self.assertEqual(changes["EXPERT_PIN_MAX_EXPERTS"], "")
 
 
 if __name__ == "__main__":

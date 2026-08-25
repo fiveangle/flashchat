@@ -477,13 +477,13 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
              "Short prompts run the exact GPU path (measured faster AND bit-faithful); long prompts keep the Neural Engine overlap."),
             ("FUSE_LINEAR", "Fused GPU scheduling for linear-attention layers (0/1)", "1",
              "~12% faster generation with byte-identical outputs; disable only for A/B comparisons."),
-            ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (empty=off, or 0.85-0.99)", "",
+            ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (off, or 0.85-0.99)", "",
              "Skips tail experts below this probability mass: ~0.90 reads ~13% fewer expert bytes; outputs can differ slightly."),
             ("PREFILL_DEBUG", "  ^ debug (0=off, 1=chunk timings, 2=+state dump, slow)", "0", None),
-            ("PREAD_PROFILE", "Disk-read timing log (empty=off, or a .tsv path)", "",
+            ("PREAD_PROFILE", "Disk-read timing log (off, or a .tsv path)", "",
              "For diagnosing slow expert streaming; analyze with tools/pread_profile_analyze.py."),
             ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", "2097152", None),
-            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (empty=use GiB cap)", "",
+            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (auto=use GiB cap)", "",
              None),
             ("EXPERT_PIN_MAX_GB", "  ^ maximum GiB cache limit (0 disables cache)", "4",
              None),
@@ -507,7 +507,13 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
             print(common.dim(f"  {help_text}"))
         if key == "EXPERT_PIN_MAX_EXPERTS":
             _expert_pin_guidance(manifest, variant_name, active_experts)
-        value = common.prompt(label, configfile.get(key, default))
+        if key in ("ADAPTIVE_K_MASS", "PREAD_PROFILE"):
+            value = common.prompt_clearable(label, configfile.get(key, default))
+        elif key == "EXPERT_PIN_MAX_EXPERTS":
+            value = common.prompt_clearable(
+                label, configfile.get(key, default), clear_word="auto")
+        else:
+            value = common.prompt(label, configfile.get(key, default))
         if key == "MTP":
             mtp_raw = value
             if value.lower() == "auto":

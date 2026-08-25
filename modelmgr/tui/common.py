@@ -40,6 +40,14 @@ def prompt(message: str, default: str = "") -> str:
     return reply or default
 
 
+def prompt_clearable(message: str, default: str = "", clear_word: str = "off") -> str:
+    """Prompt for an optional value while keeping Return as "use current"."""
+    value = prompt(message, default)
+    if value.lower() == clear_word.lower():
+        return ""
+    return value
+
+
 def confirm(message: str, default: bool = True) -> bool:
     hint = "[Y/n]" if default else "[y/N]"
     try:
