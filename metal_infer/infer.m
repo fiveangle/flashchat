@@ -462,6 +462,9 @@ typedef struct {
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
+// Decode-path lm_head wall time (accumulated across generated tokens when --timing).
+static double g_lm_head_ms_sum = 0;
+static int g_lm_head_ms_count = 0;
 // MTP profiling buckets (ms): GPU matmulN (commit+wait), CPU full-attn, GPU delta-net.
 static double g_prof_matmulN = 0, g_prof_attncpu = 0, g_prof_delta = 0;
 static double g_prof_mtp_layers = 0, g_prof_mtp_norm = 0, g_prof_mtp_head = 0;
@@ -834,6 +837,11 @@ static void timing_print(void) {
     fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
     fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
+    if (g_lm_head_ms_count > 0) {
+        fprintf(stderr, "  lm_head_avg:    %6.3f  (%d calls, total %.1f ms)\n",
+                g_lm_head_ms_sum / g_lm_head_ms_count,
+                g_lm_head_ms_count, g_lm_head_ms_sum);
+    }
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
              g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn +
@@ -1040,6 +1048,8 @@ typedef struct {
     void *data;
     size_t size;
     TensorManifest *manifest;
+    void *lm_head_lock_base;   // page-aligned base of mlock'd lm_head span (NULL if unlocked)
+    size_t lm_head_lock_len;   // bytes actually mlock'd
 } WeightFile;
 
 typedef struct {
@@ -1121,8 +1131,9 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
         return NULL;
     }
 
-    // Advise sequential access
-    madvise(data, size, MADV_SEQUENTIAL);
+    // Non-expert weights are touched randomly per layer during decode; sequential
+    // advice fights the actual access pattern and can push lm_head out under pressure.
+    madvise(data, size, MADV_RANDOM);
 
     TensorManifest *manifest = load_manifest(json_path);
     if (!manifest) {
@@ -1134,9 +1145,94 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     wf->data = data;
     wf->size = size;
     wf->manifest = manifest;
+    wf->lm_head_lock_base = NULL;
+    wf->lm_head_lock_len = 0;
 
     printf("[weights] mmap'd %.2f GB from %s\n", size / 1e9, bin_path);
     return wf;
+}
+
+// Reserve this much reclaimable RAM after any mlock so the OS + working set
+// are not forced into swap. Shared by lm_head and expert-pin mlock paths.
+static const size_t k_mlock_headroom_bytes = 512ull << 20;  // 512 MiB
+
+static size_t host_free_ram_bytes(void);  // defined with expert-pin helpers
+
+// Pin lm_head (weight+scales+biases) into RAM so expert SSD traffic cannot
+// reclaim the vocab projection under memory pressure. Default ON
+// (FLASHCHAT_LM_HEAD_MLOCK=0 to disable). Abandons mlock (keeps purgeable +
+// MADV_WILLNEED) when free RAM cannot cover the span plus headroom, or when
+// mlock itself fails — never forces the machine into swap to lock.
+static void lm_head_try_mlock(WeightFile *wf) {
+    if (!wf || !wf->data || !wf->manifest) return;
+    const char *env = getenv("FLASHCHAT_LM_HEAD_MLOCK");
+    // Empty string = unset/default (config bridge). Explicit 0/off/false disables.
+    int want = 1;
+    if (env && env[0]) {
+        if (!strcmp(env, "0") || !strcasecmp(env, "off") || !strcasecmp(env, "false"))
+            want = 0;
+    }
+    if (!want) {
+        fprintf(stderr, "[lm-head] mlock disabled by FLASHCHAT_LM_HEAD_MLOCK\n");
+        return;
+    }
+
+    TensorInfo *w = find_tensor(wf->manifest, "lm_head.weight");
+    TensorInfo *s = find_tensor(wf->manifest, "lm_head.scales");
+    TensorInfo *b = find_tensor(wf->manifest, "lm_head.biases");
+    if (!w || !s || !b) {
+        fprintf(stderr, "[lm-head] tensors missing — skip mlock\n");
+        return;
+    }
+
+    size_t start = w->offset;
+    if (s->offset < start) start = s->offset;
+    if (b->offset < start) start = b->offset;
+    size_t end = w->offset + w->size;
+    if (s->offset + s->size > end) end = s->offset + s->size;
+    if (b->offset + b->size > end) end = b->offset + b->size;
+    if (end > wf->size) end = wf->size;
+    if (end <= start) return;
+
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t base_off = start & ~(page - 1);
+    size_t end_off = (end + page - 1) & ~(page - 1);
+    if (end_off > wf->size) end_off = wf->size;
+    size_t len = end_off - base_off;
+    void *base = (char *)wf->data + base_off;
+
+    size_t free_ram = host_free_ram_bytes();
+    if (free_ram < len + k_mlock_headroom_bytes) {
+        fprintf(stderr, "[lm-head] mlock skipped — need %.1f MiB + %.0f MiB headroom, "
+                "only %.1f MiB free; leaving purgeable (MADV_WILLNEED)\n",
+                len / (1024.0 * 1024.0),
+                k_mlock_headroom_bytes / (1024.0 * 1024.0),
+                free_ram / (1024.0 * 1024.0));
+        madvise(base, len, MADV_WILLNEED);
+        return;
+    }
+
+    // Touch once so pages are faulted before mlock (mlock of untouched MAP_PRIVATE
+    // can still pay the fault on first real use on some kernels).
+    volatile char sink = 0;
+    for (size_t off = 0; off < len; off += page)
+        sink ^= *((volatile char *)base + off);
+    (void)sink;
+
+    if (mlock(base, len) != 0) {
+        fprintf(stderr, "[lm-head] mlock failed (%s) — %.1f MiB left purgeable (MADV_WILLNEED)\n",
+                strerror(errno), len / (1024.0 * 1024.0));
+        madvise(base, len, MADV_WILLNEED);
+        return;
+    }
+    wf->lm_head_lock_base = base;
+    wf->lm_head_lock_len = len;
+    fprintf(stderr, "[lm-head] mlock'd %.1f MiB (offset %.1f–%.1f MiB in weight file, "
+            "free RAM was %.1f GiB)\n",
+            len / (1024.0 * 1024.0),
+            base_off / (1024.0 * 1024.0),
+            end_off / (1024.0 * 1024.0),
+            free_ram / (1024.0 * 1024.0 * 1024.0));
 }
 
 static void *get_tensor_ptr(WeightFile *wf, const char *name) {
@@ -4468,79 +4564,75 @@ static void gpu_encode_expert_forward_slot_buf(
     }
 }
 
-// Batched expert encoding: encode K experts using 2 encoders per expert
-// (gate+up fused, SwiGLU+down fused) + 2 for shared = K*2 + 2 encoders total.
-// With K=4: 10 encoders (vs. old 4*K + 2 = 18 with per-operation encoding).
-// Each expert gets its own encoder pair for GPU parallelism across experts.
-// Within each encoder, gate+up (or SwiGLU+down) are serialized but share
-// encoder creation overhead. Net win: fewer encoders, same parallelism.
-static void gpu_encode_experts_batched_from(
+// Expert layout: [gate_w/s/b | up_w/s/b | down_w/s/b]. gate+up is a contiguous
+// prefix ending at down_w_off (≈66.7% of expert_size). Split-IO overlaps the
+// down pread with gate+up+SwiGLU GPU work (FLASHCHAT_EXPERT_SPLIT_IO=1).
+static inline size_t expert_gate_up_bytes(void) {
+    return (size_t)g_cfg.down_w_off;
+}
+
+static int g_expert_split_io = -1;
+static inline int expert_split_io_enabled(void) {
+    if (g_expert_split_io < 0) {
+        // Default ON. Empty string (config bridge of unset key) = default.
+        // Explicit 0/off/false disables.
+        const char *e = getenv("FLASHCHAT_EXPERT_SPLIT_IO");
+        int on = 1;
+        if (e && e[0] &&
+            (!strcmp(e, "0") || !strcasecmp(e, "off") || !strcasecmp(e, "false")))
+            on = 0;
+        g_expert_split_io = on;
+    }
+    return g_expert_split_io;
+}
+
+// Phase A: gate_proj + up_proj + SwiGLU per expert (needs only gate+up weights).
+static void gpu_encode_experts_gate_up_swiglu(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
-    int K,                       // number of experts to encode
-    const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs,   // per-expert weight data buffers [MAX_K]
-    id<MTLBuffer> expert_input             // routed input [hidden_dim]
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs,
+    id<MTLBuffer> expert_input
 ) {
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    gate_w_off = 0;
-    gate_s_off = g_cfg.gate_w_size;
-    gate_b_off = gate_s_off + g_cfg.gate_s_size;
-    up_w_off   = gate_b_off + g_cfg.gate_b_size;
-    up_s_off   = up_w_off + g_cfg.up_w_size;
-    up_b_off   = up_s_off + g_cfg.up_s_size;
-    down_w_off = up_b_off + g_cfg.up_b_size;
-    down_s_off = down_w_off + g_cfg.down_w_size;
-    down_b_off = down_s_off + g_cfg.down_s_size;
+    NSUInteger gate_w_off = 0;
+    NSUInteger gate_s_off = g_cfg.gate_w_size;
+    NSUInteger gate_b_off = gate_s_off + g_cfg.gate_s_size;
+    NSUInteger up_w_off   = gate_b_off + g_cfg.gate_b_size;
+    NSUInteger up_s_off   = up_w_off + g_cfg.up_w_size;
+    NSUInteger up_b_off   = up_s_off + g_cfg.up_s_size;
     id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
-
     uint32_t gate_up_out = g_cfg.moe_intermediate;
     uint32_t gate_up_in  = g_cfg.hidden_dim;
-    uint32_t down_out    = g_cfg.hidden_dim;
-    uint32_t down_in     = g_cfg.moe_intermediate;
     uint32_t gs          = g_cfg.group_size;
-    // Threadgroup count is based on out_dim; the kernel handles packed columns internally.
     uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
-    uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
-    // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
-    // Separate encoders per expert enables GPU parallelism across experts.
-    // Within each encoder, operations serialize (gate then up, SwiGLU then down).
     for (int k = 0; k < K; k++) {
         if (!valid[k]) continue;
-
-        // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // gate_proj
             [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
-            [enc setBuffer:expert_input                   offset:0           atIndex:3];
-            [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
+            [enc setBuffer:expert_bufs[k]                offset:gate_w_off atIndex:0];
+            [enc setBuffer:expert_bufs[k]                offset:gate_s_off atIndex:1];
+            [enc setBuffer:expert_bufs[k]                offset:gate_b_off atIndex:2];
+            [enc setBuffer:expert_input                  offset:0          atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0          atIndex:4];
             [enc setBytes:&gate_up_out length:4 atIndex:5];
             [enc setBytes:&gate_up_in  length:4 atIndex:6];
             [enc setBytes:&gs          length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // up_proj (same encoder, serialized after gate — shares encoder overhead)
-            [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
+            [enc setBuffer:expert_bufs[k]              offset:up_w_off atIndex:0];
+            [enc setBuffer:expert_bufs[k]              offset:up_s_off atIndex:1];
+            [enc setBuffer:expert_bufs[k]              offset:up_b_off atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0        atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
         }
-
-        // Encoder B: SwiGLU + down_proj (SwiGLU depends on gate+up from Enc A)
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // SwiGLU
             [enc setComputePipelineState:ctx->swiglu];
             [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
@@ -4548,21 +4640,57 @@ static void gpu_encode_experts_batched_from(
             [enc setBytes:&gate_up_out length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // down_proj (same encoder, serialized after SwiGLU)
-            [enc setComputePipelineState:expert_pipe];
-            [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
-            [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
-            [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
-            [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
-            [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
-            [enc setBytes:&down_out length:4 atIndex:5];
-            [enc setBytes:&down_in  length:4 atIndex:6];
-            [enc setBytes:&gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
         }
     }
+}
+
+// Phase B: down_proj per expert (needs down weights + act from phase A).
+static void gpu_encode_experts_down(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs
+) {
+    NSUInteger down_w_off = g_cfg.down_w_off;
+    NSUInteger down_s_off = down_w_off + g_cfg.down_w_size;
+    NSUInteger down_b_off = down_s_off + g_cfg.down_s_size;
+    id<MTLComputePipelineState> expert_pipe = matvec_v3_pipe(ctx);
+    uint32_t down_out = g_cfg.hidden_dim;
+    uint32_t down_in  = g_cfg.moe_intermediate;
+    uint32_t gs       = g_cfg.group_size;
+    uint32_t down_tgs = (down_out + 7) / 8;
+
+    for (int k = 0; k < K; k++) {
+        if (!valid[k]) continue;
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:expert_pipe];
+        [enc setBuffer:expert_bufs[k]               offset:down_w_off atIndex:0];
+        [enc setBuffer:expert_bufs[k]               offset:down_s_off atIndex:1];
+        [enc setBuffer:expert_bufs[k]               offset:down_b_off atIndex:2];
+        [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0          atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0          atIndex:4];
+        [enc setBytes:&down_out length:4 atIndex:5];
+        [enc setBytes:&down_in  length:4 atIndex:6];
+        [enc setBytes:&gs       length:4 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
+// Batched expert encoding: gate+up+SwiGLU+down for all K experts (single cmdbuf).
+static void gpu_encode_experts_batched_from(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs,
+    id<MTLBuffer> expert_input
+) {
+    gpu_encode_experts_gate_up_swiglu(ctx, cmdbuf, K, valid, expert_bufs, expert_input);
+    gpu_encode_experts_down(ctx, cmdbuf, K, valid, expert_bufs);
 }
 
 // Compatibility wrapper: routed input staged in buf_multi_expert_input.
@@ -7210,9 +7338,7 @@ static int fc_check_finite(const float *x, int n, const char *where) {
 }
 
 static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) {
-    // lm_head: [hidden_dim=4096] -> [vocab_size=248320]
-    // This is a HUGE matmul. For 248320 output dims, it will be slow on CPU.
-    // Optimization: only compute top candidates
+    // lm_head: [hidden_dim] -> [vocab_size]. Full matmul every token (~286 MB q4).
 
     TensorInfo *w_info = get_tensor_info(wf, "lm_head.weight");
     TensorInfo *s_info = get_tensor_info(wf, "lm_head.scales");
@@ -7227,14 +7353,16 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
-    // First-defense: catch a non-finite hidden state feeding the lm_head (upstream
-    // corruption) before it turns into garbage logits.
     fc_check_finite(hidden, g_cfg.hidden_dim, "lm_head input hidden");
 
-    // Full matmul — use GPU if available (248320 output rows!)
+    double t0 = 0;
+    if (g_timing_enabled) t0 = now_ms();
     fast_dequant_matvec(W, S, B, hidden, logits, g_cfg.vocab_size, g_cfg.hidden_dim, g_cfg.group_size);
+    if (g_timing_enabled) {
+        g_lm_head_ms_sum += now_ms() - t0;
+        g_lm_head_ms_count++;
+    }
 
-    // ...and catch non-finite logits before they reach argmax/sampling (the gibberish point).
     fc_check_finite(logits, g_cfg.vocab_size, "lm_head logits");
 }
 
@@ -7242,7 +7370,21 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 4  // 4 threads for K=4 experts (one per expert)
+// Prefill CSR / legacy pthread pool width. Decode misses use GCD one-block-per-
+// expert. Default 8 matches production K=8; override with FLASHCHAT_IO_THREADS.
+#define NUM_IO_THREADS_DEFAULT 8
+#define NUM_IO_THREADS_MAX 16
+static int g_num_io_threads = -1;
+static inline int num_io_threads(void) {
+    if (g_num_io_threads < 0) {
+        const char *e = getenv("FLASHCHAT_IO_THREADS");
+        int n = (e && e[0]) ? atoi(e) : NUM_IO_THREADS_DEFAULT;
+        if (n < 1) n = 1;
+        if (n > NUM_IO_THREADS_MAX) n = NUM_IO_THREADS_MAX;
+        g_num_io_threads = n;
+    }
+    return g_num_io_threads;
+}
 
 typedef struct {
     int fd;
@@ -7549,10 +7691,25 @@ static void expert_pin_init(void) {
     for (long i = 0; i < total_experts; i++) g_pin_slot_of_gid[i] = -1;
     for (long i = 0; i < slots; i++) g_pin_gid_of_slot[i] = -1;
 
+    // Optional pin-arena mlock. Arena size is already capped by free-RAM
+    // fraction; still refuse mlock when locking would leave less than the
+    // shared headroom (purgeable pages stay compressible/evictable instead).
     if (getenv("FLASHCHAT_EXPERT_PIN_MLOCK") && atoi(getenv("FLASHCHAT_EXPERT_PIN_MLOCK"))) {
-        if (mlock(g_pin_arena, (size_t)slots * stride) != 0)
-            fprintf(stderr, "[expert-pin] mlock failed (%s) — continuing unlocked\n",
+        size_t arena_bytes = (size_t)slots * stride;
+        size_t free_now = host_free_ram_bytes();
+        if (free_now < arena_bytes + k_mlock_headroom_bytes) {
+            fprintf(stderr, "[expert-pin] mlock skipped — locking %.1f MiB would leave "
+                    "only %.1f MiB free (need %.0f MiB headroom); arena stays purgeable\n",
+                    arena_bytes / (1024.0 * 1024.0),
+                    free_now / (1024.0 * 1024.0),
+                    k_mlock_headroom_bytes / (1024.0 * 1024.0));
+        } else if (mlock(g_pin_arena, arena_bytes) != 0) {
+            fprintf(stderr, "[expert-pin] mlock failed (%s) — continuing unlocked (purgeable)\n",
                     strerror(errno));
+        } else {
+            fprintf(stderr, "[expert-pin] mlock'd %.1f MiB arena\n",
+                    arena_bytes / (1024.0 * 1024.0));
+        }
     }
 
     g_pin_capacity_slots = slots;
@@ -7639,7 +7796,8 @@ static void expert_pin_log_stats(void) {
 __attribute__((unused))
 static void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
-    for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
+    int nthr = num_io_threads();
+    for (int i = ta->thread_id; i < ta->num_tasks; i += nthr) {
         InferPreadTask *t = &ta->tasks[i];
         t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
     }
@@ -7651,7 +7809,8 @@ static void *infer_pread_thread_fn(void *arg) {
 // ============================================================================
 
 typedef struct {
-    pthread_t threads[NUM_IO_THREADS];
+    pthread_t threads[NUM_IO_THREADS_MAX];
+    int nthreads;
     pthread_mutex_t mutex;
     pthread_cond_t work_ready;
     pthread_cond_t work_done;
@@ -7675,20 +7834,19 @@ static void *io_pool_worker(void *arg) {
         if (g_io_pool.shutdown) break;
         my_gen = g_io_pool.generation;
 
-        // Snapshot work for this generation
         int num_tasks = g_io_pool.num_tasks;
         InferPreadTask *tasks = g_io_pool.tasks;
+        int nthr = g_io_pool.nthreads;
         pthread_mutex_unlock(&g_io_pool.mutex);
 
-        // Process assigned tasks (stride by thread count)
-        for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
+        for (int i = tid; i < num_tasks; i += nthr) {
             InferPreadTask *t = &tasks[i];
             t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
         }
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == NUM_IO_THREADS)
+        if (g_io_pool.tasks_completed == g_io_pool.nthreads)
             pthread_cond_signal(&g_io_pool.work_done);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -7703,22 +7861,25 @@ static void io_pool_init(void) {
     g_io_pool.shutdown = 0;
     g_io_pool.generation = 0;
     g_io_pool.tasks = NULL;
-    for (int i = 0; i < NUM_IO_THREADS; i++)
+    g_io_pool.nthreads = num_io_threads();
+    for (int i = 0; i < g_io_pool.nthreads; i++)
         pthread_create(&g_io_pool.threads[i], NULL, io_pool_worker, (void*)(intptr_t)i);
     g_io_pool_initialized = 1;
+    fprintf(stderr, "[io-pool] %d worker threads\n", g_io_pool.nthreads);
 }
 
 static dispatch_queue_t g_io_gcd_queue = NULL;
 
 static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     if (num_tasks == 0) return;
+    io_pool_init();
     pthread_mutex_lock(&g_io_pool.mutex);
     g_io_pool.tasks = tasks;
     g_io_pool.num_tasks = num_tasks;
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+    while (g_io_pool.tasks_completed < g_io_pool.nthreads) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -7726,41 +7887,59 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
 
 // ---- Async expert pread pipeline ----
 // Starts pread on background GCD threads immediately after routing.
-// The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
-// Wait for completion right before CMD3 needs the expert data.
+// Split mode (FLASHCHAT_EXPERT_SPLIT_IO=1): wave1 = gate+up prefix, wave2 = down
+// suffix (fired after gate+up GPU encode starts so SSD and GPU overlap).
 typedef struct {
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K];       // wave1 (full or gate+up) / pin metadata
+    InferPreadTask down_tasks[MAX_K];  // wave2 down suffix (split mode only)
     int num_tasks;
     int valid[MAX_K];
-    dispatch_group_t group;
+    dispatch_group_t group;            // wave1
+    dispatch_group_t down_group;       // wave2
     int active;
-    int layer;                 // layer for this batch (pin-cache key + admission)
-    int expert_idx[MAX_K];     // routed expert per slot
-    int pinned_hit[MAX_K];     // 1 = served from pin cache (no pread issued)
-    int pin_slot[MAX_K];       // arena slot for each hit; protected until dispatch
+    int split_mode;                    // 1 = two-wave I/O
+    int down_active;                   // 1 = wave2 in flight
+    int layer;
+    int expert_idx[MAX_K];
+    int pinned_hit[MAX_K];
+    int pin_slot[MAX_K];
+    int packed_fd;
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
 
-// dst_bufs is also the OUT source-buffer array: entries for pin hits are
-// replaced by the slot's zero-copy MTLBuffer; misses keep the pool buffer
-// (which the background pread fills). The caller dispatches experts from
-// whichever buffer ends up in each slot.
+static dispatch_queue_t async_pread_io_queue(void) {
+    static dispatch_queue_t io_q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+    });
+    return io_q;
+}
+
+// dst_bufs: pin hits replaced with zero-copy slot buffers; misses keep pool bufs.
+// split_mode: only pread gate+up now; call async_pread_start_down() for suffix.
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
                                int layer_idx) {
     (void)mmap_base;
-    expert_pin_init();   // lazy, idempotent; model is resident by first call
+    expert_pin_init();
     size_t esz = active_expert_size();
+    size_t gu = expert_gate_up_bytes();
+    int split = expert_split_io_enabled() && gu > 0 && gu < esz;
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
+    g_async_pread.split_mode = split;
+    g_async_pread.down_active = 0;
     g_async_pread.layer = layer_idx;
+    g_async_pread.packed_fd = packed_fd;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+    if (!g_async_pread.down_group) g_async_pread.down_group = dispatch_group_create();
 
+    dispatch_queue_t io_q = async_pread_io_queue();
     for (int k = 0; k < K; k++) {
         InferPreadTask *t = &g_async_pread.tasks[k];
         t->dst = [dst_bufs[k] contents];
         g_async_pread.expert_idx[k] = expert_indices[k];
-        // Pin-cache hit: bind the slot buffer directly — zero copies, no pread.
         int pin_slot = -1;
         id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k], &pin_slot);
         if (slot_buf) {
@@ -7774,27 +7953,79 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         g_async_pread.pin_slot[k] = -1;
         t->fd = packed_fd;
         t->offset = (off_t)expert_indices[k] * esz;
-        t->size = esz;
+        t->size = split ? gu : esz;
         t->result = 0;
         t->gid = expert_pin_gid(layer_idx, expert_indices[k]);
-    }
-
-    // Fire off parallel preads on GCD for misses only — returns immediately.
-    static dispatch_queue_t io_q = NULL;
-    if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    for (int k = 0; k < K; k++) {
-        if (g_async_pread.pinned_hit[k]) continue;
-        InferPreadTask *t = &g_async_pread.tasks[k];
         dispatch_group_async(g_async_pread.group, io_q, ^{
             t->result = prof_pread(t->fd, t->dst, t->size, t->offset, t->gid);
         });
     }
 }
 
-static void async_pread_wait(void) {
+// Fire down-suffix preads for miss slots (split mode). Safe no-op otherwise.
+static void async_pread_start_down(void) {
+    if (!g_async_pread.active || !g_async_pread.split_mode) return;
+    size_t esz = active_expert_size();
+    size_t gu = expert_gate_up_bytes();
+    size_t dn = esz - gu;
+    if (dn == 0) return;
+    dispatch_queue_t io_q = async_pread_io_queue();
+    int any = 0;
+    for (int k = 0; k < g_async_pread.num_tasks; k++) {
+        if (g_async_pread.pinned_hit[k]) continue;
+        InferPreadTask *d = &g_async_pread.down_tasks[k];
+        InferPreadTask *t = &g_async_pread.tasks[k];
+        d->fd = g_async_pread.packed_fd;
+        d->dst = (char *)t->dst + gu;
+        d->offset = t->offset + (off_t)gu;
+        d->size = dn;
+        d->result = 0;
+        d->gid = t->gid;
+        any = 1;
+        dispatch_group_async(g_async_pread.down_group, io_q, ^{
+            d->result = prof_pread(d->fd, d->dst, d->size, d->offset, d->gid);
+        });
+    }
+    g_async_pread.down_active = any;
+}
+
+// Wait for wave1 (gate+up or full). Does not admit to pin cache in split mode
+// until wave2 completes (async_pread_wait_down).
+static void async_pread_wait_gate_up(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
     size_t esz = active_expert_size();
+    size_t gu = expert_gate_up_bytes();
+    size_t expect = g_async_pread.split_mode ? gu : esz;
+    for (int k = 0; k < g_async_pread.num_tasks; k++) {
+        if (g_async_pread.pinned_hit[k]) { g_async_pread.valid[k] = 1; continue; }
+        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)expect);
+    }
+    if (!g_async_pread.split_mode) {
+        int protected_slots[MAX_K];
+        int num_protected_slots = 0;
+        for (int k = 0; k < g_async_pread.num_tasks; k++) {
+            if (g_async_pread.pinned_hit[k] && g_async_pread.pin_slot[k] >= 0)
+                protected_slots[num_protected_slots++] = g_async_pread.pin_slot[k];
+        }
+        for (int k = 0; k < g_async_pread.num_tasks; k++) {
+            if (g_async_pread.pinned_hit[k]) continue;
+            if (g_async_pread.valid[k])
+                expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
+                                 g_async_pread.tasks[k].dst,
+                                 protected_slots, num_protected_slots);
+        }
+        g_async_pread.active = 0;
+    }
+}
+
+static void async_pread_wait_down(void) {
+    if (!g_async_pread.active || !g_async_pread.split_mode) return;
+    size_t esz = active_expert_size();
+    size_t gu = expert_gate_up_bytes();
+    size_t dn = esz - gu;
+    if (g_async_pread.down_active)
+        dispatch_group_wait(g_async_pread.down_group, DISPATCH_TIME_FOREVER);
     int protected_slots[MAX_K];
     int num_protected_slots = 0;
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
@@ -7803,14 +8034,29 @@ static void async_pread_wait(void) {
     }
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
         if (g_async_pread.pinned_hit[k]) { g_async_pread.valid[k] = 1; continue; }
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)esz);
-        // Admit freshly-read experts into the pin cache (LFU eviction inside).
-        if (g_async_pread.valid[k])
+        int ok = g_async_pread.valid[k] &&
+                 (g_async_pread.down_tasks[k].result == (ssize_t)dn);
+        g_async_pread.valid[k] = ok;
+        if (ok)
             expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
                              g_async_pread.tasks[k].dst,
                              protected_slots, num_protected_slots);
     }
+    g_async_pread.down_active = 0;
     g_async_pread.active = 0;
+}
+
+// Full wait (non-split path, or complete both waves if split left hanging).
+static void async_pread_wait(void) {
+    if (!g_async_pread.active) return;
+    if (g_async_pread.split_mode) {
+        async_pread_wait_gate_up();
+        if (g_async_pread.active && !g_async_pread.down_active)
+            async_pread_start_down();
+        async_pread_wait_down();
+        return;
+    }
+    async_pread_wait_gate_up();
 }
 
 static void io_pool_shutdown(void) {
@@ -7819,7 +8065,7 @@ static void io_pool_shutdown(void) {
     g_io_pool.shutdown = 1;
     pthread_cond_broadcast(&g_io_pool.work_ready);
     pthread_mutex_unlock(&g_io_pool.mutex);
-    for (int i = 0; i < NUM_IO_THREADS; i++)
+    for (int i = 0; i < g_io_pool.nthreads; i++)
         pthread_join(g_io_pool.threads[i], NULL);
     pthread_mutex_destroy(&g_io_pool.mutex);
     pthread_cond_destroy(&g_io_pool.work_ready);
@@ -9577,16 +9823,26 @@ static void fused_layer_forward(
                    g_cfg.shared_intermediate * sizeof(float));
         }
 
-        // Wait for the async pread to complete
+        // Wait for wave1 (gate+up or full expert). Split mode keeps wave2 for later
+        // only when at least one expert actually missed the pin cache.
+        int use_split = 0;
         if (g_async_pread.active) {
-            async_pread_wait();
-            for (int k = 0; k < actual_K; k++) {
-                valid[k] = g_async_pread.valid[k];
+            int any_miss = 0;
+            for (int k = 0; k < actual_K; k++)
+                if (!g_async_pread.pinned_hit[k]) { any_miss = 1; break; }
+            use_split = g_async_pread.split_mode && any_miss;
+            if (!use_split && g_async_pread.split_mode) {
+                // All pin hits: no pread issued, drop split bookkeeping.
+                g_async_pread.split_mode = 0;
             }
+            if (use_split)
+                async_pread_wait_gate_up();
+            else
+                async_pread_wait();  // whole-expert wait + pin admit
+            for (int k = 0; k < actual_K; k++)
+                valid[k] = g_async_pread.valid[k];
             if (g_mtp_overlap_enabled && g_overlap_in_decode) {
                 for (int k = 0; k < actual_K; k++) {
-                    // Pin off -> every fetch counts as a miss (all-fetch ceiling);
-                    // pin on -> only real misses count (the prefetch target pool).
                     if (!g_async_pread.pinned_hit[k]) {
                         g_pf_miss_total++;
                         if (k < MAX_K && g_pf_in_prev[k]) g_pf_miss_predictable++;
@@ -9596,41 +9852,69 @@ static void fused_layer_forward(
         }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
-
         if (g_timing_enabled) { t0 = now_ms(); }
 
-        // Step 3: encode ALL experts + shared expert into ONE command buffer.
-        // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
-        // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched_from(g_metal, cmd_experts, actual_K, valid, expert_bufs,
-                                        expert_input_buf);
+        if (use_split) {
+            // Wave1 GPU (gate+up+SwiGLU) while wave2 preads down suffix.
+            async_pread_start_down();
+            gpu_encode_experts_gate_up_swiglu(g_metal, cmd_experts, actual_K, valid,
+                                              expert_bufs, expert_input_buf);
+            // Shared expert SwiGLU can also run while down I/O is in flight.
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:shared_gate_buf offset:0 atIndex:0];
+                [enc setBuffer:shared_up_buf   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = g_cfg.shared_intermediate;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            if (sdw && sds && sdb) {
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
+            }
+            // Commit phase-A so GPU runs concurrent with remaining down preads.
+            [cmd_experts commit];
+            double t_down0 = 0;
+            if (g_timing_enabled) t_down0 = now_ms();
+            async_pread_wait_down();
+            for (int k = 0; k < actual_K; k++)
+                valid[k] = g_async_pread.valid[k];
+            if (g_timing_enabled) g_timing.expert_io += now_ms() - t_down0;
 
-        // Shared expert SwiGLU + down_proj (2 more encoders)
-        // Note: gate/up sources bound above (GPU-resident or staged)
-
-        // SwiGLU dispatch
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
-            [enc setComputePipelineState:g_metal->swiglu];
-            [enc setBuffer:shared_gate_buf offset:0 atIndex:0];
-            [enc setBuffer:shared_up_buf   offset:0 atIndex:1];
-            [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
-            uint32_t dim = g_cfg.shared_intermediate;
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t swiglu_tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // Shared down_proj dispatch
-        if (sdw && sds && sdb) {
-            gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_experts, sdw, sds, sdb,
-                g_metal->buf_shared_act, g_metal->buf_shared_out,
-                g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
+            // Phase B: down_proj + combine on a fresh command buffer (queue-ordered).
+            cmd_experts = [g_metal->queue commandBuffer];
+            gpu_encode_experts_down(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        } else {
+            gpu_encode_experts_batched_from(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                            expert_input_buf);
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:shared_gate_buf offset:0 atIndex:0];
+                [enc setBuffer:shared_up_buf   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = g_cfg.shared_intermediate;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            if (sdw && sds && sdb) {
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    g_cfg.hidden_dim, g_cfg.shared_intermediate, g_cfg.group_size);
+            }
         }
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
@@ -13884,11 +14168,29 @@ static void serve_loop(
             if (frac <= 0.0 || frac > 1.0) frac = 0.5;
             const char *ml = getenv("FLASHCHAT_EXPERT_PIN_MLOCK");
             server_logf("[serve]   expert_pin_cache: enabled cap=%.1f GiB auto_frac=%.2f mlock=%s "
-                        "(budget resolves at first expert read)\n",
+                        "(budget resolves at first expert read; mlock needs free RAM + headroom)\n",
                         pin_gb, frac, (ml && ml[0] && atoi(ml)) ? "on" : "off");
         } else {
             server_logf("[serve]   expert_pin_cache: disabled\n");
         }
+    }
+    {
+        const char *lm = getenv("FLASHCHAT_LM_HEAD_MLOCK");
+        int lm_on = 1;
+        if (lm && lm[0] && (!strcmp(lm, "0") || !strcasecmp(lm, "off") || !strcasecmp(lm, "false")))
+            lm_on = 0;
+        server_logf("[serve]   lm_head_mlock: %s (skips if free RAM < span + %.0f MiB headroom)\n",
+                    lm_on ? "requested" : "disabled",
+                    k_mlock_headroom_bytes / (1024.0 * 1024.0));
+    }
+    {
+        const char *sp = getenv("FLASHCHAT_EXPERT_SPLIT_IO");
+        int split_on = (sp && sp[0] && atoi(sp) != 0) ? 1 : 0;
+        // Default ON when env unset/empty (matches expert_split_io_enabled once
+        // default flips); log the resolved intent from env for serve dumps.
+        if (!sp || !sp[0]) split_on = 1;  // shipped default
+        server_logf("[serve]   expert_split_io: %s (gate+up GPU overlapped with down pread on misses)\n",
+                    split_on ? "enabled" : "disabled");
     }
     {
         const char *pp = getenv("FLASHCHAT_PREAD_PROFILE");
@@ -15621,6 +15923,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: Failed to load weights\n");
             return 1;
         }
+        lm_head_try_mlock(wf);
 
         MTPArtifacts mtp = detect_mtp_artifacts(wf, model_path);
         g_mtp_tensors_present = mtp.tensors_present;

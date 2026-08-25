@@ -540,6 +540,9 @@ cmd_status() {
     echo "Neural Engine prefill: $(flashchat_get ANE_PREFILL) (GPU below $(flashchat_get ANE_MIN_CHUNK)-token chunks)"
     _akm="$(flashchat_get ADAPTIVE_K_MASS)"
     echo "Adaptive expert routing: ${_akm:-off}"
+    echo "Expert pin cache: $(flashchat_get EXPERT_PIN_MAX_GB) GiB (mlock=$(flashchat_get EXPERT_PIN_MLOCK))"
+    echo "lm_head RAM lock: $(flashchat_get LM_HEAD_MLOCK)"
+    echo "Expert split I/O: $(flashchat_get EXPERT_SPLIT_IO)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "System prompt cache dir: $(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
     echo "Multi-token prediction: $(mtp_label "$MTP")"
@@ -665,7 +668,8 @@ cmd_config_interactive() {
           FLASHCHAT_REPETITION_PENALTY FLASHCHAT_MODEL_PATH \
           FLASHCHAT_WEIGHTS_DIR FLASHCHAT_EXPERTS_DIR \
           FLASHCHAT_EXPERT_PIN_MAX_GB FLASHCHAT_EXPERT_PIN_MAX_EXPERTS \
-          FLASHCHAT_EXPERT_PIN_AUTO_FRAC FLASHCHAT_EXPERT_PIN_MLOCK
+          FLASHCHAT_EXPERT_PIN_AUTO_FRAC FLASHCHAT_EXPERT_PIN_MLOCK \
+          FLASHCHAT_LM_HEAD_MLOCK FLASHCHAT_EXPERT_SPLIT_IO
     cmd_config "$@"
 }
 
@@ -1002,6 +1006,8 @@ server_runtime_signature() {
         echo "EXPERT_PIN_MAX_EXPERTS=$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
         echo "EXPERT_PIN_AUTO_FRAC=$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
         echo "EXPERT_PIN_MLOCK=$(flashchat_get EXPERT_PIN_MLOCK)"
+        echo "LM_HEAD_MLOCK=$(flashchat_get LM_HEAD_MLOCK)"
+        echo "EXPERT_SPLIT_IO=$(flashchat_get EXPERT_SPLIT_IO)"
         echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
         echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
         echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
@@ -1400,11 +1406,13 @@ cmd_serve() {
     [ -n "${FLASHCHAT_ANE_PREFILL}" ] && _ane_prefill="$FLASHCHAT_ANE_PREFILL" || _ane_prefill="$(flashchat_get ANE_PREFILL)"
     local _ane_min_chunk
     [ -n "${FLASHCHAT_ANE_MIN_CHUNK}" ] && _ane_min_chunk="$FLASHCHAT_ANE_MIN_CHUNK" || _ane_min_chunk="$(flashchat_get ANE_MIN_CHUNK)"
-    local _pin_max_gb _pin_max_experts _pin_auto_frac _pin_mlock
+    local _pin_max_gb _pin_max_experts _pin_auto_frac _pin_mlock _lm_head_mlock _expert_split_io
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
     [ -n "${FLASHCHAT_EXPERT_PIN_MAX_EXPERTS}" ] && _pin_max_experts="$FLASHCHAT_EXPERT_PIN_MAX_EXPERTS" || _pin_max_experts="$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
     [ -n "${FLASHCHAT_EXPERT_PIN_AUTO_FRAC}" ] && _pin_auto_frac="$FLASHCHAT_EXPERT_PIN_AUTO_FRAC" || _pin_auto_frac="$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
     [ -n "${FLASHCHAT_EXPERT_PIN_MLOCK}" ]     && _pin_mlock="$FLASHCHAT_EXPERT_PIN_MLOCK"         || _pin_mlock="$(flashchat_get EXPERT_PIN_MLOCK)"
+    [ -n "${FLASHCHAT_LM_HEAD_MLOCK}" ]       && _lm_head_mlock="$FLASHCHAT_LM_HEAD_MLOCK"       || _lm_head_mlock="$(flashchat_get LM_HEAD_MLOCK)"
+    [ -n "${FLASHCHAT_EXPERT_SPLIT_IO}" ]     && _expert_split_io="$FLASHCHAT_EXPERT_SPLIT_IO"   || _expert_split_io="$(flashchat_get EXPERT_SPLIT_IO)"
 
     FLASHCHAT_SERVER_LOG="$_server_log" \
     FLASHCHAT_SERVER_DEBUG="$_server_debug" \
@@ -1423,6 +1431,8 @@ cmd_serve() {
     FLASHCHAT_EXPERT_PIN_MAX_EXPERTS="$_pin_max_experts" \
     FLASHCHAT_EXPERT_PIN_AUTO_FRAC="$_pin_auto_frac" \
     FLASHCHAT_EXPERT_PIN_MLOCK="$_pin_mlock" \
+    FLASHCHAT_LM_HEAD_MLOCK="$_lm_head_mlock" \
+    FLASHCHAT_EXPERT_SPLIT_IO="$_expert_split_io" \
     FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
     FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
     FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
