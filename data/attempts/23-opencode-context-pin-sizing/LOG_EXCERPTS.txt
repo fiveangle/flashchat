@@ -1,0 +1,65 @@
+Flashchat attempt 23 raw evidence excerpts — 2026-08-25
+
+ORIGINAL SERVER: short prose, q8 / 262k / pin cap 8 GiB, diagnostics enabled
+[serve] chatcmpl-2 prefill=18 tokens in 1427ms
+[serve] chatcmpl-2 generated=632 tokens in 23309ms (27.11 tok/s, experts 344.8 MiB/s, 43.1 MiB/s/expert, TTFT 1.4s (0@0.0tok/s think, 632@27.1tok/s response))
+[serve] chatcmpl-3 prefill=29 tokens in 1287ms
+[serve] chatcmpl-3 generated=633 tokens in 24177ms (26.18 tok/s, experts 335.6 MiB/s, 41.9 MiB/s/expert, TTFT 1.3s (0@0.0tok/s think, 633@26.2tok/s response))
+
+ORIGINAL SERVER: evolving OpenCode sequence, q8 / 262k / pin cap 8 GiB
+[serve] chatcmpl-6 prefill=14984 tokens in 581386ms
+[serve] chatcmpl-6 generated=62 tokens in 7291ms (8.50 tok/s, experts 1.4 MiB/s, 0.2 MiB/s/expert, TTFT 581.4s (0@0.0tok/s think, 63@8.6tok/s response)) [tool_call]
+[serve] chatcmpl-11 prefill=1393 tokens in 118085ms
+[serve] chatcmpl-11 generated=55 tokens in 6369ms (8.64 tok/s, experts 6.0 MiB/s, 0.7 MiB/s/expert, TTFT 118.1s (0@0.0tok/s think, 56@8.8tok/s response)) [tool_call]
+[serve] chatcmpl-12 prefill=1476 tokens in 124329ms
+[serve] chatcmpl-12 generated=56 tokens in 6489ms (8.63 tok/s, experts 5.8 MiB/s, 0.7 MiB/s/expert, TTFT 124.3s (0@0.0tok/s think, 57@8.8tok/s response)) [tool_call]
+
+CONTROL: q8 / 64k / pin max 8 GiB, actual 7.82 GiB
+[expert-pin] mlock'd 8003.8 MiB arena
+[expert-pin] enabled (zero-copy): 4743 experts pinnable (8003.81 MiB, 7.82 GiB), free RAM 15.63 GiB, GB cap 8.00 GiB, requested 0 experts, pool total 10240 experts
+[serve] chatcmpl-1 prefill=1393 tokens in 128931ms
+[serve] chatcmpl-1 generated=55 tokens in 9814ms (5.60 tok/s, experts 5.4 MiB/s, 0.7 MiB/s/expert, TTFT 128.9s (0@0.0tok/s think, 56@5.7tok/s response)) [tool_call]
+[serve] chatcmpl-2 prefill=1393 tokens in 146523ms
+[serve] chatcmpl-2 generated=55 tokens in 5599ms (9.82 tok/s, experts 4.9 MiB/s, 0.6 MiB/s/expert, TTFT 146.5s (0@0.0tok/s think, 56@10.0tok/s response)) [tool_call]
+[expert-pin] hits 31557 / 35840 (88.0%), pinned 4283/4743, evictions 0
+
+CONTROL: fp32 / 64k / pin max 8 GiB, actual 7.17 GiB
+[expert-pin] mlock'd 7338.9 MiB arena
+[expert-pin] enabled (zero-copy): 4349 experts pinnable (7338.94 MiB, 7.17 GiB), free RAM 14.33 GiB, GB cap 8.00 GiB, requested 0 experts, pool total 10240 experts
+[serve] chatcmpl-1 sys_prompt_cache saved hash=6b79852c62f406ce tokens=14579
+[serve] chatcmpl-1 prefill=15972 tokens in 690622ms
+[serve] chatcmpl-1 generated=128 tokens in 17922ms (7.14 tok/s, experts 2.4 MiB/s, 0.3 MiB/s/expert, TTFT 690.6s (0@0.0tok/s think, 128@7.1tok/s response))
+[serve] chatcmpl-2 prefill=1393 tokens in 114467ms
+[serve] chatcmpl-2 generated=128 tokens in 17141ms (7.47 tok/s, experts 13.1 MiB/s, 1.6 MiB/s/expert, TTFT 114.5s (0@0.0tok/s think, 128@7.5tok/s response))
+[expert-pin] hits 76663 / 82880 (92.5%), pinned 4349/4349, evictions 1868
+
+CONTROL: q8 / 262k / pin 8 GiB, diagnostics disabled, repeated request
+[expert-pin] mlock'd 8191.1 MiB arena
+[expert-pin] enabled (zero-copy): 4854 experts pinnable (8191.12 MiB, 8.00 GiB), free RAM 21.12 GiB, GB cap 8.00 GiB, requested 0 experts, pool total 10240 experts
+[serve] chatcmpl-2 prefill=1393 tokens in 114464ms
+[serve] chatcmpl-2 generated=36 tokens in 4287ms (8.40 tok/s, experts 4.1 MiB/s, 0.5 MiB/s/expert, TTFT 114.5s (0@0.0tok/s think, 37@8.6tok/s response)) [tool_call]
+[serve] chatcmpl-3 prefill=1393 tokens in 114143ms
+[serve] chatcmpl-3 generated=36 tokens in 3637ms (9.90 tok/s, experts 4.1 MiB/s, 0.5 MiB/s/expert, TTFT 114.1s (0@0.0tok/s think, 37@10.2tok/s response)) [tool_call]
+[expert-pin] hits 22599 / 26240 (86.1%), pinned 3641/4854, evictions 0
+
+PIN SIZING: q8 / 262k / 4 GiB, evolving request sequence
+[expert-pin] mlock'd 4095.6 MiB arena
+[expert-pin] enabled (zero-copy): 2427 experts pinnable (4095.56 MiB, 4.00 GiB), free RAM 12.81 GiB, GB cap 4.00 GiB, requested 0 experts, pool total 10240 experts
+[serve] chatcmpl-1 prefill=405 tokens in 44162ms
+[serve] chatcmpl-1 generated=59 tokens in 10784ms (5.47 tok/s, experts 14.5 MiB/s, 1.8 MiB/s/expert, TTFT 44.2s (0@0.0tok/s think, 60@5.6tok/s response)) [tool_call]
+[serve] chatcmpl-2 prefill=1393 tokens in 156022ms
+[serve] chatcmpl-2 generated=36 tokens in 6516ms (5.52 tok/s, experts 3.0 MiB/s, 0.4 MiB/s/expert, TTFT 156.0s (0@0.0tok/s think, 37@5.7tok/s response)) [tool_call]
+[serve] chatcmpl-3 prefill=1476 tokens in 168530ms
+[serve] chatcmpl-3 generated=128 tokens in 22941ms (5.58 tok/s, experts 9.0 MiB/s, 1.1 MiB/s/expert, TTFT 168.5s (0@0.0tok/s think, 128@5.6tok/s response))
+[expert-pin] hits 52569 / 72320 (72.7%), pinned 2427/2427, evictions 6920
+
+PIN SIZING: q8 / 262k / 12 GiB max, safely resolved 9.13 GiB
+[expert-pin] mlock'd 9348.8 MiB arena
+[expert-pin] enabled (zero-copy): 5540 experts pinnable (9348.75 MiB, 9.13 GiB), free RAM 12.17 GiB, GB cap 12.00 GiB, requested 0 experts, pool total 10240 experts
+[serve] chatcmpl-1 prefill=405 tokens in 36994ms
+[serve] chatcmpl-1 generated=59 tokens in 7793ms (7.57 tok/s, experts 17.8 MiB/s, 2.2 MiB/s/expert, TTFT 37.0s (0@0.0tok/s think, 60@7.7tok/s response)) [tool_call]
+[serve] chatcmpl-2 prefill=1393 tokens in 130107ms
+[serve] chatcmpl-2 generated=36 tokens in 4424ms (8.14 tok/s, experts 3.6 MiB/s, 0.5 MiB/s/expert, TTFT 130.1s (0@0.0tok/s think, 37@8.4tok/s response)) [tool_call]
+[serve] chatcmpl-3 prefill=1476 tokens in 137205ms
+[serve] chatcmpl-3 generated=128 tokens in 15286ms (8.37 tok/s, experts 11.3 MiB/s, 1.4 MiB/s/expert, TTFT 137.2s (0@0.0tok/s think, 128@8.4tok/s response))
+[expert-pin] hits 64940 / 72320 (89.8%), pinned 5540/5540, evictions 1840

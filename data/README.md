@@ -61,6 +61,12 @@ does not rediscover dead ends.
 | 14 | expert-read-split | **KEEP** | +6.5% pin-off, +~10% over shipped defaults → **25.2 tok/s**; schema v12 default |
 | 15 | lm-head-resident | **KEEP** | mlock default on (schema v12), headroom-guarded; +15–20% under pin pressure |
 
+### This session (2026-08-25) — measured
+
+| # | slug | Verdict | Result |
+|---|------|---------|--------|
+| 23 | opencode-context-pin-sizing | **MEASURED — retain 8 GiB for this workload** | Real ~16k OpenCode: 8 GiB 8.63–8.64 tok/s; 4 GiB 5.52–5.58 (72.7% hits, 6,920 evictions); 12 GiB max safely resolved 9.13 GiB and 8.14–8.37, no win. Warm q8 64k vs 262k neutral; fp32 slower. |
+
 ### Still open
 
 | # | slug | Priority |
