@@ -65,6 +65,8 @@ does not rediscover dead ends.
 
 | # | slug | Verdict | Result |
 |---|------|---------|--------|
+| 21a | pread-into-slot (pin reserve) | **KEEP** | +2.5% @pin-on shipped defaults, all interleaved pairs win; neutral pin-off; byte-identical; bench-api decode +18–37% vs e85192f |
+| 21b | event-gated CMD3 (MTLSharedEvent) | **DEAD — removed** | −4% pin-on, −42% pin-off: issuing wave2 with wave1 competes for SSD bandwidth and destroys split-I/O overlap; GPU-side event wait serializes what CPU-spin overlapped. See NOTES "shader lesson" before touching hot kernels. |
 | 23 | opencode-context-pin-sizing | **MEASURED — retain 8 GiB for this workload** | Real ~16k OpenCode: 8 GiB 8.63–8.64 tok/s; 4 GiB 5.52–5.58 (72.7% hits, 6,920 evictions); 12 GiB max safely resolved 9.13 GiB and 8.14–8.37, no win. Warm q8 64k vs 262k neutral; fp32 slower. |
 
 ### Still open
@@ -76,5 +78,7 @@ does not rediscover dead ends.
 | 18 | ngram-spec | P2 |
 | 19 | expert-hot-repack | P3 |
 | 20 | mtp-skip-spec | P1 for 16GB >15 tok/s |
+| 22 | gpu-tail-fusion (final norm+lm_head in last CMD3) | P2 design sketched in 21 NOTES |
+| 24 | idle page-cache warmer | P2 design sketched in 21 NOTES (16GB lever) |
 
 See `2026-08-24-deep-speed-analysis/ANALYSIS.md` + `SESSION_RESULTS.md`.

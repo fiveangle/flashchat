@@ -7784,6 +7784,69 @@ static void expert_pin_admit(int layer, int expert, const void *src,
     pthread_mutex_unlock(&g_pin_mu);
 }
 
+// Reserve a free/evictable slot for an incoming miss so its pread can target
+// the slot memory DIRECTLY (no post-read admission copy). Same LFU policy and
+// protected-slot rules as expert_pin_admit; the gid<->slot mapping is armed
+// immediately, so the caller MUST confirm success (data landed) or call
+// expert_pin_release_reservation on failure — a reserved-but-failed slot must
+// never serve a future hit. Returns the slot's zero-copy MTLBuffer, else nil.
+static id<MTLBuffer> expert_pin_reserve_slot(int layer, int expert,
+                                             const int *protected_slots, int num_protected_slots,
+                                             int *out_slot) {
+    if (out_slot) *out_slot = -1;
+    if (g_pin_enabled != 1) return nil;
+    int gid = expert_pin_gid(layer, expert);
+    id<MTLBuffer> buf = nil;
+    pthread_mutex_lock(&g_pin_mu);
+    if (g_pin_slot_of_gid[gid] < 0) {
+        long slot = -1;
+        if (g_pin_used_slots < g_pin_capacity_slots) {
+            slot = g_pin_used_slots++;
+        } else {
+            int incoming_freq = g_expert_freq[layer][expert];
+            long victim = -1; int victim_freq = 0;
+            for (long s = 0; s < g_pin_capacity_slots; s++) {
+                int protected = 0;
+                for (int i = 0; i < num_protected_slots; i++) {
+                    if (protected_slots[i] == s) { protected = 1; break; }
+                }
+                if (protected) continue;
+                int vg = g_pin_gid_of_slot[s];
+                int vf = g_expert_freq[vg / g_cfg.num_experts][vg % g_cfg.num_experts];
+                if (victim < 0 || vf < victim_freq) { victim = s; victim_freq = vf; }
+            }
+            if (victim >= 0 && incoming_freq >= victim_freq) {
+                g_pin_slot_of_gid[g_pin_gid_of_slot[victim]] = -1;
+                slot = victim;
+                atomic_fetch_add(&g_pin_evictions, 1);
+            }
+        }
+        if (slot >= 0) {
+            g_pin_gid_of_slot[slot] = gid;
+            g_pin_slot_of_gid[gid] = (int)slot;
+            buf = g_pin_slot_bufs[slot];
+            if (out_slot) *out_slot = (int)slot;
+        }
+    }
+    pthread_mutex_unlock(&g_pin_mu);
+    return buf;
+}
+
+// Undo a reservation whose pread failed (short read): the slot content is
+// garbage and must not serve future hits. Only legal while the caller still
+// owns the reservation (no other thread could have remapped this gid).
+static void expert_pin_release_reservation(int layer, int expert) {
+    if (g_pin_enabled != 1) return;
+    int gid = expert_pin_gid(layer, expert);
+    pthread_mutex_lock(&g_pin_mu);
+    int slot = g_pin_slot_of_gid[gid];
+    if (slot >= 0 && g_pin_gid_of_slot[slot] == gid) {
+        g_pin_slot_of_gid[gid] = -1;
+        g_pin_gid_of_slot[slot] = -1;
+    }
+    pthread_mutex_unlock(&g_pin_mu);
+}
+
 static void expert_pin_log_stats(void) {
     if (g_pin_enabled != 1) return;
     long h = atomic_load(&g_pin_hits), m = atomic_load(&g_pin_misses);
@@ -7903,6 +7966,7 @@ typedef struct {
     int expert_idx[MAX_K];
     int pinned_hit[MAX_K];
     int pin_slot[MAX_K];
+    int reserved[MAX_K];               // miss pread targets a reserved pin slot directly
     int packed_fd;
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
@@ -7936,6 +8000,8 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     if (!g_async_pread.down_group) g_async_pread.down_group = dispatch_group_create();
 
     dispatch_queue_t io_q = async_pread_io_queue();
+    int protected_slots[MAX_K];
+    int num_protected_slots = 0;
     for (int k = 0; k < K; k++) {
         InferPreadTask *t = &g_async_pread.tasks[k];
         t->dst = [dst_bufs[k] contents];
@@ -7947,10 +8013,28 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
             g_async_pread.pinned_hit[k] = 1;
             g_async_pread.pin_slot[k] = pin_slot;
             g_async_pread.valid[k] = 1;
+            if (num_protected_slots < MAX_K) protected_slots[num_protected_slots++] = pin_slot;
             continue;
         }
         g_async_pread.pinned_hit[k] = 0;
         g_async_pread.pin_slot[k] = -1;
+        // Attempt 21a: when the pin cache can take this expert, pread straight
+        // into its (reserved) slot — no post-read admission copy. Pure pread
+        // fallback otherwise. Reservation joins the protected set immediately.
+        int rslot = -1;
+        id<MTLBuffer> rbuf = expert_pin_enabled()
+            ? expert_pin_reserve_slot(layer_idx, expert_indices[k],
+                                      protected_slots, num_protected_slots, &rslot)
+            : nil;
+        if (rbuf) {
+            dst_bufs[k] = rbuf;
+            t->dst = [rbuf contents];
+            g_async_pread.reserved[k] = 1;
+            g_async_pread.pin_slot[k] = rslot;
+            if (num_protected_slots < MAX_K) protected_slots[num_protected_slots++] = rslot;
+        } else {
+            g_async_pread.reserved[k] = 0;
+        }
         t->fd = packed_fd;
         t->offset = (off_t)expert_indices[k] * esz;
         t->size = split ? gu : esz;
@@ -8010,6 +8094,13 @@ static void async_pread_wait_gate_up(void) {
         }
         for (int k = 0; k < g_async_pread.num_tasks; k++) {
             if (g_async_pread.pinned_hit[k]) continue;
+            if (g_async_pread.reserved[k]) {
+                // 21a: bytes already landed in the reserved slot (mapping armed
+                // at reserve time). A failed read must unmap the slot.
+                if (!g_async_pread.valid[k])
+                    expert_pin_release_reservation(g_async_pread.layer, g_async_pread.expert_idx[k]);
+                continue;
+            }
             if (g_async_pread.valid[k])
                 expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
                                  g_async_pread.tasks[k].dst,
@@ -8037,6 +8128,13 @@ static void async_pread_wait_down(void) {
         int ok = g_async_pread.valid[k] &&
                  (g_async_pread.down_tasks[k].result == (ssize_t)dn);
         g_async_pread.valid[k] = ok;
+        if (g_async_pread.reserved[k]) {
+            // 21a: wave2 wrote the down suffix straight into the slot. A failed
+            // wave2 leaves garbage in the slot — unmap it.
+            if (!ok)
+                expert_pin_release_reservation(g_async_pread.layer, g_async_pread.expert_idx[k]);
+            continue;
+        }
         if (ok)
             expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
                              g_async_pread.tasks[k].dst,
@@ -9794,7 +9892,8 @@ static void fused_layer_forward(
         {
             // ---- ASYNC parallel pread: start I/O, overlap shared-expert prep ----
             // expert_bufs is initialized to the pool buffers, then async_pread_start
-            // replaces pin-hit entries with zero-copy slot buffers.
+            // replaces pin-hit entries (and 21a reserved-slot misses) with zero-copy
+            // slot buffers.
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }

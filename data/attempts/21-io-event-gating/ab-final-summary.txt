@@ -1,0 +1,16 @@
+run1 infer-base PIN=4: 24.71 tok/s
+run1 infer-final PIN=4: 25.30 tok/s
+run1 infer-base PIN=0: 18.65 tok/s
+run1 infer-final PIN=0: 19.24 tok/s
+run2 infer-base PIN=4: 24.82 tok/s
+run2 infer-final PIN=4: 25.42 tok/s
+run2 infer-base PIN=0: 19.23 tok/s
+run2 infer-final PIN=0: 19.16 tok/s
+run3 infer-base PIN=4: 24.71 tok/s
+run3 infer-final PIN=4: 25.32 tok/s
+run3 infer-base PIN=0: 19.17 tok/s
+run3 infer-final PIN=0: 19.14 tok/s
+infer-base-p0: median=19.17 n=3
+infer-base-p4: median=24.71 n=3
+infer-final-p0: median=19.16 n=3
+infer-final-p4: median=25.32 n=3

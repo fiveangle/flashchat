@@ -1,11 +1,20 @@
 # Decode-Speed Explorations
 
 Systematic exploration of decode tok/s improvements for SSD-streamed MoE
-inference. Each path gets a git branch `exp/<NN>-<slug>` and a directory
-`docs/explorations/<NN>-<slug>/` containing:
+inference. Each path gets a git branch `exp/<NN>-<slug>` and directories
+`docs/explorations/<NN>-<slug>/` + `data/attempts/<NN>-<slug>/` (mirrored raw
+benches) containing:
 
 - `NOTES.md` — hypothesis, method, observations, comparison, verdict
 - raw bench output (quick harness runs, bench_api rows, timing dumps)
+
+> **Convention (mandatory, 2026-08-25 onward):** every numbered attempt lands
+> on its `exp/<NN>-<slug>` branch AND under `data/attempts/<NN>-<slug>/` (the
+> canonical archive). A `docs/explorations/<NN>-<slug>/` mirror is created for
+> continuity with the original 00–11 campaign. `data/README.md` is the status
+> board; `docs/explorations/README.md` is the historical index. Future work
+> must follow this layout so `bench_api` coverage, NOTES, and raw outputs stay
+> discoverable.
 
 Measurement protocol:
 
@@ -32,6 +41,9 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 | 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | probed, PARKED | works, 76% acceptance, but 0.76x net at B=2; needs skip-spec gate + B>=3 + 16GB hw |
 | 10 | main | prefill "regression" vs Jul-8 fast rows | done, NO REGRESSION | fast rows were a dirty WIP tree; no clean commit reproduces them; ANE fully engaged; see 10 NOTES |
 | 11 | exp/11-prefill-ane-crossover | hybrid ANE/GPU prefill by chunk size | done, KEEP | GPU path below 512-token chunks: -37% short cold prefill, bit-faithful; ANE keeps long-chunk overlap win |
+| 14 | exp/14-expert-read-split | gate+up wave, down overlapped (shipped v12) | done, KEEP | +6.5% pin-off, +10% over shipped defaults → 25.2 tok/s |
+| 15 | exp/15-lm-head-resident | lm_head mlock headroom-guarded (shipped v12) | done, KEEP | +15–20% under pin pressure |
+| 21 | exp/21-io-event-gating | pin reserve (pread-into-slot) + event-gated CMD3 probe | done, KEEP (21a) / DEAD (21b) | 21a +2.5% shipped defaults; 21b −4%/−42% removed — see 21 NOTES |
 
 ## 16GB emulation result (ram_pressure 17GiB on the 32GB dev box)
 

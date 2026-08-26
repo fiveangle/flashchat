@@ -1,0 +1,8 @@
+run1 A: 21.32 tok/s
+run1 B: 23.15 tok/s
+run2 A: 21.81 tok/s
+run2 B: 23.35 tok/s
+run3 A: 21.61 tok/s
+run3 B: 23.39 tok/s
+A: median=21.61 runs=['21.32', '21.81', '21.61']
+B: median=23.35 runs=['23.15', '23.35', '23.39']

@@ -1,0 +1,9 @@
+quick_decode_bench: model=995ad96eacd98c81ed38be0c5b274b04031597b0 tokens=150 runs=3
+  env: PIN_GB=<unset> MTP=<unset> KV=<unset>
+  results -> data/attempts/21-io-event-gating/base
+  run1: decode=18.84 tok/s ttft=1694ms
+  run2: decode=20.24 tok/s ttft=992ms
+  run3: decode=19.58 tok/s ttft=1062ms
+  MEDIAN decode: 19.58 tok/s (runs: 18.84, 20.24, 19.58)
+  BEST   decode: 20.24 tok/s
+  layer-phase medians (ms): cmd1_submit=0.009  cmd1_wait=0.105  cmd2_encode=0.004  cmd2_wait=0.523  cmd3_encode=0.219  cpu_attn=0.002  expert_io=0.499  routing_cpu=0.002  total_layer=1.199

@@ -1,0 +1,12 @@
+run1 EV=0 PIN=4: 22.17 tok/s
+run1 EV=1 PIN=4: 21.32 tok/s
+run1 EV=0 PIN=0: 19.74 tok/s
+run1 EV=1 PIN=0: 12.35 tok/s
+run2 EV=0 PIN=4: 22.10 tok/s
+run2 EV=1 PIN=4: 21.58 tok/s
+run2 EV=0 PIN=0: 19.73 tok/s
+run2 EV=1 PIN=0: 11.39 tok/s
+run3 EV=0 PIN=4: 24.37 tok/s
+run3 EV=1 PIN=4: 22.57 tok/s
+run3 EV=0 PIN=0: 19.79 tok/s
+run3 EV=1 PIN=0: 10.85 tok/s
