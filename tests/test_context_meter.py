@@ -37,17 +37,15 @@ class MeterTests(unittest.TestCase):
                         chunk=2, chunks=3, layer=23, layers=48))
         self.assertIn("Context Used: 14k [|||||||", output)
         self.assertIn("64k (774 MiB)", output)
-        self.assertIn("Prompt progress: 4,096 / 10,541 tokens (39%)", output)
-        self.assertIn("Prompt chunk: 2 / 3", output)
-        self.assertIn("Model layer: 23 / 48", output)
-        self.assertIn("Reused context: 10,197 tokens", output)
+        self.assertIn("Processing: Prompt 39% (4,096/10,541 tokens) | layer 23/48", output)
 
     def test_decode_and_idle(self):
-        self.assertIn("Generated: 85 tokens", render(self.snapshot(phase="generating", generated_tokens=85)))
+        self.assertIn("Processing: Generating response | 85 tokens",
+                      render(self.snapshot(phase="generating", generated_tokens=85)))
         output = render(self.snapshot(phase="idle", generated_tokens=85, cached_tokens=42))
-        self.assertIn("Processing: Idle", output)
-        self.assertIn("Generated: No active request", output)
-        self.assertIn("Reused context: No active request", output)
+        self.assertIn("Processing: Idle - ready for a request", output)
+        self.assertNotIn("85", output)
+        self.assertNotIn("No active request", output)
 
     def test_unreachable_does_not_claim_zero(self):
         output = render("")
@@ -63,8 +61,7 @@ class MeterTests(unittest.TestCase):
         snapshots = [self.snapshot(phase=phase) for phase in
                      ("idle", "preparing", "prefill", "generating")]
         snapshots += [self.snapshot(), ""]
-        expected = ["Context Used", "Processing", "Prompt progress", "Prompt chunk",
-                    "Model layer", "Reused context", "Generated"]
+        expected = ["Context Used", "Processing"]
         for snapshot, server in [(s, "Running") for s in snapshots] + [("", "Not running")]:
             with self.subTest(snapshot=snapshot, server=server):
                 lines = render(snapshot, server).splitlines()

@@ -105,10 +105,11 @@ explicit unavailable reading instead of zero usage. Its capacity fallback
 uses the configured window (64K by default), clamped by known model limits.
 The MiB figure describes allocated context-cache capacity, not memory used by
 just the occupied positions. The menu remains a refresh-on-action interface.
-The status block always shows the same rows: processing state, prompt progress,
-prompt chunk, model layer, reused context, and generated tokens. Inactive rows
-say so explicitly; idle and stopped states do not display stale request counters.
-Unavailable status preserves every row rather than collapsing the menu layout.
+The status block always has two rows: context usage and one processing summary.
+Prompt processing shows its percentage, token counts, and current layer when
+available; generation shows the generated token count. Idle, stopped, preparing,
+and unavailable states use plain descriptions in that same row. Chunk and reused
+context details remain available through `/health`, not as placeholder menu rows.
 
 Validation:
 

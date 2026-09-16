@@ -164,38 +164,26 @@ import json, sys
 p = json.loads(sys.argv[1]) if sys.argv[1] else {}
 phase = p.get("phase")
 status = "Status unavailable"
-prompt = chunk = layer = reused = generated = "Unavailable"
 if not sys.argv[2].startswith("Running"):
     status = "Server stopped"
-    prompt = chunk = layer = reused = generated = "No active request"
 elif sys.argv[3] == "1":
     status = "Status temporarily unavailable"
 elif phase == "idle":
-    status = "Idle"
-    prompt = chunk = layer = reused = generated = "No active request"
+    status = "Idle - ready for a request"
 elif phase == "preparing":
     status = "Preparing prompt"
-    prompt = reused = "Waiting for prompt preparation"
-    chunk = layer = generated = "Not started"
-elif phase in ("prefill", "generating"):
-    status = "Processing prompt" if phase == "prefill" else "Generating response"
+elif phase == "prefill":
     done, total = p.get("prefill_done", 0), p.get("prompt_tokens", 0)
-    percent = 100 * done / total if total else 0
-    prompt = f"{done:,} / {total:,} tokens ({percent:.0f}%)"
-    cached = p.get("cached_tokens", 0)
-    reused = f"{cached:,} tokens" if cached else "None"
-    chunk = layer = "Not active"
-    generated = "Not started"
-    if phase == "prefill":
-        chunk = "{chunk} / {chunks}".format(**p) if p.get("chunks") else "Not using chunks"
-        layer = "{layer} / {layers}".format(**p) if p.get("layers") else "Not available"
+    if total:
+        percent = 100 * done / total
+        status = f"Prompt {percent:.0f}% ({done:,}/{total:,} tokens)"
     else:
-        prompt += " — complete"
-        generated = "{:,} tokens".format(p.get("generated_tokens", 0))
-for label, value in (("Processing", status), ("Prompt progress", prompt),
-                     ("Prompt chunk", chunk), ("Model layer", layer),
-                     ("Reused context", reused), ("Generated", generated)):
-    print(f"{label}: {value}")
+        status = "Reading prompt"
+    if p.get("layers"):
+        status += " | layer {}/{}".format(p.get("layer", 0), p["layers"])
+elif phase == "generating":
+    status = "Generating response | {:,} tokens".format(p.get("generated_tokens", 0))
+print(f"Processing: {status}")
 ' "${FLASHCHAT_HEALTH_JSON:-}" "$server_status" "$unavailable"
 }
 
