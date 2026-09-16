@@ -2,6 +2,40 @@
 
 This is a pure C/Metal inference engine for running 397B parameter MoE models on Apple Silicon.
 
+## Working Rules: Benchmarks and Git
+
+- **Expect noise, not single-digit precision.** SSD-streamed inference depends heavily
+  on prompt type (prose versus math/code, narrow versus broad topics), available RAM,
+  cache state, and competing activity. Most single-digit percentage differences are
+  inconclusive, not automatic regressions or wins. A 3% change alone does not justify
+  repeated baseline runs. Keep validation bounded and investigate material,
+  reproducible changes; do not create more noise by launching extra memory consumers.
+- **Protect performance measurements already in progress.** Before starting another
+  inference server, establish the purpose and whether the existing server is being
+  used for performance measurement, including by Dave. A second server can be fine
+  for functional testing only when neither workload needs performance measurements.
+  If either does, do not start a competing server or disturb the running workload.
+  Ask when unclear; never stop Dave's server without permission.
+- **Target shipping defaults, not Dave's current settings.** Use the Make-based
+  benchmarks and the out-of-box Qwen3.6-35B-A3B-q4 model with q8 context cache unless
+  another target is explicitly agreed. Dave's running configuration is experimental
+  and malleable. An unexpected setting is not a new baseline or a reason to launch
+  time-consuming benchmark campaigns: ask before changing the target.
+- **Keep the performance log, do not curate it.** Always include
+  `assets/api_perf_log.tsv` when committing if it has changes. It is a malleable
+  watchdog, not a source of absolute truth. Preserve noisy or confounded results;
+  do not delete, rewrite, or rerun them merely to make the log or report look clean.
+  Explain limitations when interpreting results instead.
+- **Commit headline prefixes:** `feat:` for features, `fix:` for fixes,
+  `refactor:` for refactoring, and `doc:` for non-experiment documentation.
+  Optimization, speed, and other material performance experiments use `exp/<count>:`
+  with an ongoing integer experiment index. Check existing exploration directories
+  and Git history for the next index. Document and commit every experiment,
+  including negative or inconclusive results, in
+  `docs/explorations/<count>-<experiment-name>/NOTES.md`. Record the hypothesis,
+  configuration, method, findings, and conclusion so explored approaches are not
+  repeated without a deliberate reason. Follow the commit-approval checkpoint below.
+
 ## Project Structure
 
 ```
@@ -90,15 +124,9 @@ recording **prefill (TTFT)** and **decode (tok/s)** separately to `assets/api_pe
 `make bench-report` compares the latest rows to prior commits (keyed on `hw_model`) and
 flags regressions.
 
-Do **not** selectively revert or omit `assets/api_perf_log.tsv` rows produced by normal
-validation commands such as `make api-smoke`, `make bench-api`, or related test
-surfaces. The log is a watchdog/sentinel artifact: its value is time-inverted because
-future regressions may need historical rows that did not look important when they were
-captured. If normal testing generated rows, preserve them unless the user explicitly
-asks to discard them or the rows are known corrupt/non-test output. When committing a
-verified unit of work, include `assets/api_perf_log.tsv` by default if it changed; do
-not treat it as incidental dirty-worktree noise or exclude it from the commit just
-because the code change lives elsewhere.
+Preserve and commit the performance log under the working rules above, including
+rows from functional smoke tests. Report flags are investigation hints, not a demand
+to repair history or repeatedly benchmark until everything is green.
 
 This design exists because the perf log silently went stale for the entire MTP + dense
 arc: the suite followed a single configured model, so new models/quants were never
@@ -114,16 +142,21 @@ measured. Coverage is now structural, not manual — **but two things still requ
    path, add it to the spec in `tests/bench_api.sh` so every model covers it.
 
 **Run `make bench-api` (or at least `--model-id <id>`) for any change to the decode/prefill
-hot path, kernels, attention, or speculative decoding, and confirm `make bench-report`
-shows no regression before committing.** Ad-hoc `--mtp-generate-*` numbers are for
-inner-loop iteration, not regression sign-off.
+hot path, kernels, attention, or speculative decoding, and review `make bench-report`
+before committing.** Apply the noise, workload-protection, and shipping-target rules
+above: a small delta or unrelated historical flag is not a reason for endless reruns.
+If measurements cannot run without disturbing Dave's work, defer them and report the
+validation gap. Ad-hoc `--mtp-generate-*` numbers are for inner-loop iteration, not
+regression sign-off.
 Canonical benchmarks must pass the system-health preflight. Active Time Machine,
 thermal/performance warnings, another inference process, or sustained CPU/GPU pressure
 make latency and throughput results invalid. The harness records the sampled state on
 every row and refuses to run under known contention by default. `--allow-busy-system`
 exists only for diagnostic reproduction: every row it emits must be marked `confounded`
-and excluded from regression reports. Unexpectedly low results are a stop condition;
-isolate MTP, runtime settings, system state, and a known-good binary before proceeding.
+and excluded from regression reports, but retained in the log. Material unexpected
+slowdowns warrant checking prompt, memory pressure, runtime settings, and system
+activity first, not automatically running a new baseline campaign. Historical absolute
+throughput numbers are not universal thresholds across models, prompts, and machines.
 
 ### Dense Prefill TensorOps Direction
 
