@@ -52,3 +52,15 @@ KEEP BOTH STAGES. Strongest clean win so far: +11.7% controlled A/B,
 (default-on after wiring FLASHCHAT_FUSE_LINEAR through the config chain, or
 inverting to opt-out). The pin prefill trade-off is a sizing question —
 handled separately in exp/02 (phase-aware / F_NOCACHE).
+
+## Reference audit — 2026-09-16
+
+The listed Stage A pairs imply +11.8% (the original +11.7% is a rounded
+summary). Prefill 2435→3143 ms is **+29.1% elapsed time**, correcting the
+original +26% label. The latter comparison includes added 8 GiB pinning:
+fusion alone was 2435→2399 ms. Do not attribute the combined memory-policy
+penalty to command fusion alone.
+
+See the [exploration register](../../END_TO_END_SPEED_OPPORTUNITIES.md)
+for current disposition and revisit criteria. This correction uses existing
+evidence; no benchmarks were rerun or raw results changed.

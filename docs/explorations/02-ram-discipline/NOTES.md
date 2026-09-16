@@ -62,3 +62,15 @@ pin size — the knobs change hit SPEED, not hit RATE (except pin size).
 FLASHCHAT_EXPERT_PIN_MAX_GB=3, AUTO_FRAC=0.95, MLOCK=1 (fuse already
 default-on). Emulated decode: 10.5 -> 12.8 tok/s (+22%) from mlock alone on
 top of the earlier fuse+pin gains.
+
+## Reference audit — 2026-09-16
+
+The control/locking pairs above give +15.4%, +18.4%, and +21.4%, so the
+supported range is **+15–21%**, correcting the original +15–24% headline.
+The warm pair gives +6.3%. The verdict remains mixed: retain locking with
+memory headroom; do not enable the tested cache-bypass or frequency-decay
+policies. No new measurement or default change is implied.
+
+See the [exploration register](../../END_TO_END_SPEED_OPPORTUNITIES.md)
+for current disposition and revisit criteria. This correction uses existing
+evidence; no benchmarks were rerun or raw results changed.

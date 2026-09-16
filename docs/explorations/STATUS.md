@@ -4,6 +4,10 @@ Historical campaign status board. All numbered investigations now live under
 `docs/explorations/<index>-<experiment>/`. See [README.md](README.md) for the
 archive index and [AGENTS.md](../../AGENTS.md) for current working rules.
 
+For current planning, permanent ID reservations, and cumulative dispositions,
+use the [exploration register](../END_TO_END_SPEED_OPPORTUNITIES.md). The dated
+board below is historical evidence, not the allocator for new experiment IDs.
+
 ## Layout
 
 | Path | What |

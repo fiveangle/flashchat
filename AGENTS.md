@@ -4,6 +4,8 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 ## Working Rules: Benchmarks and Git
 
+- **Check the branch before making changes.** If on `main`, alert Dave and ask
+  permission to switch to `develop` or a dedicated task branch before editing.
 - **Ask Dave before any benchmarking.** Get explicit approval for the proposed
   scope and configuration before running performance measurements, including
   ad-hoc timing probes and reruns. Approval covers the agreed bounded run or suite,
@@ -43,12 +45,23 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 - **Commit headline prefixes:** `feat:` for features, `fix:` for fixes,
   `refactor:` for refactoring, and `doc:` for non-experiment documentation.
   Optimization, speed, and other material performance experiments use `exp/<count>:`
-  with an ongoing integer experiment index. Check existing exploration directories
-  and Git history for the next index. Document and commit every experiment,
+  with a permanent integer experiment ID from
+  `docs/END_TO_END_SPEED_OPPORTUNITIES.md`, the cumulative exploration register.
+  Reuse an existing proposal's assigned ID when starting it. Before assigning a
+  new ID, check the register (including reserved proposals without directories),
+  `docs/explorations/`, and Git history/branches; allocate above the highest ID
+  across all three. Never renumber or reuse IDs after assignment, including
+  rejected or superseded explorations. Update the register's status and evidence
+  links as work advances; preserve dated findings in the exploration notes.
+  Document and commit every experiment,
   including negative or inconclusive results, in
   `docs/explorations/<count>-<experiment-name>/NOTES.md`. Record the hypothesis,
   configuration, method, findings, and conclusion so explored approaches are not
   repeated without a deliberate reason. Follow the commit-approval checkpoint below.
+- **One branch per exploration.** Before starting a new exploration, create and
+  switch to a dedicated `exp/<count>-<experiment-name>` branch matching its
+  exploration directory. Keep unrelated work off that branch; never reuse it for
+  another exploration.
 
 ## Project Structure
 

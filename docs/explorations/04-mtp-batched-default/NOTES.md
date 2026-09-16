@@ -49,3 +49,14 @@ Quick-bench 100-token decode under emulation:
 - base 15.69 -> fuse 18.28 -> fuse+pin3GB 21.59 tok/s (+37.6% over base)
 (absolute numbers flattered by this machine's faster SSD/RAM vs base M4;
 relative multipliers are the signal)
+
+## Reference audit — 2026-09-16
+
+The recorded 21.59→16.03 tok/s pair is **0.742x (−25.8%)**, rather than the
+approximately 0.76x narrative summary. This does not change the negative
+verdict. The proposed follow-up is 20; avoiding one verification path still
+incurs drafting and decision costs, so a “never worse” fallback is not established.
+
+See the [exploration register](../../END_TO_END_SPEED_OPPORTUNITIES.md)
+for current disposition and revisit criteria. This correction uses existing
+evidence; no benchmarks were rerun or raw results changed.

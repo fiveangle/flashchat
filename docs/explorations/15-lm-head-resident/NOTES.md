@@ -27,3 +27,15 @@ pages get reclaimed). Token stream identical.
 
 **KEEP default on.** On 16GB this should matter more (pair with pin 3G).
 Wire through config menu when packaging defaults.
+
+## Reference audit — 2026-09-16
+
+Saved run summaries give an off median of 19.48 tok/s and on-block medians
+of 22.16 and 23.87 tok/s: **+13.8% and +22.5%**, respectively. The original
++15–20% wording is approximate. Keep the blocks separate rather than inventing
+one more precise combined effect. The implementation also changed mapped-file
+access advice; these results do not isolate each component's contribution.
+
+See the [exploration register](../../END_TO_END_SPEED_OPPORTUNITIES.md)
+for current disposition and revisit criteria. This correction uses existing
+evidence; no benchmarks were rerun or raw results changed.

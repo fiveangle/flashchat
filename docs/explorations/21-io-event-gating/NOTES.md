@@ -173,3 +173,21 @@ cross-model noise. No regression on any benchmarked-today model.
   is the only tier. NOT implemented.
 - F_RDADVISE before miss waves: untested; likely noise-level next to 21a.
 - iogpu.wired_limit_mb guidance for 16GB: doc-only candidate, needs hardware.
+
+## Reference audit — 2026-09-16
+
+For event gating with PIN=4, the three EV=0 values above have median
+**22.17**, not 22.10. The EV=1 median is 21.58, giving **−2.7%**, not −4%.
+The PIN=0 comparison remains **19.74→11.39 tok/s (−42.3%)**. The small pin-on
+delta alone does not establish a precise handler-overhead cost; the large
+pin-off loss is the stronger negative evidence.
+
+For the shipped slot-reservation change, use the final isolated comparison
+**24.71→25.32 tok/s (+2.5%)**, with pin-off neutral, as already recorded in
+the durable sign-off. The earlier +8% prototype and +18–37% API comparisons
+are different comparisons; the API comparison includes other intervening
+optimizations. Raw runs and original chronological findings remain intact.
+
+See the [exploration register](../../END_TO_END_SPEED_OPPORTUNITIES.md)
+for current disposition and revisit criteria. This correction uses existing
+evidence; no benchmarks were rerun or raw results changed.

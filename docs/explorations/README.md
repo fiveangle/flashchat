@@ -1,7 +1,12 @@
-# Decode-Speed Explorations
+# Flashchat Exploration Archive
 
-Systematic exploration of decode tok/s improvements for SSD-streamed MoE
-inference. Each experiment has one canonical directory,
+The [cumulative exploration register](../END_TO_END_SPEED_OPPORTUNITIES.md)
+tracks permanent IDs, proposals, dispositions, and links to evidence across the
+end-to-end API loop. Consult it before allocating an experiment number: proposals
+reserve IDs even before they have a directory. IDs are never renumbered or reused.
+
+This directory preserves the detailed exploration record, including the original
+decode-speed campaign. Each started experiment has one canonical directory,
 `docs/explorations/<index>-<experiment>/`, containing:
 
 - `NOTES.md` — hypothesis, method, observations, comparison, verdict
@@ -10,8 +15,9 @@ inference. Each experiment has one canonical directory,
 Raw output retains the paths printed when it was captured; those historical paths
 do not define the current archive layout.
 
-Use `exp/<index>:` commit headlines and the next unused integer index; consult
-both this archive and Git history. Preserve negative and inconclusive findings.
+Use `exp/<index>:` commit headlines and the ID already assigned in the register.
+For a new exploration, allocate above the highest assigned or reserved ID across
+the register, this archive, and Git history/branches. Preserve negative and inconclusive findings.
 There is no second archive or mirrored notes tree. See [AGENTS.md](../../AGENTS.md)
 for benchmark scope, noise handling, and commit policy.
 
