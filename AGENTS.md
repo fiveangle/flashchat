@@ -4,6 +4,20 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 ## Working Rules: Benchmarks and Git
 
+- **Ask Dave before any benchmarking.** Get explicit approval for the proposed
+  scope and configuration before running performance measurements, including
+  ad-hoc timing probes and reruns. Approval covers the agreed bounded run or suite,
+  not an open-ended benchmark campaign.
+- **Benchmark with application windows hidden and Finder foreground.** After
+  approval, record the current application visibility and foreground app, hide all
+  running GUI applications except Finder (including Codex), and activate Finder.
+  Do not quit apps or stop their background work. Run the system-health preflight
+  after hiding apps; investigate remaining contention rather than merely retrying
+  or bypassing the check. Keep this desktop state throughout measurement, then
+  restore the prior visibility and foreground app on completion, failure, or
+  cancellation. If hiding or restoration is unavailable, explain and ask before
+  proceeding. Visible application rendering can materially consume the GPU even
+  when no inference is running; do not assume app updates preserve idle behavior.
 - **Expect noise, not single-digit precision.** SSD-streamed inference depends heavily
   on prompt type (prose versus math/code, narrow versus broad topics), available RAM,
   cache state, and competing activity. Most single-digit percentage differences are
