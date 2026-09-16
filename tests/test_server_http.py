@@ -70,6 +70,11 @@ class TransportTests(unittest.TestCase):
         with self.generation():
             pass
 
+    def test_explicit_bind_address(self):
+        for address in ("127.0.0.1", "0.0.0.0"):
+            self.assertEqual(subprocess.check_output([self.binary, address], text=True).strip(), address)
+        self.assertNotEqual(subprocess.run([self.binary, "not-an-address"]).returncode, 0)
+
     def test_slow_upload_does_not_block_status(self):
         with socket.create_connection(("127.0.0.1", self.port)) as slow:
             slow.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n{")

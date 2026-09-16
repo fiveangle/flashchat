@@ -13,6 +13,16 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <arpa/inet.h>
+
+static int server_http_bind(int fd, const char *address, unsigned short port) {
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port)};
+    if (inet_pton(AF_INET, address, &addr.sin_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    return bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+}
 
 #define HTTP_CLIENTS 16
 #define HTTP_REQUEST_LIMIT (1024 * 1024)

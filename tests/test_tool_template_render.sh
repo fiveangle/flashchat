@@ -150,6 +150,18 @@ assert_contains "assembled prompt opens assistant turn" "<|im_start|>assistant" 
 assert_contains "summary includes top_k" '"top_k": 20' "${RENDER_DIR}/summary.json"
 assert_contains "summary includes presence penalty" '"presence_penalty": 0.000' "${RENDER_DIR}/summary.json"
 
+printf 'MAX_TOKENS="123"\n' > "${TMPDIR}/response-limit-config"
+printf '{"messages":[{"role":"user","content":"hello"}]}' > "${TMPDIR}/response-limit-request.json"
+"$INFER" --config "${TMPDIR}/response-limit-config" --model-id Qwen-Qwen36-35B-A3B \
+    --render-request "${TMPDIR}/response-limit-request.json" \
+    --render-output "${TMPDIR}/response-limit-render" >/dev/null 2>&1
+assert_contains "omitted API limit uses config" '"max_tokens": 123' "${TMPDIR}/response-limit-render/summary.json"
+printf '{"input":"hello","max_output_tokens":17}' > "${TMPDIR}/response-limit-request.json"
+"$INFER" --config "${TMPDIR}/response-limit-config" --model-id Qwen-Qwen36-35B-A3B \
+    --render-kind responses --render-request "${TMPDIR}/response-limit-request.json" \
+    --render-output "${TMPDIR}/response-limit-render" >/dev/null 2>&1
+assert_contains "explicit API limit overrides config" '"max_tokens": 17' "${TMPDIR}/response-limit-render/summary.json"
+
 INSTRUCT_CONFIG="${TMPDIR}/instruct_config"
 INSTRUCT_RENDER_DIR="${TMPDIR}/instruct_rendered"
 cat >"$INSTRUCT_CONFIG" <<'EOF'

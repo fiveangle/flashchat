@@ -50,6 +50,7 @@ def run(registry: Registry) -> bool:
 
 
 def _save_selection(registry: Registry, manifest, variant_name: str) -> None:
+    configfile.initialize_defaults()
     profile_name = manifest.default_sampling_profile
     profile = manifest.sampling_profiles.get(profile_name, {})
     changes = {
@@ -57,7 +58,6 @@ def _save_selection(registry: Registry, manifest, variant_name: str) -> None:
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
         "SAMPLING_PROFILE": profile_name,
-        "CONFIG_SCHEMA_VERSION": "3",
     }
     for key, cfg_key in (("temperature", "TEMPERATURE"), ("top_p", "TOP_P"),
                          ("top_k", "TOP_K"), ("min_p", "MIN_P"),

@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+from functools import lru_cache
+from pathlib import Path
 
 from . import paths
 
@@ -44,11 +47,33 @@ def load(path: str | None = None) -> dict:
     return values
 
 
-def get(key: str, default: str = "", path: str | None = None) -> str:
+@lru_cache(maxsize=8)
+def _shipping_defaults(home: str, config_dir: str) -> dict[str, str]:
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, HOME=home, FLASHCHAT_CONFIG_DIR=config_dir)
+    output = subprocess.check_output([
+        "bash", "-c", 'source "$1/lib/config.sh"; flashchat_dump_defaults',
+        "defaults", str(root),
+    ], env=env)
+    fields = output.decode().split("\0")[:-1]
+    return dict(zip(fields[::2], fields[1::2]))
+
+
+def shipping_defaults() -> dict[str, str]:
+    """Read launcher defaults without creating or migrating user configuration."""
+    return _shipping_defaults(os.path.expanduser("~"), paths.config_dir()).copy()
+
+
+def get(key: str, default: str | None = None, path: str | None = None) -> str:
     env = os.environ.get(f"FLASHCHAT_{key}")
     if env is not None:
         return env
-    return load(path).get(key, default)
+    values = load(path)
+    if key in values:
+        return values[key]
+    if default is None:
+        default = shipping_defaults().get(key, "")
+    return default
 
 
 def mtp_enabled(path: str | None = None) -> bool:
@@ -86,3 +111,17 @@ def update(changes: dict, path: str | None = None) -> None:
 
 def exists(path: str | None = None) -> bool:
     return os.path.isfile(path or paths.config_file_path())
+
+
+def initialize_defaults(path: str | None = None) -> None:
+    """Initialize or migrate through the same defaults used by the launcher."""
+    target = path or paths.config_file_path()
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([
+        "bash", "-c",
+        'source "$1/lib/config.sh"; '
+        'FLASHCHAT_CONFIG_FILE_OVERRIDE="$2"; '
+        'if [ ! -f "$2" ]; then FLASHCHAT_CONFIG_FILE="$2"; '
+        'flashchat_create_default_config; fi; flashchat_load_config',
+        "defaults", str(root), target,
+    ], check=True)

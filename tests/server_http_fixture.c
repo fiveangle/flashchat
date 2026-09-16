@@ -7,14 +7,21 @@ static void status(char *out, size_t size) {
     snprintf(out, size, "{\"status\":\"ok\",\"context_used\":1234}");
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, stop);
     int listener = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-    if (bind(listener, (void *)&addr, sizeof(addr)) || listen(listener, 16)) return 1;
+    const char *address = argc > 1 ? argv[1] : "127.0.0.1";
+    struct sockaddr_in addr = {0};
+    if (server_http_bind(listener, address, 0) || listen(listener, 16)) return 1;
     socklen_t size = sizeof(addr);
     getsockname(listener, (void *)&addr, &size);
+    if (argc > 1) {
+        char actual[INET_ADDRSTRLEN];
+        puts(inet_ntop(AF_INET, &addr.sin_addr, actual, sizeof(actual)));
+        close(listener);
+        return 0;
+    }
     server_http_t server = {.listener = listener, .shutdown = &stopping,
         .status_json = status, .model_id = "fixture"};
     if (server_http_start(&server)) return 2;

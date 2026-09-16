@@ -59,13 +59,12 @@ def run(registry: Registry) -> None:
         "MODEL": resolved_id(manifest, variant_name),
         "MODEL_BASE": manifest.id,
         "MODEL_VARIANT": variant_name,
-        "CONFIG_SCHEMA_VERSION": "9",
     })
     registry.state.enabled[manifest.id] = True
     registry.state.save()
 
     changes["MAX_TOKENS"] = common.prompt(
-        "Max response tokens", configfile.get("MAX_TOKENS", "8192"))
+        "Max response tokens", configfile.get("MAX_TOKENS"))
 
     cw = _context_window_setting(manifest)
     changes.update(cw)
@@ -80,6 +79,7 @@ def run(registry: Registry) -> None:
     changes.update(_advanced_settings(manifest, variant_name, changes.get("ACTIVE_EXPERTS", "")))
 
     changed = _has_config_changes(changes)
+    configfile.initialize_defaults()
     configfile.update(changes)
     resolved.write(registry)
     if changed:
@@ -112,31 +112,36 @@ def _print_summary(registry: Registry) -> None:
         print(f"Variant: {vname} | Quantization: {variant.bits}-bit")
     else:
         print("Model: (none configured)")
-    print(f"Sampling profile: {configfile.get('SAMPLING_PROFILE', '')}")
-    print(f"Max response tokens: {configfile.get('MAX_TOKENS', '8192')}")
-    print(f"Temperature: {configfile.get('TEMPERATURE', '')} | "
-          f"Top-p: {configfile.get('TOP_P', '')} | Top-k: {configfile.get('TOP_K', '')}")
-    print(f"Server: {configfile.get('SERVER_HOST', '127.0.0.1')}:"
-          f"{configfile.get('SERVER_PORT', '8000')}")
-    print(f"HuggingFace cache dir: {configfile.get('HUGGINGFACE_CACHE_DIR', '~/.cache/huggingface/hub')}")
-    print(f"Offload dir: {configfile.get('OFFLOAD_DIR', '') or '(not configured)'}")
-    print(f"System prompt cache: {configfile.get('SYSTEM_PROMPT_CACHE', '1')} "
-          f"(max entries: {configfile.get('SYSTEM_PROMPT_CACHE_MAX_ENTRIES', '2')})")
-    print(f"System prompt cache dir: {configfile.get('SYSTEM_PROMPT_CACHE_DIR', '') or '(model directory)'}")
-    print(f"MTP: {configfile.get('MTP', '') or '(registry default)'}"
-          f" | Show thinking: {configfile.get('SHOW_THINKING', '0')}")
-    active = configfile.get("ACTIVE_EXPERTS", "")
+    print(f"Sampling profile: {configfile.get('SAMPLING_PROFILE')}")
+    print(f"Max response tokens: {configfile.get('MAX_TOKENS')}")
+    print(f"Temperature: {configfile.get('TEMPERATURE')} | "
+          f"Top-p: {configfile.get('TOP_P')} | Top-k: {configfile.get('TOP_K')}")
+    print(f"Server: {configfile.get('SERVER_HOST')}:"
+          f"{configfile.get('SERVER_PORT')}")
+    print(f"Listen address: {configfile.get('SERVER_BIND')}")
+    print(f"HuggingFace cache dir: {configfile.get('HUGGINGFACE_CACHE_DIR')}")
+    print(f"Offload dir: {configfile.get('OFFLOAD_DIR') or '(not configured)'}")
+    print(f"System prompt cache: {configfile.get('SYSTEM_PROMPT_CACHE')} "
+          f"(max entries: {configfile.get('SYSTEM_PROMPT_CACHE_MAX_ENTRIES')})")
+    print(f"System prompt cache dir: {configfile.get('SYSTEM_PROMPT_CACHE_DIR') or '(model directory)'}")
+    print(f"MTP: {configfile.get('MTP') or '(registry default)'}"
+          f" | Show thinking: {configfile.get('SHOW_THINKING')}")
+    active = configfile.get("ACTIVE_EXPERTS")
     if current and current[0].num_experts_per_tok > 0:
         print(f"Active experts (K): {active or current[0].num_experts_per_tok}")
-    win = configfile.get("CONTEXT_WINDOW", "") or "65536 (default)"
+    win = configfile.get("CONTEXT_WINDOW") or "65536 (default)"
     model_max = current[0].max_context if current else 0
     max_label = f" (model max {model_max})" if model_max > 0 else ""
     print(f"Context window: {win} tokens{max_label}")
-    print(f"KV cache quantization: {configfile.get('KV_QUANT', '') or 'off'}")
-    print(f"Fused GPU scheduling: {configfile.get('FUSE_LINEAR', '1') or '1'}")
-    print(f"Neural Engine prefill: {configfile.get('ANE_PREFILL', '1') or '1'} "
-          f"(GPU below {configfile.get('ANE_MIN_CHUNK', '512') or '512'}-token chunks)")
-    print(f"Adaptive expert routing: {configfile.get('ADAPTIVE_K_MASS', '') or 'off'}")
+    print(f"KV cache quantization: {configfile.get('KV_QUANT', configfile.shipping_defaults()['KV_QUANT'] if not configfile.exists() else 'off') or 'off'}")
+    print(f"Fused GPU scheduling: {configfile.get('FUSE_LINEAR')}")
+    print(f"Neural Engine prefill: {configfile.get('ANE_PREFILL')} "
+          f"(GPU below {configfile.get('ANE_MIN_CHUNK')}-token chunks)")
+    print(f"Expert disk readers: {configfile.get('IO_THREADS')} | "
+          f"GPU rotary encoding: {configfile.get('GPU_ROPE')} | "
+          f"Fused fp32 attention: {configfile.get('FUSED_ATTN')}")
+    print(f"Release prompt-processing memory: {configfile.get('PREFILL_RELEASE')}")
+    print(f"Adaptive expert routing: {configfile.get('ADAPTIVE_K_MASS') or 'off'}")
     print()
 
 
@@ -284,7 +289,7 @@ def _select_sampling_profile(manifest) -> dict:
     if manifest.num_experts_per_tok > 0:
         default_k = str(manifest.num_experts_per_tok)
         max_k = _runtime_max_active_experts()
-        current_k = configfile.get("ACTIVE_EXPERTS", "")
+        current_k = configfile.get("ACTIVE_EXPERTS")
         if current_k and current_k.isdigit() and int(current_k) > max_k:
             print(common.yellow(f"  saved K={current_k} exceeds runtime max {max_k}; using {max_k}"))
             current_k = str(max_k)
@@ -303,7 +308,7 @@ def _context_window_setting(manifest) -> dict:
     machines). Ships at 64K; clamps to the model's trained max_context."""
     max_ctx = manifest.max_context
     default_win = min(65536, max_ctx) if max_ctx > 0 else 65536
-    current_win = configfile.get("CONTEXT_WINDOW", "")
+    current_win = configfile.get("CONTEXT_WINDOW")
     if current_win.isdigit() and max_ctx > 0 and int(current_win) > max_ctx:
         print(common.yellow(f"  saved context window {current_win} exceeds model max {max_ctx}; using {max_ctx}"))
         current_win = str(max_ctx)
@@ -339,7 +344,7 @@ def _kv_quant_setting(manifest, window: int) -> dict:
         ("q4",  2 * (kv_dim // 2) + 2 * (n_kv * 2), "lossy, smallest"),
     ]
     names = [m[0] for m in modes]
-    current = (configfile.get("KV_QUANT", "") or "off").lower()
+    current = (configfile.get("KV_QUANT", "off" if configfile.exists() else configfile.shipping_defaults()["KV_QUANT"]) or "off").lower()
     default_idx = names.index(current) + 1 if current in names else 1
 
     common.heading("KV cache quantization")
@@ -352,16 +357,18 @@ def _kv_quant_setting(manifest, window: int) -> dict:
 
     choice = common.select_number(len(modes), "Select", default=default_idx)
     value = names[choice - 1] if choice else current
-    return {"KV_QUANT": "" if value == "off" else value}
+    return {"KV_QUANT": value}
 
 
 def _server_settings() -> dict:
     common.heading("Server")
     return {
-        "SERVER_PORT": common.prompt("Port", configfile.get("SERVER_PORT", "8000")),
-        "SERVER_HOST": common.prompt("Host", configfile.get("SERVER_HOST", "127.0.0.1")),
+        "SERVER_PORT": common.prompt("Port", configfile.get("SERVER_PORT")),
+        "SERVER_HOST": common.prompt("Host clients connect to", configfile.get("SERVER_HOST")),
+        "SERVER_BIND": common.prompt("Listen on IPv4 address (0.0.0.0 = all interfaces)",
+                                     configfile.get("SERVER_BIND")),
         "SERVER_LOG_PATH": common.prompt(
-            "Log path", configfile.get("SERVER_LOG_PATH", "")),
+            "Log path", configfile.get("SERVER_LOG_PATH")),
     }
 
 
@@ -370,10 +377,10 @@ def _storage_settings() -> dict:
     out = {
         "HUGGINGFACE_CACHE_DIR": common.prompt(
             "HuggingFace cache dir",
-            configfile.get("HUGGINGFACE_CACHE_DIR", "~/.cache/huggingface/hub")),
+            configfile.get("HUGGINGFACE_CACHE_DIR")),
     }
     od = common.prompt("Offload dir for archived models ('-' to disable)",
-                       configfile.get("OFFLOAD_DIR", ""))
+                       configfile.get("OFFLOAD_DIR"))
     out["OFFLOAD_DIR"] = "" if od == "-" else od
     if out["OFFLOAD_DIR"]:
         from .. import offload
@@ -418,7 +425,7 @@ def _estimated_packed_expert_size(manifest, variant_name: str) -> int:
 def _expert_pin_guidance(manifest, variant_name: str, active_experts: str) -> None:
     k = manifest.num_experts_per_tok
     if not active_experts:
-        active_experts = configfile.get("ACTIVE_EXPERTS", "")
+        active_experts = configfile.get("ACTIVE_EXPERTS")
     if active_experts and active_experts.isdigit():
         k = int(active_experts)
     layers = int(manifest.architecture.get("num_hidden_layers")
@@ -460,60 +467,65 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
         return {}
     out = {}
     mtp_raw = ""
-    # Entries: (KEY, prompt label, default, optional ONE-line dim help). The
+    # Entries: (KEY, prompt label, optional ONE-line dim help). The
     # label carries the value space; help exists only where the label alone
     # cannot explain the consequence. No headers, no blank lines — the section
     # reads as a serial choice log.
-    for key, label, default, help_text in (
-            ("SERVER_DEBUG", "Server debug logging to server.log (0/1)", "0", None),
-            ("SERVER_HTTP_LOG", "HTTP request/response log to http.log (0/1)", "0", None),
-            ("BATCH_PREFILL", "Batched prompt processing (0/1)", "1",
+    for key, label, help_text in (
+            ("IO_THREADS", "Parallel expert disk readers (1-16)", None),
+            ("GPU_ROPE", "GPU rotary position encoding (0/1)", None),
+            ("FUSED_ATTN", "Fused attention for fp32 context cache (0/1)",
+             "Quantized context caches use their own attention path."),
+            ("PREFILL_RELEASE", "Release temporary prompt-processing memory (0/1)", None),
+            ("SERVER_DEBUG", "Server debug logging to server.log (0/1)", None),
+            ("SERVER_HTTP_LOG", "HTTP request/response log to http.log (0/1)", None),
+            ("BATCH_PREFILL", "Batched prompt processing (0/1)",
              "~4-6x faster prompt reading; responses unchanged in normal use."),
-            ("PREFILL_CHUNK", "  ^ chunk size in tokens (8-4096)", "1024",
+            ("PREFILL_CHUNK", "  ^ chunk size in tokens (8-4096)",
              "Bigger = faster but more working RAM: 1024 ~170 MB, 2048 ~340 MB."),
-            ("ANE_PREFILL", "  ^ Neural Engine expert offload (0/1)", "1",
+            ("ANE_PREFILL", "  ^ Neural Engine expert offload (0/1)",
              "Faster prompt reading on long prompts; auto-falls back to GPU if the hardware lacks a Neural Engine."),
-            ("ANE_MIN_CHUNK", "  ^ GPU below this prompt length in tokens (0=always Neural Engine)", "512",
+            ("ANE_MIN_CHUNK", "  ^ GPU below this prompt length in tokens (0=always Neural Engine)",
              "Short prompts run the exact GPU path (measured faster AND bit-faithful); long prompts keep the Neural Engine overlap."),
-            ("FUSE_LINEAR", "Fused GPU scheduling for linear-attention layers (0/1)", "1",
+            ("FUSE_LINEAR", "Fused GPU scheduling for linear-attention layers (0/1)",
              "~12% faster generation with byte-identical outputs; disable only for A/B comparisons."),
-            ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (off, or 0.85-0.99)", "",
+            ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (off, or 0.85-0.99)",
              "Skips tail experts below this probability mass: ~0.90 reads ~13% fewer expert bytes; outputs can differ slightly."),
-            ("PREFILL_DEBUG", "  ^ debug (0=off, 1=chunk timings, 2=+state dump, slow)", "0", None),
-            ("PREAD_PROFILE", "Disk-read timing log (off, or a .tsv path)", "",
+            ("PREFILL_DEBUG", "  ^ debug (0=off, 1=chunk timings, 2=+state dump, slow)", None),
+            ("PREAD_PROFILE", "Disk-read timing log (off, or a .tsv path)",
              "For diagnosing slow expert streaming; analyze with tools/pread_profile_analyze.py."),
-            ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", "2097152", None),
-            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (auto=use GiB cap)", "",
+            ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", None),
+            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (auto=use GiB cap)",
              None),
-            ("EXPERT_PIN_MAX_GB", "  ^ maximum GiB cache limit (0 disables cache)", "4",
+            ("EXPERT_PIN_MAX_GB", "  ^ maximum GiB cache limit (0 disables cache)",
              None),
-            ("EXPERT_PIN_AUTO_FRAC", "  ^ also capped to this fraction of free RAM (0.1-0.9)", "0.5", None),
-            ("EXPERT_PIN_MLOCK", "  ^ lock pin cache against swap (0/1)", "1",
+            ("EXPERT_PIN_AUTO_FRAC", "  ^ also capped to this fraction of free RAM (0.1-0.9)", None),
+            ("EXPERT_PIN_MLOCK", "  ^ lock pin cache against swap (0/1)",
              "Faster hits under memory pressure; skipped automatically if free RAM is too low."),
-            ("LM_HEAD_MLOCK", "Lock vocabulary head in RAM (0/1)", "1",
+            ("LM_HEAD_MLOCK", "Lock vocabulary head in RAM (0/1)",
              "~0.3 GB on q4 35B; keeps generation from re-faulting the big final projection. Skipped if free RAM is too low."),
-            ("EXPERT_SPLIT_IO", "Overlap expert disk reads with GPU (0/1)", "1",
+            ("EXPERT_SPLIT_IO", "Overlap expert disk reads with GPU (0/1)",
              "Starts GPU on gate+up while the down half still streams from SSD; byte-identical outputs."),
-            ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)", "1",
+            ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)",
              "Repeat requests skip re-reading the system prompt — big win for long agent prompts."),
-            ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "  ^ max saved prompts (1-64; entries can be tens of MB)", "2", None),
-            ("SYSTEM_PROMPT_CACHE_DIR", "  ^ cache folder ('-' = beside the model)", "", None),
-            ("MTP", "Multi-token prediction (0=off, auto=model default, 2+=batch size)", "0",
+            ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "  ^ max saved prompts (1-64; entries can be tens of MB)", None),
+            ("SYSTEM_PROMPT_CACHE_DIR", "  ^ cache folder ('-' = beside the model)", None),
+            ("MTP", "Multi-token prediction (0=off, auto=model default, 2+=batch size)",
              "Lossless speculative decoding for models that ship a predictor head."),
-            ("MTP_BF16", "  ^ BF16 predictor weights (0/1; more RAM, slightly better drafts)", "0", None),
-            ("SHOW_THINKING", "Show thinking tokens (0/1)", "0", None),
-            ("COLOR_OUTPUT", "Color output (0/1)", "1", None)):
+            ("MTP_BF16", "  ^ BF16 predictor weights (0/1; more RAM, slightly better drafts)", None),
+            ("SHOW_THINKING", "Show thinking tokens (0/1)", None),
+            ("COLOR_OUTPUT", "Color output (0/1)", None)):
         if help_text:
             print(common.dim(f"  {help_text}"))
         if key == "EXPERT_PIN_MAX_EXPERTS":
             _expert_pin_guidance(manifest, variant_name, active_experts)
         if key in ("ADAPTIVE_K_MASS", "PREAD_PROFILE"):
-            value = common.prompt_clearable(label, configfile.get(key, default))
+            value = common.prompt_clearable(label, configfile.get(key))
         elif key == "EXPERT_PIN_MAX_EXPERTS":
             value = common.prompt_clearable(
-                label, configfile.get(key, default), clear_word="auto")
+                label, configfile.get(key), clear_word="auto")
         else:
-            value = common.prompt(label, configfile.get(key, default))
+            value = common.prompt(label, configfile.get(key))
         if key == "MTP":
             mtp_raw = value
             if value.lower() == "auto":

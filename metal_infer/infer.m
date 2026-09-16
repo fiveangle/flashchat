@@ -70,6 +70,7 @@
 #include <Accelerate/Accelerate.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <compression.h>
@@ -204,6 +205,8 @@ static char g_custom_system_prompt_path[PATH_MAX] = {0};
 static int g_custom_system_prompt_loaded = 0;
 static long g_custom_system_prompt_bytes = 0;
 static float g_default_temperature = 0.7f;
+static int g_default_max_tokens = 8192;
+static char g_server_bind[INET_ADDRSTRLEN] = "127.0.0.1";
 static float g_default_top_p = 0.8f;
 static int g_default_top_k = 20;
 static float g_default_min_p = 0.0f;
@@ -10534,7 +10537,7 @@ static void api_request_init(ApiRequest *req, ApiKind kind) {
     memset(req, 0, sizeof(*req));
     req->api_kind = kind;
     req->stream = 1;
-    req->max_tokens = 8192;
+    req->max_tokens = g_default_max_tokens;
     req->temperature = g_default_temperature;
     req->top_p = g_default_top_p;
     req->top_k = g_default_top_k;
@@ -11388,7 +11391,7 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
     NSNumber *max_tokens = root[@"max_tokens"];
     if (max_completion) req->max_tokens = [max_completion intValue];
     else if (max_tokens) req->max_tokens = [max_tokens intValue];
-    if (req->max_tokens <= 0) req->max_tokens = 8192;
+    if (req->max_tokens <= 0) req->max_tokens = g_default_max_tokens;
     if (req->max_tokens > 32768) req->max_tokens = 32768;
     NSNumber *temperature = root[@"temperature"];
     if (temperature) req->temperature = [temperature floatValue];
@@ -11615,7 +11618,7 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     if (stream) req->stream = [stream boolValue] ? 1 : 0;
     NSNumber *max_output_tokens = root[@"max_output_tokens"];
     if (max_output_tokens) req->max_tokens = [max_output_tokens intValue];
-    if (req->max_tokens <= 0) req->max_tokens = 8192;
+    if (req->max_tokens <= 0) req->max_tokens = g_default_max_tokens;
     if (req->max_tokens > 32768) req->max_tokens = 32768;
     NSNumber *temperature = root[@"temperature"];
     if (temperature) req->temperature = [temperature floatValue];
@@ -12687,6 +12690,7 @@ static int render_request_debug(const char *request_path, const char *output_dir
     printf("assembled_chars=%zu\n", strlen(assembled));
     printf("system_tokens=%d\n", sys_tokens);
     printf("assembled_tokens=%d\n", full_token_count);
+    printf("max_tokens=%d\n", req.max_tokens);
     printf("temperature=%.3f\n", req.temperature);
     printf("top_p=%.3f\n", req.top_p);
     printf("top_k=%d\n", req.top_k);
@@ -12711,6 +12715,7 @@ static int render_request_debug(const char *request_path, const char *output_dir
                  "  \"assembled_chars\": %zu,\n"
                  "  \"system_tokens\": %d,\n"
                  "  \"assembled_tokens\": %d,\n"
+                 "  \"max_tokens\": %d,\n"
                  "  \"temperature\": %.3f,\n"
                  "  \"top_p\": %.3f,\n"
                  "  \"top_k\": %d,\n"
@@ -12721,7 +12726,7 @@ static int render_request_debug(const char *request_path, const char *output_dir
                  kind == API_KIND_RESPONSES ? "responses" : "chat",
                  req.tool_count, req.tool_choice_mode,
                  strlen(sys_prompt), strlen(req.conversation_text ?: ""),
-                 strlen(assembled), sys_tokens, full_token_count,
+                 strlen(assembled), sys_tokens, full_token_count, req.max_tokens,
                  req.temperature, req.top_p, req.top_k, req.min_p,
                  req.presence_penalty, req.repetition_penalty);
         write_text_file(output_dir, "summary.json", summary);
@@ -14726,19 +14731,18 @@ static void serve_loop(
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); server_log_errorf("[serve] bind failed on port %d: %s\n", port, strerror(errno)); close(server_fd); g_server_listen_fd = -1; return;
+    const char *bind_address = getenv("FLASHCHAT_SERVER_BIND");
+    if (!bind_address || !bind_address[0]) bind_address = g_server_bind;
+    if (server_http_bind(server_fd, bind_address, port) < 0) {
+        server_log_errorf("[serve] bind failed for SERVER_BIND=%s port %d: %s\n",
+                          bind_address, port, strerror(errno));
+        close(server_fd); g_server_listen_fd = -1; return;
     }
     if (listen(server_fd, 8) < 0) {
         perror("listen"); server_log_errorf("[serve] listen failed on port %d: %s\n", port, strerror(errno)); close(server_fd); g_server_listen_fd = -1; return;
     }
 
-    server_logf("[serve] Listening on http://0.0.0.0:%d\n", port);
+    server_logf("[serve] Listening on http://%s:%d\n", bind_address, port);
     server_logf("[serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health\n");
     if (g_server_log_path[0]) {
         server_logf("[serve] Persistent log: %s\n", g_server_log_path);
@@ -16180,9 +16184,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Dev/advanced env knobs that are NOT user-facing settings remain available
-        // as environment overrides (benchmark / diagnostic use only). Everything that
-        // is a real setting now comes from the config file, not the environment.
+        // The launcher exports resolved settings; direct invocations can also use
+        // environment overrides. One-off diagnostic controls remain env-only.
         const char *env_active_experts = getenv("FLASHCHAT_ACTIVE_EXPERTS");
         const char *env_tool_call_greedy = getenv("FLASHCHAT_TOOL_CALL_GREEDY");
         const char *env_mtp_active_experts = getenv("FLASHCHAT_MTP_ACTIVE_EXPERTS");
@@ -16235,6 +16238,25 @@ int main(int argc, char **argv) {
             if (cfg) {
                 char line[512];
                 while (fgets(line, sizeof(line), cfg)) {
+                    if (strncmp(line, "SERVER_BIND=", 12) == 0) {
+                        char *value = strchr(line, '\"');
+                        char *end = value ? strchr(value + 1, '\"') : NULL;
+                        if (end && end > value + 1) {
+                            size_t length = (size_t)(end - value - 1);
+                            if (length >= sizeof(g_server_bind)) {
+                                fprintf(stderr, "Invalid SERVER_BIND: expected an IPv4 address\n");
+                                fclose(cfg);
+                                return 1;
+                            }
+                            memcpy(g_server_bind, value + 1, length);
+                            g_server_bind[length] = '\0';
+                        }
+                    }
+                    if (strncmp(line, "MAX_TOKENS=", 11) == 0) {
+                        char *value = strchr(line, '\"');
+                        int limit = value ? atoi(value + 1) : 0;
+                        if (limit > 0) g_default_max_tokens = limit > 32768 ? 32768 : limit;
+                    }
                     // model id/path: config provides them; an explicit --model-id /
                     // --model on the CLI (parsed below) overrides, so only take the
                     // config value if not already set.

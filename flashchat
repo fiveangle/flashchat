@@ -415,6 +415,7 @@ Environment variables:
   FLASHCHAT_OFFLOAD_DIR     Unified model offload directory
   FLASHCHAT_SERVER_PORT    Server port
   FLASHCHAT_SERVER_HOST    Server host clients connect to
+  FLASHCHAT_SERVER_BIND    IPv4 listen address (default 127.0.0.1)
   FLASHCHAT_TEMPERATURE    Default generation temperature
   FLASHCHAT_TOP_P          Default nucleus sampling value
   FLASHCHAT_TOP_K          Default candidate limit
@@ -527,6 +528,7 @@ cmd_status() {
     
     echo "=== Flashchat Show Status ==="
     echo "Server: http://$(flashchat_get SERVER_HOST):$(flashchat_get SERVER_PORT)"
+    echo "Listen address: $(flashchat_get SERVER_BIND)"
     
     # Check if server is running
     local pid_file
@@ -1027,37 +1029,11 @@ server_runtime_signature() {
         # new settings without having to enumerate every key below.
         echo "CONFIG_FILE=$(file_signature_part "$(flashchat_get CONFIG_FILE)")"
         echo "SERVER_PORT=$effective_port"
-        echo "TEMPERATURE=$(flashchat_get TEMPERATURE)"
-        echo "SAMPLING_PROFILE=$(flashchat_get SAMPLING_PROFILE)"
-        echo "REASONING=$(flashchat_get REASONING)"
-        echo "TOP_P=$(flashchat_get TOP_P)"
-        echo "TOP_K=$(flashchat_get TOP_K)"
-        echo "MIN_P=$(flashchat_get MIN_P)"
-        echo "PRESENCE_PENALTY=$(flashchat_get PRESENCE_PENALTY)"
-        echo "REPETITION_PENALTY=$(flashchat_get REPETITION_PENALTY)"
-        echo "SERVER_LOG_PATH=$(flashchat_get SERVER_LOG_PATH)"
-        echo "SERVER_DEBUG=$(flashchat_get SERVER_DEBUG)"
-        echo "SERVER_HTTP_LOG=$(flashchat_get SERVER_HTTP_LOG)"
-        echo "FUSE_LINEAR=$(flashchat_get FUSE_LINEAR)"
-        echo "ADAPTIVE_K_MASS=$(flashchat_get ADAPTIVE_K_MASS)"
-        echo "BATCH_PREFILL=$(flashchat_get BATCH_PREFILL)"
-        echo "PREFILL_CHUNK=$(flashchat_get PREFILL_CHUNK)"
-        echo "PREFILL_DEBUG=$(flashchat_get PREFILL_DEBUG)"
-        echo "ANE_PREFILL=$(flashchat_get ANE_PREFILL)"
-        echo "ANE_MIN_CHUNK=$(flashchat_get ANE_MIN_CHUNK)"
-        echo "PREAD_PROFILE=$(flashchat_get PREAD_PROFILE)"
-        echo "PREAD_PROFILE_CAP=$(flashchat_get PREAD_PROFILE_CAP)"
-        echo "EXPERT_PIN_MAX_GB=$(flashchat_get EXPERT_PIN_MAX_GB)"
-        echo "EXPERT_PIN_MAX_EXPERTS=$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
-        echo "EXPERT_PIN_AUTO_FRAC=$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
-        echo "EXPERT_PIN_MLOCK=$(flashchat_get EXPERT_PIN_MLOCK)"
-        echo "LM_HEAD_MLOCK=$(flashchat_get LM_HEAD_MLOCK)"
-        echo "EXPERT_SPLIT_IO=$(flashchat_get EXPERT_SPLIT_IO)"
-        echo "SHOW_THINKING=$(flashchat_get SHOW_THINKING)"
-        echo "SYSTEM_PROMPT_CACHE=$(flashchat_get SYSTEM_PROMPT_CACHE)"
-        echo "SYSTEM_PROMPT_CACHE_MAX_ENTRIES=$(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES)"
-        echo "SYSTEM_PROMPT_CACHE_DIR=$(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
-        echo "MTP=$(flashchat_get MTP)"
+        local default_key key
+        for default_key in ${!FLASHCHAT_DEFAULT_@}; do
+            key="${default_key#FLASHCHAT_DEFAULT_}"
+            printf '%s=%s\n' "$key" "$(flashchat_get "$key")"
+        done
         echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
         echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"
         echo "HTTP_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/server_http.h")"
@@ -1413,15 +1389,10 @@ cmd_serve() {
     local pid_file
     pid_file=$(flashchat_get_pid_file)
     
-    # Launch infer with config as the single source of truth for persistent
-    # settings (sampling, MTP, cache, reasoning, model id): the engine reads the
-    # config file directly via --config. Launch-resolved values (the model weights
-    # path) are passed as explicit CLI flags, visible in `ps`. There is no longer an
-    # env bridge for settings — a stray FLASHCHAT_TEMPERATURE/FLASHCHAT_MTP in the
-    # shell is intentionally ignored by the engine; edit the config to change them.
-    # Only infra paths/flags (log destination, sessions/system-prompt/registry
-    # locations) are still passed via the environment.
-    local _model_path _config_file _server_log _server_debug _server_http_log
+    # The engine reads sampling/model settings from --config; runtime execution
+    # settings use the environment bridge below. Resolved artifact paths are
+    # passed explicitly so a one-off archived model need not alter saved config.
+    local _model_path _config_file
     _model_path="$(flashchat_get MODEL_PATH)"
     _config_file="$(flashchat_get CONFIG_FILE)"
     # One-off run-from-archive: ensure.run may have written a transient marker
@@ -1434,59 +1405,14 @@ cmd_serve() {
         rm -f "$_one_off_marker"
         echo "Running one-off from archived model at: $_model_path"
     fi
-    [ -n "${FLASHCHAT_SERVER_LOG}" ]      && _server_log="$FLASHCHAT_SERVER_LOG"           || _server_log="$(flashchat_get SERVER_LOG_PATH)"
-    [ -n "${FLASHCHAT_SERVER_DEBUG}" ]    && _server_debug="$FLASHCHAT_SERVER_DEBUG"       || _server_debug="$(flashchat_get SERVER_DEBUG)"
-    [ -n "${FLASHCHAT_SERVER_HTTP_LOG}" ] && _server_http_log="$FLASHCHAT_SERVER_HTTP_LOG" || _server_http_log="$(flashchat_get SERVER_HTTP_LOG)"
-    local _fuse_linear _adaptive_k_mass
-    [ -n "${FLASHCHAT_FUSE_LINEAR}" ]     && _fuse_linear="$FLASHCHAT_FUSE_LINEAR"           || _fuse_linear="$(flashchat_get FUSE_LINEAR)"
-    [ -n "${FLASHCHAT_ADAPTIVE_K_MASS}" ] && _adaptive_k_mass="$FLASHCHAT_ADAPTIVE_K_MASS"   || _adaptive_k_mass="$(flashchat_get ADAPTIVE_K_MASS)"
-    local _pread_profile _pread_profile_cap
-    [ -n "${FLASHCHAT_PREAD_PROFILE}" ]     && _pread_profile="$FLASHCHAT_PREAD_PROFILE"         || _pread_profile="$(flashchat_get PREAD_PROFILE)"
-    [ -n "${FLASHCHAT_PREAD_PROFILE_CAP}" ] && _pread_profile_cap="$FLASHCHAT_PREAD_PROFILE_CAP" || _pread_profile_cap="$(flashchat_get PREAD_PROFILE_CAP)"
-    local _batch_prefill _prefill_chunk _prefill_debug _prefill_release
-    [ -n "${FLASHCHAT_BATCH_PREFILL}" ] && _batch_prefill="$FLASHCHAT_BATCH_PREFILL" || _batch_prefill="$(flashchat_get BATCH_PREFILL)"
-    [ -n "${FLASHCHAT_PREFILL_CHUNK}" ] && _prefill_chunk="$FLASHCHAT_PREFILL_CHUNK" || _prefill_chunk="$(flashchat_get PREFILL_CHUNK)"
-    [ -n "${FLASHCHAT_PREFILL_DEBUG}" ] && _prefill_debug="$FLASHCHAT_PREFILL_DEBUG" || _prefill_debug="$(flashchat_get PREFILL_DEBUG)"
-    [ -n "${FLASHCHAT_PREFILL_RELEASE}" ] && _prefill_release="$FLASHCHAT_PREFILL_RELEASE"
-    local _ane_prefill
-    [ -n "${FLASHCHAT_ANE_PREFILL}" ] && _ane_prefill="$FLASHCHAT_ANE_PREFILL" || _ane_prefill="$(flashchat_get ANE_PREFILL)"
-    local _ane_min_chunk
-    [ -n "${FLASHCHAT_ANE_MIN_CHUNK}" ] && _ane_min_chunk="$FLASHCHAT_ANE_MIN_CHUNK" || _ane_min_chunk="$(flashchat_get ANE_MIN_CHUNK)"
-    local _pin_max_gb _pin_max_experts _pin_auto_frac _pin_mlock _lm_head_mlock _expert_split_io
-    [ -n "${FLASHCHAT_EXPERT_PIN_MAX_GB}" ]    && _pin_max_gb="$FLASHCHAT_EXPERT_PIN_MAX_GB"       || _pin_max_gb="$(flashchat_get EXPERT_PIN_MAX_GB)"
-    [ -n "${FLASHCHAT_EXPERT_PIN_MAX_EXPERTS}" ] && _pin_max_experts="$FLASHCHAT_EXPERT_PIN_MAX_EXPERTS" || _pin_max_experts="$(flashchat_get EXPERT_PIN_MAX_EXPERTS)"
-    [ -n "${FLASHCHAT_EXPERT_PIN_AUTO_FRAC}" ] && _pin_auto_frac="$FLASHCHAT_EXPERT_PIN_AUTO_FRAC" || _pin_auto_frac="$(flashchat_get EXPERT_PIN_AUTO_FRAC)"
-    [ -n "${FLASHCHAT_EXPERT_PIN_MLOCK}" ]     && _pin_mlock="$FLASHCHAT_EXPERT_PIN_MLOCK"         || _pin_mlock="$(flashchat_get EXPERT_PIN_MLOCK)"
-    [ -n "${FLASHCHAT_LM_HEAD_MLOCK}" ]       && _lm_head_mlock="$FLASHCHAT_LM_HEAD_MLOCK"       || _lm_head_mlock="$(flashchat_get LM_HEAD_MLOCK)"
-    [ -n "${FLASHCHAT_EXPERT_SPLIT_IO}" ]     && _expert_split_io="$FLASHCHAT_EXPERT_SPLIT_IO"   || _expert_split_io="$(flashchat_get EXPERT_SPLIT_IO)"
-
-    FLASHCHAT_SERVER_LOG="$_server_log" \
-    FLASHCHAT_SERVER_DEBUG="$_server_debug" \
-    FLASHCHAT_SERVER_HTTP_LOG="$_server_http_log" \
-    FLASHCHAT_FUSE_LINEAR="$_fuse_linear" \
-    FLASHCHAT_ADAPTIVE_K_MASS="$_adaptive_k_mass" \
-    FLASHCHAT_BATCH_PREFILL="$_batch_prefill" \
-    FLASHCHAT_PREFILL_CHUNK="$_prefill_chunk" \
-    FLASHCHAT_PREFILL_DEBUG="$_prefill_debug" \
-    FLASHCHAT_PREFILL_RELEASE="$_prefill_release" \
-    FLASHCHAT_ANE_PREFILL="$_ane_prefill" \
-    FLASHCHAT_ANE_MIN_CHUNK="$_ane_min_chunk" \
-    FLASHCHAT_PREAD_PROFILE="$_pread_profile" \
-    FLASHCHAT_PREAD_PROFILE_CAP="$_pread_profile_cap" \
-    FLASHCHAT_EXPERT_PIN_MAX_GB="$_pin_max_gb" \
-    FLASHCHAT_EXPERT_PIN_MAX_EXPERTS="$_pin_max_experts" \
-    FLASHCHAT_EXPERT_PIN_AUTO_FRAC="$_pin_auto_frac" \
-    FLASHCHAT_EXPERT_PIN_MLOCK="$_pin_mlock" \
-    FLASHCHAT_LM_HEAD_MLOCK="$_lm_head_mlock" \
-    FLASHCHAT_EXPERT_SPLIT_IO="$_expert_split_io" \
-    FLASHCHAT_SESSIONS_DIR="$(flashchat_get SESSIONS_DIR)" \
-    FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)" \
-    FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)" \
-    FLASHCHAT_ACTIVE_EXPERTS="$(flashchat_get ACTIVE_EXPERTS)" \
-    FLASHCHAT_CONTEXT_WINDOW="$(flashchat_get CONTEXT_WINDOW)" \
-    FLASHCHAT_KV_QUANT="$(flashchat_get KV_QUANT)" \
-    "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" \
-        --config "$_config_file" --model "$_model_path" > /dev/null 2>&1 &
+    (
+        flashchat_export_runtime_config
+        export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
+        export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
+        export FLASHCHAT_MODEL_CONFIG="$(flashchat_get MODEL_CONFIG)"
+        exec "$SCRIPT_DIR/metal_infer/infer" --serve "$server_port" \
+            --config "$_config_file" --model "$_model_path"
+    ) > /dev/null 2>&1 &
     local infer_pid=$!
     
     # Wait for server to be ready

@@ -11,7 +11,7 @@ from .. import configfile
 
 
 def color_enabled() -> bool:
-    return sys.stdout.isatty() and configfile.get("COLOR_OUTPUT", "1") != "0"
+    return sys.stdout.isatty() and configfile.get("COLOR_OUTPUT") != "0"
 
 
 def _c(code: str, text: str) -> str:

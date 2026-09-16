@@ -35,6 +35,11 @@ cd flashchat
 
 …and follow the prompts to set up and run.
 
+New installations default to Qwen3.6-35B-A3B q4 weights, a q8 context cache,
+and a 64K context window. The API listens on localhost by default; remote access
+requires an explicit listen address in configuration. Existing context-cache
+choices are preserved. See [server configuration](docs/SERVER.md).
+
 ## Features
 I've extended the original project from a research project to usable system including:
 * TUI driven setup wizard

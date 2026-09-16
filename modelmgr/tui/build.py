@@ -16,7 +16,7 @@ from . import common
 
 def want_optional() -> bool:
     """BF16 MTP artifacts are wanted when the user enabled MTP_BF16."""
-    return configfile.get("MTP_BF16", "0") == "1"
+    return configfile.get("MTP_BF16") == "1"
 
 
 def want_mtp() -> bool:
