@@ -9181,8 +9181,20 @@ static void fused_layer_forward(
     float *attn_out_for_oproj = NULL;
     int gpu_rope_ready = 0;
     int gpu_q_norm = 0;
+    int gpu_attn_ready = 0;
 
     if (is_full) {
+        int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
+        // Decide before preprocessing Q, using the length after the pending append.
+        // All deferred attention work requires the fully fused CMD2 path below.
+        gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
+                          fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+                          kv->len + 1 >= 32 && kv->len + 1 < GPU_KV_SEQ &&
+                          g_cfg.num_experts > 0 && oproj_w && oproj_s && oproj_b &&
+                          g_metal->wf_buf && have_moe_weights &&
+                          g_metal->residual_rms_norm_bf16 && lc->post_attn_norm_w);
+        gpu_rope_ready = (gpu_attn_ready && gpu_rope_enabled() &&
+                          g_metal->rope_apply_pipe && g_metal->buf_rope_freq);
         // ---- Full attention CPU compute ----
         int q_proj_dim = g_cfg.num_attn_heads * g_cfg.head_dim * 2;
         int q_dim = g_cfg.num_attn_heads * g_cfg.head_dim;
@@ -9226,8 +9238,6 @@ static void fused_layer_forward(
         // (GPU RoPE dispatches in CMD2 before attention, using fast::cos/sin).
         // Only enable when gpu_attn_ready is also true (RoPE dispatch is in CMD2's
         // gpu_attn_fuse block) — otherwise Q would be un-RoPE'd for CPU attention.
-        gpu_rope_ready = (gpu_rope_enabled() && g_metal && g_metal->rope_apply_pipe
-                          && g_metal->buf_rope_freq && kv->len >= 32);
         if (!gpu_rope_ready) {
             apply_rotary_emb(q, k_out, pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, g_cfg.head_dim, g_cfg.rotary_dim);
         } else {
@@ -9251,7 +9261,6 @@ static void fused_layer_forward(
         }
 
         // Update KV cache (CPU + GPU mirror) via the unified append
-        int fa_idx = (layer_idx + 1) / g_cfg.full_attn_interval - 1;
         kv_append_token(kv, fa_idx, k_out, v_out);
 
         // Scaled dot-product attention (GQA) — GPU or CPU
@@ -9262,11 +9271,6 @@ static void fused_layer_forward(
 
         // GPU attention: defer dispatches to CMD2 (fused into a single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
-        int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
-                              fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ &&
-                              g_cfg.num_experts > 0);
-
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
@@ -9509,8 +9513,7 @@ static void fused_layer_forward(
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
-    int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+    int gpu_attn_fuse = gpu_attn_ready;
 
     int gpu_attn_fused = (gpu_attn_fuse && fused_attn_enabled()
                           && g_metal->flash_attn_fused_pipe
@@ -9588,7 +9591,7 @@ static void fused_layer_forward(
                 [enc setBytes:&hd  length:4 atIndex:2];
                 [enc setBytes:&eps length:4 atIndex:3];
                 [enc dispatchThreadgroups:MTLSizeMake(g_cfg.num_attn_heads, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(g_metal->rms_norm_q_weighted.threadExecutionWidth, 1, 1)];
                 [enc endEncoding];
             }
 

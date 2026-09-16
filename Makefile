@@ -185,6 +185,7 @@ help:
 	@printf "Tests:\n"
 	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
 	@printf "  make server-http-smoke  Test responsive HTTP transport and context meter\n"
+	@printf "  make q-norm-smoke       Check GPU query normalization against CPU reference\n"
 	@printf "  make manage-smoke  Run model management integration test\n"
 	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
@@ -355,6 +356,12 @@ cli-smoke:
 	bash tests/test_flashchat_cli.sh
 
 .PHONY: server-http-smoke
+.PHONY: q-norm-smoke
+q-norm-smoke:
+	@mkdir -p debug/q-norm
+	$(CC) -Wall -Wextra -fobjc-arc -O2 -framework Foundation -framework Metal tests/test_q_norm.m -o debug/q-norm/test_q_norm
+	./debug/q-norm/test_q_norm
+
 server-http-smoke:
 	python3 tests/test_server_http.py
 	python3 tests/test_context_meter.py
@@ -383,4 +390,4 @@ native-qwen-compile-smoke: $(INFER_TARGET)
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke

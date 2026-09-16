@@ -2068,9 +2068,9 @@ kernel void conv1d_step(
 //
 // Normalizes each head independently: q[i] = q[i] * inv_rms * weight[i]
 // where inv_rms = rsqrt(sum_sq / head_dim + eps).
-// Uses simd_sum for the reduction (one simdgroup, no cross-simd barrier).
+// One SIMD group per head; each lane sums a strided slice of the entire head.
 //
-// Dispatch: num_heads threadgroups, head_dim threads each (256).
+// Dispatch: num_heads threadgroups, threadExecutionWidth threads each.
 
 kernel void rms_norm_q_weighted(
     device float*       q          [[buffer(0)]],  // [num_heads, head_dim] in/out
@@ -2078,18 +2078,21 @@ kernel void rms_norm_q_weighted(
     constant uint&      head_dim   [[buffer(2)]],
     constant float&     eps        [[buffer(3)]],
     uint head [[threadgroup_position_in_grid]],
-    uint tid  [[thread_position_in_threadgroup]]
+    uint tid  [[thread_position_in_threadgroup]],
+    uint width [[threads_per_simdgroup]]
 ) {
-    if (tid >= head_dim) return;
-
     uint base = head * head_dim;
-    float val = q[base + tid];
-    float sq = val * val;
+    float sq = 0.0f;
+    for (uint i = tid; i < head_dim; i += width) {
+        float val = q[base + i];
+        sq += val * val;
+    }
 
     float sum_sq = simd_sum(sq);
 
     float inv_rms = rsqrt(sum_sq / float(head_dim) + eps);
-    q[base + tid] = val * inv_rms * bf16_to_f32(w[tid]);
+    for (uint i = tid; i < head_dim; i += width)
+        q[base + i] *= inv_rms * bf16_to_f32(w[i]);
 }
 
 
