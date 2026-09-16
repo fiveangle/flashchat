@@ -1,27 +1,27 @@
 # Flashchat Speed-Attempt Archive
 
-Every decode/prefill speed investigation lands here (or under
-`docs/explorations/` for the 2026-08-17 systematic campaign) so future work
-does not rediscover dead ends.
+Historical campaign status board. All numbered investigations now live under
+`docs/explorations/<index>-<experiment>/`. See [README.md](README.md) for the
+archive index and [AGENTS.md](../../AGENTS.md) for current working rules.
 
 ## Layout
 
 | Path | What |
 |------|------|
-| `docs/explorations/` | Original exp/00–11 campaign (branches + NOTES + raw benches) |
+| `docs/explorations/<index>-<experiment>/` | All experiments (NOTES + raw results) |
 | `docs/POTENTIAL_OPTIMIZATIONS.md` | Code-review candidates (prefill RAM, pin slots, MTP KV) |
 | `docs/PINNED_EXPERT_CACHE_SIZING_LOG.md` | Slot-based pin sizing control surface |
 | `docs/PREFILL_RELEASE_BENCHMARK_LOG.md` | Post-prefill buffer release A/B |
-| `data/2026-08-24-deep-speed-analysis/` | This session’s full hot-path analysis + ranked roadmap |
-| `data/attempts/<NN>-<slug>/` | One directory per new attempt (NOTES + raw) |
+| `12-pin-default-on/campaign-analysis/` | Shared August 24 hot-path analysis + ranked roadmap |
 
-## Protocol (mandatory)
+## Reading the historical results
 
 1. Read this index + the matching NOTES before starting.
-2. Interleave A/B runs (±6% ambient drift on the 32GB box).
-3. Inner loop: `tools/quick_decode_bench.sh data/attempts/<slug> 150 3`
-4. Sign-off: `bash tests/bench_api.sh --model-id Qwen-Qwen36-35B-A3B` + `make bench-report`
-5. Verdict in NOTES: KEEP / PARK / DEAD + why + numbers.
+2. These measurements had ±6% ambient drift on the 32GB box; small deltas are
+   not reliable universal gains or regressions.
+3. Inner-loop output belongs in `docs/explorations/<index>-<experiment>/`.
+4. Use the Make-based benchmark and shipping-target policy in AGENTS.md.
+5. Record verdicts in NOTES: KEEP / PARK / DEAD / INCONCLUSIVE + evidence.
 
 ## Status board (2026-08-24)
 
@@ -42,7 +42,7 @@ does not rediscover dead ends.
 |---|------|-----|
 | 02 | F_NOCACHE | unstable / page cache helps misses |
 | 02 | pin decode-decay | no hit-rate or speed effect |
-| 05 | matvec occupancy remap | v3 already 8×8; cost is RTT |
+| 05 | matvec occupancy remap | Deprioritized by review, not measured dead; see [05 notes](05-matvec-occupancy/NOTES.md) |
 | 09 | prev-token / frequency prefetch | 5.7–8.2% of miss pool only |
 
 ### PARKED (needs fix or 16GB hardware)
@@ -81,4 +81,5 @@ does not rediscover dead ends.
 | 22 | gpu-tail-fusion (final norm+lm_head in last CMD3) | P2 design sketched in 21 NOTES |
 | 24 | idle page-cache warmer | P2 design sketched in 21 NOTES (16GB lever) |
 
-See `2026-08-24-deep-speed-analysis/ANALYSIS.md` + `SESSION_RESULTS.md`.
+See [analysis](12-pin-default-on/campaign-analysis/ANALYSIS.md) and
+[session results](12-pin-default-on/campaign-analysis/SESSION_RESULTS.md).

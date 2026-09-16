@@ -1,7 +1,7 @@
 # 14 — Split expert I/O (gate+up wave, down overlapped)
 
 Date: 2026-08-24  
-Status: **KEEP** — default candidate `FLASHCHAT_EXPERT_SPLIT_IO=1`
+Status: **KEEP — shipped default-on in `5af6a43` (schema v12).**
 
 ## Implementation
 
@@ -10,7 +10,7 @@ Status: **KEEP** — default candidate `FLASHCHAT_EXPERT_SPLIT_IO=1`
 - Concurrent: pread down suffix on GCD.
 - Wave2: wait down → encode down_proj + combine on next cmd buffer (queue-ordered).
 - All-pin-hit layers skip split (single whole-expert path, no extra RTT).
-- Flag: `FLASHCHAT_EXPERT_SPLIT_IO=1` (currently opt-in).
+- Flag: `FLASHCHAT_EXPERT_SPLIT_IO=1` (default-on in the landing commit).
 
 ## Results (interleaved, fuse on, lm_head mlock on)
 
@@ -33,3 +33,16 @@ First 50+ generated token_ids **byte-identical** vs baseline at temp-0
 
 **KEEP.** Recommend default-on after config-chain wiring. Works with pin
 (miss tail still benefits) and without. Largest new code win this session.
+
+## Recovered disposition (2026-09-16)
+
+The recommendation above was fulfilled by `5af6a43`; its commit message and
+`lib/config.sh` diff record `EXPERT_SPLIT_IO=1` as a shipped default. The original
+"opt-in" wording described the experiment before landing, not its final state.
+
+[08's reconstructed notes](../08-expert-read-split/NOTES.md) preserve earlier
+negative prototypes from another worktree. Their different results are not a
+matched A/B against this implementation. [21](../21-io-event-gating/NOTES.md)
+documents a later failed event-gating variant. Keep those histories separate;
+the old single-digit deltas here are historical observations, not universal
+performance promises. No benchmarks were rerun for this documentation repair.

@@ -1,30 +1,36 @@
 # Decode-Speed Explorations
 
 Systematic exploration of decode tok/s improvements for SSD-streamed MoE
-inference. Each path gets a git branch `exp/<NN>-<slug>` and directories
-`docs/explorations/<NN>-<slug>/` + `data/attempts/<NN>-<slug>/` (mirrored raw
-benches) containing:
+inference. Each experiment has one canonical directory,
+`docs/explorations/<index>-<experiment>/`, containing:
 
 - `NOTES.md` — hypothesis, method, observations, comparison, verdict
 - raw bench output (quick harness runs, bench_api rows, timing dumps)
 
-> **Convention (mandatory, 2026-08-25 onward):** every numbered attempt lands
-> on its `exp/<NN>-<slug>` branch AND under `data/attempts/<NN>-<slug>/` (the
-> canonical archive). A `docs/explorations/<NN>-<slug>/` mirror is created for
-> continuity with the original 00–11 campaign. `data/README.md` is the status
-> board; `docs/explorations/README.md` is the historical index. Future work
-> must follow this layout so `bench_api` coverage, NOTES, and raw outputs stay
-> discoverable.
+Raw output retains the paths printed when it was captured; those historical paths
+do not define the current archive layout.
+
+Use `exp/<index>:` commit headlines and the next unused integer index; consult
+both this archive and Git history. Preserve negative and inconclusive findings.
+There is no second archive or mirrored notes tree. See [AGENTS.md](../../AGENTS.md)
+for benchmark scope, noise handling, and commit policy.
+
+[STATUS.md](STATUS.md) preserves the later campaign's status board, including
+experiments 12–23 and reserved proposals 22 and 24. Shared August 24 analysis,
+cost model, and session results are retained as
+[campaign background](12-pin-default-on/campaign-analysis/ANALYSIS.md) alongside
+experiment 12, the first experiment in that campaign. Their scope spans the
+campaign, not just experiment 12.
 
 Measurement protocol:
 
 - Inner loop: `tools/quick_decode_bench.sh <dir> [tokens] [runs]` — fixed
   prompt, 150 tokens, 3 runs, median decode tok/s + layer-phase medians.
 - Sign-off: `bash tests/bench_api.sh --model-id Qwen-Qwen36-35B-A3B` +
-  `make bench-report` (no regression), on this 32GB machine. 16GB targets
+  `make bench-report` (interpret under AGENTS.md's noise policy), on this 32GB machine. 16GB targets
   are reasoned about via bytes/token math until hardware is available.
 
-Baseline (see `00-BASELINE.md`): 32GB M4 Pro-class, warm cache, pin cache off,
+Baseline (see [00-baseline/NOTES.md](00-baseline/NOTES.md)): 32GB M4 Pro-class, warm cache, pin cache off,
 MTP off, K=8: ~12.4 tok/s decode, per-layer 2.02ms (cmd1_wait 0.605,
 cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
 
@@ -63,10 +69,32 @@ the remaining lever to cross 15.
 - Before shipping defaults: wire FLASHCHAT_FUSE_LINEAR / pin sizing through
   the config chain (menu + config.sh sites + schema bump) per AGENTS.md.
 
-| 05 | exp/05-matvec-occupancy | kernel remap | deprioritized | v3 kernel already 8x8; cost is dispatch/RTT not occupancy |
-| 06 | exp/06-io-threads-prefill | NUM_IO_THREADS 4->8 | pending | prefill TTFT |
-| 08 | exp/08-expert-read-split | gate+up wave, down overlapped | pending | |
-| 09 | exp/09-expert-prefetch-spec | pre-gated expert prefetch | pending | |
+## Recovered proposal dispositions (2026-09-16)
+
+These entries previously lacked dedicated notes. Reconstruction uses repository
+documents, commit messages/diffs, and, for 08, a surviving worktree note plus its
+session record. No new performance tests were run. "Not found" describes the
+inspected evidence, not proof that no private experiment ever existed.
+
+| # | Notes | Disposition |
+|---|-------|-------------|
+| 05 | [Matrix-vector occupancy](05-matvec-occupancy/NOTES.md) | Deprioritized by code review; no measured negative result recovered |
+| 06 | [Prefill I/O threads](06-io-threads-prefill/NOTES.md) | Implemented through 13; decode neutral, prefill benefit unmeasured |
+| 08 | [Split expert reads](08-expert-read-split/NOTES.md) | Early negative prototypes recovered; later implementation shipped as 14 |
+| 22 | [GPU tail fusion](22-gpu-tail-fusion/NOTES.md) | Design only; estimated benefit is not a measurement |
+| 24 | [Idle page-cache warmer](24-idle-page-cache-warmer/NOTES.md) | Design only; no measured benefit recovered |
+
+The old pending entry for 09 is superseded by
+[its measured prefetch notes](09-expert-prefetch/NOTES.md). Experiment 14's
+pre-landing "opt-in" wording is also corrected in its notes using `5af6a43`.
+
+### Other-checkout recovery
+
+[25 — recovered wonderment campaign](25-wonderment-recovered/NOTES.md) preserves
+the unique `flashchat-work` commit `a399937`, its original notes, and 39 API rows
+absent from this tree. Its original index 10 collided with our prefill-regression
+investigation. The summary maps recovered work to 01/02/07/08 and later commits;
+25 is an archival assignment, not a newly run experiment.
 
 Measurement protocol notes: ambient machine drift is +-6% across this
 session — ALWAYS interleave A/B runs; never compare across hours. The
@@ -75,5 +103,6 @@ creative, so its decode numbers run higher than the 150-token quick
 harness at long context; compare like with like.
 
 
-Merge policy: experiments land on their branch with measurements; merges to
-main only after bench_api sign-off; each merge re-baselines the next path.
+Historical measurements above describe their original workloads, not universal
+performance expectations. Follow AGENTS.md for current validation; do not
+automatically re-baseline after every merge.

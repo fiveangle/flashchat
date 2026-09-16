@@ -4,7 +4,7 @@ Machine context: 32GB Mac17,2 (MBP M-class). Target: 16GB Mac Mini M4
 usability threshold ≈ 15 tok/s on Qwen3.6-35B-A3B q4.
 
 This document is a code-level + historical synthesis. It does **not** claim
-new measured wins until the attempt dirs under `data/attempts/` are filled.
+new measured wins until the experiment dirs under `docs/explorations/` are filled.
 
 ---
 

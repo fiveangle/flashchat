@@ -14,7 +14,7 @@ eviction-while-in-flight safety argument (decode-thread phase ordering).
 ## Method
 
 - `tools/quick_decode_bench.sh <dir> 150 3` per pin size; PIN off baseline
-  = 17.33 tok/s median (00-BASELINE).
+  = 17.33 tok/s median (../00-baseline/NOTES.md).
 - Correctness: temp-0 fixed prompts, output text compared PIN vs NOPIN.
 
 ## Observations

@@ -10,7 +10,7 @@ of routed mass, renormalize; cuts expert bytes (16GB) + expert GPU compute.
 ## Method
 
 Interleaved A/B/A/B quick-bench (100 tok x 1 run x 2 rounds — ambient machine
-drift was +-6% this session, so interleaving is mandatory; see 00-BASELINE
+drift was +-6% this session, so interleaving is mandatory; see ../00-baseline/NOTES.md
 protocol note). Temp-0 output comparison for quality.
 
 ## Observations

@@ -1,0 +1,264 @@
+commit a399937b4a63fe36e1f9f788986a244ebe689338
+Author:     fiveangle <fiveangle@gmail.com>
+AuthorDate: Tue Aug 18 21:45:47 2026 -0700
+Commit:     fiveangle <fiveangle@gmail.com>
+CommitDate: Tue Aug 18 21:45:47 2026 -0700
+
+    Harden pin cache and enable lossless fusion
+
+diff --git a/AGENTS.md b/AGENTS.md
+index b3f76d1..8468805 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -185,6 +185,7 @@ the worked example when adding the next debug feature:
+ - No comments unless required for the complexity (comments are never for historical context)
+ - Prefer early returns for error conditions
+ - Keep functions focused and single-purpose
++- **Use cost models to rank performance experiments, not to veto cheap, bounded measurements.** In complex hardware/software optimization, preserve room for surprising interactions: state the skeptical prediction, design the smallest falsifiable probe, measure it, and let evidence close the door.
+ - **Configuration policy:** shipped model metadata belongs in `assets/model_configs.json`; user settings belong in `~/.config/flashchat/config` and should select models by `MODEL` ID; generated per-model runtime artifacts belong in `<model>/flashchat/` so entire model snapshots can be moved or restored as a unit. Model offload storage is one global `OFFLOAD_DIR`, never a per-model config path.
+ - **User/app state policy:** Flashchat-owned user state belongs under `~/.config/flashchat/`, including sessions, prompt history, default server logs, pid files, and optional `system.md`.
+ - **Do not add implicit config fallbacks.** Use `--config FILE` only as an explicit override, otherwise use `~/.config/flashchat/config`, environment overrides, and defaults derived from the bundled model registry.
+diff --git a/assets/api_perf_log.tsv b/assets/api_perf_log.tsv
+index 32418f4..c97d153 100644
+--- a/assets/api_perf_log.tsv
++++ b/assets/api_perf_log.tsv
+@@ -826,3 +826,42 @@ timestamp	branch	commit	hostname	hw_model	ram_gib	cpu_summary	model	server_mode
+ 2026-08-17T11:26:24Z	exp/07-cmd-fuse-linear	281dfd4	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	9664.000	decode_tok_per_sec	17.483	17.483	pass	min_tps=17.476 n=2
+ 2026-08-17T11:26:24Z	exp/07-cmd-fuse-linear	281dfd4	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	2400.000	prefill_ms	2400.000		pass	n=2
+ 2026-08-17T11:26:27Z	exp/07-cmd-fuse-linear	281dfd4	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_tool_call	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	2864	tool_call_ms	2864		pass	forced record_result
++2026-08-17T13:10:16Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	15438.000	decode_tok_per_sec	8.264	8.264	pass	min_tps=7.306 n=2
++2026-08-17T13:10:16Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3050.500	prefill_ms	3050.500		pass	n=2
++2026-08-17T13:11:16Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	20560.500	decode_tok_per_sec	6.121	6.121	pass	min_tps=6.105 n=2
++2026-08-17T13:11:16Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	4059.500	prefill_ms	4059.500		pass	n=2
++2026-08-17T13:12:29Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	24058.000	decode_tok_per_sec	6.269	6.269	pass	min_tps=6.262 n=2
++2026-08-17T13:12:29Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3801.000	prefill_ms	3801.000		pass	n=2
++2026-08-17T13:13:32Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	22302.000	decode_tok_per_sec	6.557	6.557	pass	min_tps=6.319 n=2
++2026-08-17T13:13:32Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	2908.000	prefill_ms	2908.000		pass	n=2
++2026-08-17T13:14:45Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	23830.500	decode_tok_per_sec	6.616	6.616	pass	min_tps=6.541 n=2
++2026-08-17T13:14:45Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	4631.500	prefill_ms	4631.500		pass	n=2
++2026-08-17T13:15:48Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	19833.500	decode_tok_per_sec	8.275	8.275	pass	min_tps=7.290 n=2
++2026-08-17T13:15:48Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	4265.500	prefill_ms	4265.500		pass	n=2
++2026-08-17T13:15:53Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	experiment-nocache	chat_tool_call	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	5054	tool_call_ms	5054		pass	forced record_result
++2026-08-17T13:16:42Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	12525.000	decode_tok_per_sec	11.111	11.111	pass	min_tps=11.107 n=2
++2026-08-17T13:16:42Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3434.500	prefill_ms	3434.500		pass	n=2
++2026-08-17T13:17:20Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	12512.000	decode_tok_per_sec	11.125	11.125	pass	min_tps=11.101 n=2
++2026-08-17T13:17:20Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	3433.000	prefill_ms	3433.000		pass	n=2
++2026-08-17T13:18:05Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	14692.000	decode_tok_per_sec	11.052	11.052	pass	min_tps=11.051 n=2
++2026-08-17T13:18:05Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3201.000	prefill_ms	3201.000		pass	n=2
++2026-08-17T13:18:50Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	14699.000	decode_tok_per_sec	11.040	11.040	pass	min_tps=11.025 n=2
++2026-08-17T13:18:50Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	3195.500	prefill_ms	3195.500		pass	n=2
++2026-08-17T13:19:36Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	15292.000	decode_tok_per_sec	11.103	11.103	pass	min_tps=11.099 n=2
++2026-08-17T13:19:36Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3854.000	prefill_ms	3854.000		pass	n=2
++2026-08-17T13:20:22Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	15187.500	decode_tok_per_sec	13.020	13.020	pass	min_tps=10.145 n=2
++2026-08-17T13:20:22Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	4933.500	prefill_ms	4933.500		pass	n=2
++2026-08-17T13:20:27Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_tool_call	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	5164	tool_call_ms	5164		pass	forced record_result
++2026-08-17T13:29:32Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	12625.000	decode_tok_per_sec	11.041	11.041	pass	min_tps=11.033 n=2
++2026-08-17T13:29:32Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:technical	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3477.500	prefill_ms	3477.500		pass	n=2
++2026-08-17T13:30:10Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	12569.500	decode_tok_per_sec	11.070	11.070	pass	min_tps=11.059 n=2
++2026-08-17T13:30:10Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:technical	/v1/responses	true	none	0	0	1	0	0	0	1.0	3445.500	prefill_ms	3445.500		pass	n=2
++2026-08-17T13:30:55Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	14757.500	decode_tok_per_sec	11.023	11.023	pass	min_tps=11.020 n=2
++2026-08-17T13:30:55Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:creative	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3236.000	prefill_ms	3236.000		pass	n=2
++2026-08-17T13:31:40Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	14756.500	decode_tok_per_sec	11.032	11.032	pass	min_tps=11.027 n=2
++2026-08-17T13:31:40Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:creative	/v1/responses	true	none	0	0	1	0	0	0	1.0	3245.000	prefill_ms	3245.000		pass	n=2
++2026-08-17T13:32:27Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	15383.500	decode_tok_per_sec	11.044	11.044	pass	min_tps=11.021 n=2
++2026-08-17T13:32:27Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_stream:worstcase	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	3884.500	prefill_ms	3884.500		pass	n=2
++2026-08-17T13:33:15Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	15782.000	decode_tok_per_sec	10.677	10.677	pass	min_tps=10.326 n=2
++2026-08-17T13:33:15Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	responses_stream:worstcase	/v1/responses	true	none	0	0	1	0	0	0	1.0	3874.500	prefill_ms	3874.500		pass	n=2
++2026-08-17T13:33:19Z	codex/decode-speed-wonderment	bb22cc5	fiveangle.lan	Mac17,2	32.0	4p 6e 10g	Qwen-Qwen36-35B-A3B	bench	chat_tool_call	/v1/chat/completions	true	none	0	0	1	0	0	0	1.0	4619	tool_call_ms	4619		pass	forced record_result
+diff --git a/docs/explorations/10-wonderment-round/NOTES.md b/docs/explorations/10-wonderment-round/NOTES.md
+new file mode 100644
+index 0000000..d6256e0
+--- /dev/null
++++ b/docs/explorations/10-wonderment-round/NOTES.md
+@@ -0,0 +1,51 @@
++# 10 — Bounded unlikely experiments
++
++Branch: `codex/decode-speed-wonderment`
++Date: 2026-08-17
++
++## Kept
++
++- Zero-copy pin slots selected by the current layer are excluded from LFU
++  eviction until that layer's misses have been admitted. A deliberately tiny
++  60-slot cache forced 1,774 evictions during an 80-token run and remained
++  byte-identical to pinning off.
++- Lossless CMD1+CMD2 fusion is now automatic whenever its existing runtime
++  invariants hold. Interleaved 100-token runs: off 9.92/10.40 tok/s, fused
++  11.35/11.33 tok/s (about +11.6%).
++
++## Rejected: `F_NOCACHE` expert streams
++
++Short CLI runs looked promising. With a 3 GiB pin cache, normal expert reads
++ran at 16.85/18.51 tok/s while `F_NOCACHE` reached 21.17/21.26 tok/s. Without
++pinning, normal reads ran at 18.22/18.70 and `F_NOCACHE` at 19.70/19.69.
++Outputs were byte-identical.
++
++The canonical API benchmark reversed the result. `F_NOCACHE` produced mostly
++6.1–8.3 tok/s, while the immediately following cached control produced about
++11.0–11.1 tok/s in five of six decode scenarios. Bypassing the filesystem
++cache helps the short process-local case but destroys useful expert reuse in
++sustained server generation. The code was removed. Perf-log rows from
++13:10–13:15 UTC are `F_NOCACHE=1`; rows from 13:16–13:20 UTC are the cached
++control with automatic fusion.
++
++## Rejected: split expert reads
++
++The packed expert layout has a page-aligned 1.125 MiB gate/up prefix and a
++0.5625 MiB down suffix. A prototype read them into separate Metal buffers and
++overlapped the suffix read with gate/up GPU work.
++
++- Concurrent fragment dispatch: 10.81 off vs 9.97 on.
++- Staged prefix, then suffix concurrent with GPU: off 11.10/11.08 vs split
++  10.52/10.48 tok/s.
++
++Both schedules were byte-identical. The staged version reduced the loss, but
++the extra Metal command-buffer boundary cost more than the hidden suffix I/O.
++The prototype and its extra buffers were removed.
++
++## Follow-up
++
++Split reads are only worth revisiting if Metal shared events, a single-kernel
++path, or another mechanism removes the extra submission boundary. Preserve
++normal filesystem caching and focus next on reducing command boundaries,
++improving explicit pin-cache policy, or eliminating bytes rather than globally
++bypassing reuse.
+diff --git a/docs/explorations/README.md b/docs/explorations/README.md
+index 399563e..77a9aa9 100644
+--- a/docs/explorations/README.md
++++ b/docs/explorations/README.md
+@@ -27,8 +27,8 @@ cmd2_wait 0.599, expert_io 0.771 — strictly serial phases).
+ | — | main d507059 | serve segfault fix (blocking bench since 86c8846) | done | bench resurrected |
+ | 01 | exp/01-pin-zero-copy | zero-copy pin slot buffers | done, KEEP | +10% quick A/B; 88% hits @8GB; byte-identical |
+ | 03 | exp/03-adaptive-k | routing-mass K truncation | done, opt-in | +4.6%; router flat (K 6.92 @0.90) |
+-| 07 | exp/07-cmd-fuse-linear | single commit+wait on linear layers | done, KEEP | +11.7% A/B; bench +14-24% decode, no prefill cost; combo w/ pin up to +80% short-ctx |
+-| 02 | exp/02-ram-discipline | F_NOCACHE + decode-aware admission + post-prefill pin growth | next | pin steals page cache -> prefill -26% @8GB; fix sizing/phase |
++| 07 | exp/07-cmd-fuse-linear | single commit+wait on linear layers | done, KEEP, automatic | +11.7% A/B; revalidated +11.6%; no hidden opt-in |
++| 02 | exp/02-ram-discipline | cache discipline + decode-aware admission | partial | global F_NOCACHE rejected by API bench; policy/growth remain |
+ | 04 | exp/04-mtp-batched-default | batched verify (union expert I/O) as default | probed, PARKED | works, 76% acceptance, but 0.76x net at B=2; needs skip-spec gate + B>=3 + 16GB hw |
+ 
+ ## 16GB emulation result (ram_pressure 17GiB on the 32GB dev box)
+@@ -51,7 +51,7 @@ the remaining lever to cross 15.
+ 
+ | 05 | exp/05-matvec-occupancy | kernel remap | deprioritized | v3 kernel already 8x8; cost is dispatch/RTT not occupancy |
+ | 06 | exp/06-io-threads-prefill | NUM_IO_THREADS 4->8 | pending | prefill TTFT |
+-| 08 | exp/08-expert-read-split | gate+up wave, down overlapped | pending | |
++| 08 | exp/08-expert-read-split | gate+up wave, down overlapped | rejected | byte-identical but 5-8% slower; extra Metal boundary dominates |
+ | 09 | exp/09-expert-prefetch-spec | pre-gated expert prefetch | pending | |
+ 
+ Measurement protocol notes: ambient machine drift is +-6% across this
+diff --git a/metal_infer/infer.m b/metal_infer/infer.m
+index 5173b16..84d1703 100644
+--- a/metal_infer/infer.m
++++ b/metal_infer/infer.m
+@@ -767,16 +767,6 @@ static inline size_t active_expert_size(void) {
+     return g_cfg.expert_size;
+ }
+ static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+-static int g_fuse_linear_enabled = -1;  // CMD1+CMD2 fuse on GPU-linear layers
+-
+-static inline int fuse_linear_enabled(void) {
+-    if (g_fuse_linear_enabled < 0) {
+-        const char *e = getenv("FLASHCHAT_FUSE_LINEAR");
+-        g_fuse_linear_enabled = (e && e[0] && strcmp(e, "0") && strcmp(e, "off")) ? 1 : 0;
+-    }
+-    return g_fuse_linear_enabled;
+-}
+-
+ static long g_adaptive_k_sum = 0;    // sum of K actually used (adaptive-K)
+ static long g_adaptive_k_tokens = 0; // layers routed with adaptive-K active
+ 
+@@ -7433,20 +7423,22 @@ static inline int expert_pin_gid(int layer, int expert) {
+ // copy). The caller must keep the buffer referenced for the lifetime of any
+ // command buffer that binds it (decode-thread discipline guarantees no slot
+ // is evicted between binding and deferred completion). Else NULL (miss).
+-static id<MTLBuffer> expert_pin_slot_buffer(int layer, int expert) {
++static id<MTLBuffer> expert_pin_slot_buffer(int layer, int expert, int *out_slot) {
+     if (g_pin_enabled != 1) return nil;
+     int gid = expert_pin_gid(layer, expert);
+     pthread_mutex_lock(&g_pin_mu);
+     int slot = g_pin_slot_of_gid[gid];
+     id<MTLBuffer> buf = (slot >= 0) ? g_pin_slot_bufs[slot] : nil;
+     pthread_mutex_unlock(&g_pin_mu);
++    if (out_slot) *out_slot = slot;
+     atomic_fetch_add(buf ? &g_pin_hits : &g_pin_misses, 1);
+     return buf;
+ }
+ 
+ // Admit expert bytes after a miss. Evicts the lowest-frequency pinned expert
+ // (by g_expert_freq) only if the incoming expert is at least as hot.
+-static void expert_pin_admit(int layer, int expert, const void *src) {
++static void expert_pin_admit(int layer, int expert, const void *src,
++                             const int *protected_slots, int num_protected_slots) {
+     if (g_pin_enabled != 1) return;
+     int gid = expert_pin_gid(layer, expert);
+     pthread_mutex_lock(&g_pin_mu);
+@@ -7460,6 +7452,11 @@ static void expert_pin_admit(int layer, int expert, const void *src) {
+         int incoming_freq = g_expert_freq[layer][expert];
+         long victim = -1; int victim_freq = 0;
+         for (long s = 0; s < g_pin_capacity_slots; s++) {
++            int protected = 0;
++            for (int i = 0; i < num_protected_slots; i++) {
++                if (protected_slots[i] == s) { protected = 1; break; }
++            }
++            if (protected) continue;
+             int vg = g_pin_gid_of_slot[s];
+             int vf = g_expert_freq[vg / g_cfg.num_experts][vg % g_cfg.num_experts];
+             if (victim < 0 || vf < victim_freq) { victim = s; victim_freq = vf; }
+@@ -7588,6 +7585,7 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
+     int layer;                 // layer for this batch (pin-cache key + admission)
+     int expert_idx[MAX_K];     // routed expert per slot
+     int pinned_hit[MAX_K];     // 1 = served from pin cache (no pread issued)
++    int pin_slot[MAX_K];       // arena slot for each hit; protected until dispatch
+ } AsyncPreadState;
+ static AsyncPreadState g_async_pread = {0};
+ 
+@@ -7611,14 +7609,17 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
+         t->dst = [dst_bufs[k] contents];
+         g_async_pread.expert_idx[k] = expert_indices[k];
+         // Pin-cache hit: bind the slot buffer directly — zero copies, no pread.
+-        id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k]);
++        int pin_slot = -1;
++        id<MTLBuffer> slot_buf = expert_pin_slot_buffer(layer_idx, expert_indices[k], &pin_slot);
+         if (slot_buf) {
+             dst_bufs[k] = slot_buf;
+             g_async_pread.pinned_hit[k] = 1;
++            g_async_pread.pin_slot[k] = pin_slot;
+             g_async_pread.valid[k] = 1;
+             continue;
+         }
+         g_async_pread.pinned_hit[k] = 0;
++        g_async_pread.pin_slot[k] = -1;
+         t->fd = packed_fd;
+         t->offset = (off_t)expert_indices[k] * esz;
+         t->size = esz;
+@@ -7642,13 +7643,20 @@ static void async_pread_wait(void) {
+     if (!g_async_pread.active) return;
+     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+     size_t esz = active_expert_size();
++    int protected_slots[MAX_K];
++    int num_protected_slots = 0;
++    for (int k = 0; k < g_async_pread.num_tasks; k++) {
++        if (g_async_pread.pinned_hit[k] && g_async_pread.pin_slot[k] >= 0)
++            protected_slots[num_protected_slots++] = g_async_pread.pin_slot[k];
++    }
+     for (int k = 0; k < g_async_pread.num_tasks; k++) {
+         if (g_async_pread.pinned_hit[k]) { g_async_pread.valid[k] = 1; continue; }
+         g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)esz);
+         // Admit freshly-read experts into the pin cache (LFU eviction inside).
+         if (g_async_pread.valid[k])
+             expert_pin_admit(g_async_pread.layer, g_async_pread.expert_idx[k],
+-                             g_async_pread.tasks[k].dst);
++                             g_async_pread.tasks[k].dst,
++                             protected_slots, num_protected_slots);
+     }
+     g_async_pread.active = 0;
+ }
+@@ -8364,7 +8372,7 @@ static void fused_layer_forward(
+     // CMD1's command buffer and do a single commit+wait. Saves one GPU round
+     // trip + the per-layer finalize readback per linear layer.
+     int gpu_linear_attn_will_run = (can_gpu_linear && num_attn_specs == 4);
+-    int fuse_cmd12 = (fuse_linear_enabled() && prev_gpu_combined && gpu_linear_attn_will_run &&
++    int fuse_cmd12 = (prev_gpu_combined && gpu_linear_attn_will_run &&
+                       oproj_w && oproj_s && oproj_b &&
+                       have_moe_weights && g_metal->wf_buf &&
+                       g_metal->residual_rms_norm_bf16 && lc->post_attn_norm_w);

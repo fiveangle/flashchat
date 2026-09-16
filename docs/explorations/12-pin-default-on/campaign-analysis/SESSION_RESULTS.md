@@ -1,13 +1,14 @@
 # Session results — 2026-08-24 (unattended continuation)
 
 Machine: 32GB Mac17,2. Model: Qwen3.6-35B-A3B q4. Fuse on, MTP off.
-TM idle. All work under `data/` (no Desktop/tmp dependency).
+TM idle. All work archived in the repository (no Desktop/tmp dependency).
 
 ## desktop-tmp-stuff-cleanup
 
 No LaunchAgent/cron matching that name found. No cleanup job that would
 touch `/Users/speedster/dev/flashchat`. All artifacts written only under
-`data/attempts/` and `data/2026-08-24-deep-speed-analysis/`. **Safe.**
+the repository. Experiments are now under `docs/explorations/`; shared analysis
+is alongside experiment 12 in `campaign-analysis/`. **Safe.**
 
 ## Stack progression (quick_decode_bench 150 tok median)
 

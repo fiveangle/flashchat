@@ -1,0 +1,254 @@
+[2026-08-18 19:24:31] [serve] Logging started
+[2026-08-18 19:24:31] [serve] Build: Aug 18 2026 19:17:05
+[2026-08-18 19:24:31] [serve] Listening on http://0.0.0.0:9677
+[2026-08-18 19:24:31] [serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health
+[2026-08-18 19:24:31] [serve] Persistent log: /Users/speedster/dev/flashchat/docs/explorations/10-prefill-regression/raw/4f2356a-ane-server.log
+[2026-08-18 19:24:31] [serve] Runtime configuration:
+[2026-08-18 19:24:31] [serve]   model: Qwen3.6-35B-A3B-4bit (Qwen-Qwen36-35B-A3B)
+[2026-08-18 19:24:31] [serve]   repo: Qwen/Qwen3.6-35B-A3B
+[2026-08-18 19:24:31] [serve]   model_path: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
+[2026-08-18 19:24:31] [serve]   config_file: /Users/speedster/.config/flashchat/config
+[2026-08-18 19:24:31] [serve]   weights: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.bin
+[2026-08-18 19:24:31] [serve]   manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.json
+[2026-08-18 19:24:31] [serve]   vocab: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/vocab.bin
+[2026-08-18 19:24:31] [serve]   quantization: 4-bit group_size=64
+[2026-08-18 19:24:31] [serve]   architecture: layers=40 hidden=2048 vocab=248320 heads=16 kv_heads=2 head_dim=256 full_attn=10 linear_attn=30
+[2026-08-18 19:24:31] [serve]   experts: total=256 active_per_token=8 trained_active_per_token=8 expert_size=1769472 expert_size_per_token=13.5 MiB
+[2026-08-18 19:24:31] [serve]   max_response_tokens: 20
+[2026-08-18 19:24:31] [serve]   reasoning: disabled
+[2026-08-18 19:24:31] [serve]   show_thinking: disabled
+[2026-08-18 19:24:31] [serve]   sampling: temp=0.700 top_p=0.800 top_k=20 min_p=0.000 presence=1.500 repetition=1.000
+[2026-08-18 19:24:31] [serve]   mtp: disabled
+[2026-08-18 19:24:31] [serve]   gpu_linear_attention: enabled
+[2026-08-18 19:24:31] [serve]   kv_cache: window=65536 quant=fp32 total_bytes=2560.0 MiB
+[2026-08-18 19:24:31] [serve]   batched_prefill: disabled (per-token prefill)
+[2026-08-18 19:24:31] [serve]   ane_prefill: requested but INACTIVE — requires batched_prefill
+[2026-08-18 19:24:31] [serve]   expert_pin_cache: disabled
+[2026-08-18 19:24:31] [serve]   pread_profile: disabled
+[2026-08-18 19:24:31] [serve]   system_prompt_cache: enabled max_entries=16
+[2026-08-18 19:24:31] [serve]   system_prompt_cache_dir: /Volumes/usr/Users/speedster/dev/flashchat_cache/
+[2026-08-18 19:24:31] [serve]   server_debug: disabled http_log: disabled prefill_debug: 0
+[2026-08-18 19:24:31] [serve]   custom_user_system_prompt: /Users/speedster/.config/flashchat/system.md (not present; using built-in default)
+[2026-08-18 19:24:32] [serve] chatcmpl-2 endpoint=chat prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:24:32] [serve] sys_prompt_disk_cache loaded /Volumes/usr/Users/speedster/dev/flashchat_cache//Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/40151882ca0c04f9-v2.fcache raw=0.18GiB stored=0.06GiB chunks=140
+[2026-08-18 19:24:32] [serve] chatcmpl-2 sys_prompt_cache disk hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:24:32] [serve] chatcmpl-2 request parsed; beginning prompt tokenization
+[2026-08-18 19:24:32] [serve] chatcmpl-2 tokenizing snapshot continuation chars=190
+[2026-08-18 19:24:32] [serve] chatcmpl-2 tokenized snapshot continuation tokens=40
+[2026-08-18 19:24:35] [serve] chatcmpl-2 prefill=40 tokens in 2701ms
+[2026-08-18 19:24:35] [serve] chatcmpl-2 first_token=71093
+[2026-08-18 19:24:37] [serve] chatcmpl-2 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:24:39] [serve] chatcmpl-2 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:24:41] [serve] chatcmpl-2 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:24:41] [serve] chatcmpl-2 generated=102 tokens in 6869ms (14.85 tok/s, experts 143.8 MiB/s, 18.0 MiB/s/expert, TTFT 2.7s (0@0.0tok/s think, 102@14.8tok/s response))
+[2026-08-18 19:24:41] [serve] chatcmpl-3 endpoint=chat prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:24:41] [serve] chatcmpl-3 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:24:41] [serve] chatcmpl-3 request parsed; beginning prompt tokenization
+[2026-08-18 19:24:41] [serve] chatcmpl-3 tokenizing snapshot continuation chars=190
+[2026-08-18 19:24:41] [serve] chatcmpl-3 tokenized snapshot continuation tokens=40
+[2026-08-18 19:24:44] [serve] chatcmpl-3 prefill=40 tokens in 2588ms
+[2026-08-18 19:24:44] [serve] chatcmpl-3 first_token=71093
+[2026-08-18 19:24:46] [serve] chatcmpl-3 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:24:48] [serve] chatcmpl-3 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:24:50] [serve] chatcmpl-3 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:24:51] [serve] chatcmpl-3 generated=102 tokens in 6868ms (14.85 tok/s, experts 145.6 MiB/s, 18.2 MiB/s/expert, TTFT 2.6s (0@0.0tok/s think, 102@14.9tok/s response))
+[2026-08-18 19:24:51] [serve] chatcmpl-4 endpoint=chat prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:24:51] [serve] chatcmpl-4 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:24:51] [serve] chatcmpl-4 request parsed; beginning prompt tokenization
+[2026-08-18 19:24:51] [serve] chatcmpl-4 tokenizing snapshot continuation chars=190
+[2026-08-18 19:24:51] [serve] chatcmpl-4 tokenized snapshot continuation tokens=40
+[2026-08-18 19:24:54] [serve] chatcmpl-4 prefill=40 tokens in 2562ms
+[2026-08-18 19:24:54] [serve] chatcmpl-4 first_token=71093
+[2026-08-18 19:24:56] [serve] chatcmpl-4 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:24:58] [serve] chatcmpl-4 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:25:00] [serve] chatcmpl-4 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:25:00] [serve] chatcmpl-4 generated=102 tokens in 6866ms (14.86 tok/s, experts 146.0 MiB/s, 18.3 MiB/s/expert, TTFT 2.6s (0@0.0tok/s think, 102@14.9tok/s response))
+[2026-08-18 19:25:00] [serve] resp-5 endpoint=responses prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:00] [serve] resp-5 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:00] [serve] resp-5 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:00] [serve] resp-5 tokenizing snapshot continuation chars=190
+[2026-08-18 19:25:00] [serve] resp-5 tokenized snapshot continuation tokens=40
+[2026-08-18 19:25:03] [serve] resp-5 prefill=40 tokens in 2520ms
+[2026-08-18 19:25:03] [serve] resp-5 first_token=71093
+[2026-08-18 19:25:05] [serve] resp-5 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:25:07] [serve] resp-5 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:25:09] [serve] resp-5 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:25:10] [serve] resp-5 generated=102 tokens in 6526ms (15.63 tok/s, experts 152.2 MiB/s, 19.0 MiB/s/expert, TTFT 2.5s (0@0.0tok/s think, 102@15.6tok/s response))
+[2026-08-18 19:25:10] [serve] resp-6 endpoint=responses prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:10] [serve] resp-6 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:10] [serve] resp-6 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:10] [serve] resp-6 tokenizing snapshot continuation chars=190
+[2026-08-18 19:25:10] [serve] resp-6 tokenized snapshot continuation tokens=40
+[2026-08-18 19:25:12] [serve] resp-6 prefill=40 tokens in 2473ms
+[2026-08-18 19:25:12] [serve] resp-6 first_token=71093
+[2026-08-18 19:25:14] [serve] resp-6 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:25:16] [serve] resp-6 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:25:18] [serve] resp-6 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:25:19] [serve] resp-6 generated=102 tokens in 6493ms (15.71 tok/s, experts 153.5 MiB/s, 19.2 MiB/s/expert, TTFT 2.5s (0@0.0tok/s think, 102@15.7tok/s response))
+[2026-08-18 19:25:19] [serve] resp-7 endpoint=responses prompt_chars=190 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:19] [serve] resp-7 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:19] [serve] resp-7 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:19] [serve] resp-7 tokenizing snapshot continuation chars=190
+[2026-08-18 19:25:19] [serve] resp-7 tokenized snapshot continuation tokens=40
+[2026-08-18 19:25:21] [serve] resp-7 prefill=40 tokens in 2409ms
+[2026-08-18 19:25:21] [serve] resp-7 first_token=71093
+[2026-08-18 19:25:23] [serve] resp-7 progress generated=32 pos=102 next_token=361
+[2026-08-18 19:25:25] [serve] resp-7 progress generated=64 pos=134 next_token=16
+[2026-08-18 19:25:27] [serve] resp-7 progress generated=96 pos=166 next_token=198
+[2026-08-18 19:25:28] [serve] resp-7 generated=102 tokens in 6516ms (15.65 tok/s, experts 154.2 MiB/s, 19.3 MiB/s/expert, TTFT 2.4s (0@0.0tok/s think, 102@15.7tok/s response))
+[2026-08-18 19:25:28] [serve] chatcmpl-8 endpoint=chat prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:28] [serve] chatcmpl-8 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:28] [serve] chatcmpl-8 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:28] [serve] chatcmpl-8 tokenizing snapshot continuation chars=166
+[2026-08-18 19:25:28] [serve] chatcmpl-8 tokenized snapshot continuation tokens=35
+[2026-08-18 19:25:30] [serve] chatcmpl-8 prefill=35 tokens in 2240ms
+[2026-08-18 19:25:30] [serve] chatcmpl-8 first_token=36
+[2026-08-18 19:25:32] [serve] chatcmpl-8 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:25:34] [serve] chatcmpl-8 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:25:36] [serve] chatcmpl-8 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:25:38] [serve] chatcmpl-8 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:25:38] [serve] chatcmpl-8 generated=128 tokens in 8335ms (15.36 tok/s, experts 163.4 MiB/s, 20.4 MiB/s/expert, TTFT 2.2s (0@0.0tok/s think, 128@15.4tok/s response))
+[2026-08-18 19:25:38] [serve] chatcmpl-9 endpoint=chat prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:38] [serve] chatcmpl-9 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:38] [serve] chatcmpl-9 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:38] [serve] chatcmpl-9 tokenizing snapshot continuation chars=166
+[2026-08-18 19:25:38] [serve] chatcmpl-9 tokenized snapshot continuation tokens=35
+[2026-08-18 19:25:40] [serve] chatcmpl-9 prefill=35 tokens in 2157ms
+[2026-08-18 19:25:40] [serve] chatcmpl-9 first_token=36
+[2026-08-18 19:25:42] [serve] chatcmpl-9 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:25:44] [serve] chatcmpl-9 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:25:46] [serve] chatcmpl-9 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:25:48] [serve] chatcmpl-9 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:25:49] [serve] chatcmpl-9 generated=128 tokens in 8144ms (15.72 tok/s, experts 167.7 MiB/s, 21.0 MiB/s/expert, TTFT 2.2s (0@0.0tok/s think, 128@15.7tok/s response))
+[2026-08-18 19:25:49] [serve] chatcmpl-10 endpoint=chat prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:49] [serve] chatcmpl-10 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:49] [serve] chatcmpl-10 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:49] [serve] chatcmpl-10 tokenizing snapshot continuation chars=166
+[2026-08-18 19:25:49] [serve] chatcmpl-10 tokenized snapshot continuation tokens=35
+[2026-08-18 19:25:51] [serve] chatcmpl-10 prefill=35 tokens in 2122ms
+[2026-08-18 19:25:51] [serve] chatcmpl-10 first_token=36
+[2026-08-18 19:25:53] [serve] chatcmpl-10 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:25:55] [serve] chatcmpl-10 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:25:57] [serve] chatcmpl-10 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:25:59] [serve] chatcmpl-10 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:25:59] [serve] chatcmpl-10 generated=128 tokens in 8175ms (15.66 tok/s, experts 167.8 MiB/s, 21.0 MiB/s/expert, TTFT 2.1s (0@0.0tok/s think, 128@15.7tok/s response))
+[2026-08-18 19:25:59] [serve] resp-11 endpoint=responses prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:25:59] [serve] resp-11 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:25:59] [serve] resp-11 request parsed; beginning prompt tokenization
+[2026-08-18 19:25:59] [serve] resp-11 tokenizing snapshot continuation chars=166
+[2026-08-18 19:25:59] [serve] resp-11 tokenized snapshot continuation tokens=35
+[2026-08-18 19:26:01] [serve] resp-11 prefill=35 tokens in 2127ms
+[2026-08-18 19:26:01] [serve] resp-11 first_token=36
+[2026-08-18 19:26:03] [serve] resp-11 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:26:05] [serve] resp-11 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:26:07] [serve] resp-11 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:26:09] [serve] resp-11 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:26:09] [serve] resp-11 generated=128 tokens in 8145ms (15.71 tok/s, experts 168.2 MiB/s, 21.0 MiB/s/expert, TTFT 2.1s (0@0.0tok/s think, 128@15.7tok/s response))
+[2026-08-18 19:26:09] [serve] resp-12 endpoint=responses prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:26:09] [serve] resp-12 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:26:09] [serve] resp-12 request parsed; beginning prompt tokenization
+[2026-08-18 19:26:09] [serve] resp-12 tokenizing snapshot continuation chars=166
+[2026-08-18 19:26:09] [serve] resp-12 tokenized snapshot continuation tokens=35
+[2026-08-18 19:26:11] [serve] resp-12 prefill=35 tokens in 2123ms
+[2026-08-18 19:26:11] [serve] resp-12 first_token=36
+[2026-08-18 19:26:13] [serve] resp-12 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:26:15] [serve] resp-12 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:26:17] [serve] resp-12 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:26:20] [serve] resp-12 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:26:20] [serve] resp-12 generated=128 tokens in 8245ms (15.52 tok/s, experts 166.6 MiB/s, 20.8 MiB/s/expert, TTFT 2.1s (0@0.0tok/s think, 128@15.5tok/s response))
+[2026-08-18 19:26:20] [serve] resp-13 endpoint=responses prompt_chars=166 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:26:20] [serve] resp-13 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:26:20] [serve] resp-13 request parsed; beginning prompt tokenization
+[2026-08-18 19:26:20] [serve] resp-13 tokenizing snapshot continuation chars=166
+[2026-08-18 19:26:20] [serve] resp-13 tokenized snapshot continuation tokens=35
+[2026-08-18 19:26:22] [serve] resp-13 prefill=35 tokens in 2116ms
+[2026-08-18 19:26:22] [serve] resp-13 first_token=36
+[2026-08-18 19:26:24] [serve] resp-13 progress generated=32 pos=97 next_token=11
+[2026-08-18 19:26:26] [serve] resp-13 progress generated=64 pos=129 next_token=3105
+[2026-08-18 19:26:28] [serve] resp-13 progress generated=96 pos=161 next_token=48335
+[2026-08-18 19:26:30] [serve] resp-13 progress generated=128 pos=193 next_token=279
+[2026-08-18 19:26:30] [serve] resp-13 generated=128 tokens in 8300ms (15.42 tok/s, experts 165.9 MiB/s, 20.7 MiB/s/expert, TTFT 2.1s (0@0.0tok/s think, 128@15.4tok/s response))
+[2026-08-18 19:26:30] [serve] chatcmpl-14 endpoint=chat prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:26:30] [serve] chatcmpl-14 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:26:30] [serve] chatcmpl-14 request parsed; beginning prompt tokenization
+[2026-08-18 19:26:30] [serve] chatcmpl-14 tokenizing snapshot continuation chars=245
+[2026-08-18 19:26:30] [serve] chatcmpl-14 tokenized snapshot continuation tokens=46
+[2026-08-18 19:26:33] [serve] chatcmpl-14 prefill=46 tokens in 2923ms
+[2026-08-18 19:26:33] [serve] chatcmpl-14 first_token=8160
+[2026-08-18 19:26:35] [serve] chatcmpl-14 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:26:37] [serve] chatcmpl-14 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:26:39] [serve] chatcmpl-14 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:26:42] [serve] chatcmpl-14 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:26:42] [serve] chatcmpl-14 generated=128 tokens in 8570ms (14.94 tok/s, experts 150.3 MiB/s, 18.8 MiB/s/expert, TTFT 2.9s (0@0.0tok/s think, 128@14.9tok/s response))
+[2026-08-18 19:26:42] [serve] chatcmpl-15 endpoint=chat prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:26:42] [serve] chatcmpl-15 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:26:42] [serve] chatcmpl-15 request parsed; beginning prompt tokenization
+[2026-08-18 19:26:42] [serve] chatcmpl-15 tokenizing snapshot continuation chars=245
+[2026-08-18 19:26:42] [serve] chatcmpl-15 tokenized snapshot continuation tokens=46
+[2026-08-18 19:26:45] [serve] chatcmpl-15 prefill=46 tokens in 2851ms
+[2026-08-18 19:26:45] [serve] chatcmpl-15 first_token=8160
+[2026-08-18 19:26:47] [serve] chatcmpl-15 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:26:49] [serve] chatcmpl-15 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:26:51] [serve] chatcmpl-15 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:26:53] [serve] chatcmpl-15 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:26:53] [serve] chatcmpl-15 generated=128 tokens in 8184ms (15.64 tok/s, experts 156.5 MiB/s, 19.6 MiB/s/expert, TTFT 2.9s (0@0.0tok/s think, 128@15.6tok/s response))
+[2026-08-18 19:26:53] [serve] chatcmpl-16 endpoint=chat prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:26:53] [serve] chatcmpl-16 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:26:53] [serve] chatcmpl-16 request parsed; beginning prompt tokenization
+[2026-08-18 19:26:53] [serve] chatcmpl-16 tokenizing snapshot continuation chars=245
+[2026-08-18 19:26:53] [serve] chatcmpl-16 tokenized snapshot continuation tokens=46
+[2026-08-18 19:26:56] [serve] chatcmpl-16 prefill=46 tokens in 2782ms
+[2026-08-18 19:26:56] [serve] chatcmpl-16 first_token=8160
+[2026-08-18 19:26:58] [serve] chatcmpl-16 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:27:00] [serve] chatcmpl-16 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:27:02] [serve] chatcmpl-16 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:27:04] [serve] chatcmpl-16 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:27:04] [serve] chatcmpl-16 generated=128 tokens in 8185ms (15.64 tok/s, experts 157.5 MiB/s, 19.7 MiB/s/expert, TTFT 2.8s (0@0.0tok/s think, 128@15.6tok/s response))
+[2026-08-18 19:27:04] [serve] resp-17 endpoint=responses prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:27:04] [serve] resp-17 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:27:04] [serve] resp-17 request parsed; beginning prompt tokenization
+[2026-08-18 19:27:04] [serve] resp-17 tokenizing snapshot continuation chars=245
+[2026-08-18 19:27:04] [serve] resp-17 tokenized snapshot continuation tokens=46
+[2026-08-18 19:27:07] [serve] resp-17 prefill=46 tokens in 2785ms
+[2026-08-18 19:27:07] [serve] resp-17 first_token=8160
+[2026-08-18 19:27:09] [serve] resp-17 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:27:11] [serve] resp-17 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:27:13] [serve] resp-17 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:27:15] [serve] resp-17 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:27:15] [serve] resp-17 generated=128 tokens in 8206ms (15.60 tok/s, experts 157.2 MiB/s, 19.6 MiB/s/expert, TTFT 2.8s (0@0.0tok/s think, 128@15.6tok/s response))
+[2026-08-18 19:27:15] [serve] resp-18 endpoint=responses prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:27:15] [serve] resp-18 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:27:15] [serve] resp-18 request parsed; beginning prompt tokenization
+[2026-08-18 19:27:15] [serve] resp-18 tokenizing snapshot continuation chars=245
+[2026-08-18 19:27:15] [serve] resp-18 tokenized snapshot continuation tokens=46
+[2026-08-18 19:27:18] [serve] resp-18 prefill=46 tokens in 2783ms
+[2026-08-18 19:27:18] [serve] resp-18 first_token=8160
+[2026-08-18 19:27:20] [serve] resp-18 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:27:22] [serve] resp-18 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:27:24] [serve] resp-18 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:27:26] [serve] resp-18 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:27:26] [serve] resp-18 generated=128 tokens in 8175ms (15.66 tok/s, experts 157.6 MiB/s, 19.7 MiB/s/expert, TTFT 2.8s (0@0.0tok/s think, 128@15.7tok/s response))
+[2026-08-18 19:27:26] [serve] resp-19 endpoint=responses prompt_chars=245 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:27:26] [serve] resp-19 sys_prompt_cache hit hash=4617623942952912121 tokens=31
+[2026-08-18 19:27:26] [serve] resp-19 request parsed; beginning prompt tokenization
+[2026-08-18 19:27:26] [serve] resp-19 tokenizing snapshot continuation chars=245
+[2026-08-18 19:27:26] [serve] resp-19 tokenized snapshot continuation tokens=46
+[2026-08-18 19:27:29] [serve] resp-19 prefill=46 tokens in 2785ms
+[2026-08-18 19:27:29] [serve] resp-19 first_token=8160
+[2026-08-18 19:27:31] [serve] resp-19 progress generated=32 pos=108 next_token=285
+[2026-08-18 19:27:33] [serve] resp-19 progress generated=64 pos=140 next_token=303
+[2026-08-18 19:27:35] [serve] resp-19 progress generated=96 pos=172 next_token=68230
+[2026-08-18 19:27:37] [serve] resp-19 progress generated=128 pos=204 next_token=307
+[2026-08-18 19:27:37] [serve] resp-19 generated=128 tokens in 8212ms (15.59 tok/s, experts 157.1 MiB/s, 19.6 MiB/s/expert, TTFT 2.8s (0@0.0tok/s think, 128@15.6tok/s response))
+[2026-08-18 19:27:37] [serve] chatcmpl-20 endpoint=chat prompt_chars=129 tools=1 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-08-18 19:27:37] [serve] sys_prompt_disk_cache loaded /Volumes/usr/Users/speedster/dev/flashchat_cache//Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/6517233bbcdcf8c3-v2.fcache raw=0.19GiB stored=0.07GiB chunks=140
+[2026-08-18 19:27:37] [serve] chatcmpl-20 sys_prompt_cache disk hit hash=7284329661773707459 tokens=260
+[2026-08-18 19:27:37] [serve] chatcmpl-20 request parsed; beginning prompt tokenization
+[2026-08-18 19:27:37] [serve] chatcmpl-20 tokenizing snapshot continuation chars=129
+[2026-08-18 19:27:37] [serve] chatcmpl-20 tokenized snapshot continuation tokens=28
+[2026-08-18 19:27:39] [serve] chatcmpl-20 prefill=28 tokens in 1863ms
+[2026-08-18 19:27:39] [serve] chatcmpl-20 first_token=27 [tool_call greedy]
+[2026-08-18 19:27:40] [serve] chatcmpl-20 generated=13 tokens in 878ms (14.80 tok/s, experts 64.0 MiB/s, 8.0 MiB/s/expert, TTFT 1.9s (0@0.0tok/s think, 14@15.9tok/s response)) [tool_call]
+[signal] Shutdown requested
+[2026-08-18 19:27:40] [serve] Shutdown requested by signal 15
+[2026-08-18 19:27:40] [serve] Logging stopped

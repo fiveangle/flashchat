@@ -1,0 +1,21 @@
+=== Flashchat API performance benchmark ===
+machine: FiveAngle.5angle.com Mac17,2 32.0GB (4p 6e 10g)
+system:  cpu_idle=77.53% gpu_util=62% load1=3.81 mem_free=85% swap=0.25MB time_machine=0 thermal=ok
+commit:  main@2561405  | repeats=2 warmup=1 max_tokens=128
+log:     /Users/speedster/dev/flashchat/assets/api_perf_log.tsv
+
+[0;32mbench[0m Qwen-Qwen36-35B-A3B  experts=256 bits=4
+      weights=/Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4
+      [bench-config] model=Qwen-Qwen36-35B-A3B fuse=1 adaptive_k= pin_gb=4 pin_experts= pin_auto=0.5 pin_mlock=1 batch_prefill=1 ane_prefill=1 kv_quant= config=/var/folders/8m/s74gkyn530zd36bc6t2n00_h0000gn/T/tmp.3AYBVpOkoI/home-Qwen-Qwen36-35B-A3B/.config/flashchat/config
+      [perf] experts=256 | delta_batch=1 verify_gpu_attn=0 matmulN=v5 kv_quant=off fused_attn=1 gpu_rope=1 kv_window=65536 | mtp=lossless draft/verify when MTP artifacts present
+      [serve]   expert_pin_cache: enabled cap=4.0 GiB auto_frac=0.50 mlock=on (budget resolves at first expert read; mlock needs free RAM + headroom)
+    chat_stream:technical  decode= 25.57 tok/s (min 25.28)  prefill=1261 ms
+    responses_stream:technical decode= 26.39 tok/s (min 26.39)  prefill=1104 ms
+    chat_stream:creative   decode= 23.85 tok/s (min 23.35)  prefill=1010 ms
+    responses_stream:creative decode= 25.62 tok/s (min 25.48)  prefill=1006 ms
+    chat_stream:worstcase  decode= 20.24 tok/s (min 20.10)  prefill=1674 ms
+    responses_stream:worstcase decode= 20.88 tok/s (min 20.86)  prefill=1694 ms
+    tool_call              2304 ms (pass)
+
+=== done: 1 model(s) benchmarked, 0 skipped ===
+rows appended to /Users/speedster/dev/flashchat/assets/api_perf_log.tsv — run 'make bench-report' to compare.

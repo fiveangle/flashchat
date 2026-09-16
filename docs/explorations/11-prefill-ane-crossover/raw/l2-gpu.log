@@ -1,0 +1,95 @@
+[perf] experts=256 | delta_batch=1 verify_gpu_attn=0 matmulN=v5 kv_quant=off fused_attn=1 gpu_rope=1 kv_window=65536 | mtp=lossless draft/verify when MTP artifacts present
+[init] K=8 active experts (from config num_experts_per_tok)
+[mtp] artifacts detected but disabled; using existing decode path
+[config] Loaded model: Qwen3.6-35B-A3B (q4) (Qwen-Qwen36-35B-A3B)
+[config]  hidden_dim=2048, layers=40, experts=256, vocab=248320
+[config]  expert_size=1769472 bytes
+[metal] Device: Apple M5
+[metal] Shader compile: 2 ms
+[metal] GPU attention buffers: 10 KV caches (134.2 MB each), scores buf 67.1 MB
+[metal] Delta-net GPU buffers: 30 layers (130.3 MB state + 0.2 MB scratch)
+[metal] Inference pipelines ready (multi-expert[16] + shared buffers allocated)
+=== Qwen3.6-35B-A3B (q4) Metal Inference Engine ===
+Model:    /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/
+Weights:  /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.bin
+Manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.json
+Vocab:    /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/vocab.bin
+K:        8 experts/layer
+Experts:  1769472 bytes each
+Linear:   fused GPU delta-net
+MTP:      disabled
+Tokens:   20
+[manifest] Loaded 1414 tensors from /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.json
+[weights] mmap'd 1.46 GB from /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.bin
+[metal] Weight file wrapped as Metal buffer (1.46 GB)
+[vocab] Loaded 248078 tokens
+[experts] 40/40 packed layer files available (mmap'd)
+[init] Setup: 85.8 ms
+
+[serve] Listening on http://0.0.0.0:9806
+[serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health
+[serve] Persistent log: /Users/speedster/.config/flashchat/logs/server.log
+[serve] Runtime configuration:
+[serve]   model: Qwen3.6-35B-A3B (q4) (Qwen-Qwen36-35B-A3B)
+[serve]   repo: Qwen/Qwen3.6-35B-A3B
+[serve]   model_path: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/
+[serve]   config_file: /Users/speedster/.config/flashchat/config
+[serve]   weights: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.bin
+[serve]   manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/model_weights.json
+[serve]   vocab: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0//flashchat/q4/vocab.bin
+[serve]   quantization: 4-bit group_size=64
+[serve]   architecture: layers=40 hidden=2048 vocab=248320 heads=16 kv_heads=2 head_dim=256 full_attn=10 linear_attn=30
+[serve]   experts: total=256 active_per_token=8 trained_active_per_token=8 expert_size=1769472 expert_size_per_token=13.5 MiB
+[serve]   max_response_tokens: 20
+[serve]   reasoning: disabled
+[serve]   show_thinking: disabled
+[serve]   sampling: temp=0.700 top_p=0.800 top_k=20 min_p=0.000 presence=1.500 repetition=1.000
+[serve]   mtp: disabled
+[serve]   gpu_linear_attention: enabled
+[serve]   cmd_fuse_linear: enabled
+[serve]   kv_cache: window=65536 quant=fp32 total_bytes=2560.0 MiB
+[serve]   batched_prefill: enabled chunk=1024 min_tokens=16
+[serve]   ane_prefill: disabled
+[serve]   expert_pin_cache: disabled
+[serve]   pread_profile: disabled
+[serve]   system_prompt_cache: enabled max_entries=16
+[serve]   system_prompt_cache_dir: /Volumes/usr/Users/speedster/dev/flashchat_cache/
+[serve]   server_debug: disabled http_log: disabled prefill_debug: 0
+[serve]   custom_user_system_prompt: /Users/speedster/.config/flashchat/system.md (not present; using built-in default)
+[serve] chatcmpl-2 endpoint=chat prompt_chars=3887 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+bpe_load: 248044 vocab, 247587 merges, 26 added tokens
+Tokens (31): [248045, 8678, 198, 2523, 513, 264, 10631, 17313, 13, 271, 2665, 7141, 513, 2420, 13, 38224, 5774, 310, 279, 1156, ...]
+[serve] sys_prompt_disk_cache loaded /Volumes/usr/Users/speedster/dev/flashchat_cache//Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/40151882ca0c04f9-v2.fcache raw=0.18GiB stored=0.06GiB chunks=140
+[serve] chatcmpl-2 sys_prompt_cache disk hit hash=40151882ca0c04f9 tokens=31
+[serve] chatcmpl-2 request parsed; beginning prompt tokenization
+[serve] chatcmpl-2 tokenizing snapshot continuation chars=3887
+Tokens (725): [248045, 846, 198, 8917, 5437, 537, 279, 2614, 20438, 303, 7472, 13, 561, 3712, 314, 23470, 42824, 3679, 10476, 314, ...]
+[serve] chatcmpl-2 tokenized snapshot continuation tokens=725
+[serve] chatcmpl-2 prefill=725 tokens in 10751ms
+[ane-prefill] chatcmpl-2 engagement: disabled | chunks 0/40 ANE | experts 0 ANE / 7457 GPU | rows 0 ANE (0.0%) / 231680 GPU | ane producer=0ms eval=0ms scatter=148ms | gpu gemm=3791ms io=615ms route=606ms
+[serve] chatcmpl-2 first_token=760
+[serve] chatcmpl-2 generated=4 tokens in 251ms (15.95 tok/s, experts 4.9 MiB/s, 0.6 MiB/s/expert, TTFT 10.8s (0@0.0tok/s think, 4@16.0tok/s response))
+[serve] chatcmpl-3 endpoint=chat prompt_chars=3887 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+Tokens (31): [248045, 8678, 198, 2523, 513, 264, 10631, 17313, 13, 271, 2665, 7141, 513, 2420, 13, 38224, 5774, 310, 279, 1156, ...]
+[serve] chatcmpl-3 sys_prompt_cache hit hash=40151882ca0c04f9 tokens=31
+[serve] chatcmpl-3 request parsed; beginning prompt tokenization
+[serve] chatcmpl-3 tokenizing snapshot continuation chars=3887
+Tokens (725): [248045, 846, 198, 8917, 5437, 537, 279, 2614, 20438, 303, 7472, 13, 561, 3712, 314, 23470, 42824, 3679, 10476, 314, ...]
+[serve] chatcmpl-3 tokenized snapshot continuation tokens=725
+[serve] chatcmpl-3 prefill=725 tokens in 15794ms
+[ane-prefill] chatcmpl-3 engagement: disabled | chunks 0/40 ANE | experts 0 ANE / 7457 GPU | rows 0 ANE (0.0%) / 231680 GPU | ane producer=0ms eval=0ms scatter=152ms | gpu gemm=3785ms io=478ms route=608ms
+[serve] chatcmpl-3 first_token=760
+[serve] chatcmpl-3 generated=4 tokens in 243ms (16.46 tok/s, experts 3.4 MiB/s, 0.4 MiB/s/expert, TTFT 15.8s (0@0.0tok/s think, 4@16.5tok/s response))
+[serve] chatcmpl-4 endpoint=chat prompt_chars=3887 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+Tokens (31): [248045, 8678, 198, 2523, 513, 264, 10631, 17313, 13, 271, 2665, 7141, 513, 2420, 13, 38224, 5774, 310, 279, 1156, ...]
+[serve] chatcmpl-4 sys_prompt_cache hit hash=40151882ca0c04f9 tokens=31
+[serve] chatcmpl-4 request parsed; beginning prompt tokenization
+[serve] chatcmpl-4 tokenizing snapshot continuation chars=3887
+Tokens (725): [248045, 846, 198, 8917, 5437, 537, 279, 2614, 20438, 303, 7472, 13, 561, 3712, 314, 23470, 42824, 3679, 10476, 314, ...]
+[serve] chatcmpl-4 tokenized snapshot continuation tokens=725
+[serve] chatcmpl-4 prefill=725 tokens in 15728ms
+[ane-prefill] chatcmpl-4 engagement: disabled | chunks 0/40 ANE | experts 0 ANE / 7457 GPU | rows 0 ANE (0.0%) / 231680 GPU | ane producer=0ms eval=0ms scatter=150ms | gpu gemm=3797ms io=463ms route=600ms
+[serve] chatcmpl-4 first_token=760
+[serve] chatcmpl-4 generated=4 tokens in 243ms (16.45 tok/s, experts 3.4 MiB/s, 0.4 MiB/s/expert, TTFT 15.7s (0@0.0tok/s think, 4@16.5tok/s response))
+[signal] Shutdown requested
+[serve] Shutdown requested by signal 15
