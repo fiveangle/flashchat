@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -31,8 +32,13 @@ class TransportTests(unittest.TestCase):
 
     def tearDown(self):
         self.process.terminate()
-        self.process.wait(timeout=3)
-        self.process.stdout.close()
+        try:
+            self.process.wait(timeout=3)
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
+                self.process.wait()
+            self.process.stdout.close()
 
     def request(self, path="/health", method="GET", body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
@@ -112,6 +118,23 @@ class TransportTests(unittest.TestCase):
                 sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n" + headers + b"\r\n\r\n")
                 self.assertIn(b"400 Bad Request", sock.recv(4096))
         self.assertEqual(self.request()[0], 200)
+
+    def test_cancel_long_compute_and_accept_next_request(self):
+        for mode in (b"quiet", b"prefill"):
+            with self.subTest(mode=mode):
+                stream = self.generation(mode)
+                self.assertEqual(self.request()[0], 200)
+                if mode == b"quiet":
+                    stream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                      struct.pack("ii", 1, 0))
+                stream.close()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    code, _ = self.request("/v1/responses", "POST", "{}")
+                    if code == 200:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(code, 200, "cancelled compute retained inference ownership")
 
     def test_shutdown_during_blocked_output(self):
         with self.generation(b"bulk"):

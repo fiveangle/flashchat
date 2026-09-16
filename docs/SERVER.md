@@ -53,6 +53,30 @@ that stops accepting output for ten seconds is disconnected. Request uploads
 also have a ten-second deadline, with a 1 MiB request limit and at most sixteen
 pending HTTP connections. HTTP payload logging remains available.
 
+Closing a streaming request cancels its work once the transport detects the
+disconnect. The worker checks between prompt-processing layers and generated
+tokens (between speculative batches when MTP is active), even when tool-call or
+reasoning output is buffered. Streaming heartbeats continue during otherwise
+silent generation so a disconnected reader can be detected. An in-flight GPU,
+Neural Engine, or disk operation finishes before cleanup; cancellation does not
+interrupt accelerator operations or allow overlapping inference.
+
+Cancelled prefill does not save a partial system-prompt snapshot. Incomplete live
+context is cleared, request allocations are released, and the server becomes
+available after cleanup. Logs distinguish prefill and generation cancellation.
+A client that only half-closes its request-writing side may still read the full
+response; that alone is not treated as cancellation. For a non-streaming response,
+a TCP reset is detected while computing, but a graceful half-close cannot be
+distinguished from abandonment until output is attempted.
+
+SIGTERM/SIGINT stop the HTTP transport and use the same cooperative cancellation
+checks, waiting for in-flight operations and request cleanup before model teardown.
+
+`tests/test_server_http.py` covers transport cancellation without model weights.
+`tests/test_api_cancel.py --port PORT` exercises prefill/generation disconnects and
+checks that a subsequent request matches a clean response. Run it only against a
+dedicated functional-test server, not a user's active server.
+
 The inference worker publishes a small status snapshot under a short mutex.
 No inference or network I/O occurs while that mutex is held. `/health` retains
 its previous fields and adds:
@@ -85,12 +109,6 @@ The status block always shows the same rows: processing state, prompt progress,
 prompt chunk, model layer, reused context, and generated tokens. Inactive rows
 say so explicitly; idle and stopped states do not display stale request counters.
 Unavailable status preserves every row rather than collapsing the menu layout.
-
-Disconnecting a client releases its network resources and makes subsequent
-worker writes fail. Admission remains busy until the inference worker actually
-returns. This does not add cancellation inside a running prefill kernel.
-SIGTERM/SIGINT stop the HTTP transport and retain the existing inference-drain
-behavior before model teardown.
 
 Validation:
 

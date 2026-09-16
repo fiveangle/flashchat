@@ -81,6 +81,7 @@
 #include <mach/mach.h>
 
 #include "model_config.h"
+#include "server_http.h"
 
 #define FLASHCHAT_BUILD_STAMP __DATE__ " " __TIME__
 
@@ -12068,6 +12069,10 @@ static int sse_send_initial_role_chunk(int fd, const char *request_id) {
     return (wr <= 0) ? -1 : 0;
 }
 
+static int server_request_cancelled(int fd) {
+    return g_server_shutdown_signal || server_http_cancelled(fd);
+}
+
 static int write_prefill_keepalive(int fd, const char *phase, int done, int total) {
     char chunk[160];
     int n = snprintf(chunk, sizeof(chunk),
@@ -12209,6 +12214,10 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
             else embed_lookup(wf, ids[i+t], hs + (size_t)t*H);
         }
         for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+            if (ka_enabled && server_request_cancelled(client_fd)) {
+                free(hs); free(posv);
+                return -1;
+            }
             int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
             batched_layer_forward_N(wf, layer, hs, n,
                                     is_full ? kv_caches[layer] : NULL,
@@ -12551,7 +12560,9 @@ static int append_tool_validation_retry_context(WeightFile *wf,
                                                 void **layer_states,
                                                 int *layer_fds,
                                                 void **layer_mmaps,
-                                                int K) {
+                                                int K, int client_fd,
+                                                const char *request_id,
+                                                int *keepalive_enabled, double *next_keepalive_ms) {
     if (!wf || !result || !pos_io || !hidden || !logits) return -1;
     char *turn = build_tool_validation_retry_turn(tool_name, result, reasoning_enabled, force_tool);
     if (!turn) return -1;
@@ -12564,19 +12575,19 @@ static int append_tool_validation_retry_context(WeightFile *wf,
         return -1;
     }
 
-    embed_lookup(wf, current_token, hidden);
-    prod_forward_1(wf, hidden, *pos_io, kv_caches,
-                   (LinearAttnState **)layer_states, layer_fds, layer_mmaps, K, logits);
-    (*pos_io)++;
-    for (int i = 0; i < retry->count; i++) {
-        embed_lookup(wf, retry->ids[i], hidden);
+    int cancelled = 0;
+    for (int i = -1; i < retry->count; i++) {
+        report_prefill_keepalive(client_fd, request_id, keepalive_enabled,
+                                 next_keepalive_ms, "tool-retry", i + 1, retry->count + 1);
+        if (server_request_cancelled(client_fd)) { cancelled = 1; break; }
+        embed_lookup(wf, i < 0 ? current_token : retry->ids[i], hidden);
         prod_forward_1(wf, hidden, *pos_io, kv_caches,
                        (LinearAttnState **)layer_states, layer_fds, layer_mmaps, K, logits);
         (*pos_io)++;
     }
     free(retry->ids);
     free(retry);
-    return 0;
+    return cancelled ? -1 : 0;
 }
 
 static NSString *tool_validation_terminal_message(const char *tool_name,
@@ -14687,8 +14698,6 @@ cleanup:
     return 1;
 }
 
-#include "server_http.h"
-
 static void server_transport_trace(const char *direction, const char *payload) {
     server_http_log_block(NULL, direction, "http transport", payload);
 }
@@ -15180,6 +15189,7 @@ static void serve_loop(
         if (pt->count > 1) {
             serve_embed_batch = malloc((size_t)pt->count * g_cfg.hidden_dim * sizeof(float));
             for (int i = 0; i < pt->count; i++) {
+                if (server_request_cancelled(client_fd)) goto prefill_finished;
                 embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * g_cfg.hidden_dim);
                 report_prefill_keepalive(client_fd, request_id,
                                                  &prefill_keepalive_enabled,
@@ -15198,6 +15208,7 @@ static void serve_loop(
                                                 client_fd, request_id,
                                                 &prefill_keepalive_enabled,
                                                 &next_prefill_keepalive_ms, "system");
+            if (sys_i0 < 0) goto prefill_finished;
             for (int i = sys_i0; i < sys_token_end; i++) {
                 if (serve_embed_batch) {
                     memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
@@ -15205,6 +15216,7 @@ static void serve_loop(
                     embed_lookup(wf, pt->ids[i], hidden);
                 }
                 for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                    if (server_request_cancelled(client_fd)) goto prefill_finished;
                     int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
@@ -15221,6 +15233,7 @@ static void serve_loop(
                                                  &next_prefill_keepalive_ms,
                                                  "system", i + 1, pt->count);
             }
+            if (server_request_cancelled(client_fd)) goto prefill_finished;
             // Save snapshot at system prompt boundary. When the cache is disabled we
             // do NONE of this: no in-memory snapshot capture (allocations + KV-state
             // memcpys), no disk write, and no "saved" log line. "Disabled" means the
@@ -15282,6 +15295,7 @@ static void serve_loop(
                                                    client_fd, request_id,
                                                    &prefill_keepalive_enabled,
                                                    &next_prefill_keepalive_ms, "conversation");
+        if (prefill_start < 0) goto prefill_finished;
         for (int i = prefill_start; i < pt->count; i++) {
             if (serve_embed_batch) {
                 memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
@@ -15289,6 +15303,7 @@ static void serve_loop(
                 embed_lookup(wf, pt->ids[i], hidden);
             }
             for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                if (server_request_cancelled(client_fd)) goto prefill_finished;
                 int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
                 fused_layer_forward(wf, layer, hidden,
                                     is_full ? kv_caches[layer] : NULL,
@@ -15305,7 +15320,21 @@ static void serve_loop(
                                              &next_prefill_keepalive_ms,
                                              "conversation", i + 1, pt->count);
         }
+prefill_finished:
         free(serve_embed_batch);
+        if (server_request_cancelled(client_fd)) {
+            discard_deferred_experts();
+            server_log_errorf("[serve] %s cancelled during prefill\n", request_id);
+            clear_runtime_state_serve(layer_states, kv_caches);
+            server_progress_decode(0, 0);
+            free(req_sys_prompt);
+            free(token_counts);
+            free(pt->ids); free(pt);
+            api_request_free(&req);
+            free(reqbuf); close(client_fd);
+            prefill_release_transient_buffers();
+            continue;
+        }
         prefill_log_memory("before transient release");
         prefill_release_transient_buffers();
         free(req_sys_prompt);
@@ -15473,6 +15502,9 @@ static void serve_loop(
         int think_budget_hit = 0;
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
+            report_prefill_keepalive(client_fd, request_id, &prefill_keepalive_enabled,
+                                     &next_prefill_keepalive_ms, "decode", gen_count, req.max_tokens);
+            if (server_request_cancelled(client_fd)) break;
             server_progress_decode(pos, gen_count);
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
             if (next_token == g_cfg.think_start_token) in_think = 1;
@@ -15582,7 +15614,8 @@ static void serve_loop(
                                         wf, retry_tool_name, &validation, req.reasoning_enabled,
                                         force_retry_tool,
                                         next_token, &pos, hidden, logits, kv_caches, layer_states,
-                                        layer_fds, layer_mmaps, K) == 0) {
+                                        layer_fds, layer_mmaps, K, client_fd, request_id,
+                                        &prefill_keepalive_enabled, &next_prefill_keepalive_ms) == 0) {
                                     parsed_tool_call_free(&parsed_tool_call);
                                     memset(&parsed_tool_call, 0, sizeof(parsed_tool_call));
                                     tool_call_len = 0;
@@ -15619,6 +15652,7 @@ static void serve_loop(
                                                       request_id, retry_tool_name, pos);
                                     continue;
                                 }
+                                if (server_request_cancelled(client_fd)) break;
                                 server_log_errorf("[serve] %s tool_call correction context failed name=%s action=stop\n",
                                                   request_id, retry_tool_name);
                             }
@@ -15913,6 +15947,14 @@ tool_call_checked:
             }
         }
 
+        int cancelled = server_request_cancelled(client_fd);
+        if (cancelled) {
+            discard_deferred_experts();
+            clear_runtime_state_serve(layer_states, kv_caches);
+            pos = 0;
+            server_log_errorf("[serve] %s cancelled during generation\n", request_id);
+        }
+
         // Final context length of this request (prompt + generated) for the menu meter.
         server_progress_decode(pos, gen_count);
 
@@ -15961,7 +16003,9 @@ tool_call_checked:
             ? build_chat_completion_json(request_id, req.model, gen_response, gen_reasoning, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL)
             : build_responses_json(request_id, req.model, gen_response, parsed_tool_call.is_tool_call ? &parsed_tool_call : NULL);
 
-        if (req.stream) {
+        if (cancelled) {
+            // No completion or tool call is emitted for an abandoned request.
+        } else if (req.stream) {
             if (parsed_tool_call.is_tool_call) {
                 if (is_chat) sse_send_tool_calls(client_fd, request_id, parsed_tool_call.id, parsed_tool_call.name, parsed_tool_call.arguments);
                 else sse_send_response_tool_call(client_fd, request_id, &parsed_tool_call);

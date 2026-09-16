@@ -33,7 +33,16 @@ int main(int argc, char **argv) {
         if (fd < 0) break;
         const char *head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         write(fd, head, strlen(head));
-        if (strstr(request, "bulk")) {
+        if (strstr(request, "quiet") || strstr(request, "prefill")) {
+            // Simulate long compute with no token output. Prefill has heartbeats;
+            // quiet represents a buffered response interrupted with TCP reset.
+            for (int i = 0; i < 200; i++) {
+                if (server_http_cancelled(fd)) break;
+                usleep(50000);
+                if (strstr(request, "prefill") && i % 4 == 0)
+                    if (write(fd, ": keepalive\n\n", 13) <= 0) break;
+            }
+        } else if (strstr(request, "bulk")) {
             char buffer[16384];
             memset(buffer, 'x', sizeof(buffer));
             for (int i = 0; i < 4096; i++) {

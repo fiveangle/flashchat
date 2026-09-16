@@ -59,6 +59,17 @@ static void http_nonblocking(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
 
+// The event thread closes the private output socket when the client is gone.
+// Check without writing so hidden reasoning/tool output and prefill can stop too.
+static int server_http_cancelled(int fd) {
+    if (fd < 0) return 0;
+    struct pollfd p = {fd, POLLIN, 0};
+    if (poll(&p, 1, 0) <= 0) return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return 1;
+    char unused;
+    return (p.revents & POLLIN) && recv(fd, &unused, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
 static void http_client_close(http_client_t *c) {
     if (c->fd >= 0) close(c->fd);
     free(c->data);
@@ -130,7 +141,7 @@ static void *http_event_loop(void *arg) {
         fds[0] = (struct pollfd){s->listener, POLLIN, 0};
         for (int i = 0; i < HTTP_CLIENTS; i++)
             fds[i + 1] = (struct pollfd){clients[i].fd, clients[i].output ? POLLOUT : POLLIN, 0};
-        fds[HTTP_CLIENTS + 1] = (struct pollfd){read_closed && !buffered ? -1 : active,
+        fds[HTTP_CLIENTS + 1] = (struct pollfd){active,
             (read_closed ? 0 : POLLIN) | (buffered ? POLLOUT : 0), 0};
         fds[HTTP_CLIENTS + 2] = (struct pollfd){pipe_eof ? -1 : pipe_fd,
             !pipe_eof && buffered < sizeof(output) ? POLLIN : 0, 0};
