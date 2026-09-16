@@ -336,7 +336,12 @@ n_full = int(m.get('num_hidden_layers', 0) or 0) // max(1, int(m.get('full_atten
 if kvq in ('q8', 'int8', '8'):   per = 2*kv_dim + 2*(n_kv*2)
 elif kvq in ('q4', 'int4', '4'): per = 2*(kv_dim//2) + 2*(n_kv*2)
 else:                            per = 2*kv_dim*4
-print(int(m.get('max_context', 0) or 0), per * n_full * win)
+model_max = int(m.get('max_context', 0) or 0)
+win = max(512, win or 65536)
+if model_max > 0:
+    win = min(win, model_max)
+win = min(win, 1048576)
+print(win, per * n_full * win)
 " "$config_file" "$model_id" "$window" "$kvq" 2>/dev/null || echo "0 0"
 }
 
@@ -474,7 +479,11 @@ flashchat_kv_cache_field() {
     local field="$1"
     [ -n "$field" ] || return 1
     local body
-    body="$(_flashchat_kv_cache_health_json)" || return 1
+    if [ "${FLASHCHAT_HEALTH_JSON+x}" = x ]; then
+        body="$FLASHCHAT_HEALTH_JSON"
+    else
+        body="$(_flashchat_kv_cache_health_json)" || return 1
+    fi
     [ -n "$body" ] || return 1
     python3 -c "
 import json, sys

@@ -48,6 +48,7 @@ I've extended the original project from a research project to usable system incl
 - Persistant prompt caching
 - MTP support (tho MoE architecture does not lend itself well to MTP)
 - Full server-side API debugging capability (speed metrics, full HTTP payload dumping, timing, etc)
+- Responsive HTTP status during inference, with separate context occupancy and prompt-processing progress in the management menu. One generation at a time; overlapping generation requests return `503 server_busy`. See [server behavior](docs/SERVER.md).
 - Model archive/offload management (allows keeping runtime-only artifacts on Apple Fabric SSD while original weights or full HF repo copies can be stored on nearline USB/NAS)
 
 ## Model Support

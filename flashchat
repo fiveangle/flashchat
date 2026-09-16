@@ -83,15 +83,14 @@ quant_pair_label() {
 }
 
 # Context usage meter: a 0 -> max_context (in k) horizontal bar filled to the
-# most recent request's context length, with the configured-window KV RAM in
+# committed context length, with the configured-window KV RAM in
 # parens. Format mirrors the user's spec:
 #   Context Used: 0k [|||...|||          ] 256k (2.6GiB)
 #                ^used  ^bar (fixed width)   ^max  ^ram
-# Reads 0 used when no server / no requests yet, and degrades to "0 / 0"
-# when neither the server nor the registry can resolve a max window.
+# Reads 0 used when stopped, and explicitly unavailable when live status fails.
 render_context_meter() {
     local server_status="$1"
-    local model_id window kvq used=0 maxctx rambytes live_max live_bytes
+    local model_id window kvq used=0 maxctx rambytes live_max live_bytes unavailable=0
     model_id=$(flashchat_get MODEL)
     window=$(flashchat_get CONTEXT_WINDOW); [ -n "$window" ] || window=65536
     kvq=$(flashchat_get KV_QUANT); [ -n "$kvq" ] || kvq=off
@@ -101,10 +100,10 @@ render_context_meter() {
     # config if the launcher clamped the window to the model's max_context).
     case "$server_status" in
         Running*)
-            live_max=$(flashchat_kv_cache_max 2>/dev/null)
+            live_max=$(flashchat_kv_cache_field max_context 2>/dev/null) || true
             live_bytes=$(flashchat_kv_cache_total_bytes 2>/dev/null)
             used=$(flashchat_kv_cache_used 2>/dev/null)
-            [ -n "$used" ] || used=0
+            if ! [[ "$used" =~ ^[0-9]+$ ]]; then used=0; unavailable=1; fi
             ;;
     esac
 
@@ -151,8 +150,53 @@ render_context_meter() {
     else
         ram_disp="?"
     fi
-    printf 'Context Used: %dk [%s] %s (%s)\n' \
-        "$(( (used + 512) / 1024 ))" "$bar" "$max_disp" "$ram_disp"
+    local used_disp="$(( (used + 512) / 1024 ))k"
+    if [ "$used" -gt 0 ] && [ "$used" -lt 1024 ]; then
+        used_disp="$used tokens"
+    fi
+    if [ "$unavailable" -eq 1 ]; then
+        used_disp="unavailable"
+        bar="$(printf '%*s' "$width" '' | tr ' ' '-')"
+    fi
+    printf 'Context Used: %s [%s] %s (%s)\n' "$used_disp" "$bar" "$max_disp" "$ram_disp"
+    python3 -c '
+import json, sys
+p = json.loads(sys.argv[1]) if sys.argv[1] else {}
+phase = p.get("phase")
+status = "Status unavailable"
+prompt = chunk = layer = reused = generated = "Unavailable"
+if not sys.argv[2].startswith("Running"):
+    status = "Server stopped"
+    prompt = chunk = layer = reused = generated = "No active request"
+elif sys.argv[3] == "1":
+    status = "Status temporarily unavailable"
+elif phase == "idle":
+    status = "Idle"
+    prompt = chunk = layer = reused = generated = "No active request"
+elif phase == "preparing":
+    status = "Preparing prompt"
+    prompt = reused = "Waiting for prompt preparation"
+    chunk = layer = generated = "Not started"
+elif phase in ("prefill", "generating"):
+    status = "Processing prompt" if phase == "prefill" else "Generating response"
+    done, total = p.get("prefill_done", 0), p.get("prompt_tokens", 0)
+    percent = 100 * done / total if total else 0
+    prompt = f"{done:,} / {total:,} tokens ({percent:.0f}%)"
+    cached = p.get("cached_tokens", 0)
+    reused = f"{cached:,} tokens" if cached else "None"
+    chunk = layer = "Not active"
+    generated = "Not started"
+    if phase == "prefill":
+        chunk = "{chunk} / {chunks}".format(**p) if p.get("chunks") else "Not using chunks"
+        layer = "{layer} / {layers}".format(**p) if p.get("layers") else "Not available"
+    else:
+        prompt += " — complete"
+        generated = "{:,} tokens".format(p.get("generated_tokens", 0))
+for label, value in (("Processing", status), ("Prompt progress", prompt),
+                     ("Prompt chunk", chunk), ("Model layer", layer),
+                     ("Reused context", reused), ("Generated", generated)):
+    print(f"{label}: {value}")
+' "${FLASHCHAT_HEALTH_JSON:-}" "$server_status" "$unavailable"
 }
 
 flashchat_set_config_value() {
@@ -760,6 +804,7 @@ file_newer_than() {
 check_binaries_current() {
     check_binaries || return 1
     file_newer_than "$SCRIPT_DIR/metal_infer/infer.m" "$SCRIPT_DIR/metal_infer/infer" && return 1
+    file_newer_than "$SCRIPT_DIR/metal_infer/server_http.h" "$SCRIPT_DIR/metal_infer/infer" && return 1
     file_newer_than "$SCRIPT_DIR/metal_infer/model_config.h" "$SCRIPT_DIR/metal_infer/infer" && return 1
     file_newer_than "$SCRIPT_DIR/metal_infer/shaders.metal" "$SCRIPT_DIR/metal_infer/infer" && return 1
     file_newer_than "$SCRIPT_DIR/metal_infer/chat.m" "$SCRIPT_DIR/metal_infer/chat" && return 1
@@ -1015,6 +1060,7 @@ server_runtime_signature() {
         echo "MTP=$(flashchat_get MTP)"
         echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
         echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"
+        echo "HTTP_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/server_http.h")"
         echo "MODEL_CONFIG_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/model_config.h")"
         echo "SHADERS_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/shaders.metal")"
     } | cksum | awk '{print $1 ":" $2}'
@@ -1698,8 +1744,13 @@ interactive_menu() {
         echo "           Flashchat Management"
         echo "=================================================="
         echo "$server_line"
+        FLASHCHAT_HEALTH_JSON=""
+        case "$server_status" in
+            Running*) FLASHCHAT_HEALTH_JSON="$(_flashchat_kv_cache_health_json)" || true ;;
+        esac
         echo "Model: $(flashchat_get MODEL)   Quantization (model/kv-cache): $(quant_pair_label)"
         render_context_meter "$server_status"
+        unset FLASHCHAT_HEALTH_JSON
         echo "[N]ew [D]ialog, Server [O]n/[O]ff, [S]how [C]onfig, [M]anage, [Q]uit"
         read_menu_key "> " "nNdDsSoOcCmMqQ" "Invalid selection — please choose N, D, S, O, C, M, or Q." || { echo "Goodbye!"; break; }
 

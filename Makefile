@@ -184,6 +184,7 @@ help:
 	@printf "\n"
 	@printf "Tests:\n"
 	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
+	@printf "  make server-http-smoke  Test responsive HTTP transport and context meter\n"
 	@printf "  make manage-smoke  Run model management integration test\n"
 	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
@@ -240,7 +241,7 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine (links the ANE MLP library for batched-prefill offload)
-$(INFER_TARGET): $(INFER_SRC) $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(INFER_TARGET): $(INFER_SRC) $(BUILD_DIR)/server_http.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) $(INFER_SRC) $(ANE_MLP_SRC) -o $(INFER_TARGET)
 
@@ -353,6 +354,11 @@ py-tests:
 cli-smoke:
 	bash tests/test_flashchat_cli.sh
 
+.PHONY: server-http-smoke
+server-http-smoke:
+	python3 tests/test_server_http.py
+	python3 tests/test_context_meter.py
+
 manage-smoke:
 	bash tests/test_modelmgr_cli.sh
 
@@ -377,4 +383,4 @@ native-qwen-compile-smoke: $(INFER_TARGET)
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke

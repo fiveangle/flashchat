@@ -100,9 +100,41 @@ ModelConfig g_cfg;
 static int g_gpu_kv_seq = DEFAULT_CONTEXT_WINDOW;
 #define GPU_KV_SEQ  g_gpu_kv_seq
 
-// Context length (prompt + generated) of the most recent chat request, for the
-// management-menu usage meter via /health. 0 until the first request completes.
-static int g_last_context_used = 0;
+// Only the inference owner publishes progress. HTTP copies this small snapshot
+// under a short lock; it never reads live model buffers or waits for GPU work.
+typedef struct {
+    const char *phase;
+    int context_used, cached_tokens, prompt_tokens, prefill_done;
+    int generated_tokens, chunk, chunks, layer, layers;
+} server_progress_t;
+static pthread_mutex_t g_progress_mutex = PTHREAD_MUTEX_INITIALIZER;
+static server_progress_t g_progress = {.phase = "idle"};
+
+static void server_progress_phase(const char *phase) {
+    pthread_mutex_lock(&g_progress_mutex);
+    g_progress.phase = phase;
+    pthread_mutex_unlock(&g_progress_mutex);
+}
+
+static void server_progress_prefill(int done, int chunk, int chunks, int layer, int layers) {
+    pthread_mutex_lock(&g_progress_mutex);
+    g_progress.phase = "prefill";
+    g_progress.prefill_done = done;
+    g_progress.context_used = g_progress.cached_tokens + done;
+    g_progress.chunk = chunk;
+    g_progress.chunks = chunks;
+    g_progress.layer = layer;
+    g_progress.layers = layers;
+    pthread_mutex_unlock(&g_progress_mutex);
+}
+
+static void server_progress_decode(int pos, int generated) {
+    pthread_mutex_lock(&g_progress_mutex);
+    g_progress.phase = "generating";
+    g_progress.context_used = pos;
+    g_progress.generated_tokens = generated;
+    pthread_mutex_unlock(&g_progress_mutex);
+}
 
 // Model path has NO hardcoded default. It must be supplied explicitly (--model or
 // config); a missing model path is a fatal error, never a silent fallback to some
@@ -386,6 +418,7 @@ static void server_log_open(void) {
 static void server_http_log_block(const char *request_id, const char *direction,
                                   const char *label, const char *payload) {
     if (!g_server_http_log_enabled || !g_server_http_log) return;
+    flockfile(g_server_http_log);
     server_log_timestamp(g_server_http_log);
     fprintf(g_server_http_log, "[%s] %s %s\n", direction,
             request_id ? request_id : "-", label ? label : "");
@@ -395,6 +428,7 @@ static void server_http_log_block(const char *request_id, const char *direction,
     }
     fprintf(g_server_http_log, "\n");
     fflush(g_server_http_log);
+    funlockfile(g_server_http_log);
 }
 
 static volatile sig_atomic_t g_server_shutdown_signal = 0;
@@ -406,10 +440,8 @@ static void serve_signal_handler(int signo) {
     if (g_server_log_fd >= 0) write(g_server_log_fd, msg, len);
     write(STDERR_FILENO, msg, len);
     g_server_shutdown_signal = signo;
-    if (g_server_listen_fd >= 0) {
-        close(g_server_listen_fd);
-        g_server_listen_fd = -1;
-    }
+    // The HTTP event loop observes this flag within its bounded poll timeout.
+    // Only its owner closes descriptors, avoiding reuse races across threads.
 }
 
 static void install_serve_signal_handlers(void) {
@@ -10312,47 +10344,6 @@ static void freq_print_analysis(int K) {
 // HTTP Serve Mode — OpenAI-compatible /v1/chat/completions (SSE streaming)
 // ============================================================================
 
-// Read exactly n bytes from fd, returns 0 on success, -1 on error/EOF
-static int read_exact(int fd, char *buf, int n) {
-    int got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
-        if (r <= 0) return -1;
-        got += (int)r;
-    }
-    return 0;
-}
-
-// Read HTTP request into buf (up to bufsz-1). Returns total bytes read, or -1.
-// Reads headers, then Content-Length body if present.
-static int read_http_request(int fd, char *buf, int bufsz) {
-    int total = 0;
-    // Read until we find \r\n\r\n (end of headers)
-    while (total < bufsz - 1) {
-        ssize_t r = read(fd, buf + total, 1);
-        if (r <= 0) return -1;
-        total++;
-        if (total >= 4 &&
-            buf[total-4] == '\r' && buf[total-3] == '\n' &&
-            buf[total-2] == '\r' && buf[total-1] == '\n') {
-            break;
-        }
-    }
-    buf[total] = '\0';
-
-    // Find Content-Length
-    const char *cl = strcasestr(buf, "Content-Length:");
-    if (cl) {
-        int content_len = atoi(cl + 15);
-        if (content_len > 0 && total + content_len < bufsz - 1) {
-            if (read_exact(fd, buf + total, content_len) < 0) return -1;
-            total += content_len;
-            buf[total] = '\0';
-        }
-    }
-    return total;
-}
-
 static char *load_system_prompt(void);
 static char *json_escape_alloc(const char *src);
 
@@ -12080,13 +12071,13 @@ static int write_prefill_keepalive(int fd, const char *phase, int done, int tota
     return (wr <= 0) ? -1 : 0;
 }
 
-// Per-token prefill keepalive: heartbeat frame to the streaming client plus a
-// server-log line. Self-throttling (per interval, streaming only), so it is
-// safe to call in the token loop. The batched path uses report_prefill_progress
-// instead, which also carries chunk/layer position.
+// Publish completed positions for every server request. Streaming heartbeats
+// and their log lines are independently throttled to avoid per-token traffic.
 static void report_prefill_keepalive(int fd, const char *request_id,
                                              int *enabled, double *next_ms,
                                              const char *phase, int done, int total) {
+    if (enabled && (!strcmp(phase, "system") || !strcmp(phase, "conversation")))
+        server_progress_prefill(done, 0, 0, 0, 0);
     if (!enabled || !*enabled || !next_ms) return;
     double t = now_ms();
     if (t < *next_ms) return;
@@ -12102,17 +12093,13 @@ static void report_prefill_keepalive(int fd, const char *request_id,
     *next_ms = t + 2000.0;
 }
 
-// Report batched-prefill progress: writes a heartbeat frame to the streaming
-// client and a server-log line. Safe to call every layer — it self-throttles,
-// doing nothing unless streaming is enabled and the interval since the last
-// report has elapsed. Unlike the per-token path, `done` doesn't advance within
-// a chunk (a whole chunk clears at once — ~15s at chunk=1024), so a bare
-// tokens=0/N reads as a stall until the chunk lands; reporting the in-flight
-// chunk and its layer sweep shows forward motion the whole time.
+// Publish layer progress even for non-streaming requests; throttle only the
+// streaming heartbeat and logs. Positions advance when the whole chunk lands.
 static void report_prefill_progress(
         int fd, const char *request_id, int *enabled, double *next_ms,
         const char *phase, int done, int total,
         int chunk_idx, int chunk_total, int chunk_tokens, int layer, int num_layers) {
+    if (enabled) server_progress_prefill(done, chunk_idx, chunk_total, layer, num_layers);
     if (!enabled || !*enabled || !next_ms) return;
     double t = now_ms();
     if (t < *next_ms) return;
@@ -12248,14 +12235,6 @@ static int prefill_tokens_batched(WeightFile *wf, const uint32_t *ids, const flo
     }
     return i;
 }
-
-static const char *CORS_RESPONSE =
-    "HTTP/1.1 204 No Content\r\n"
-    "Access-Control-Allow-Origin: *\r\n"
-    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-    "Access-Control-Max-Age: 86400\r\n"
-    "\r\n";
 
 static int json_escape_cstr(const char *src, char *buf, int bufsize) {
     int j = 0;
@@ -14700,6 +14679,28 @@ cleanup:
     return 1;
 }
 
+#include "server_http.h"
+
+static void server_transport_trace(const char *direction, const char *payload) {
+    server_http_log_block(NULL, direction, "http transport", payload);
+}
+
+static void server_status_json(char *out, size_t capacity) {
+    pthread_mutex_lock(&g_progress_mutex);
+    server_progress_t p = g_progress;
+    pthread_mutex_unlock(&g_progress_mutex);
+    size_t bytes = (size_t)g_cfg.num_full_attn_layers * 2 * GPU_KV_SEQ * kv_token_bytes();
+    int bits = kv_quant_bits();
+    snprintf(out, capacity,
+        "{\"status\":\"ok\",\"ready\":true,\"model\":\"%s\","
+        "\"context_used\":%d,\"max_context\":%d,\"kv_quantization\":\"%s\",\"kv_total_bytes\":%zu,"
+        "\"phase\":\"%s\",\"cached_tokens\":%d,\"prompt_tokens\":%d,\"prefill_done\":%d,"
+        "\"generated_tokens\":%d,\"chunk\":%d,\"chunks\":%d,\"layer\":%d,\"layers\":%d}\n",
+        g_cfg.model_id, p.context_used, GPU_KV_SEQ, bits == 8 ? "q8" : bits == 4 ? "q4" : "fp32", bytes,
+        p.phase, p.cached_tokens, p.prompt_tokens, p.prefill_done, p.generated_tokens,
+        p.chunk, p.chunks, p.layer, p.layers);
+}
+
 static void serve_loop(
     int port,
     const char *config_path,
@@ -14915,91 +14916,37 @@ static void serve_loop(
     memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
     memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
 
+    server_http_t http = {.listener = server_fd, .shutdown = &g_server_shutdown_signal,
+                         .status_json = server_status_json, .model_id = g_cfg.model_id,
+                         .trace = server_transport_trace};
+    if (server_http_start(&http)) {
+        server_log_errorf("[serve] Unable to start HTTP event thread\n");
+        close(server_fd);
+        g_server_listen_fd = -1;
+        return;
+    }
     for (;;) {
+        server_progress_phase("idle");
         if (g_server_shutdown_signal) {
             server_log_errorf("[serve] Shutdown requested by signal %d\n", g_server_shutdown_signal);
             break;
         }
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        char *reqbuf = NULL;
+        int client_fd = server_http_take(&http, &reqbuf);
         if (client_fd < 0) {
             if (g_server_shutdown_signal) {
                 server_log_errorf("[serve] Shutdown requested by signal %d\n", g_server_shutdown_signal);
                 break;
             }
-            perror("accept"); server_log_errorf("[serve] accept failed: %s\n", strerror(errno)); continue;
+            break;
         }
-
-        char *reqbuf = malloc(1024 * 1024);
-        int reqlen = read_http_request(client_fd, reqbuf, 1024 * 1024);
-        if (reqlen <= 0) { free(reqbuf); close(client_fd); continue; }
+        server_progress_phase("preparing");
 
         char method[16] = {0}, path[256] = {0};
         sscanf(reqbuf, "%15s %255s", method, path);
         uint64_t req_num = ++req_counter;
-        char early_request_id[64];
-        snprintf(early_request_id, sizeof(early_request_id), "conn-%llu", req_num);
-        server_http_log_block(early_request_id, "request", "raw http request", reqbuf);
 
-        if (strcmp(method, "OPTIONS") == 0) {
-            server_http_log_block(early_request_id, "response", "cors preflight", CORS_RESPONSE);
-            http_write_str(client_fd, CORS_RESPONSE);
-            free(reqbuf); close(client_fd);
-            continue;
-        }
-
-        if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            // context_used = final length (prompt + generated) of the most recent
-            // request; the management menu renders it as a usage meter.
-            // max_context / quantization / total_bytes describe the configured
-            // KV-cache footprint so the menu can render the right-hand end of the
-            // meter and the RAM figure without trusting client-side config (the
-            // server is the only place that knows GPU_KV_SEQ and the chosen
-            // kv_quant mode at runtime). Field names are part of the menu
-            // contract — flashchat's TUI parses them.
-            size_t kv_total = (size_t)g_cfg.num_full_attn_layers * 2 *
-                              (size_t)GPU_KV_SEQ * kv_token_bytes();
-            const char *kv_q = "fp32";
-            int qb = kv_quant_bits();
-            if (qb == 8) kv_q = "q8";
-            else if (qb == 4) kv_q = "q4";
-            char health_json[384];
-            snprintf(health_json, sizeof(health_json),
-                     "{\"status\":\"ok\",\"model\":\"%s\",\"ready\":true,"
-                     "\"context_used\":%d,\"max_context\":%d,"
-                     "\"kv_quantization\":\"%s\",\"kv_total_bytes\":%zu}\n",
-                     g_cfg.model_id, g_last_context_used, GPU_KV_SEQ,
-                     kv_q, kv_total);
-            send_json_ok(client_fd, health_json);
-            free(reqbuf); close(client_fd);
-            continue;
-        }
-
-        if (strcmp(method, "GET") == 0 && strcmp(path, "/v1") == 0) {
-            send_json_ok(client_fd,
-                         "{\"object\":\"service\",\"id\":\"flashchat\",\"api\":\"openai-compatible\","
-                         "\"endpoints\":[\"/v1/chat/completions\",\"/v1/responses\",\"/v1/models\",\"/health\"]}\n");
-            free(reqbuf); close(client_fd);
-            continue;
-        }
-
-        if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-            char models_json[256];
-            snprintf(models_json, sizeof(models_json),
-                     "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"local\"}]}\n", g_cfg.model_id);
-            send_json_ok(client_fd, models_json);
-            free(reqbuf); close(client_fd);
-            continue;
-        }
-
-        int is_chat = (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0);
-        int is_responses = (strcmp(method, "POST") == 0 && strcmp(path, "/v1/responses") == 0);
-        if (!is_chat && !is_responses) {
-            send_json_error(client_fd, 404, "invalid_request_error", "not found");
-            free(reqbuf); close(client_fd);
-            continue;
-        }
+        int is_chat = !strcmp(path, "/v1/chat/completions");
 
         char *body = strstr(reqbuf, "\r\n\r\n");
         if (!body) {
@@ -15180,6 +15127,10 @@ static void serve_loop(
             cached_sys_disk_backed = 0;
         }
 
+        pthread_mutex_lock(&g_progress_mutex);
+        g_progress = (server_progress_t){.phase = "preparing", .context_used = pos,
+            .cached_tokens = pos};
+        pthread_mutex_unlock(&g_progress_mutex);
         server_log_errorf("[serve] %s request parsed; beginning prompt tokenization\n", request_id);
         PromptTokens *pt = tokenize_request_prompt(&req, request_id);
         if (!pt) {
@@ -15207,6 +15158,9 @@ static void serve_loop(
             }
         }
 
+        pthread_mutex_lock(&g_progress_mutex);
+        g_progress.prompt_tokens = pt->count;
+        pthread_mutex_unlock(&g_progress_mutex);
         double t_prefill = now_ms();
         ane_prefill_engagement_reset();
         int prefill_keepalive_enabled = req.stream;
@@ -15350,6 +15304,7 @@ static void serve_loop(
         free(req_sys_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
         ane_prefill_engagement_log(request_id);
+        server_progress_decode(pos, 0);
 
         // Generation-side state. Declared up here (instead of further down where
         // it used to live) so the very first sampler call can honor the
@@ -15511,6 +15466,7 @@ static void serve_loop(
         int think_budget_hit = 0;
 
         for (int gen = 0; gen < req.max_tokens; gen++) {
+            server_progress_decode(pos, gen_count);
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
             if (next_token == g_cfg.think_start_token) in_think = 1;
             if (next_token == g_cfg.think_end_token) in_think = 0;
@@ -15951,7 +15907,7 @@ tool_call_checked:
         }
 
         // Final context length of this request (prompt + generated) for the menu meter.
-        g_last_context_used = pos;
+        server_progress_decode(pos, gen_count);
 
         if (mtp_shadow_checks > 0) {
             double acc_rate = (100.0 * (double)mtp_shadow_hits) / (double)mtp_shadow_checks;
@@ -16108,6 +16064,7 @@ tool_call_checked:
         }
     }
 
+    server_http_join(&http);
     if (server_fd >= 0 && g_server_listen_fd == server_fd) close(server_fd);
     g_server_listen_fd = -1;
 
