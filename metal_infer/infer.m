@@ -118,11 +118,12 @@ static void server_progress_phase(const char *phase) {
     pthread_mutex_unlock(&g_progress_mutex);
 }
 
-static void server_progress_prefill(int done, int chunk, int chunks, int layer, int layers) {
+static void server_progress_prefill(int position, int chunk, int chunks, int layer, int layers) {
     pthread_mutex_lock(&g_progress_mutex);
     g_progress.phase = "prefill";
-    g_progress.prefill_done = done;
-    g_progress.context_used = g_progress.cached_tokens + done;
+    g_progress.prefill_done = position > g_progress.cached_tokens
+        ? position - g_progress.cached_tokens : 0;
+    g_progress.context_used = g_progress.cached_tokens + g_progress.prefill_done;
     g_progress.chunk = chunk;
     g_progress.chunks = chunks;
     g_progress.layer = layer;
@@ -178,6 +179,7 @@ static int g_server_debug_enabled = 0;
 static int g_server_http_log_enabled = 0;
 static int g_show_thinking_enabled = 0;
 static int g_system_prompt_cache_enabled = 1;
+static int g_conversation_cache_enabled = 1;
 static int g_system_prompt_cache_max_entries = 2;
 static char g_system_prompt_cache_dir[PATH_MAX] = {0};
 static int g_mtp_predictions = -1;
@@ -10406,6 +10408,7 @@ typedef struct {
     ToolDef tools[MAX_TOOLS];
     int tool_count;
     int used_snapshot;
+    size_t generation_prefix_offset;
 } ApiRequest;
 
 typedef struct {
@@ -11565,6 +11568,7 @@ static int fill_request_from_chat_json(NSDictionary *root, ApiRequest *req, char
         }
         append_chat_turn(conversation, @"user", body);
     }
+    req->generation_prefix_offset = strlen([conversation UTF8String]);
     // Native Qwen3 generation prompt: open the assistant turn with <think>\n
     // for reasoning-on (model generates content INSIDE the think block first),
     // or inject an empty <think>...</think> block for reasoning-off. The
@@ -11686,6 +11690,7 @@ static int fill_request_from_responses_json(NSDictionary *root, ApiRequest *req,
     return fill_request_from_chat_json(@{
         @"model": root[@"model"] ?: @"",
         @"messages": messages,
+        @"session_id": root[@"session_id"] ?: @"",
         @"stream": @(req->stream),
         @"max_tokens": @(req->max_tokens),
         @"temperature": @(req->temperature),
@@ -13666,6 +13671,118 @@ static int capture_system_prompt_snapshots(int token_count,
     return 0;
 }
 
+// Attention entries before a checkpoint are append-only. Only recurrent state
+// needs copying; resetting lengths hides the later attention entries on rollback.
+// This checkpoint is valid only while its corresponding live buffers remain intact.
+typedef struct {
+    uint32_t *ids;
+    int count;
+    int capacity;
+    int live_valid;
+    int checkpoint_count;
+    char session_id[64];
+    float *conv[MAX_NUM_LAYERS];
+    float *ssm[MAX_NUM_LAYERS];
+    void *gpu_delta[MAX_LINEAR_LAYERS];
+    void *gpu_conv[MAX_LINEAR_LAYERS];
+    int kv_len[MAX_NUM_LAYERS];
+} ConversationCache;
+
+static void conversation_cache_invalidate(ConversationCache *cache) {
+    cache->live_valid = 0;
+    cache->checkpoint_count = 0;
+    cache->count = 0;
+}
+
+static void conversation_cache_free(ConversationCache *cache) {
+    free_system_prompt_snapshots(NULL, cache->conv, cache->ssm,
+                                cache->gpu_delta, cache->gpu_conv);
+    free(cache->ids);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static int conversation_cache_prefix_matches(const ConversationCache *cache,
+                                             const PromptTokens *prompt, int count) {
+    return count > 0 && count <= cache->count && count < prompt->count &&
+           !memcmp(cache->ids, prompt->ids, (size_t)count * sizeof(uint32_t));
+}
+
+static int conversation_cache_match(const ConversationCache *cache,
+                                    const PromptTokens *prompt, const char *session_id,
+                                    int *restore_checkpoint) {
+    *restore_checkpoint = 0;
+    if (strcmp(cache->session_id, session_id)) return 0;
+    if (cache->live_valid && conversation_cache_prefix_matches(cache, prompt, cache->count))
+        return cache->count;
+    if (conversation_cache_prefix_matches(cache, prompt, cache->checkpoint_count)) {
+        *restore_checkpoint = 1;
+        return cache->checkpoint_count;
+    }
+    return 0;
+}
+
+static int conversation_cache_begin(ConversationCache *cache, const PromptTokens *prompt,
+                                    const char *session_id, int max_tokens) {
+    conversation_cache_invalidate(cache);
+    size_t capacity = (size_t)prompt->count + (size_t)max_tokens;
+    if (capacity > (size_t)GPU_KV_SEQ) capacity = GPU_KV_SEQ;
+    if (capacity < (size_t)prompt->count) return -1;
+    if (cache->capacity < (int)capacity) {
+        uint32_t *ids = realloc(cache->ids, capacity * sizeof(uint32_t));
+        if (!ids) return -1;
+        cache->ids = ids;
+        cache->capacity = (int)capacity;
+    }
+    memcpy(cache->ids, prompt->ids, (size_t)prompt->count * sizeof(uint32_t));
+    cache->count = prompt->count;
+    snprintf(cache->session_id, sizeof(cache->session_id), "%s", session_id);
+    return 0;
+}
+
+static int conversation_checkpoint_capture(ConversationCache *cache, int pos,
+                                           void **layer_states, KVCache **kv_caches) {
+    KVCache *no_kv[MAX_NUM_LAYERS] = {0};
+    cache->checkpoint_count = 0;
+    if (pos <= 0 || pos > cache->count) return -1;
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (kv_caches[i] && kv_caches[i]->len != pos) return -1;
+        cache->kv_len[i] = kv_caches[i] ? kv_caches[i]->len : 0;
+    }
+    if (capture_system_prompt_snapshots(0, NULL, cache->conv, cache->ssm,
+                                       cache->gpu_delta, cache->gpu_conv,
+                                       layer_states, no_kv) != 0) return -1;
+    cache->checkpoint_count = pos;
+    return 0;
+}
+
+static int conversation_checkpoint_restore(ConversationCache *cache,
+                                           void **layer_states, KVCache **kv_caches) {
+    KVCache *no_kv[MAX_NUM_LAYERS] = {0};
+    if (cache->checkpoint_count <= 0) return -1;
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (kv_caches[i] && kv_caches[i]->len < cache->kv_len[i]) return -1;
+    }
+    restore_system_prompt_snapshots(0, NULL, cache->conv, cache->ssm,
+                                   cache->gpu_delta, cache->gpu_conv, layer_states, no_kv);
+    for (int i = 0; i < g_cfg.num_layers; i++) {
+        if (kv_caches[i]) kv_caches[i]->len = cache->kv_len[i];
+    }
+    return 0;
+}
+
+static int conversation_checkpoint_boundary(ApiRequest *req, const PromptTokens *prompt) {
+    // The suffix begins at the special assistant-start token, a tokenizer boundary.
+    const char *suffix = req->conversation_text + req->generation_prefix_offset;
+    PromptTokens *tail = encode_prompt_text_to_tokens(suffix);
+    if (!tail) return 0;
+    int count = prompt->count - tail->count;
+    int matches = count > 0 && tail->count > 0 &&
+        !memcmp(prompt->ids + count, tail->ids, (size_t)tail->count * sizeof(uint32_t));
+    free(tail->ids);
+    free(tail);
+    return matches ? count : 0;
+}
+
 static size_t first_byte_diff(const void *a, const void *b, size_t n);
 static int load_system_prompt_disk_cache(const char *model_path, uint64_t prompt_hash, int expected_tokens,
                                          KVSnapshot *kv_snapshots,
@@ -14910,11 +15027,15 @@ static void serve_loop(
         }
     }
 
+    server_logf("[serve]   conversation_cache: %s (one active conversation)\n",
+                g_conversation_cache_enabled ? "enabled" : "disabled");
+
     static uint64_t req_counter = 0;
 
     // ---- Lazy system prompt cache: snapshot keyed by system prompt hash ----
     // On first request with a given system prompt, prefill it and save state.
     // On subsequent requests with the same hash, restore the snapshot.
+    ConversationCache conversation_cache = {0};
     uint64_t cached_sys_hash = 0;
     int cached_sys_token_count = 0;
     int cached_sys_disk_backed = 0;
@@ -15063,7 +15184,30 @@ static void serve_loop(
         int disk_cache_invalid = 0;
         int pos = 0;
 
-        if (g_system_prompt_cache_enabled && cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
+        // Match the full rendered input before restoring or clearing any live state.
+        PromptTokens *pt = tokenize_request_prompt(&req, request_id);
+        if (!pt || pt->count <= 0 || pt->count >= GPU_KV_SEQ) {
+            send_json_error(client_fd, 400, "invalid_request_error", "prompt is empty, cannot be tokenized, or exceeds the context window");
+            if (pt) { free(pt->ids); free(pt); }
+            free(req_sys_prompt);
+            api_request_free(&req);
+            free(reqbuf); close(client_fd);
+            continue;
+        }
+        int restore_conversation = 0;
+        int reused_conversation = g_conversation_cache_enabled
+            ? conversation_cache_match(&conversation_cache, pt, req.session_id, &restore_conversation) : 0;
+        if (reused_conversation && restore_conversation &&
+            conversation_checkpoint_restore(&conversation_cache, layer_states, kv_caches) != 0)
+            reused_conversation = 0;
+        if (reused_conversation) {
+            pos = reused_conversation;
+            snapshot_restored = 1;
+            req.used_snapshot = 1;
+            server_log_errorf("[serve] %s conversation_cache hit source=%s reused=%d remaining=%d\n",
+                              request_id, restore_conversation ? "checkpoint" : "live",
+                              pos, pt->count - pos);
+        } else if (g_system_prompt_cache_enabled && cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
             // Cache hit: restore snapshot
             server_log_errorf("[serve] %s sys_prompt_cache hit hash=%016llx tokens=%d\n",
                               request_id, (unsigned long long)req_sys_hash, cached_sys_token_count);
@@ -15147,16 +15291,14 @@ static void serve_loop(
         g_progress = (server_progress_t){.phase = "preparing", .context_used = pos,
             .cached_tokens = pos};
         pthread_mutex_unlock(&g_progress_mutex);
-        server_log_errorf("[serve] %s request parsed; beginning prompt tokenization\n", request_id);
-        PromptTokens *pt = tokenize_request_prompt(&req, request_id);
-        if (!pt) {
-            send_json_error(client_fd, 500, "server_error", "tokenization failed");
-            free(req_sys_prompt);
-            api_request_free(&req);
-            free(reqbuf);
-            close(client_fd);
-            continue;
-        }
+        int prefill_origin = pos;
+        int checkpoint_boundary = g_conversation_cache_enabled
+            ? conversation_checkpoint_boundary(&req, pt) : 0;
+        int cache_recording = g_conversation_cache_enabled &&
+            conversation_cache_begin(&conversation_cache, pt, req.session_id, req.max_tokens) == 0;
+        if (!cache_recording) conversation_cache_invalidate(&conversation_cache);
+        if (!reused_conversation && g_conversation_cache_enabled)
+            server_log_errorf("[serve] %s conversation_cache miss reused=0\n", request_id);
         int active_tools = (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE);
         float effective_presence_penalty = active_tools ? 0.0f : req.presence_penalty;
         float effective_repetition_penalty = active_tools ? 1.0f : req.repetition_penalty;
@@ -15166,7 +15308,7 @@ static void serve_loop(
             token_counts = calloc((size_t)g_cfg.vocab_size, sizeof(int));
             if (token_counts) {
                 if (!active_tools) {
-                    int history_start = req.used_snapshot ? 0 : sys_prompt_token_count;
+                    int history_start = sys_prompt_token_count;
                     seed_token_counts_from_prompt(token_counts, g_cfg.vocab_size, pt, history_start);
                 }
             } else {
@@ -15175,7 +15317,7 @@ static void serve_loop(
         }
 
         pthread_mutex_lock(&g_progress_mutex);
-        g_progress.prompt_tokens = pt->count;
+        g_progress.prompt_tokens = pt->count - prefill_origin;
         pthread_mutex_unlock(&g_progress_mutex);
         double t_prefill = now_ms();
         ane_prefill_engagement_reset();
@@ -15188,9 +15330,10 @@ static void serve_loop(
         float *serve_embed_batch = NULL;
         if (pt->count > 1) {
             serve_embed_batch = malloc((size_t)pt->count * g_cfg.hidden_dim * sizeof(float));
-            for (int i = 0; i < pt->count; i++) {
+            for (int i = prefill_origin; i < pt->count; i++) {
                 if (server_request_cancelled(client_fd)) goto prefill_finished;
-                embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * g_cfg.hidden_dim);
+                if (serve_embed_batch)
+                    embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * g_cfg.hidden_dim);
                 report_prefill_keepalive(client_fd, request_id,
                                                  &prefill_keepalive_enabled,
                                                  &next_prefill_keepalive_ms,
@@ -15199,7 +15342,7 @@ static void serve_loop(
         }
 
         // Split prefill: system prompt first, then conversation
-        int sys_token_end = req.used_snapshot ? 0 : sys_prompt_token_count;
+        int sys_token_end = sys_prompt_token_count;
         if (!snapshot_restored && sys_token_end > 0) {
             // Prefill system prompt tokens: chunked batched forward first
             // (FLASHCHAT_BATCH_PREFILL=1), per-token loop finishes the tail.
@@ -15236,8 +15379,8 @@ static void serve_loop(
             if (server_request_cancelled(client_fd)) goto prefill_finished;
             // Save snapshot at system prompt boundary. When the cache is disabled we
             // do NONE of this: no in-memory snapshot capture (allocations + KV-state
-            // memcpys), no disk write, and no "saved" log line. "Disabled" means the
-            // request always cold-prefills and leaves no cache state behind.
+            // memcpys), no disk write, and no "saved" log line. Conversation reuse
+            // is independent and may still avoid prefilling unchanged history.
             int snapshot_saved = 0;
             if (g_system_prompt_cache_enabled) {
                 if (capture_system_prompt_snapshots(sys_token_end,
@@ -15289,42 +15432,57 @@ static void serve_loop(
             }
         }
 
-        // Prefill remaining tokens (conversation, or all tokens if snapshot restored)
-        int prefill_start = prefill_tokens_batched(wf, pt->ids, serve_embed_batch,
-                                                   sys_token_end, pt->count, kv_caches, layer_fds, &pos,
-                                                   client_fd, request_id,
-                                                   &prefill_keepalive_enabled,
-                                                   &next_prefill_keepalive_ms, "conversation");
-        if (prefill_start < 0) goto prefill_finished;
-        for (int i = prefill_start; i < pt->count; i++) {
-            if (serve_embed_batch) {
-                memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
-            } else {
-                embed_lookup(wf, pt->ids[i], hidden);
+        if (cache_recording && pos == checkpoint_boundary &&
+            conversation_checkpoint_capture(&conversation_cache, pos, layer_states, kv_caches) != 0)
+            server_log_errorf("[serve] %s conversation_cache checkpoint unavailable\n", request_id);
+
+        // Stop before the newest assistant header to preserve a reusable checkpoint
+        // even when clients normalize the generated reasoning or tool-call text.
+        while (pos < pt->count) {
+            int segment_end = cache_recording && checkpoint_boundary > pos
+                ? checkpoint_boundary : pt->count;
+            int prefill_start = prefill_tokens_batched(wf, pt->ids, serve_embed_batch,
+                                                       pos, segment_end, kv_caches, layer_fds, &pos,
+                                                       client_fd, request_id,
+                                                       &prefill_keepalive_enabled,
+                                                       &next_prefill_keepalive_ms, "conversation");
+            if (prefill_start < 0) goto prefill_finished;
+            for (int i = prefill_start; i < segment_end; i++) {
+                if (serve_embed_batch) {
+                    memcpy(hidden, serve_embed_batch + (size_t)i * g_cfg.hidden_dim, g_cfg.hidden_dim * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[i], hidden);
+                }
+                for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                    if (server_request_cancelled(client_fd)) goto prefill_finished;
+                    int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                if (i == pt->count - 1) complete_deferred_experts();
+                else discard_deferred_experts();
+                pos++;
+                report_prefill_keepalive(client_fd, request_id,
+                                                 &prefill_keepalive_enabled,
+                                                 &next_prefill_keepalive_ms,
+                                                 "conversation", i + 1, pt->count);
             }
-            for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                if (server_request_cancelled(client_fd)) goto prefill_finished;
-                int is_full = ((layer + 1) % g_cfg.full_attn_interval == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
+            if (server_request_cancelled(client_fd)) goto prefill_finished;
+            if (cache_recording && pos == checkpoint_boundary &&
+                conversation_checkpoint_capture(&conversation_cache, pos, layer_states, kv_caches) != 0) {
+                server_log_errorf("[serve] %s conversation_cache checkpoint unavailable\n", request_id);
             }
-            if (i == pt->count - 1) complete_deferred_experts();
-            else discard_deferred_experts();
-            pos++;
-            report_prefill_keepalive(client_fd, request_id,
-                                             &prefill_keepalive_enabled,
-                                             &next_prefill_keepalive_ms,
-                                             "conversation", i + 1, pt->count);
         }
 prefill_finished:
         free(serve_embed_batch);
         if (server_request_cancelled(client_fd)) {
             discard_deferred_experts();
             server_log_errorf("[serve] %s cancelled during prefill\n", request_id);
+            conversation_cache_invalidate(&conversation_cache);
             clear_runtime_state_serve(layer_states, kv_caches);
             server_progress_decode(0, 0);
             free(req_sys_prompt);
@@ -15338,7 +15496,8 @@ prefill_finished:
         prefill_log_memory("before transient release");
         prefill_release_transient_buffers();
         free(req_sys_prompt);
-        server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count, now_ms() - t_prefill);
+        server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count - prefill_origin, now_ms() - t_prefill);
+        conversation_cache.live_valid = cache_recording;
         ane_prefill_engagement_log(request_id);
         server_progress_decode(pos, 0);
 
@@ -15411,6 +15570,7 @@ prefill_finished:
         int mtp_spec_iters = 0, mtp_refwd_iters = 0, mtp_full_reject_iters = 0, mtp_verified_positions = 0;
         int mtp_batched_verify_iters = 0, mtp_prod_verify_iters = 0;
         if (mtp_shadow_available) {
+            conversation_cache.live_valid = 0;
             gpu_snap_alloc(&mtp_snap); mtp_snap_ready = 1;
             mtp_hs   = malloc((size_t)mtp_B*mtp_H*sizeof(float));
             mtp_ln   = malloc((size_t)mtp_B*mtp_V*sizeof(float));
@@ -15504,7 +15664,8 @@ prefill_finished:
         for (int gen = 0; gen < req.max_tokens; gen++) {
             report_prefill_keepalive(client_fd, request_id, &prefill_keepalive_enabled,
                                      &next_prefill_keepalive_ms, "decode", gen_count, req.max_tokens);
-            if (server_request_cancelled(client_fd)) break;
+            if (server_request_cancelled(client_fd) ||
+                pos + (mtp_shadow_available ? mtp_B : 1) > GPU_KV_SEQ) break;
             server_progress_decode(pos, gen_count);
             if (next_token == g_cfg.eos_token_1 || next_token == g_cfg.eos_token_2) break;
             if (next_token == g_cfg.think_start_token) in_think = 1;
@@ -15607,6 +15768,7 @@ prefill_finished:
                                 char retry_tool_name[MAX_TOOL_NAME];
                                 snprintf(retry_tool_name, sizeof(retry_tool_name), "%s", parsed_tool_call.name);
                                 tool_validation_attempts++;
+                                conversation_cache.live_valid = 0;
                                 gen_count++;
                                 int force_retry_tool =
                                     req.tool_choice_mode == TOOL_CHOICE_FORCED && req.forced_tool_name[0];
@@ -15929,6 +16091,11 @@ tool_call_checked:
                                         K, layer_fds[layer]);
                 }
                 complete_deferred_experts();
+                if (conversation_cache.live_valid) {
+                    if (conversation_cache.count == pos && pos < conversation_cache.capacity)
+                        conversation_cache.ids[conversation_cache.count++] = (uint32_t)next_token;
+                    else conversation_cache.live_valid = 0;
+                }
                 pos++;
                 if (mtp_shadow_available) {
                     memcpy(mtp_backbone_hidden, hidden, g_cfg.hidden_dim * sizeof(float));
@@ -15952,6 +16119,7 @@ tool_call_checked:
             discard_deferred_experts();
             clear_runtime_state_serve(layer_states, kv_caches);
             pos = 0;
+            conversation_cache_invalidate(&conversation_cache);
             server_log_errorf("[serve] %s cancelled during generation\n", request_id);
         }
 
@@ -16096,6 +16264,11 @@ tool_call_checked:
                                   g_prof_mtp_moe_union_max, g_prof_mtp_moe_fallbacks);
             }
         }
+        if (g_conversation_cache_enabled && !cancelled) {
+            server_log_errorf("[serve] %s conversation_cache retained live=%d checkpoint=%d\n",
+                              request_id, conversation_cache.live_valid ? conversation_cache.count : 0,
+                              conversation_cache.checkpoint_count);
+        }
         free(final_json);
         free(gen_response);
         free(gen_reasoning);
@@ -16115,6 +16288,7 @@ tool_call_checked:
         }
     }
 
+    conversation_cache_free(&conversation_cache);
     server_http_join(&http);
     if (server_fd >= 0 && g_server_listen_fd == server_fd) close(server_fd);
     g_server_listen_fd = -1;
@@ -16365,6 +16539,14 @@ int main(int argc, char **argv) {
                             char *end_quote = strchr(quote + 1, '"');
                             if (end_quote) *end_quote = '\0';
                             g_show_thinking_enabled = server_flag_enabled(quote + 1);
+                        }
+                    }
+                    if (strncmp(line, "CONVERSATION_CACHE=", 19) == 0) {
+                        char *quote = strchr(line + 19, '"');
+                        if (quote) {
+                            char *end_quote = strchr(quote + 1, '"');
+                            if (end_quote) *end_quote = '\0';
+                            if (quote[1]) g_conversation_cache_enabled = server_flag_enabled(quote + 1);
                         }
                     }
                     if (strncmp(line, "SYSTEM_PROMPT_CACHE=", 20) == 0) {
@@ -16643,6 +16825,10 @@ int main(int argc, char **argv) {
                     K, MAX_K, MAX_K);
             K = MAX_K;
         }
+
+        const char *conversation_env = getenv("FLASHCHAT_CONVERSATION_CACHE");
+        if (conversation_env && conversation_env[0])
+            g_conversation_cache_enabled = server_flag_enabled(conversation_env);
 
         if (parse_tool_call_path) {
             return parse_tool_call_debug(parse_tool_call_path, validate_tool_call_request_path);

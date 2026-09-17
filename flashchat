@@ -421,6 +421,7 @@ Environment variables:
                               stability. Set to 0 to allow sampled tool-call
                               content (e.g. for diversifying parameter values
                               across runs).
+  FLASHCHAT_CONVERSATION_CACHE  Reuse unchanged conversation turns (0/1)
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
   FLASHCHAT_SYSTEM_PROMPT_CACHE_DIR
                                   Optional external cache root for system prompt caches
@@ -577,6 +578,7 @@ cmd_status() {
     echo "Expert pin cache: $(flashchat_get EXPERT_PIN_MAX_GB) GiB (mlock=$(flashchat_get EXPERT_PIN_MLOCK))"
     echo "lm_head RAM lock: $(flashchat_get LM_HEAD_MLOCK)"
     echo "Expert split I/O: $(flashchat_get EXPERT_SPLIT_IO)"
+    echo "Conversation cache: $(flashchat_get CONVERSATION_CACHE)"
     echo "System prompt cache: $(flashchat_get SYSTEM_PROMPT_CACHE) (max entries: $(flashchat_get SYSTEM_PROMPT_CACHE_MAX_ENTRIES))"
     echo "System prompt cache dir: $(flashchat_get SYSTEM_PROMPT_CACHE_DIR)"
     echo "Multi-token prediction: $(mtp_label "$MTP")"

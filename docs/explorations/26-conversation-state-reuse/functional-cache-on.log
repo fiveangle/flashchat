@@ -1,0 +1,160 @@
+[2026-09-16 17:00:44] [serve] Logging started
+[2026-09-16 17:00:44] [serve] Build: Sep 16 2026 16:57:55
+[2026-09-16 17:00:44] [serve] Listening on http://127.0.0.1:58103
+[2026-09-16 17:00:44] [serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health
+[2026-09-16 17:00:44] [serve] Persistent log: /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/server.log
+[2026-09-16 17:00:44] [serve] Runtime configuration:
+[2026-09-16 17:00:44] [serve]   model: Qwen3.6-35B-A3B (q4) (Qwen-Qwen36-35B-A3B)
+[2026-09-16 17:00:44] [serve]   repo: Qwen/Qwen3.6-35B-A3B
+[2026-09-16 17:00:44] [serve]   model_path: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
+[2026-09-16 17:00:44] [serve]   config_file: /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/config
+[2026-09-16 17:00:44] [serve]   weights: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.bin
+[2026-09-16 17:00:44] [serve]   manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.json
+[2026-09-16 17:00:44] [serve]   vocab: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/vocab.bin
+[2026-09-16 17:00:44] [serve]   quantization: 4-bit group_size=64
+[2026-09-16 17:00:44] [serve]   architecture: layers=40 hidden=2048 vocab=248320 heads=16 kv_heads=2 head_dim=256 full_attn=10 linear_attn=30
+[2026-09-16 17:00:44] [serve]   experts: total=256 active_per_token=8 trained_active_per_token=8 expert_size=1769472 expert_size_per_token=13.5 MiB
+[2026-09-16 17:00:44] [serve]   max_response_tokens: 20
+[2026-09-16 17:00:44] [serve]   reasoning: disabled
+[2026-09-16 17:00:44] [serve]   show_thinking: disabled
+[2026-09-16 17:00:44] [serve]   sampling: temp=0.700 top_p=0.800 top_k=20 min_p=0.000 presence=1.500 repetition=1.000
+[2026-09-16 17:00:44] [serve]   mtp: disabled
+[2026-09-16 17:00:44] [serve]   gpu_linear_attention: enabled
+[2026-09-16 17:00:44] [serve]   cmd_fuse_linear: enabled
+[2026-09-16 17:00:44] [serve]   kv_cache: window=4096 quant=q8 total_bytes=40.0 MiB
+[2026-09-16 17:00:44] [serve]   batched_prefill: enabled chunk=1024 min_tokens=16
+[2026-09-16 17:00:44] [serve]   ane_prefill: enabled (falls back to GPU if Neural Engine unavailable) batch=256 w_qscale=195 x_qscale=16 mid_qscale=16
+[2026-09-16 17:00:44] [serve]   ane_prefill: hybrid — chunks < 512 tokens run the GPU path (measured crossover; also bit-faithful)
+[2026-09-16 17:00:44] [serve]   expert_pin_cache: disabled
+[2026-09-16 17:00:44] [serve]   lm_head_mlock: requested (skips if free RAM < span + 512 MiB headroom)
+[2026-09-16 17:00:44] [serve]   expert_split_io: enabled (gate+up GPU overlapped with down pread on misses)
+[2026-09-16 17:00:44] [serve]   pread_profile: disabled
+[2026-09-16 17:00:44] [serve]   system_prompt_cache: enabled max_entries=2
+[2026-09-16 17:00:44] [serve]   system_prompt_cache_dir: /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/system-cache
+[2026-09-16 17:00:44] [serve]   server_debug: disabled http_log: disabled prefill_debug: 0
+[2026-09-16 17:00:44] [serve]   custom_user_system_prompt: /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/home/absent-system.md (not present; using built-in default)
+[2026-09-16 17:00:44] [serve]   conversation_cache: enabled (one active conversation)
+[2026-09-16 17:00:44] [serve] chatcmpl-1 endpoint=chat prompt_chars=113 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:44] [serve] chatcmpl-1 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=113 total_chars=386
+[2026-09-16 17:00:44] [serve] chatcmpl-1 tokenizing prompt chars=288
+[2026-09-16 17:00:44] [serve] chatcmpl-1 tokenized prompt tokens=56
+[2026-09-16 17:00:44] [serve] chatcmpl-1 sys_prompt_cache miss new_hash=9e466a66ad541b8b tokens=34
+[2026-09-16 17:00:44] [serve] chatcmpl-1 conversation_cache miss reused=0
+[2026-09-16 17:00:46] [serve] sys_prompt_disk_cache saved /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/system-cache/Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/9e466a66ad541b8b-v2.fcache raw=0.18GiB stored=0.06GiB chunks=160
+[2026-09-16 17:00:46] [serve] chatcmpl-1 sys_prompt_cache saved hash=9e466a66ad541b8b tokens=34
+[2026-09-16 17:00:47] [serve] chatcmpl-1 prefill=56 tokens in 3198ms
+[2026-09-16 17:00:47] [ane-prefill] chatcmpl-1 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3234 GPU | rows 0 ANE (0.0%) / 10560 GPU | ane producer=0ms eval=0ms scatter=7ms | gpu gemm=258ms io=213ms route=36ms
+[2026-09-16 17:00:47] [serve] chatcmpl-1 first_token=3793
+[2026-09-16 17:00:47] [serve] chatcmpl-1 generated=1 tokens in 49ms (20.41 tok/s, experts 4.2 MiB/s, 0.5 MiB/s/expert, TTFT 3.2s (0@0.0tok/s think, 1@20.4tok/s response))
+[2026-09-16 17:00:47] [serve] chatcmpl-1 conversation_cache retained live=57 checkpoint=49
+[2026-09-16 17:00:47] [serve] chatcmpl-2 endpoint=chat prompt_chars=225 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:47] [serve] chatcmpl-2 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=225 total_chars=498
+[2026-09-16 17:00:47] [serve] chatcmpl-2 tokenizing prompt chars=400
+[2026-09-16 17:00:47] [serve] chatcmpl-2 tokenized prompt tokens=79
+[2026-09-16 17:00:47] [serve] chatcmpl-2 conversation_cache hit source=checkpoint reused=49 remaining=30
+[2026-09-16 17:00:48] [serve] chatcmpl-2 prefill=30 tokens in 1047ms
+[2026-09-16 17:00:48] [ane-prefill] chatcmpl-2 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 2569 GPU | rows 0 ANE (0.0%) / 7040 GPU | ane producer=0ms eval=0ms scatter=4ms | gpu gemm=187ms io=168ms route=24ms
+[2026-09-16 17:00:48] [serve] chatcmpl-2 first_token=14778
+[2026-09-16 17:00:48] [serve] chatcmpl-2 generated=1 tokens in 55ms (18.20 tok/s, experts 12.2 MiB/s, 1.5 MiB/s/expert, TTFT 1.1s (0@0.0tok/s think, 1@18.2tok/s response))
+[2026-09-16 17:00:48] [serve] chatcmpl-2 conversation_cache retained live=80 checkpoint=72
+[2026-09-16 17:00:48] [serve] chatcmpl-3 endpoint=chat prompt_chars=330 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:48] [serve] chatcmpl-3 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=330 total_chars=603
+[2026-09-16 17:00:48] [serve] chatcmpl-3 tokenizing prompt chars=505
+[2026-09-16 17:00:48] [serve] chatcmpl-3 tokenized prompt tokens=98
+[2026-09-16 17:00:48] [serve] chatcmpl-3 conversation_cache hit source=checkpoint reused=72 remaining=26
+[2026-09-16 17:00:49] [serve] chatcmpl-3 prefill=26 tokens in 979ms
+[2026-09-16 17:00:49] [ane-prefill] chatcmpl-3 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 2472 GPU | rows 0 ANE (0.0%) / 5760 GPU | ane producer=0ms eval=0ms scatter=4ms | gpu gemm=169ms io=159ms route=21ms
+[2026-09-16 17:00:49] [serve] chatcmpl-3 first_token=1354
+[2026-09-16 17:00:49] [serve] chatcmpl-3 generated=2 tokens in 108ms (18.58 tok/s, experts 24.8 MiB/s, 3.1 MiB/s/expert, TTFT 1.0s (0@0.0tok/s think, 2@18.6tok/s response))
+[2026-09-16 17:00:49] [serve] chatcmpl-3 conversation_cache retained live=100 checkpoint=91
+[2026-09-16 17:00:49] [serve] chatcmpl-4 endpoint=chat prompt_chars=226 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:49] [serve] chatcmpl-4 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=226 total_chars=499
+[2026-09-16 17:00:49] [serve] chatcmpl-4 tokenizing prompt chars=401
+[2026-09-16 17:00:49] [serve] chatcmpl-4 tokenized prompt tokens=79
+[2026-09-16 17:00:49] [serve] chatcmpl-4 sys_prompt_cache hit hash=9e466a66ad541b8b tokens=34
+[2026-09-16 17:00:49] [serve] chatcmpl-4 conversation_cache miss reused=0
+[2026-09-16 17:00:50] [serve] chatcmpl-4 prefill=45 tokens in 1345ms
+[2026-09-16 17:00:50] [ane-prefill] chatcmpl-4 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3135 GPU | rows 0 ANE (0.0%) / 11840 GPU | ane producer=0ms eval=0ms scatter=7ms | gpu gemm=263ms io=193ms route=38ms
+[2026-09-16 17:00:50] [serve] chatcmpl-4 first_token=85
+[2026-09-16 17:00:51] [serve] chatcmpl-4 generated=2 tokens in 103ms (19.39 tok/s, experts 18.6 MiB/s, 2.3 MiB/s/expert, TTFT 1.3s (0@0.0tok/s think, 2@19.4tok/s response))
+[2026-09-16 17:00:51] [serve] chatcmpl-4 conversation_cache retained live=81 checkpoint=72
+[2026-09-16 17:00:51] [serve] chatcmpl-5 endpoint=chat prompt_chars=113 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:51] [serve] chatcmpl-5 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=113 total_chars=386
+[2026-09-16 17:00:51] [serve] chatcmpl-5 tokenizing prompt chars=288
+[2026-09-16 17:00:51] [serve] chatcmpl-5 tokenized prompt tokens=56
+[2026-09-16 17:00:51] [serve] chatcmpl-5 sys_prompt_cache hit hash=9e466a66ad541b8b tokens=34
+[2026-09-16 17:00:51] [serve] chatcmpl-5 conversation_cache miss reused=0
+[2026-09-16 17:00:52] [serve] chatcmpl-5 prefill=22 tokens in 1053ms
+[2026-09-16 17:00:52] [serve] chatcmpl-5 first_token=3793
+[2026-09-16 17:00:52] [serve] chatcmpl-5 generated=1 tokens in 49ms (20.33 tok/s, experts 12.2 MiB/s, 1.5 MiB/s/expert, TTFT 1.1s (0@0.0tok/s think, 1@20.3tok/s response))
+[2026-09-16 17:00:52] [serve] chatcmpl-5 conversation_cache retained live=57 checkpoint=49
+[2026-09-16 17:00:52] [serve] chatcmpl-6 endpoint=chat prompt_chars=113 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:52] [serve] chatcmpl-6 prompt_parts upstream_system_chars=50 default_system_chars=28 tool_instruction_chars=0 final_system_chars=145 conversation_chars=113 total_chars=386
+[2026-09-16 17:00:52] [serve] chatcmpl-6 tokenizing prompt chars=288
+[2026-09-16 17:00:52] [serve] chatcmpl-6 tokenized prompt tokens=56
+[2026-09-16 17:00:52] [serve] chatcmpl-6 conversation_cache hit source=checkpoint reused=49 remaining=7
+[2026-09-16 17:00:52] [serve] chatcmpl-6 prefill=7 tokens in 323ms
+[2026-09-16 17:00:52] [serve] chatcmpl-6 first_token=3793
+[2026-09-16 17:00:52] [serve] chatcmpl-6 generated=1 tokens in 60ms (16.77 tok/s, experts 35.1 MiB/s, 4.4 MiB/s/expert, TTFT 0.3s (0@0.0tok/s think, 1@16.8tok/s response))
+[2026-09-16 17:00:52] [serve] chatcmpl-6 conversation_cache retained live=57 checkpoint=49
+[2026-09-16 17:00:52] [serve] chatcmpl-7 endpoint=chat prompt_chars=113 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=0.40 repetition=1.05 reasoning=0 snapshot=0
+[2026-09-16 17:00:52] [serve] chatcmpl-7 prompt_parts upstream_system_chars=17 default_system_chars=28 tool_instruction_chars=0 final_system_chars=112 conversation_chars=113 total_chars=353
+[2026-09-16 17:00:52] [serve] chatcmpl-7 tokenizing prompt chars=255
+[2026-09-16 17:00:52] [serve] chatcmpl-7 tokenized prompt tokens=51
+[2026-09-16 17:00:52] [serve] chatcmpl-7 sys_prompt_cache miss old_hash=9e466a66ad541b8b new_hash=2fab2c8353990d16
+[2026-09-16 17:00:52] [serve] chatcmpl-7 conversation_cache miss reused=0
+[2026-09-16 17:00:54] [serve] sys_prompt_disk_cache saved /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/system-cache/Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/2fab2c8353990d16-v2.fcache raw=0.18GiB stored=0.06GiB chunks=160
+[2026-09-16 17:00:54] [serve] chatcmpl-7 sys_prompt_cache saved hash=2fab2c8353990d16 tokens=29
+[2026-09-16 17:00:55] [serve] chatcmpl-7 prefill=51 tokens in 3005ms
+[2026-09-16 17:00:55] [ane-prefill] chatcmpl-7 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3089 GPU | rows 0 ANE (0.0%) / 8960 GPU | ane producer=0ms eval=0ms scatter=6ms | gpu gemm=237ms io=203ms route=31ms
+[2026-09-16 17:00:55] [serve] chatcmpl-7 first_token=3793
+[2026-09-16 17:00:55] [serve] chatcmpl-7 generated=1 tokens in 51ms (19.56 tok/s, experts 4.4 MiB/s, 0.6 MiB/s/expert, TTFT 3.0s (0@0.0tok/s think, 1@19.6tok/s response))
+[2026-09-16 17:00:55] [serve] chatcmpl-7 conversation_cache retained live=52 checkpoint=44
+[2026-09-16 17:00:55] [serve] chatcmpl-8 endpoint=chat prompt_chars=126 tools=1 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:00:55] [serve] chatcmpl-8 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=1078 final_system_chars=1108 conversation_chars=126 total_chars=1362
+[2026-09-16 17:00:55] [serve] chatcmpl-8 tokenizing prompt chars=1264
+[2026-09-16 17:00:55] [serve] chatcmpl-8 tokenized prompt tokens=288
+[2026-09-16 17:00:55] [serve] chatcmpl-8 sys_prompt_cache miss old_hash=2fab2c8353990d16 new_hash=dee8f3f9fd3ae2b8
+[2026-09-16 17:00:55] [serve] chatcmpl-8 conversation_cache miss reused=0
+[2026-09-16 17:01:03] [serve] sys_prompt_disk_cache saved /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/system-cache/Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/dee8f3f9fd3ae2b8-v2.fcache raw=0.19GiB stored=0.06GiB chunks=160
+[2026-09-16 17:01:03] [serve] chatcmpl-8 sys_prompt_cache saved hash=dee8f3f9fd3ae2b8 tokens=260
+[2026-09-16 17:01:04] [serve] chatcmpl-8 prefill=288 tokens in 8674ms
+[2026-09-16 17:01:04] [ane-prefill] chatcmpl-8 engagement: short-chunk-gpu | chunks 0/80 ANE | experts 0 ANE / 9567 GPU | rows 0 ANE (0.0%) / 88000 GPU | ane producer=0ms eval=0ms scatter=47ms | gpu gemm=1542ms io=1596ms route=226ms
+[2026-09-16 17:01:04] [serve] chatcmpl-8 first_token=27 [tool_call greedy]
+[2026-09-16 17:01:05] [serve] chatcmpl-8 generated=13 tokens in 729ms (17.82 tok/s, experts 18.7 MiB/s, 2.3 MiB/s/expert, TTFT 8.7s (0@0.0tok/s think, 14@19.2tok/s response)) [tool_call]
+[2026-09-16 17:01:05] [serve] chatcmpl-8 conversation_cache retained live=301 checkpoint=271
+[2026-09-16 17:01:05] [serve] chatcmpl-9 endpoint=chat prompt_chars=318 tools=1 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:01:05] [serve] chatcmpl-9 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=1078 final_system_chars=1108 conversation_chars=318 total_chars=1554
+[2026-09-16 17:01:05] [serve] chatcmpl-9 tokenizing prompt chars=1456
+[2026-09-16 17:01:05] [serve] chatcmpl-9 tokenized prompt tokens=329
+[2026-09-16 17:01:05] [serve] chatcmpl-9 conversation_cache hit source=checkpoint reused=271 remaining=58
+[2026-09-16 17:01:06] [serve] chatcmpl-9 prefill=58 tokens in 1761ms
+[2026-09-16 17:01:06] [ane-prefill] chatcmpl-9 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 4007 GPU | rows 0 ANE (0.0%) / 16000 GPU | ane producer=0ms eval=0ms scatter=11ms | gpu gemm=340ms io=313ms route=45ms
+[2026-09-16 17:01:06] [serve] chatcmpl-9 first_token=6269
+[2026-09-16 17:01:07] [serve] chatcmpl-9 generated=6 tokens in 324ms (18.49 tok/s, experts 38.8 MiB/s, 4.8 MiB/s/expert, TTFT 1.8s (0@0.0tok/s think, 6@18.5tok/s response))
+[2026-09-16 17:01:07] [serve] chatcmpl-9 conversation_cache retained live=335 checkpoint=322
+[2026-09-16 17:01:07] [serve] resp-10 endpoint=responses prompt_chars=107 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:01:07] [serve] resp-10 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=107 total_chars=358
+[2026-09-16 17:01:07] [serve] resp-10 tokenizing prompt chars=260
+[2026-09-16 17:01:07] [serve] resp-10 tokenized prompt tokens=54
+[2026-09-16 17:01:07] [serve] resp-10 sys_prompt_cache miss old_hash=dee8f3f9fd3ae2b8 new_hash=40151882ca0c04f9
+[2026-09-16 17:01:07] [serve] resp-10 conversation_cache miss reused=0
+[2026-09-16 17:01:09] [serve] sys_prompt_disk_cache saved /Users/speedster/dev/flashchat/debug/exp26-live-20260916/cache-1/system-cache/Qwen-Qwen36-35B-A3B/q4/system_prompt_cache/40151882ca0c04f9-v2.fcache raw=0.18GiB stored=0.06GiB chunks=160
+[2026-09-16 17:01:09] [serve] resp-10 sys_prompt_cache saved hash=40151882ca0c04f9 tokens=31
+[2026-09-16 17:01:10] [serve] resp-10 prefill=54 tokens in 3150ms
+[2026-09-16 17:01:10] [ane-prefill] resp-10 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3237 GPU | rows 0 ANE (0.0%) / 9600 GPU | ane producer=0ms eval=0ms scatter=6ms | gpu gemm=241ms io=332ms route=32ms
+[2026-09-16 17:01:10] [serve] resp-10 first_token=3793
+[2026-09-16 17:01:10] [serve] resp-10 generated=1 tokens in 50ms (19.98 tok/s, experts 4.2 MiB/s, 0.5 MiB/s/expert, TTFT 3.2s (0@0.0tok/s think, 1@20.0tok/s response))
+[2026-09-16 17:01:10] [serve] resp-10 conversation_cache retained live=55 checkpoint=47
+[2026-09-16 17:01:10] [serve] resp-11 endpoint=responses prompt_chars=193 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:01:10] [serve] resp-11 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=193 total_chars=444
+[2026-09-16 17:01:10] [serve] resp-11 tokenizing prompt chars=346
+[2026-09-16 17:01:10] [serve] resp-11 tokenized prompt tokens=70
+[2026-09-16 17:01:10] [serve] resp-11 conversation_cache hit source=checkpoint reused=47 remaining=23
+[2026-09-16 17:01:11] [serve] resp-11 prefill=23 tokens in 1080ms
+[2026-09-16 17:01:11] [serve] resp-11 first_token=17
+[2026-09-16 17:01:11] [serve] resp-11 generated=2 tokens in 103ms (19.45 tok/s, experts 22.8 MiB/s, 2.8 MiB/s/expert, TTFT 1.1s (0@0.0tok/s think, 2@19.5tok/s response))
+[2026-09-16 17:01:11] [serve] resp-11 conversation_cache retained live=72 checkpoint=63
+[signal] Shutdown requested
+[2026-09-16 17:01:11] [serve] Shutdown requested by signal 15
+[2026-09-16 17:01:11] [serve] Logging stopped

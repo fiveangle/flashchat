@@ -121,6 +121,7 @@ def _print_summary(registry: Registry) -> None:
     print(f"Listen address: {configfile.get('SERVER_BIND')}")
     print(f"HuggingFace cache dir: {configfile.get('HUGGINGFACE_CACHE_DIR')}")
     print(f"Offload dir: {configfile.get('OFFLOAD_DIR') or '(not configured)'}")
+    print(f"Conversation cache: {configfile.get('CONVERSATION_CACHE')}")
     print(f"System prompt cache: {configfile.get('SYSTEM_PROMPT_CACHE')} "
           f"(max entries: {configfile.get('SYSTEM_PROMPT_CACHE_MAX_ENTRIES')})")
     print(f"System prompt cache dir: {configfile.get('SYSTEM_PROMPT_CACHE_DIR') or '(model directory)'}")
@@ -506,6 +507,8 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
              "~0.3 GB on q4 35B; keeps generation from re-faulting the big final projection. Skipped if free RAM is too low."),
             ("EXPERT_SPLIT_IO", "Overlap expert disk reads with GPU (0/1)",
              "Starts GPU on gate+up while the down half still streams from SSD; byte-identical outputs."),
+            ("CONVERSATION_CACHE", "Reuse unchanged conversation turns (0/1)",
+             "Keeps one active conversation in memory; falls back safely when input changes."),
             ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)",
              "Repeat requests skip re-reading the system prompt — big win for long agent prompts."),
             ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "  ^ max saved prompts (1-64; entries can be tens of MB)", None),

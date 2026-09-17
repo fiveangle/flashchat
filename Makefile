@@ -117,7 +117,7 @@ ANE_MLP_SRC = $(BUILD_DIR)/fc_ane_mlp.m
 ANE_MLP_HDR = $(BUILD_DIR)/fc_ane_mlp.h
 ANE_SMOKE_TARGET = tests/ane_mlp_smoke
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests ane-smoke
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke conversation-cache-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests ane-smoke
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -189,6 +189,7 @@ help:
 	@printf "  make manage-smoke  Run model management integration test\n"
 	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
+	@printf "  make conversation-cache-smoke  Check exact conversation matching and state restoration\n"
 	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
 	@printf "  make quant-helper-smoke  Run native checkpoint quantization helper tests\n"
 	@printf "  make tokenizer-export-smoke  Run tokenizer export helper tests\n"
@@ -332,7 +333,7 @@ api-smoke: $(INFER_TARGET)
 # appends prefill/decode metrics to assets/api_perf_log.tsv. Separate from `make test`
 # because it starts a real server per model and is minutes-long.
 bench-api: $(INFER_TARGET)
-	bash tests/bench_api.sh
+	bash tests/bench_api.sh $(BENCH_ARGS)
 
 # Compare the latest benchmark rows against prior commits and flag regressions.
 bench-report:
@@ -375,6 +376,13 @@ chat-render-smoke: $(CHAT_TARGET)
 tool-template-smoke: $(INFER_TARGET)
 	bash tests/test_tool_template_render.sh
 
+$(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/conversation_cache_fixture.m $(ANE_MLP_SRC) -o $@
+
+.PHONY: conversation-cache-smoke
+conversation-cache-smoke: $(BUILD_DIR)/conversation_cache_fixture
+	./$(BUILD_DIR)/conversation_cache_fixture
+
 cache-roundtrip-smoke: $(INFER_TARGET)
 	bash tests/test_disk_cache_roundtrip.sh
 
@@ -390,4 +398,4 @@ native-qwen-compile-smoke: $(INFER_TARGET)
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke conversation-cache-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke

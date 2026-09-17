@@ -39,11 +39,12 @@ class ShippingDefaultsTests(unittest.TestCase):
         self.assertEqual(values["KV_QUANT"], "q8")
         self.assertEqual(values["MODEL"], "Qwen-Qwen36-35B-A3B")
         self.assertEqual(values["SERVER_BIND"], "127.0.0.1")
+        self.assertEqual(values["CONVERSATION_CACHE"], "1")
         self.assertEqual(values["FUSE_LINEAR"], "1")
         self.assertEqual(values["ADAPTIVE_K_MASS"], "")
         self.assertEqual(values["EXPERT_PIN_MAX_GB"], "8")
         self.assertEqual(values["SHOW_THINKING"], "1")
-        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "14")
+        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "15")
         with patch.dict(os.environ, self.env, clear=True):
             defaults = configfile.shipping_defaults()
         self.assertFalse(defaults.keys() - values.keys())
@@ -53,6 +54,17 @@ class ShippingDefaultsTests(unittest.TestCase):
                                    'printf "%s %s %s" "$FLASHCHAT_KV_QUANT" '
                                    '"$FLASHCHAT_LM_HEAD_MLOCK" "$FLASHCHAT_EXPERT_SPLIT_IO"'),
                          "q8 1 1")
+
+    def test_conversation_cache_migration_and_environment_override(self):
+        Path(self.config).write_text('CONFIG_SCHEMA_VERSION="14"\n')
+        self.assertEqual(self.shell('flashchat_load_config; flashchat_get CONVERSATION_CACHE').strip(), "1")
+        configfile.update({"CONVERSATION_CACHE": "0"}, self.config)
+        self.assertEqual(self.shell('flashchat_load_config; flashchat_export_runtime_config; '
+                                   'printf "%s" "$FLASHCHAT_CONVERSATION_CACHE"'), "0")
+        self.env["FLASHCHAT_CONVERSATION_CACHE"] = "1"
+        self.assertEqual(self.shell('flashchat_load_config; flashchat_export_runtime_config; '
+                                   'printf "%s" "$FLASHCHAT_CONVERSATION_CACHE"'), "1")
+        self.assertEqual(configfile.load(self.config)["CONVERSATION_CACHE"], "0")
 
     def test_existing_cache_choices_are_preserved(self):
         for saved, expected in ((None, "off"), ("", "off"), ("off", "off"),
@@ -83,7 +95,7 @@ class ShippingDefaultsTests(unittest.TestCase):
             with patch.object(registry.state, "save"), patch.object(onboarding.resolved, "write"):
                 onboarding._save_selection(registry, manifest, "q4")
         values = configfile.load(self.config)
-        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "14")
+        self.assertEqual(values["CONFIG_SCHEMA_VERSION"], "15")
         self.assertEqual(values["KV_QUANT"], "q8")
         self.assertEqual(values["SAMPLING_PROFILE"], "instruct")
 

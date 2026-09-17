@@ -13,7 +13,7 @@
 #
 # Usage: tests/bench_api.sh [--port N] [--repeats N] [--max-tokens N]
 #                           [--model-id ID] [--no-perf-log] [--perf-log FILE]
-#                           [--allow-busy-system]
+#                           [--allow-busy-system] [--conversation-only --conversation-cache 0|1]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +27,8 @@ REPEATS="${BENCH_REPEATS:-2}"
 # Use bench-prefixed names here so sourcing it / flashchat_load_config can't clobber ours.
 BENCH_MAX_TOK="${BENCH_MAX_TOKENS:-128}"
 ONLY_MODEL=""
+BENCH_CONVERSATION_ONLY=0
+BENCH_CONVERSATION_CACHE=""
 PERF_LOG_ENABLED=1
 PERF_LOG_PATH="${REPO_ROOT}/assets/api_perf_log.tsv"
 SERVER_MODE="bench"
@@ -40,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --repeats) REPEATS="$2"; shift 2 ;;
         --max-tokens) BENCH_MAX_TOK="$2"; shift 2 ;;
         --model-id) ONLY_MODEL="$2"; shift 2 ;;
+        --conversation-only) BENCH_CONVERSATION_ONLY=1; shift ;;
+        --conversation-cache) BENCH_CONVERSATION_CACHE="$2"; shift 2 ;;
         --no-perf-log) PERF_LOG_ENABLED=0; shift ;;
         --perf-log) PERF_LOG_PATH="$2"; shift 2 ;;
         --allow-busy-system) ALLOW_BUSY_SYSTEM=1; shift ;;
@@ -49,6 +53,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$BENCH_CONVERSATION_CACHE" && "$BENCH_CONVERSATION_CACHE" != 0 && "$BENCH_CONVERSATION_CACHE" != 1 ]]; then
+    echo "--conversation-cache must be 0 or 1" >&2; exit 2
+fi
+if [[ -n "$BENCH_CONVERSATION_CACHE" && "$BENCH_CONVERSATION_ONLY" != 1 ]]; then
+    echo "--conversation-cache requires --conversation-only; standard rows measure shipping defaults" >&2; exit 2
+fi
 BASE_URL="http://${HOST}:${PORT}"
 TMPDIR="$(mktemp -d)"
 SERVER_PID=""
@@ -192,7 +202,7 @@ resolve_model() {
     local id="$1"
     set +u
     FLASHCHAT_MODEL="$id" FLASHCHAT_MODEL_PATH="" FLASHCHAT_WEIGHTS_DIR="" FLASHCHAT_EXPERTS_DIR="" \
-        flashchat_load_config >/dev/null 2>&1
+        FLASHCHAT_CONFIG_FILE_OVERRIDE="${TMPDIR}/resolve-config" flashchat_load_config >/dev/null 2>&1
     MP="$(flashchat_get MODEL_PATH)"; WD="$(flashchat_get WEIGHTS_DIR)"; ED="$(flashchat_get EXPERTS_DIR)"
     BITS="$(flashchat_model_quant_bits "$id" 2>/dev/null)"; NE="$(flashchat_model_num_experts "$id" 2>/dev/null)"
     set -u
@@ -241,6 +251,7 @@ start_server() {
         set +u
         source "${REPO_ROOT}/lib/config.sh"
         MODEL="$id"
+        SYSTEM_PROMPT_CACHE_DIR="${bench_home}/system_prompt_cache"
         flashchat_create_default_config >/dev/null
         flashchat_load_config >/dev/null
         set -u
@@ -256,6 +267,9 @@ start_server() {
 
         cd "${REPO_ROOT}/metal_infer"
         flashchat_export_runtime_config
+        if [[ -n "${BENCH_CONVERSATION_CACHE:-}" ]]; then
+            export FLASHCHAT_CONVERSATION_CACHE="$BENCH_CONVERSATION_CACHE"
+        fi
         export FLASHCHAT_SESSIONS_DIR="$(flashchat_get_sessions_dir)"
         export FLASHCHAT_SYSTEM_PROMPT="$(flashchat_get_system_prompt_file)"
         exec ./infer --serve "$PORT" --config "$config_file" \
@@ -365,6 +379,23 @@ bench_case() {
     log_perf_row "$model" "$scenario" "$ep_path" "$m_ttft" "prefill_ms"         "$m_ttft" ""       "$status" "n=${REPEATS}"
 }
 
+# Three growing turns; separate scenario names keep explicit off/on probes out
+# of standard shipping-default comparisons. Uses the same preflight and server.
+bench_conversation() {
+    local model="$1" mode="${BENCH_CONVERSATION_CACHE:-default}"
+    local results="${TMPDIR}/conversation.tsv"
+    source "${REPO_ROOT}/lib/python.sh"
+    if ! "$(flashchat_python_bin)" "${REPO_ROOT}/tests/bench_conversation_cache.py" "$BASE_URL" > "$results"; then
+        echo "FAIL: conversation comparison did not complete correctly" >&2
+        return 1
+    fi
+    local turn ttft total cached prefilled
+    while IFS=$'\t' read -r turn ttft total cached prefilled; do
+        printf '    conversation cache=%s turn=%s TTFT=%s ms reused=%s prefilled=%s\n' "$mode" "$turn" "$ttft" "$cached" "$prefilled"
+        log_perf_row "$model" "conversation_cache_${mode}:turn${turn}" "/v1/chat/completions" "$total" "prefill_ms" "$ttft" "" "pass" "n=1 conversation_cache=${mode} cached_tokens=${cached} prefilled_tokens=${prefilled} reasoning=off completion=OK"
+    done < "$results"
+}
+
 # bench_tool <model> -> one forced tool-call latency row (fixed prompt, coverage)
 bench_tool() {
     local model="$1" body start end dur status
@@ -417,12 +448,16 @@ for id in $MODEL_IDS; do
     fi
     grep -E -m3 '^\[(bench-config|perf)\]|^\[serve\]   expert_pin_cache:' \
         "${TMPDIR}/server.log" 2>/dev/null | sed 's/^/      /' || true
-    for i in "${!PROMPT_NAMES[@]}"; do
-        for ep in chat responses; do
-            bench_case "$id" "$ep" "${PROMPT_NAMES[$i]}" "${PROMPT_TEXTS[$i]}"
+    if [[ "$BENCH_CONVERSATION_ONLY" == 1 ]]; then
+        bench_conversation "$id" || exit 1
+    else
+        for i in "${!PROMPT_NAMES[@]}"; do
+            for ep in chat responses; do
+                bench_case "$id" "$ep" "${PROMPT_NAMES[$i]}" "${PROMPT_TEXTS[$i]}"
+            done
         done
-    done
-    bench_tool "$id"
+        bench_tool "$id"
+    fi
     stop_server
     CASES_RUN=$((CASES_RUN+1))
     echo

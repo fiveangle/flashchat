@@ -1,0 +1,92 @@
+[2026-09-16 17:03:49] [serve] Logging started
+[2026-09-16 17:03:49] [serve] Build: Sep 16 2026 17:02:13
+[2026-09-16 17:03:49] [serve] Listening on http://127.0.0.1:58253
+[2026-09-16 17:03:49] [serve] Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health
+[2026-09-16 17:03:49] [serve] Persistent log: /Users/speedster/dev/flashchat/debug/exp26-edges-20260916/cache-1/server.log
+[2026-09-16 17:03:49] [serve] Runtime configuration:
+[2026-09-16 17:03:49] [serve]   model: Qwen3.6-35B-A3B (q4) (Qwen-Qwen36-35B-A3B)
+[2026-09-16 17:03:49] [serve]   repo: Qwen/Qwen3.6-35B-A3B
+[2026-09-16 17:03:49] [serve]   model_path: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
+[2026-09-16 17:03:49] [serve]   config_file: /Users/speedster/dev/flashchat/debug/exp26-edges-20260916/cache-1/config
+[2026-09-16 17:03:49] [serve]   weights: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.bin
+[2026-09-16 17:03:49] [serve]   manifest: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/model_weights.json
+[2026-09-16 17:03:49] [serve]   vocab: /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/vocab.bin
+[2026-09-16 17:03:49] [serve]   quantization: 4-bit group_size=64
+[2026-09-16 17:03:49] [serve]   architecture: layers=40 hidden=2048 vocab=248320 heads=16 kv_heads=2 head_dim=256 full_attn=10 linear_attn=30
+[2026-09-16 17:03:49] [serve]   experts: total=256 active_per_token=8 trained_active_per_token=8 expert_size=1769472 expert_size_per_token=13.5 MiB
+[2026-09-16 17:03:49] [serve]   max_response_tokens: 20
+[2026-09-16 17:03:49] [serve]   reasoning: disabled
+[2026-09-16 17:03:49] [serve]   show_thinking: disabled
+[2026-09-16 17:03:49] [serve]   sampling: temp=0.700 top_p=0.800 top_k=20 min_p=0.000 presence=1.500 repetition=1.000
+[2026-09-16 17:03:49] [serve]   mtp: disabled
+[2026-09-16 17:03:49] [serve]   gpu_linear_attention: enabled
+[2026-09-16 17:03:49] [serve]   cmd_fuse_linear: enabled
+[2026-09-16 17:03:49] [serve]   kv_cache: window=4096 quant=q8 total_bytes=40.0 MiB
+[2026-09-16 17:03:49] [serve]   batched_prefill: enabled chunk=1024 min_tokens=16
+[2026-09-16 17:03:49] [serve]   ane_prefill: enabled (falls back to GPU if Neural Engine unavailable) batch=256 w_qscale=195 x_qscale=16 mid_qscale=16
+[2026-09-16 17:03:49] [serve]   ane_prefill: hybrid — chunks < 512 tokens run the GPU path (measured crossover; also bit-faithful)
+[2026-09-16 17:03:49] [serve]   expert_pin_cache: disabled
+[2026-09-16 17:03:49] [serve]   lm_head_mlock: requested (skips if free RAM < span + 512 MiB headroom)
+[2026-09-16 17:03:49] [serve]   expert_split_io: enabled (gate+up GPU overlapped with down pread on misses)
+[2026-09-16 17:03:49] [serve]   pread_profile: disabled
+[2026-09-16 17:03:49] [serve]   system_prompt_cache: disabled max_entries=2
+[2026-09-16 17:03:49] [serve]   system_prompt_cache_dir: /Users/speedster/dev/flashchat/debug/exp26-edges-20260916/cache-1/system-cache
+[2026-09-16 17:03:49] [serve]   server_debug: disabled http_log: disabled prefill_debug: 0
+[2026-09-16 17:03:49] [serve]   custom_user_system_prompt: /Users/speedster/dev/flashchat/debug/exp26-edges-20260916/cache-1/home/absent-system.md (not present; using built-in default)
+[2026-09-16 17:03:49] [serve]   conversation_cache: enabled (one active conversation)
+[2026-09-16 17:03:49] [serve] chatcmpl-1 endpoint=chat prompt_chars=83 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:03:49] [serve] chatcmpl-1 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=83 total_chars=334
+[2026-09-16 17:03:49] [serve] chatcmpl-1 tokenizing prompt chars=236
+[2026-09-16 17:03:49] [serve] chatcmpl-1 tokenized prompt tokens=47
+[2026-09-16 17:03:49] [serve] chatcmpl-1 conversation_cache miss reused=0
+[2026-09-16 17:03:52] [serve] chatcmpl-1 prefill=47 tokens in 3064ms
+[2026-09-16 17:03:52] [ane-prefill] chatcmpl-1 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3237 GPU | rows 0 ANE (0.0%) / 9600 GPU | ane producer=0ms eval=0ms scatter=7ms | gpu gemm=550ms io=201ms route=68ms
+[2026-09-16 17:03:52] [serve] chatcmpl-1 first_token=3793
+[2026-09-16 17:03:52] [serve] chatcmpl-1 generated=1 tokens in 102ms (9.81 tok/s, experts 4.3 MiB/s, 0.5 MiB/s/expert, TTFT 3.1s (0@0.0tok/s think, 1@9.8tok/s response))
+[2026-09-16 17:03:52] [serve] chatcmpl-1 conversation_cache retained live=48 checkpoint=40
+[2026-09-16 17:03:52] [serve] chatcmpl-2 endpoint=chat prompt_chars=83 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:03:52] [serve] chatcmpl-2 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=83 total_chars=334
+[2026-09-16 17:03:52] [serve] chatcmpl-2 tokenizing prompt chars=236
+[2026-09-16 17:03:52] [serve] chatcmpl-2 tokenized prompt tokens=47
+[2026-09-16 17:03:52] [serve] chatcmpl-2 conversation_cache hit source=checkpoint reused=40 remaining=7
+[2026-09-16 17:03:53] [serve] chatcmpl-2 prefill=7 tokens in 638ms
+[2026-09-16 17:03:53] [serve] chatcmpl-2 first_token=3793
+[2026-09-16 17:03:53] [serve] chatcmpl-2 generated=1 tokens in 85ms (11.82 tok/s, experts 18.6 MiB/s, 2.3 MiB/s/expert, TTFT 0.6s (0@0.0tok/s think, 1@11.8tok/s response))
+[2026-09-16 17:03:53] [serve] chatcmpl-2 conversation_cache retained live=48 checkpoint=40
+[2026-09-16 17:03:53] [serve] chatcmpl-3 endpoint=chat prompt_chars=83 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:03:53] [serve] chatcmpl-3 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=83 total_chars=334
+[2026-09-16 17:03:53] [serve] chatcmpl-3 tokenizing prompt chars=236
+[2026-09-16 17:03:53] [serve] chatcmpl-3 tokenized prompt tokens=47
+[2026-09-16 17:03:53] [serve] chatcmpl-3 conversation_cache miss reused=0
+[2026-09-16 17:03:56] [serve] chatcmpl-3 prefill=47 tokens in 2842ms
+[2026-09-16 17:03:56] [ane-prefill] chatcmpl-3 engagement: short-chunk-gpu | chunks 0/40 ANE | experts 0 ANE / 3237 GPU | rows 0 ANE (0.0%) / 9600 GPU | ane producer=0ms eval=0ms scatter=7ms | gpu gemm=516ms io=201ms route=59ms
+[2026-09-16 17:03:56] [serve] chatcmpl-3 first_token=3793
+[2026-09-16 17:03:56] [serve] chatcmpl-3 generated=1 tokens in 91ms (11.05 tok/s, experts 4.6 MiB/s, 0.6 MiB/s/expert, TTFT 2.8s (0@0.0tok/s think, 1@11.1tok/s response))
+[2026-09-16 17:03:56] [serve] chatcmpl-3 conversation_cache retained live=48 checkpoint=40
+[2026-09-16 17:03:56] [serve] chatcmpl-4 endpoint=chat prompt_chars=25068 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:03:56] [serve] chatcmpl-4 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=25068 total_chars=25319
+[2026-09-16 17:03:56] [serve] chatcmpl-4 tokenizing prompt chars=25221
+[2026-09-16 17:03:56] [serve] chatcmpl-4 tokenized prompt tokens=5043
+[2026-09-16 17:03:56] [serve] chatcmpl-5 endpoint=chat prompt_chars=110 tools=0 stream=1 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:03:56] [serve] chatcmpl-5 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=110 total_chars=361
+[2026-09-16 17:03:56] [serve] chatcmpl-5 tokenizing prompt chars=263
+[2026-09-16 17:03:56] [serve] chatcmpl-5 tokenized prompt tokens=58
+[2026-09-16 17:03:56] [serve] chatcmpl-5 conversation_cache miss reused=0
+[2026-09-16 17:03:59] [serve] chatcmpl-5 prefill=58 tokens in 3333ms
+[2026-09-16 17:03:59] [ane-prefill] chatcmpl-5 engagement: short-chunk-gpu | chunks 0/80 ANE | experts 0 ANE / 5566 GPU | rows 0 ANE (0.0%) / 15680 GPU | ane producer=0ms eval=0ms scatter=10ms | gpu gemm=937ms io=407ms route=101ms
+[2026-09-16 17:03:59] [serve] chatcmpl-5 first_token=16
+[2026-09-16 17:04:00] [serve] chatcmpl-5 cancelled during generation
+[2026-09-16 17:04:00] [serve] chatcmpl-5 generated=3 tokens in 290ms (10.35 tok/s, experts 11.2 MiB/s, 1.4 MiB/s/expert, TTFT 3.3s (0@0.0tok/s think, 3@10.4tok/s response))
+[2026-09-16 17:04:00] [serve] chatcmpl-6 endpoint=chat prompt_chars=110 tools=0 stream=0 active_experts=8/8 temp=0.00 top_p=0.80 top_k=20 min_p=0.000 presence=1.50 repetition=1.00 reasoning=0 snapshot=0
+[2026-09-16 17:04:00] [serve] chatcmpl-6 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=110 total_chars=361
+[2026-09-16 17:04:00] [serve] chatcmpl-6 tokenizing prompt chars=263
+[2026-09-16 17:04:00] [serve] chatcmpl-6 tokenized prompt tokens=58
+[2026-09-16 17:04:00] [serve] chatcmpl-6 conversation_cache miss reused=0
+[2026-09-16 17:04:03] [serve] chatcmpl-6 prefill=58 tokens in 3053ms
+[2026-09-16 17:04:03] [ane-prefill] chatcmpl-6 engagement: short-chunk-gpu | chunks 0/80 ANE | experts 0 ANE / 5566 GPU | rows 0 ANE (0.0%) / 15680 GPU | ane producer=0ms eval=0ms scatter=11ms | gpu gemm=852ms io=362ms route=107ms
+[2026-09-16 17:04:03] [serve] chatcmpl-6 first_token=16
+[2026-09-16 17:04:03] [serve] chatcmpl-6 generated=8 tokens in 674ms (11.87 tok/s, experts 28.9 MiB/s, 3.6 MiB/s/expert, TTFT 3.1s (0@0.0tok/s think, 8@11.9tok/s response))
+[2026-09-16 17:04:03] [serve] chatcmpl-6 conversation_cache retained live=66 checkpoint=51
+[signal] Shutdown requested
+[2026-09-16 17:04:04] [serve] Shutdown requested by signal 15
+[2026-09-16 17:04:04] [serve] Logging stopped

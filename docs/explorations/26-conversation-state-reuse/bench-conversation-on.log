@@ -1,0 +1,18 @@
+bash tests/bench_api.sh --model-id Qwen-Qwen36-35B-A3B --conversation-only --conversation-cache 1
+=== Flashchat API performance benchmark ===
+machine: fiveangle.lan Mac17,2 32.0GB (4p 6e 10g)
+system:  cpu_idle=92.97% gpu_util=2% load1=1.79 mem_free=69% swap=54.19MB time_machine=0 thermal=ok
+commit:  exp/26-conversation-state-reuse@d193340  | repeats=2 warmup=1 max_tokens=128
+log:     /Users/speedster/dev/flashchat/assets/api_perf_log.tsv
+
+[0;32mbench[0m Qwen-Qwen36-35B-A3B  experts=256 bits=4
+      weights=/Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4
+      [bench-config] model=Qwen-Qwen36-35B-A3B fuse=1 adaptive_k= pin_gb=8 pin_experts= pin_auto=0.5 pin_mlock=1 batch_prefill=1 ane_prefill=1 kv_quant=q8 config=/var/folders/8m/s74gkyn530zd36bc6t2n00_h0000gn/T/tmp.nz0CR0wpKO/home-Qwen-Qwen36-35B-A3B/.config/flashchat/config
+      [perf] experts=256 | delta_batch=1 verify_gpu_attn=0 matmulN=v5 kv_quant=q8 fused_attn=1 gpu_rope=1 kv_window=65536 | mtp=lossless draft/verify when MTP artifacts present
+      [serve]   expert_pin_cache: enabled cap=8.0 GiB auto_frac=0.50 mlock=on (budget resolves at first expert read; mlock needs free RAM + headroom)
+    conversation cache=1 turn=1 TTFT=8784.0 ms reused=0 prefilled=341
+    conversation cache=1 turn=2 TTFT=7965.0 ms reused=334 prefilled=312
+    conversation cache=1 turn=3 TTFT=8343.8 ms reused=639 prefilled=312
+
+=== done: 1 model(s) benchmarked, 0 skipped ===
+rows appended to /Users/speedster/dev/flashchat/assets/api_perf_log.tsv — run 'make bench-report' to compare.

@@ -1,0 +1,327 @@
+[
+  [
+    "chat-turn-1",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "chat-turn-2",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        },
+        {
+          "role": "assistant",
+          "content": "OK"
+        },
+        {
+          "role": "user",
+          "content": "What is the code word? Reply with that word only."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "chat-turn-3",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        },
+        {
+          "role": "assistant",
+          "content": "OK"
+        },
+        {
+          "role": "user",
+          "content": "What is the code word? Reply with that word only."
+        },
+        {
+          "role": "assistant",
+          "content": "amber"
+        },
+        {
+          "role": "user",
+          "content": "Repeat the code word in uppercase only."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": true,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "edited-history",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word violet. Reply only OK."
+        },
+        {
+          "role": "assistant",
+          "content": "OK"
+        },
+        {
+          "role": "user",
+          "content": "What is the code word? Reply with that word only."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "shortened-history",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "identical-retry",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly and follow the user's instructions."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "changed-system",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer in French."
+        },
+        {
+          "role": "user",
+          "content": "Remember the code word amber. Reply only OK."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false,
+      "presence_penalty": 0.4,
+      "repetition_penalty": 1.05
+    }
+  ],
+  [
+    "forced-tool",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Record the number 7."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "record_number",
+            "description": "Record a number.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "record_number"
+        }
+      },
+      "max_tokens": 48,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false
+    }
+  ],
+  [
+    "tool-result",
+    "/v1/chat/completions",
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Record the number 7."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "fixture-call",
+              "type": "function",
+              "function": {
+                "name": "record_number",
+                "arguments": "{\"value\":7}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "fixture-call",
+          "name": "record_number",
+          "content": "Recorded 7 successfully. Reply only done."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "record_number",
+            "description": "Record a number.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "max_tokens": 48,
+      "temperature": 0,
+      "reasoning": false,
+      "stream": false
+    }
+  ],
+  [
+    "responses-turn-1",
+    "/v1/responses",
+    {
+      "input": [
+        {
+          "role": "user",
+          "content": "Remember the number 27. Reply only OK."
+        }
+      ],
+      "temperature": 0,
+      "max_output_tokens": 16,
+      "reasoning": false,
+      "stream": false
+    }
+  ],
+  [
+    "responses-turn-2",
+    "/v1/responses",
+    {
+      "input": [
+        {
+          "role": "user",
+          "content": "Remember the number 27. Reply only OK."
+        },
+        {
+          "role": "assistant",
+          "content": "OK"
+        },
+        {
+          "role": "user",
+          "content": "Repeat the number only."
+        }
+      ],
+      "temperature": 0,
+      "max_output_tokens": 16,
+      "reasoning": false,
+      "stream": false
+    }
+  ]
+]

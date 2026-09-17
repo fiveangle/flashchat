@@ -1,5 +1,28 @@
 # HTTP responsiveness and inference ownership
 
+## Conversation reuse
+
+`CONVERSATION_CACHE=1` reuses unchanged turns from one active conversation. It is
+available as **Reuse unchanged conversation turns (0/1)** in advanced configuration;
+`FLASHCHAT_CONVERSATION_CACHE=0` overrides it for a test run. The setting participates
+in server invalidation, so a running server restarts before changed settings are reused.
+
+The server compares exact rendered tokens. It retains live state when possible,
+otherwise restores a checkpoint before the latest assistant response and processes
+that response plus new input. This handles client normalization of reasoning and
+tool arguments without treating a matching session ID as proof of matching input.
+Changed/shortened history falls back safely; cancellation discards conversation reuse.
+Both Chat Completions and Responses use this path. Clients still send the complete
+conversation; this does not add a server-side conversation-ID storage API.
+
+The cache is held only in memory and is independent of persistent system/tool
+caching. It keeps one recurrent-state checkpoint and token ledger; attention history
+uses the existing buffers. Interleaving unrelated conversations replaces the active
+entry. Logs report `conversation_cache hit source=live|checkpoint`, reused/remaining
+tokens, misses, and retained checkpoint positions. See
+[experiment 26](explorations/26-conversation-state-reuse/NOTES.md) for measurements
+and limits.
+
 ## Shipping configuration
 
 New configurations use Qwen3.6-35B-A3B q4 with a q8 context cache and a
@@ -86,7 +109,7 @@ its previous fields and adds:
 | `phase` | `idle`, `preparing`, `prefill`, or `generating` |
 | `context_used` | Positions committed across the model; retained after completion |
 | `max_context` | Actual configured context window |
-| `cached_tokens` | Positions restored from the system prompt cache for this request |
+| `cached_tokens` | Positions reused from the active conversation or restored from the system prompt cache |
 | `prompt_tokens` | Tokens requiring prompt processing, excluding restored context |
 | `prefill_done` | Completed prompt positions; advances when a whole chunk completes |
 | `generated_tokens` | Generated output tokens, including reasoning/tool output |
