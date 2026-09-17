@@ -6,6 +6,14 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 - **Check the branch before making changes.** If on `main`, alert Dave and ask
   permission to switch to `develop` or a dedicated task branch before editing.
+- **Do not duplicate the performance watchdog.** The watchdog owns routine
+  performance regression checks. Do not run or request an additional benchmark
+  suite, baseline, before/after probe, or rerun merely because a change touches
+  inference or is ready to commit. Use existing watchdog results; their absence
+  is not a reason to block a functionally verified fix from being committed.
+  Additional measurements need a specific unanswered experimental question or
+  concrete anomaly that the watchdog does not cover, plus Dave's explicit
+  approval. Continue to run relevant correctness tests.
 - **Ask Dave before any benchmarking.** Get explicit approval for the proposed
   scope and configuration before running performance measurements, including
   ad-hoc timing probes and reruns. Approval covers the agreed bounded run or suite,
@@ -168,13 +176,15 @@ measured. Coverage is now structural, not manual — **but two things still requ
    automatically *only* if it's part of the model's default config. If it's a new opt-in
    path, add it to the spec in `tests/bench_api.sh` so every model covers it.
 
-**Run `make bench-api` (or at least `--model-id <id>`) for any change to the decode/prefill
-hot path, kernels, attention, or speculative decoding, and review `make bench-report`
-before committing.** Apply the noise, workload-protection, and shipping-target rules
-above: a small delta or unrelated historical flag is not a reason for endless reruns.
-If measurements cannot run without disturbing Dave's work, defer them and report the
-validation gap. Ad-hoc `--mtp-generate-*` numbers are for inner-loop iteration, not
-regression sign-off.
+**Routine performance validation belongs to the watchdog, including changes to
+decode/prefill, kernels, attention, and speculative decoding.** Review existing
+watchdog results when available; do not add a separate benchmark approval or run
+as a completion or commit checkpoint. Use `make bench-api` and `make bench-report`
+when Dave explicitly requests a manual run, or approves measurements for a specific
+unanswered question or concrete anomaly outside the watchdog's coverage. Apply
+the noise, workload-protection, and shipping-target rules above. Ad-hoc
+`--mtp-generate-*` numbers are for approved experiments, not routine regression
+sign-off.
 Canonical benchmarks must pass the system-health preflight. Active Time Machine,
 thermal/performance warnings, another inference process, or sustained CPU/GPU pressure
 make latency and throughput results invalid. The harness records the sampled state on
