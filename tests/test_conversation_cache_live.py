@@ -116,10 +116,10 @@ def main():
                     request(url, "/v1/chat/completions", cancel)
                     wait_idle(url, process)
                     text = (run_dir / "server.log").read_text()
-                    assert "chatcmpl-2 conversation_cache hit" in text
-                    assert "chatcmpl-3 conversation_cache miss" in text
+                    assert "chatcmpl-2 conversation cache: reused" in text
+                    assert "chatcmpl-3 conversation cache: no reusable history" in text
                     assert "chatcmpl-5 cancelled during generation" in text
-                    assert "chatcmpl-6 conversation_cache miss" in text
+                    assert "chatcmpl-6 conversation cache: no reusable history" in text
                     print("PASS: system-cache-independent reuse, session change, oversized input, disconnect invalidation", flush=True)
                 elif enabled == 0:
                     history = [{"role": "system", "content": "Answer briefly and follow the user's instructions."}]
@@ -210,10 +210,10 @@ def main():
     log = (output / "cache-1/server.log").read_text()
     for request_id in (2, 3, 6, 9, 11):
         prefix = "resp" if request_id == 11 else "chatcmpl"
-        assert f"{prefix}-{request_id} conversation_cache hit" in log, request_id
+        assert f"{prefix}-{request_id} conversation cache: reused" in log, request_id
     for request_id in (4, 5, 7, 8, 10):
         prefix = "resp" if request_id == 10 else "chatcmpl"
-        assert f"{prefix}-{request_id} conversation_cache miss" in log, request_id
+        assert f"{prefix}-{request_id} conversation cache: no reusable history" in log, request_id
     print("PASS: expected continuation/retry hits and changed-input misses; all test servers exited", flush=True)
 
 

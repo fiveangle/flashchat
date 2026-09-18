@@ -12104,8 +12104,12 @@ static void report_prefill_keepalive(int fd, const char *request_id,
         return;
     }
     if (g_server_debug_enabled) {
-        server_log_errorf("[serve] %s prefill_keepalive phase=%s tokens=%d/%d\n",
-                          request_id, phase ? phase : "prompt", done, total);
+        if (!strcmp(phase, "decode"))
+            server_log_errorf("[serve] %s generation heartbeat: %d output tokens generated; output limit=%d\n",
+                              request_id, done, total);
+        else
+            server_log_errorf("[serve] %s prefill_keepalive phase=%s tokens=%d/%d\n",
+                              request_id, phase ? phase : "prompt", done, total);
     }
     *next_ms = t + 2000.0;
 }
@@ -15180,9 +15184,9 @@ static void serve_loop(
             pos = reused_conversation;
             snapshot_restored = 1;
             req.used_snapshot = 1;
-            server_log_errorf("[serve] %s conversation_cache hit source=%s reused=%d remaining=%d\n",
-                              request_id, restore_conversation ? "checkpoint" : "live",
-                              pos, pt->count - pos);
+            server_log_errorf("[serve] %s conversation cache: reused %d history tokens from %s; %d prompt tokens left to process\n",
+                              request_id, pos, restore_conversation ? "checkpoint" : "current state",
+                              pt->count - pos);
         } else if (g_system_prompt_cache_enabled && cached_sys_hash == req_sys_hash && cached_sys_token_count > 0) {
             // Cache hit: restore snapshot
             server_log_errorf("[serve] %s sys_prompt_cache hit hash=%016llx tokens=%d\n",
@@ -15274,7 +15278,8 @@ static void serve_loop(
             conversation_cache_begin(&conversation_cache, pt, req.session_id, req.max_tokens) == 0;
         if (!cache_recording) conversation_cache_invalidate(&conversation_cache);
         if (!reused_conversation && g_conversation_cache_enabled)
-            server_log_errorf("[serve] %s conversation_cache miss reused=0\n", request_id);
+            server_log_errorf("[serve] %s conversation cache: no reusable history; system/tool cache supplied %d prompt tokens\n",
+                              request_id, pos);
         int active_tools = (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE);
         float effective_presence_penalty = active_tools ? 0.0f : req.presence_penalty;
         float effective_repetition_penalty = active_tools ? 1.0f : req.repetition_penalty;
@@ -16241,7 +16246,7 @@ tool_call_checked:
             }
         }
         if (g_conversation_cache_enabled && !cancelled) {
-            server_log_errorf("[serve] %s conversation_cache retained live=%d checkpoint=%d\n",
+            server_log_errorf("[serve] %s conversation cache: saved current state (%d tokens) and checkpoint (%d tokens)\n",
                               request_id, conversation_cache.live_valid ? conversation_cache.count : 0,
                               conversation_cache.checkpoint_count);
         }

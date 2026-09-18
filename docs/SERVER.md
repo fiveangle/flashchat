@@ -18,8 +18,11 @@ conversation; this does not add a server-side conversation-ID storage API.
 The cache is held only in memory and is independent of persistent system/tool
 caching. It keeps one recurrent-state checkpoint and token ledger; attention history
 uses the existing buffers. Interleaving unrelated conversations replaces the active
-entry. Logs report `conversation_cache hit source=live|checkpoint`, reused/remaining
-tokens, misses, and retained checkpoint positions. See
+entry. Logs state how many history tokens were reused and how many prompt tokens
+remain to process. When history cannot be reused, they separately report tokens
+supplied by the system/tool cache, for example: `conversation cache: no reusable
+history; system/tool cache supplied 10197 prompt tokens`. Saved current-state and
+checkpoint token counts are also logged. See
 [experiment 26](explorations/26-conversation-state-reuse/NOTES.md) for measurements
 and limits.
 
