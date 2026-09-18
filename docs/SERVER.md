@@ -160,3 +160,8 @@ make bench-report
 
 See [live acceptance and baseline comparison](HTTP_RESPONSIVENESS_VALIDATION.md)
 for the measured results and test-artifact provenance.
+
+Sampling uses the selected model profile, with explicit API parameters taking
+precedence. Temperature and repetition-related penalties remain the same inside
+tool calls, including file contents and other free-form arguments. Tool syntax
+and argument validation do not silently change sampling settings.

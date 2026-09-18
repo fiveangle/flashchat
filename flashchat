@@ -416,11 +416,6 @@ Environment variables:
                             the model registry's num_experts_per_tok (the trained
                             value). Set to a numeric value for K-sweeps or to
                             trade quality for SSD streaming bandwidth.
-  FLASHCHAT_TOOL_CALL_GREEDY  When 1 (default), force greedy decoding inside
-                              <tool_call>...</tool_call> blocks for format
-                              stability. Set to 0 to allow sampled tool-call
-                              content (e.g. for diversifying parameter values
-                              across runs).
   FLASHCHAT_CONVERSATION_CACHE  Reuse unchanged conversation turns (0/1)
   FLASHCHAT_SYSTEM_PROMPT_CACHE  Enable persistent system prompt cache (0/1)
   FLASHCHAT_SYSTEM_PROMPT_CACHE_DIR

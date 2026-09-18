@@ -1,5 +1,6 @@
 """Shipping defaults and legacy choices use the real shell config resolver."""
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -31,6 +32,29 @@ class ShippingDefaultsTests(unittest.TestCase):
         return subprocess.check_output(
             ["bash", "-c", 'source lib/config.sh; ' + script],
             cwd=ROOT, env=self.env, text=True)
+
+    def test_imported_model_profile_replaces_unavailable_previous_profile(self):
+        from modelmgr.addmodel import derive_manifest
+        from modelmgr.manifest import parse_manifest
+        from modelmgr.resolved import flat_entry
+        raw = derive_manifest("Example/Coder", {"model_type": "qwen3_next", "vocab_size": 151936,
+                                               "num_experts": 512}, Registry.load(),
+                              thinking_capable=False,
+                              generation_config={"temperature": 1.0, "top_p": 0.95, "top_k": 40})
+        entry = flat_entry(parse_manifest(raw, user_defined=True), "q4")
+        registry = Path(self.tmp.name) / "resolved.json"
+        registry.write_text(json.dumps({"models": {"Example-Coder-q4": entry},
+                                        "default_model": "Example-Coder-q4"}))
+        self.env["FLASHCHAT_MODEL_CONFIG"] = str(registry)
+        configfile.update({"MODEL": "Example-Coder-q4", "SAMPLING_PROFILE": "instruct",
+                           "TEMPERATURE": "0.7", "TOP_P": "0.8", "TOP_K": "20"}, self.config)
+        values = self.shell('flashchat_load_config; printf "%s,%s,%s,%s" "$SAMPLING_PROFILE" '
+                            '"$TEMPERATURE" "$TOP_P" "$TOP_K"')
+        self.assertEqual(values, "model-default,1.0,0.95,40")
+        configfile.update({"SAMPLING_PROFILE": "custom"}, self.config)
+        values = self.shell('flashchat_load_config; printf "%s,%s,%s" "$TEMPERATURE" "$TOP_P" "$TOP_K"')
+        self.assertEqual(values, "0.7,0.8,20")
+        self.assertEqual(configfile.load(self.config)["SAMPLING_PROFILE"], "custom")
 
     def test_new_config_and_export_match_shipping_defaults(self):
         with patch.dict(os.environ, self.env, clear=True):

@@ -217,16 +217,6 @@ static float g_default_min_p = 0.0f;
 static float g_default_presence_penalty = 1.5f;
 static float g_default_repetition_penalty = 1.0f;
 static int g_default_reasoning_enabled = 1;
-// When 1 (default), the sampler hard-overrides to greedy (temp=0) for any
-// token generated *inside* a `<tool_call>...</tool_call>` block. Sampling
-// diversity inside the rigid XML format has no upside (the format primer
-// has high-confidence tokens) and a real downside (model occasionally
-// picks `\n` instead of the function-name token, which we observed
-// post-K=8 fix on long multi-turn nanocoder sessions). Override via the
-// FLASHCHAT_TOOL_CALL_GREEDY=0 env var if you want sampled tool-call
-// content (e.g. for diversifying tool parameter values across runs).
-static int g_tool_call_greedy_enabled = 1;
-
 static void server_log_emit(FILE *stream, const char *fmt, va_list ap) {
     va_list stream_ap;
     va_copy(stream_ap, ap);
@@ -10541,6 +10531,13 @@ static NSString *normalized_tool_response(NSDictionary *msg) {
     return [NSString stringWithFormat:@"<tool_response>\n%@\n</tool_response>", content];
 }
 
+// All generation paths use the selected request settings, including tool arguments.
+static int sample_request_token(const ApiRequest *req, const float *logits, const int *token_counts) {
+    return pick_next_token(logits, g_cfg.vocab_size, req->temperature, req->top_p,
+                           req->top_k, req->min_p, req->presence_penalty,
+                           req->repetition_penalty, token_counts, req->reasoning_enabled);
+}
+
 static void api_request_init(ApiRequest *req, ApiKind kind) {
     memset(req, 0, sizeof(*req));
     req->api_kind = kind;
@@ -15281,17 +15278,12 @@ static void serve_loop(
             server_log_errorf("[serve] %s conversation cache: no reusable history; system/tool cache supplied %d prompt tokens\n",
                               request_id, pos);
         int active_tools = (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE);
-        float effective_presence_penalty = active_tools ? 0.0f : req.presence_penalty;
-        float effective_repetition_penalty = active_tools ? 1.0f : req.repetition_penalty;
         int *token_counts = NULL;
-        if (fabsf(effective_presence_penalty) > 0.000001f ||
-            fabsf(effective_repetition_penalty - 1.0f) > 0.000001f) {
+        if (fabsf(req.presence_penalty) > 0.000001f ||
+            fabsf(req.repetition_penalty - 1.0f) > 0.000001f) {
             token_counts = calloc((size_t)g_cfg.vocab_size, sizeof(int));
             if (token_counts) {
-                if (!active_tools) {
-                    int history_start = sys_prompt_token_count;
-                    seed_token_counts_from_prompt(token_counts, g_cfg.vocab_size, pt, history_start);
-                }
+                seed_token_counts_from_prompt(token_counts, g_cfg.vocab_size, pt, sys_prompt_token_count);
             } else {
                 server_log_errorf("[serve] %s sampler penalties disabled: token count allocation failed\n", request_id);
             }
@@ -15482,11 +15474,6 @@ prefill_finished:
         ane_prefill_engagement_log(request_id);
         server_progress_decode(pos, 0);
 
-        // Generation-side state. Declared up here (instead of further down where
-        // it used to live) so the very first sampler call can honor the
-        // tool-call-greedy override for forced tool_choice (where the prompt
-        // already places us inside <tool_call><function=NAME> and the first
-        // generated token should likewise be format-deterministic).
         char *tool_call_buf = NULL;
         size_t tool_call_len = 0;
         size_t tool_call_cap = 0;
@@ -15578,21 +15565,9 @@ prefill_finished:
             free(normed);
         }
         lm_head_forward(wf, hidden, logits);
-        // Tool-call format-stability override: when we're inside a <tool_call>
-        // block, force greedy decoding on every token. The model has high
-        // confidence on the right format tokens; sampling diversity here only
-        // produces malformed XML / dropped function-name tokens. Disable via
-        // FLASHCHAT_TOOL_CALL_GREEDY=0.
-        float effective_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
-                                      ? 0.0f
-                                      : req.temperature;
-        int next_token = pick_next_token(logits, g_cfg.vocab_size, effective_temperature, req.top_p,
-                                         req.top_k, req.min_p, effective_presence_penalty,
-                                         effective_repetition_penalty, token_counts,
-                                         req.reasoning_enabled);
+        int next_token = sample_request_token(&req, logits, token_counts);
         double t_first_token = now_ms();
-        server_log_errorf("[serve] %s first_token=%d%s\n", request_id, next_token,
-                          (g_tool_call_greedy_enabled && saw_tool_call_start) ? " [tool_call greedy]" : "");
+        server_log_errorf("[serve] %s first_token=%d\n", request_id, next_token);
 
         g_overlap_in_decode = 1;
         // RAM discipline: decay prefill-trained expert frequencies so decode
@@ -15783,14 +15758,7 @@ prefill_finished:
                                     t_first_response = 0.0;
                                     in_think = g_cfg.thinking_capable && req.reasoning_enabled &&
                                                !force_retry_tool;
-                                    float retry_temperature =
-                                        (g_tool_call_greedy_enabled && saw_tool_call_start)
-                                        ? 0.0f : req.temperature;
-                                    next_token = pick_next_token(
-                                        logits, g_cfg.vocab_size, retry_temperature, req.top_p,
-                                        req.top_k, req.min_p, effective_presence_penalty,
-                                        effective_repetition_penalty, token_counts,
-                                        req.reasoning_enabled);
+                                    next_token = sample_request_token(&req, logits, token_counts);
                                     server_log_errorf("[serve] %s tool_call correction retry name=%s pos=%d\n",
                                                       request_id, retry_tool_name, pos);
                                     continue;
@@ -15874,13 +15842,7 @@ tool_call_checked:
                 continue;
             }
 
-            // Greedy override inside a <tool_call> block keeps the rigid XML format
-            // from being sampled into something malformed.
-            float iter_temperature = (g_tool_call_greedy_enabled && saw_tool_call_start)
-                                     ? 0.0f : req.temperature;
-            #define MTP_PICK(L) pick_next_token((L), g_cfg.vocab_size, iter_temperature, req.top_p, \
-                                                req.top_k, req.min_p, effective_presence_penalty,    \
-                                                effective_repetition_penalty, token_counts, req.reasoning_enabled)
+            #define MTP_PICK(L) sample_request_token(&req, (L), token_counts)
 
             int mtp_did_spec = 0;
             double mtp_iter_ms = 0, mtp_draft_ms = 0, mtp_verify_ms = 0, mtp_refwd_ms = 0;
@@ -16088,10 +16050,7 @@ tool_call_checked:
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = pick_next_token(logits, g_cfg.vocab_size, iter_temperature, req.top_p,
-                                             req.top_k, req.min_p, effective_presence_penalty,
-                                             effective_repetition_penalty, token_counts,
-                                             req.reasoning_enabled);
+                next_token = sample_request_token(&req, logits, token_counts);
             }
         }
 
@@ -16389,7 +16348,6 @@ int main(int argc, char **argv) {
         // The launcher exports resolved settings; direct invocations can also use
         // environment overrides. One-off diagnostic controls remain env-only.
         const char *env_active_experts = getenv("FLASHCHAT_ACTIVE_EXPERTS");
-        const char *env_tool_call_greedy = getenv("FLASHCHAT_TOOL_CALL_GREEDY");
         const char *env_mtp_active_experts = getenv("FLASHCHAT_MTP_ACTIVE_EXPERTS");
         const char *env_mtp_trace = getenv("FLASHCHAT_MTP_TRACE");
         const char *env_mtp_trace_top = getenv("FLASHCHAT_MTP_TRACE_TOP");
@@ -16402,12 +16360,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[init] FLASHCHAT_ACTIVE_EXPERTS=%d overrides config K\n", v);
             }
         }
-        if (env_tool_call_greedy && env_tool_call_greedy[0]) {
-            g_tool_call_greedy_enabled = server_flag_enabled(env_tool_call_greedy);
-            fprintf(stderr, "[init] FLASHCHAT_TOOL_CALL_GREEDY=%d (sampling inside <tool_call>...</tool_call> %s)\n",
-                    g_tool_call_greedy_enabled,
-                    g_tool_call_greedy_enabled ? "forced greedy" : "uses request sampling");
-        }
+
         if (env_mtp_active_experts && env_mtp_active_experts[0]) {
             g_mtp_active_experts = atoi(env_mtp_active_experts);
         }

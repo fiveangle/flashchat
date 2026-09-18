@@ -831,6 +831,11 @@ flashchat_load_config() {
     local default_profile
     default_profile=$(flashchat_model_default_sampling_profile "$MODEL")
     SAMPLING_PROFILE="${SAMPLING_PROFILE:-${default_profile:-$FLASHCHAT_DEFAULT_SAMPLING_PROFILE}}"
+    if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ] &&
+       [ -z "$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")" ]; then
+        echo "WARNING: sampling profile '$SAMPLING_PROFILE' is unavailable for '$MODEL'; using '$default_profile'." >&2
+        SAMPLING_PROFILE="$default_profile"
+    fi
     if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ]; then
         local profile_temperature profile_top_p profile_top_k profile_min_p profile_presence_penalty profile_repetition_penalty profile_reasoning profile_mtp
         profile_temperature=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")

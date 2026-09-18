@@ -159,7 +159,7 @@ def cmd_verify(args) -> int:
 def cmd_add_model(args) -> int:
     import json
 
-    from .addmodel import AddModelError, derive_manifest, save_user_manifest
+    from .addmodel import AddModelError, derive_manifest, load_generation_config, save_user_manifest
     from .artifacts import template_supports_thinking
     from .steps.download import DownloadError, download_file
 
@@ -175,7 +175,9 @@ def cmd_add_model(args) -> int:
         thinking_capable = template_supports_thinking(paths.snapshot_dir(hf_cache_dir(), args.repo))
         manifest_dict = derive_manifest(args.repo, hf_config, registry,
                                         variants=args.variants.split(",") if args.variants else None,
-                                        thinking_capable=thinking_capable)
+                                        thinking_capable=thinking_capable,
+                                        generation_config=load_generation_config(
+                                            args.repo, hf_cache_dir(), args.generation_config))
         path = save_user_manifest(manifest_dict)
     except (AddModelError, DownloadError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -272,6 +274,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("add-model", help="add a model from HuggingFace")
     p.add_argument("repo", help="HF repo id, e.g. Qwen/Qwen3.6-35B-A3B")
     p.add_argument("--variants", default=None, help="comma-separated, e.g. q4,q8")
+    p.add_argument("--generation-config", help="explicit model-specific generation settings JSON file")
     p.set_defaults(func=cmd_add_model)
 
     p = sub.add_parser("doctor", help="environment sanity checks")

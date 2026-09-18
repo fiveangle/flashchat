@@ -201,7 +201,7 @@ def _toggle_enabled(registry: Registry) -> None:
 
 
 def _add_model(registry: Registry) -> bool:
-    from ..addmodel import AddModelError, derive_manifest, save_user_manifest
+    from ..addmodel import AddModelError, derive_manifest, load_generation_config, save_user_manifest
     from ..status import hf_cache_dir
     from ..steps.download import DownloadError, download_file
 
@@ -225,8 +225,25 @@ def _add_model(registry: Registry) -> bool:
         hf_config = json.load(f)
     try:
         thinking_capable = template_supports_thinking(paths.snapshot_dir(hf_cache_dir(), repo))
-        manifest_dict = derive_manifest(repo, hf_config, registry,
-                                        thinking_capable=thinking_capable)
+        try:
+            generation_config = load_generation_config(repo, hf_cache_dir())
+            manifest_dict = derive_manifest(repo, hf_config, registry,
+                                            thinking_capable=thinking_capable,
+                                            generation_config=generation_config)
+        except AddModelError as e:
+            print(common.yellow(str(e)))
+            filename = common.prompt("Generation settings JSON file (empty to cancel)")
+            if not filename:
+                print("Cancelled.")
+                return False
+            manifest_dict = derive_manifest(repo, hf_config, registry,
+                                            thinking_capable=thinking_capable,
+                                            generation_config=load_generation_config(
+                                                repo, hf_cache_dir(), os.path.expanduser(filename)))
+        p = manifest_dict["sampling_profiles"]["model-default"]
+        print(f"Model settings: temperature={p['temperature']} top_p={p['top_p']} "
+              f"top_k={p['top_k']} presence_penalty={p['presence_penalty']} "
+              f"repetition_penalty={p['repetition_penalty']} reasoning={p['reasoning']}")
         path = save_user_manifest(manifest_dict)
     except AddModelError as e:
         print(common.red(str(e)))
@@ -259,7 +276,7 @@ def _select_sampling_profile(manifest) -> dict:
             note = common.yellow("  ⚠ your selected model does not support reasoning mode!")
         print(f"  {i}) {p.get('label', name)}{mark}{note}")
         print(common.dim(f"     {p.get('description', '')} "
-                         f"temp={p.get('temperature')} top_p={p.get('top_p')} "
+                         f"temp={p.get('temperature')} top_p={p.get('top_p')} top_k={p.get('top_k')} "
                          f"reasoning={p.get('reasoning')}"))
     custom_idx = len(names) + 1
     custom_mark = " (current)" if current == "custom" else ""

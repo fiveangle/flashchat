@@ -43,6 +43,32 @@ Adding a model = writing one manifest (`./flashchat config` → add model does
 this from the HF config.json automatically, into `~/.config/flashchat/models.d/`).
 Code is only needed for architecturally novel models.
 
+### Sampling belongs to the individual model
+
+Each manifest owns `sampling_profiles` and `default_sampling_profile`; the resolved
+registry forwards them to the configuration menu and server. Vocabulary size and
+architecture do not establish suitable sampling settings.
+
+Add Model reads the selected repository's `generation_config.json` and creates one
+`model-default` profile. Temperature, top-p, and top-k must be explicitly supplied
+for sampled generation; `do_sample: false` selects greedy generation. Missing
+penalties use their disabled values, not values copied from another model. Reasoning
+is enabled only when the source template is known to support it; importing a
+non-thinking model does not create thinking profiles. Existing curated profiles in
+shipped manifests remain unchanged.
+
+When metadata is missing or outside the engine's supported ranges, import stops
+with an explanation. Supply a model-specific JSON file at the menu prompt or with
+`python -m modelmgr add-model OWNER/MODEL --generation-config FILE`. This is also
+how to supply model-card recommendations when the repository metadata is incomplete.
+Review the imported settings in the menu; model owners can curate additional named
+profiles in their manifest. Existing user manifests are not silently overwritten.
+
+A saved named profile that does not exist for the selected model falls back to that
+model's declared default with a warning. Explicit `custom` settings and environment
+or API overrides remain authoritative. Running servers need a restart to pick up
+changed model metadata.
+
 ## Steps and recipes
 
 `modelmgr/steps/` is a shared, parameterized step library:

@@ -117,7 +117,7 @@ ANE_MLP_SRC = $(BUILD_DIR)/fc_ane_mlp.m
 ANE_MLP_HDR = $(BUILD_DIR)/fc_ane_mlp.h
 ANE_SMOKE_TARGET = tests/ane_mlp_smoke
 
-.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke conversation-cache-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests ane-smoke
+.PHONY: all clean archive-debug clean-venv distclean help print-build-config run verify bench moe moebench full fullbench fast metallib metal_infer infer chat ram-pressure build-infer infer-run chat-run build-chat api-smoke cli-smoke manage-smoke chat-render-smoke tool-template-smoke conversation-cache-smoke request-sampling-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke test bench-api bench-report registry registry-check py-tests ane-smoke
 
 define RUN_ENGINE_BENCH
 	@bash -c 'set -eo pipefail; \
@@ -383,6 +383,13 @@ $(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(IN
 conversation-cache-smoke: $(BUILD_DIR)/conversation_cache_fixture
 	./$(BUILD_DIR)/conversation_cache_fixture
 
+$(BUILD_DIR)/request_sampling_fixture: tests/request_sampling_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/request_sampling_fixture.m $(ANE_MLP_SRC) -o $@
+
+.PHONY: request-sampling-smoke
+request-sampling-smoke: $(BUILD_DIR)/request_sampling_fixture
+	./$(BUILD_DIR)/request_sampling_fixture
+
 cache-roundtrip-smoke: $(INFER_TARGET)
 	bash tests/test_disk_cache_roundtrip.sh
 
@@ -398,4 +405,4 @@ native-qwen-compile-smoke: $(INFER_TARGET)
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke conversation-cache-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke conversation-cache-smoke request-sampling-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
