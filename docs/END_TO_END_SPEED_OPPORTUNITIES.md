@@ -147,7 +147,7 @@ with old rounded summaries are explicit. No missing historical measurement was i
 | 26 | [Recover exact conversation-state reuse](explorations/26-conversation-state-reuse/NOTES.md) | Closed | Successful | **Observed −40.7% / −53.9% first-token wait** (turns 2/3), **confounded by visible Codex UI**<br>Cold turn: +2.5% | Qwen3.6 q4/q8, 32 GiB, one three-turn off/on comparison with unquantified UI contention: **13.430→7.965 s**, **18.104→8.344 s**; newly prefilled **611→312**, **916→312** tokens. Eleven live output comparisons plus state/config/cancellation checks passed. Standard cases recorded; post-case harness error and historical decode flag retained in notes. | Keep exact single-conversation reuse with a pre-assistant checkpoint, default on; commit approved. Client normalization may require replaying the latest assistant turn. No further benchmark run pending; revisit reproducible correctness/memory issues. Multi-conversation branching remains 27. |
 | 27 | Reuse partial prefixes and conversation branches | Untested | No measurement | — Not measured | No measurement. Current memory snapshot is one whole system prefix; multiple conversations, partial prefixes, and branch checkpoints are the proposed extension. | Select checkpoint boundaries and a bounded memory budget. |
 | 28 | Cache prepared prompts, tokens, and schemas | Untested | No measurement | — Not measured | No measurement. System/tool prefix is rebuilt and token-counted before lookup, even on a hit. Proposed caching covers rendered bytes, token IDs, and validation structures. | Identify repeated CPU work and cache invalidation inputs. |
-| 29 | Reduce cache persistence and restoration latency | Untested | No measurement | — Not measured | No measurement. Cold-prefix capture, compression, disk flush and pruning occur before conversation prefill; restore copies state. Deferred persistence/shared immutable storage are proposals. | Compare persistence policies and restore-copy requirements. |
+| 29 | Reduce cache persistence and restoration latency | Untested / design agreed | Snapshot sizes inspected; no optimization result | — No speed measurement | 2026-09-17: one Coder-Next prefix snapshot has 75.4 MiB of entirely zero CPU chunks and 73.7 MiB of zero GPU padding. This is a byte inspection, not demonstrated runtime memory or speed savings. Detailed findings below. | Prioritize actual-size snapshots, explicit zero chunks, and disk-backed saved state with bounded capture/restore workspace. CPU/GPU ownership tracking follows; compressed RAM tiers are deferred. |
 | 30 | Recover request and prompt-staging memory | Untested | No measurement | — Not measured | No measurement. Server lacks a per-request autorelease pool and stages full-prompt embeddings before chunk processing. Memory growth and its speed impact remain unmeasured; transient GPU-buffer release already exists. | Audit object lifetimes and chunk-local embeddings. |
 | 31 | Constrain tool generation before validation fails | Untested | No measurement | — Not measured | No measurement. Final tool validation plus a bounded repair attempt already exists (`520fb0f`); token-by-token grammar/schema constraints are the new proposal. | Choose supported grammar/schema coverage and correctness cases. |
 | 32 | Batch predetermined output structure | Untested | No measurement | — Not measured | No measurement. Forced tool choice already inserts opening markup; skipping prediction of later uniquely determined structure is proposed. Model state must still process those tokens. | Identify forced spans and validate model-state advancement. |
@@ -345,6 +345,55 @@ Recurrent state still requires correct restoration, and deferred snapshots need
 bounded, explicit ownership.
 
 **The synchronous work is confirmed; the achievable savings are unmeasured.**
+
+#### 2026-09-17 — Snapshot inspection and agreed disk-backed direction
+
+No storage optimization has been implemented or benchmarked. The existing cache
+`c8d59b92db36997d-v2.fcache` was expanded into individual chunks and every checksum
+verified. It represents a 10,197-token Coder-Next q4 system/tool prefix with q8
+attention storage. Its 192 payloads total 344.9 MiB uncompressed, 178.0 MiB stored.
+Byte inspection found:
+
+- All 36 CPU convolution chunks and 36 CPU recurrent chunks are entirely zero:
+  75.375 MiB uncompressed, already only 55.4 KiB after LZFSE compression.
+- The 36 GPU recurrent buffers have 72 MiB of zero tails beyond this model's
+  dimensions; GPU convolution buffers add 1.6875 MiB of zero tails.
+- All attention and GPU-state chunks contain some nonzero data. These are layer
+  state buffers, not expert slots; expert routing does not leave attention layers
+  unused. CPU and GPU state ownership can differ in hybrid execution.
+- The recurrent-state chunk subset compresses from 224.4 to 71.7 MiB. This is a
+  system-prefix observation, not a measured conversation-checkpoint compression ratio.
+
+Current conversation checkpoints allocate approximately 187 MiB for the shipping
+35B model, 224.4 MiB for Coder-Next, and 372.7 MiB for the registered 397B model when
+CPU and GPU copies exist, plus a token ledger capped at four bytes per context
+position. These are calculated allocations, not measured resident memory. They
+share live attention history, retain only one checkpoint, and currently have no
+memory-budget or pressure-eviction guard; invalidation alone does not free payloads.
+
+Agreed implementation order:
+
+1. Copy actual model dimensions instead of maximum GPU buffer capacity.
+2. Represent known-zero chunks explicitly without payload allocations. Restore
+   zero markers by clearing destinations, never by leaving previous state intact.
+3. Prioritize disk backing: release the expanded system snapshot once safely
+   persisted, then use the same storage mechanism for conversation checkpoints.
+   Capture and restore one chunk at a time with bounded working memory; avoid a
+   full expanded intermediate snapshot. Retain lossless validation and bounded
+   disk usage, with recomputation when storage or validation fails.
+4. Track authoritative convolution and recurrent state per layer to avoid
+   unnecessary capture work. Do not infer ownership from one global GPU flag:
+   convolution can run on CPU while recurrence runs on GPU. Do not require this
+   tracking to complete before implementing disk backing.
+
+Disk backing releases saved copies, not the live buffers used each token. The
+current conversation checkpoint remains dependent on live attention history and
+does not become restart-persistent merely by saving recurrent state to disk.
+Compressed RAM tiers are deferred until real disk-backed usage provides evidence
+for their value. Observe capture/restore overhead, reuse, workspace peaks, and
+storage sizes without duplicating routine performance-watchdog runs. Correctness
+checks must include restoration into nonzero destinations, execution-path handling,
+and exact state comparisons. The 16 GiB target remains unvalidated.
 
 ### 30 — Recover request and prompt-staging memory
 

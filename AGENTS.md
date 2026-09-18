@@ -6,14 +6,16 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 - **Check the branch before making changes.** If on `main`, alert Dave and ask
   permission to switch to `develop` or a dedicated task branch before editing.
-- **Do not duplicate the performance watchdog.** The watchdog owns routine
-  performance regression checks. Do not run or request an additional benchmark
-  suite, baseline, before/after probe, or rerun merely because a change touches
-  inference or is ready to commit. Use existing watchdog results; their absence
-  is not a reason to block a functionally verified fix from being committed.
-  Additional measurements need a specific unanswered experimental question or
-  concrete anomaly that the watchdog does not cover, plus Dave's explicit
-  approval. Continue to run relevant correctness tests.
+- **Run the standard watchdog; do not duplicate it.** Any change to `infer.m`
+  requires `make bench-api` followed by `make bench-report`, even when the change
+  appears unrelated to the hot path. The same applies to decode/prefill, kernel,
+  attention, and speculative-decoding changes. One approved standard run covers
+  the finalized batch; do not add redundant baselines, before/after probes, or
+  reruns. An existing run counts only if it covers the actual code being committed.
+  Do not assume an automatic watchdog ran: verify its results and include changed
+  `assets/api_perf_log.tsv` rows in the commit. Additional measurements beyond the
+  watchdog need a specific unanswered question or concrete anomaly and Dave's
+  explicit approval. Continue to run relevant correctness tests.
 - **Ask Dave before any benchmarking.** Get explicit approval for the proposed
   scope and configuration before running performance measurements, including
   ad-hoc timing probes and reruns. Approval covers the agreed bounded run or suite,
@@ -176,15 +178,16 @@ measured. Coverage is now structural, not manual — **but two things still requ
    automatically *only* if it's part of the model's default config. If it's a new opt-in
    path, add it to the spec in `tests/bench_api.sh` so every model covers it.
 
-**Routine performance validation belongs to the watchdog, including changes to
-decode/prefill, kernels, attention, and speculative decoding.** Review existing
-watchdog results when available; do not add a separate benchmark approval or run
-as a completion or commit checkpoint. Use `make bench-api` and `make bench-report`
-when Dave explicitly requests a manual run, or approves measurements for a specific
-unanswered question or concrete anomaly outside the watchdog's coverage. Apply
-the noise, workload-protection, and shipping-target rules above. Ad-hoc
-`--mtp-generate-*` numbers are for approved experiments, not routine regression
-sign-off.
+**Changes to `infer.m` require the standard watchdog regardless of their apparent
+hot-path impact.** Run `make bench-api` and review `make bench-report` against the
+finalized code before committing; decode/prefill, kernel, attention, and
+speculative-decoding changes have the same requirement. Seek the bounded approval
+required above unless Dave has already authorized the run. If it cannot run safely,
+report the performance-validation gap explicitly rather than treating functional
+tests as watchdog coverage. Preserve and commit its log, including noisy rows and
+report warnings. Do not duplicate this run with ad-hoc baselines or rerun it merely
+to clear small or historical flags. Ad-hoc `--mtp-generate-*` numbers are for
+approved experiments, not routine regression sign-off.
 Canonical benchmarks must pass the system-health preflight. Active Time Machine,
 thermal/performance warnings, another inference process, or sustained CPU/GPU pressure
 make latency and throughput results invalid. The harness records the sampled state on
@@ -195,26 +198,6 @@ slowdowns warrant checking prompt, memory pressure, runtime settings, and system
 activity first, not automatically running a new baseline campaign. Historical absolute
 throughput numbers are not universal thresholds across models, prompts, and machines.
 
-### Dense Prefill TensorOps Direction
-
-For dense prefill performance work, investigate Metal 4 MPP/TensorOps `matmul2d`
-for the `gpu_dequant_matmulN` / `gpu_dequant_matmulN_batch` path first. Treat
-`MPSNDArrayQuantizedMatrixMultiplication` as a useful affine-quantized comparator
-or fallback probe only if the local SDK exposes it, but keep the likely production
-direction focused on a low-overhead MPP kernel path, gated by runtime capability
-checks and preserving the existing Metal 3 kernels as the fallback on older
-toolchains or devices.
-Preserve MLX affine quantization semantics: TensorOps experiments must process
-64-wide quant groups and apply each group's scale/bias with a per-token group
-sum; a single full-K raw uint4 matmul is not equivalent. BF16 activations are the
-current production-oriented input candidate, and zero-copy integration still
-needs an aligned/repacked 4-bit tensor layout or another validated binding path.
-Current SDK probes also show two practical MPP limits: Metal buffer argument
-indices top out at 30, so group-wise TensorOps kernels must chunk groups, and
-the simple one-MTLTensor-per-group shape is only validated for small output
-tiles before TensorOps returns zero results. Do not wire this into production
-until a compact resource layout or tensor-pool strategy is validated at full
-80-group dense dimensions.
 
 ## Debug Features Must Be Settable From the Config Menu
 
