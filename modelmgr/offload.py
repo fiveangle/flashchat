@@ -17,6 +17,13 @@ Design rules learned from the failures of the old `mv`-based implementation:
   expanded to copies. Restore recreates them; on filesystems without
   symlink support the *local* restore side still gets real links because
   restores always target the local APFS cache.
+- **Never delete archive bytes implicitly**: pushes to the archive never
+  mirror-delete at repo level (an interrupted restore or a deleted local
+  component must not erase the only good copy), and local artifact scopes
+  that are absent or fail verification are excluded from the push.
+- **Restores are inventory-driven and preflighted**: the file set comes from
+  the journal, or from walking a legacy unjournaled archive; local free space
+  is checked before the first byte is written.
 """
 from __future__ import annotations
 
@@ -327,6 +334,13 @@ def sync_artifact_scopes(manifest: Manifest, snapshot: str, offload_dir: str,
         raise OffloadError("no full offload archive found for this model")
     dest = dest_repo_dir(offload_dir, manifest)
     repo_root = os.path.dirname(os.path.dirname(snapshot))
+    problems = local_scope_problems(manifest, snapshot)
+    bad = {s: problems[s] for s in scopes
+           if s in problems and os.path.isdir(_scope_dir(snapshot, s))}
+    if bad:
+        raise OffloadError(
+            "local artifacts fail verification, refusing to overwrite the "
+            "offload copy: " + "; ".join(f"{s}: {r}" for s, r in sorted(bad.items())))
     total = 0
     for scope in sorted(set(scopes)):
         rel = os.path.join("snapshots", os.path.basename(snapshot),
@@ -335,8 +349,9 @@ def sync_artifact_scopes(manifest: Manifest, snapshot: str, offload_dir: str,
         dst = os.path.join(dest, rel)
         if not os.path.isdir(src):
             continue
+        # Verified complete above, so mirroring this one scope is safe.
         _rsync_tree(src, dst, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
-                    progress=progress)
+                    progress=progress, delete=True)
         total += paths.dir_size_bytes(src)
     journal = Journal(dest)
     _record_archive_tree(dest, journal, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
@@ -347,11 +362,20 @@ def sync_artifact_scopes(manifest: Manifest, snapshot: str, offload_dir: str,
     return total
 
 
-def _rsync_tree(src_root: str, dest_root: str, skip_dirs=None, progress=None) -> None:
+def _rsync_tree(src_root: str, dest_root: str, skip_dirs=None, progress=None,
+                delete: bool = False, exclude_paths=None) -> None:
+    """Push src_root into dest_root. `delete` mirror-deletes receiver files
+    absent from the source; only pass it for a scope that verified complete
+    locally. `exclude_paths` are src-relative dirs anchored at the root;
+    rsync also protects excluded receiver paths from --delete."""
     os.makedirs(dest_root, exist_ok=True)
-    cmd = ["rsync", "-a", "--delete"]
+    cmd = ["rsync", "-a"]
+    if delete:
+        cmd.append("--delete")
     for dirname in sorted(set(skip_dirs or ())):
         cmd.extend(["--exclude", dirname + "/"])
+    for rel in sorted(set(exclude_paths or ())):
+        cmd.extend(["--exclude", "/" + rel.strip("/") + "/"])
     cmd.extend([src_root.rstrip("/") + "/", dest_root.rstrip("/") + "/"])
     if progress:
         progress("rsync", 0, 0, os.path.basename(src_root.rstrip("/")) or src_root)
@@ -422,21 +446,20 @@ def transfer_tree(src_root: str, dest_root: str, journal: Journal,
     return copied
 
 
-def restore_tree(dest_root: str, src_root: str, journal: Journal,
-                 progress=None, relpaths=None, verify: bool = True) -> int:
-    """Copy files back from the archive and recreate journaled links."""
+def restore_tree(dest_root: str, src_root: str, files: dict, links: dict,
+                 progress=None, verify: bool = True) -> int:
+    """Copy files back from the archive and recreate archived links. Never
+    deletes local files. Smallest files go first so an interrupted restore
+    still lands metadata (layout.json, vocab.bin, indexes) before bulk data."""
     restored = 0
-    files = journal.data["files"]
-    if relpaths is not None:
-        wanted = set(relpaths)
-        files = {k: v for k, v in files.items() if k in wanted}
-    for i, (rel, entry) in enumerate(sorted(files.items())):
+    order = sorted(files.items(), key=lambda kv: (kv[1]["size"], kv[0]))
+    for i, (rel, entry) in enumerate(order):
         src = os.path.join(dest_root, rel)
         dst = os.path.join(src_root, rel)
         if os.path.isfile(dst) and os.path.getsize(dst) == entry["size"]:
             continue
         if progress:
-            progress("restore", i + 1, len(files), rel)
+            progress("restore", i + 1, len(order), rel)
         digest, size = copy_file_verified(src, dst)
         if verify and entry.get("sha256") and digest != entry["sha256"]:
             os.unlink(dst)
@@ -444,12 +467,14 @@ def restore_tree(dest_root: str, src_root: str, journal: Journal,
                 f"restored file failed hash verification: {rel} "
                 f"(archive may be corrupt)")
         restored += size
-    for rel, target in sorted(journal.data["links"].items()):
-        if relpaths is not None and rel not in set(relpaths):
-            continue
+    for rel, target in sorted(links.items()):
         link = os.path.join(src_root, rel)
         os.makedirs(os.path.dirname(link), exist_ok=True)
         if os.path.lexists(link):
+            if os.path.islink(link) and os.readlink(link) == target:
+                continue
+            if not os.path.islink(link):
+                continue  # never replace a real local file with a link
             os.unlink(link)
         os.symlink(target, link)
     return restored
@@ -483,6 +508,38 @@ def blobs_size(snapshot: str) -> int:
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
+
+
+def _scope_dir(snapshot: str, scope: str) -> str:
+    return paths.shared_dir(snapshot) if scope == "shared" \
+        else paths.variant_dir(snapshot, scope)
+
+
+_BROKEN_STATES = ("missing", "incomplete", "invalid", "size-mismatch", "hash-mismatch")
+
+
+def local_scope_problems(manifest: Manifest, snapshot: str) -> dict:
+    """{scope: reason} for local artifact scopes that must not be pushed to
+    the archive: absent entirely, or present but failing quick verification
+    (e.g. a half-finished restore). Pushing those would overwrite or, with
+    mirroring, erase a good archived copy."""
+    from .artifacts import shared_status, variant_status
+
+    out = {}
+    scopes = [("shared", lambda: shared_status(manifest, snapshot))]
+    scopes += [(v, (lambda v=v: variant_status(manifest, v, snapshot)))
+               for v in manifest.variants]
+    for scope, status in scopes:
+        if not os.path.isdir(_scope_dir(snapshot, scope)):
+            out[scope] = "not present locally"
+            continue
+        bad = [s for s in status() if s.state in _BROKEN_STATES
+               and not (s.state == "missing" and not s.required)]
+        if bad:
+            out[scope] = ", ".join(
+                f"{s.relpath} {s.state}" + (f" ({s.detail})" if s.detail else "")
+                for s in bad)
+    return out
 
 
 def dest_repo_dir(offload_dir: str, manifest: Manifest) -> str:
@@ -537,7 +594,13 @@ def offload_model(manifest: Manifest, snapshot: str, offload_dir: str,
     blob_files = list_blob_files(snapshot)
     needed = 0
     dest = dest_repo_dir(offload_dir, manifest)
+    # Absent or broken local scopes stay out of the push so they can neither
+    # overwrite nor (historically, via --delete) erase the archived copy.
+    excluded = [os.path.relpath(_scope_dir(snapshot, scope), repo_root)
+                for scope in local_scope_problems(manifest, snapshot)]
     for rel, kind in _walk_tree(repo_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS):
+        if any(rel.startswith(prefix + os.sep) for prefix in excluded):
+            continue
         if kind != "file":
             continue
         src = os.path.join(repo_root, rel)
@@ -550,7 +613,7 @@ def offload_model(manifest: Manifest, snapshot: str, offload_dir: str,
         raise OffloadError("; ".join(report.errors))
     journal = Journal(dest)
     _rsync_tree(repo_root, dest, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
-                progress=progress)
+                progress=progress, exclude_paths=excluded)
     _prune_archive_dirs(dest, journal, _FULL_ARCHIVE_SKIP_DIRS)
     archived_bytes = _record_archive_tree(dest, journal,
                                           skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
@@ -566,20 +629,6 @@ def offload_model(manifest: Manifest, snapshot: str, offload_dir: str,
             raise OffloadError(
                 f"offload copy missing or incomplete for source blob: {blob_rel}")
     return archived_bytes if not removed else removed
-
-
-def restore_originals(manifest: Manifest, snapshot: str, offload_dir: str,
-                      progress=None) -> int:
-    dest = dest_repo_dir(offload_dir, manifest)
-    journal = Journal(dest)
-    blob_entries = {rel: e for rel, e in journal.data["files"].items()
-                    if rel.startswith("blobs/")}
-    if not blob_entries:
-        raise OffloadError(f"no archived originals found under {dest}")
-    repo_root = os.path.dirname(os.path.dirname(snapshot))
-    restored = restore_tree(dest, repo_root, journal, progress=progress,
-                            relpaths=list(blob_entries))
-    return restored
 
 
 def offload_full(manifest: Manifest, snapshot: str, offload_dir: str,
@@ -609,34 +658,139 @@ def offload_full(manifest: Manifest, snapshot: str, offload_dir: str,
                          skip_dirs=_FULL_ARCHIVE_SKIP_DIRS)
 
 
-def restore_full(manifest: Manifest, cache_dir: str, offload_dir: str,
-                 progress=None) -> int:
-    dest = dest_repo_dir(offload_dir, manifest)
+# Keep the boot volume usable after a restore: leave free space proportional
+# to the restore (capped), so tiny restores still fit on a nearly-full disk.
+RESTORE_HEADROOM = 2 * 1024 ** 3
+
+
+def _is_runtime_rel(rel: str) -> bool:
+    return "flashchat" in rel.split(os.sep)
+
+
+_RESTORE_SELECTORS = {
+    "originals": lambda rel: not _is_runtime_rel(rel),
+    "runtime": _is_runtime_rel,
+    "full": lambda rel: True,
+}
+
+
+def archive_inventory(dest: str) -> tuple[dict, dict]:
+    """({rel: {size, sha256}}, {rel: link_target}) for an archived repo.
+
+    The journal is authoritative when it has entries. Legacy archives (the old
+    mv/rsync offload, no journal) are walked directly instead of being treated
+    as empty — the tree itself is the record."""
     journal = Journal(dest)
+    skip = _FULL_ARCHIVE_SKIP_DIRS
+
+    def keep(rel):
+        return not any(_rel_contains_component(rel, d) for d in skip)
+
+    if journal.data["files"] or journal.data["links"]:
+        return ({r: e for r, e in journal.data["files"].items() if keep(r)},
+                {r: t for r, t in journal.data["links"].items() if keep(r)})
+    files, links = {}, {}
+    if not os.path.isdir(dest):
+        return files, links
+    for rel, kind in _walk_tree(dest, skip_dirs=skip):
+        full = os.path.join(dest, rel)
+        if kind == "link":
+            links[rel] = os.readlink(full)
+        else:
+            files[rel] = {"size": os.path.getsize(full), "sha256": None}
+    return files, links
+
+
+def _local_free_bytes(path: str) -> int:
+    probe = os.path.abspath(path)
+    while not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    st = os.statvfs(probe)
+    return st.f_bavail * st.f_frsize
+
+
+@dataclass
+class RestorePlan:
+    what: str
+    dest: str
+    repo_root: str
+    files: dict
+    links: dict
+    needed_bytes: int   # bytes still to copy (already-present files skipped)
+    free_bytes: int
+
+    @property
+    def headroom_bytes(self) -> int:
+        return min(RESTORE_HEADROOM, self.needed_bytes)
+
+    @property
+    def fits(self) -> bool:
+        return self.needed_bytes + self.headroom_bytes <= self.free_bytes
+
+    @property
+    def shortfall_bytes(self) -> int:
+        return max(0, self.needed_bytes + self.headroom_bytes - self.free_bytes)
+
+
+def plan_restore(manifest: Manifest, cache_dir: str, offload_dir: str,
+                 what: str) -> RestorePlan:
+    """What a restore of `what` (originals|runtime|full) would copy locally."""
+    dest = dest_repo_dir(offload_dir, manifest)
     repo_root = paths.repo_root_dir(os.path.expanduser(cache_dir), manifest.hf_repo)
-    if not journal.data["files"]:
-        if not os.path.isdir(os.path.join(dest, "snapshots")):
-            raise OffloadError(f"no archive found under {dest}")
-        _rsync_tree(dest, repo_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS,
-                    progress=progress)
-        return paths.dir_size_bytes(repo_root)
-    return restore_tree(dest, repo_root, journal, progress=progress)
+    select = _RESTORE_SELECTORS[what]
+    files, links = archive_inventory(dest)
+    files = {r: e for r, e in files.items() if select(r)}
+    links = {r: t for r, t in links.items() if select(r)}
+    needed = 0
+    for rel, entry in files.items():
+        dst = os.path.join(repo_root, rel)
+        if not (os.path.isfile(dst) and os.path.getsize(dst) == entry["size"]):
+            # Counted in full even when replacing a wrong-size file: the old
+            # copy lives until the verified .partial is renamed over it.
+            needed += entry["size"]
+    return RestorePlan(what, dest, repo_root, files, links, needed,
+                       _local_free_bytes(repo_root))
+
+
+_RESTORE_LABELS = {"originals": "archived originals",
+                   "runtime": "archived runtime artifacts",
+                   "full": "archive"}
+
+
+def _restore(manifest: Manifest, cache_dir: str, offload_dir: str, what: str,
+             progress=None) -> int:
+    plan = plan_restore(manifest, cache_dir, offload_dir, what)
+    if not plan.files and not plan.links:
+        raise OffloadError(f"no {_RESTORE_LABELS[what]} found under {plan.dest}")
+    if not plan.fits:
+        raise OffloadError(
+            f"not enough local disk space to restore: need "
+            f"{paths.human_bytes(plan.needed_bytes)} (+"
+            f"{paths.human_bytes(plan.headroom_bytes)} headroom), only "
+            f"{paths.human_bytes(plan.free_bytes)} free — free "
+            f"{paths.human_bytes(plan.shortfall_bytes)} and retry "
+            f"(already-restored files are skipped)")
+    return restore_tree(plan.dest, plan.repo_root, plan.files, plan.links,
+                        progress=progress)
+
+
+def restore_originals(manifest: Manifest, cache_dir: str, offload_dir: str,
+                      progress=None) -> int:
+    return _restore(manifest, cache_dir, offload_dir, "originals", progress)
 
 
 def restore_runtime_only(manifest: Manifest, cache_dir: str, offload_dir: str,
                          progress=None) -> int:
     """Bring back only flashchat runtime artifacts (no original blobs)."""
-    dest = dest_repo_dir(offload_dir, manifest)
-    journal = Journal(dest)
-    runtime = [rel for rel in journal.data["files"]
-               if "/flashchat/" in rel or rel.startswith("flashchat/")]
-    if not runtime:
-        raise OffloadError(f"no archived runtime artifacts found under {dest}")
-    runtime_links = [rel for rel in journal.data["links"]
-                     if "/flashchat/" in rel or rel.startswith("flashchat/")]
-    repo_root = paths.repo_root_dir(os.path.expanduser(cache_dir), manifest.hf_repo)
-    return restore_tree(dest, repo_root, journal, progress=progress,
-                        relpaths=runtime + runtime_links)
+    return _restore(manifest, cache_dir, offload_dir, "runtime", progress)
+
+
+def restore_full(manifest: Manifest, cache_dir: str, offload_dir: str,
+                 progress=None) -> int:
+    return _restore(manifest, cache_dir, offload_dir, "full", progress)
 
 
 def archive_state(manifest: Manifest, offload_dir: str) -> str:

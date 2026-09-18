@@ -411,6 +411,11 @@ def check_artifact(manifest: Manifest, variant: Variant, adir: ArtifactDir,
         if spec.layout:
             layers = _layers_for(manifest, spec)
             layout_path = os.path.join(packed_dir, spec.layout)
+            if not os.path.isfile(layout_path):
+                # Distinct from a real mismatch: usually an interrupted
+                # restore/build, recoverable without regenerating the layers.
+                return ArtifactStatus(rel, "incomplete", required,
+                                      f"{spec.layout} missing")
             if not packed_layout_matches(manifest, variant, layout_path, layers, rel.rstrip("/")):
                 return ArtifactStatus(rel, "invalid", required, "layout mismatch")
             missing = packed_layer_files(packed_dir, layers)

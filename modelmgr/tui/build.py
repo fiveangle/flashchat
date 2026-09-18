@@ -148,7 +148,7 @@ def _offer_download_or_restore(manifest: Manifest, cache_dir: str,
         if common.confirm("Restore original source blobs locally?", default=False):
             progress = common.ProgressLine()
             try:
-                offload.restore_originals(manifest, local_snapshot or "", od,
+                offload.restore_originals(manifest, cache_dir, od,
                                           progress=progress)
                 return paths.snapshot_dir(cache_dir, manifest.hf_repo)
             except offload.OffloadError as e:

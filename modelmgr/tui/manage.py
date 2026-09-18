@@ -270,6 +270,9 @@ def _build_repair(registry, manifest, status) -> None:
     print("  (re)build variant(s): " + ", ".join(chosen))
     if rebuild_targets:
         print(common.yellow("  the 'broken' artifacts above will be DELETED, then rebuilt"))
+        if status.archive == "full":
+            print(common.dim("  the offload archive holds a copy — '[l] restore from "
+                             "archive' may be faster than rebuilding"))
     if not common.confirm("Proceed?", default=False):
         return
     err = guard_model_not_serving([resolved_id(manifest, v) for v in manifest.variants])
@@ -293,6 +296,10 @@ def _offload_model(registry, manifest, status) -> None:
           "safetensors source blobs. Runtime artifacts stay local and usable.")
     print("system_prompt_cache directories are skipped and never written to the "
           "offload copy because they may contain prompt-derived user data.")
+    held_back = offload.local_scope_problems(manifest, status.snapshot)
+    for scope, reason in sorted(held_back.items()):
+        print(common.yellow(f"  flashchat/{scope}/ is not synced ({reason}); "
+                            f"the offload copy of it is left untouched"))
     if not status.any_ready:
         print(common.yellow(
             "no runtime variant is built yet — offloading the model now "
@@ -317,19 +324,43 @@ def _restore_menu(registry, manifest) -> None:
     if not od or offload.archive_state(manifest, od) == "none":
         print("no archive found for this model")
         return
-    print("  1) restore originals only")
-    print("  2) restore runtime artifacts only")
-    print("  3) restore everything")
-    choice = common.select_number(3, "Restore what")
+    cache = hf_cache_dir()
+    options = [("originals", "restore originals only"),
+               ("runtime", "restore runtime artifacts only"),
+               ("full", "restore everything")]
+    plans = {}
+    for i, (what, label) in enumerate(options, 1):
+        plan = offload.plan_restore(manifest, cache, od, what)
+        plans[what] = plan
+        if not plan.files and not plan.links:
+            note = common.dim("nothing archived")
+        elif not plan.needed_bytes:
+            note = common.dim("already local")
+        else:
+            note = f"needs {paths.human_bytes(plan.needed_bytes)}"
+            note = common.green(note) if plan.fits else common.red(note + " — won't fit")
+        print(f"  {i}) {label}  {note}")
+    free = next(iter(plans.values())).free_bytes
+    print(common.dim(f"     local free space: {paths.human_bytes(free)} "
+                     f"(files already restored at full size are skipped)"))
+    choice = common.select_number(len(options), "Restore what")
     if choice is None:
         return
-    cache = hf_cache_dir()
+    what = options[int(choice) - 1][0]
+    plan = plans[what]
+    if plan.needed_bytes and not plan.fits:
+        print(common.red(
+            f"not enough local disk space: free "
+            f"{paths.human_bytes(plan.shortfall_bytes)} more and retry"))
+        if what == "full" and plans["runtime"].fits and plans["runtime"].needed_bytes:
+            print(common.dim("  restoring runtime artifacts only would fit — originals "
+                             "are only needed to rebuild artifacts"))
+        return
     progress = common.ProgressLine()
     try:
-        if choice == 1:
-            snapshot = paths.snapshot_dir(cache, manifest.hf_repo) or ""
-            n = offload.restore_originals(manifest, snapshot, od, progress=progress)
-        elif choice == 2:
+        if what == "originals":
+            n = offload.restore_originals(manifest, cache, od, progress=progress)
+        elif what == "runtime":
             n = offload.restore_runtime_only(manifest, cache, od, progress=progress)
         else:
             n = offload.restore_full(manifest, cache, od, progress=progress)

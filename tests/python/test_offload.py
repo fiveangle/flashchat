@@ -27,8 +27,12 @@ class OffloadBase(unittest.TestCase):
         os.makedirs(self.dest)
         registry = Registry.load()
         self.moe = registry.get("qwen3.6-35b-a3b")
+        # Restores preflight local free space; don't depend on the host disk.
+        self._orig_free = offload._local_free_bytes
+        offload._local_free_bytes = lambda _p: 1 << 50
 
     def tearDown(self):
+        offload._local_free_bytes = self._orig_free
         if self.old_config_dir is None:
             os.environ.pop("FLASHCHAT_CONFIG_DIR", None)
         else:
@@ -90,7 +94,7 @@ class TestOriginals(OffloadBase):
         self.assertEqual(offload.archive_state(self.moe, self.dest), "originals")
         self.assertTrue(recipes.plan(self.moe, "q4", snapshot, force=True).needs_download)
 
-        restored = offload.restore_originals(self.moe, snapshot, self.dest)
+        restored = offload.restore_originals(self.moe, self.cache, self.dest)
         self.assertEqual(restored, moved)
         self.assertTrue(os.path.exists(blob_link))
         self.assertFalse(recipes.plan(self.moe, "q4", snapshot, force=True).needs_download)
@@ -204,6 +208,11 @@ class TestFullOffload(OffloadBase):
                                      "model_weights.bin")
         with open(local_weights, "ab") as f:
             f.write(b"changed")
+        # a real rebuild re-records the artifact; unrecorded drift is refused
+        from modelmgr.artifacts import ArtifactDir
+        adir = ArtifactDir(paths.variant_dir(snapshot, "q4"), self.moe.id, "q4")
+        adir.backfill("model_weights.bin")
+        adir.commit()
 
         offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4"])
         self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
@@ -331,6 +340,117 @@ class TestTransferEngine(OffloadBase):
         shutil.rmtree(repo_root)
         restored = offload.restore_full(self.moe, self.cache, self.dest)
         self.assertGreater(restored, 0)
+
+
+class TestRestoreAndPushSafety(OffloadBase):
+    """Regressions from a 397B restore that ran the boot volume out of space
+    mid-copy, left packed_experts/ without layout.json, and was one [o]ffload
+    away from rsync --delete erasing the only complete copy on the archive."""
+
+    def _legacy_archive(self, variants=("q4",)):
+        snapshot = make_snapshot(self.cache, self.moe, variants=list(variants))
+        repo_root = paths.repo_root_dir(self.cache, self.moe.hf_repo)
+        dest_repo = offload.dest_repo_dir(self.dest, self.moe)
+        shutil.copytree(repo_root, dest_repo, symlinks=True)
+        return snapshot, repo_root, dest_repo
+
+    def _packed_dir(self, root_snapshot):
+        return os.path.join(paths.variant_dir(root_snapshot, "q4"), "packed_experts")
+
+    def test_runtime_only_restore_from_legacy_unjournaled_archive(self):
+        snapshot, repo_root, _dest = self._legacy_archive()
+        shutil.rmtree(paths.flashchat_dir(snapshot))
+        restored = offload.restore_runtime_only(self.moe, self.cache, self.dest)
+        self.assertGreater(restored, 0)
+        from modelmgr.artifacts import variant_ready
+        self.assertTrue(variant_ready(self.moe, "q4", snapshot))
+        self.assertTrue(os.path.isfile(os.path.join(repo_root, "blobs", "blob0")),
+                        "local originals untouched")
+
+    def test_originals_only_restore_from_legacy_unjournaled_archive(self):
+        snapshot, repo_root, _dest = self._legacy_archive()
+        shutil.rmtree(os.path.join(repo_root, "blobs"))
+        offload.restore_originals(self.moe, self.cache, self.dest)
+        self.assertTrue(os.path.exists(
+            os.path.join(snapshot, "model-00001-of-00001.safetensors")))
+
+    def test_restore_never_deletes_local_only_files(self):
+        snapshot, _repo_root, _dest = self._legacy_archive()
+        local_only = os.path.join(paths.variant_dir(snapshot, "q4"),
+                                  "system_prompt_cache", "keep.fcache")
+        os.makedirs(os.path.dirname(local_only))
+        with open(local_only, "w") as f:
+            f.write("local")
+        offload.restore_full(self.moe, self.cache, self.dest)
+        self.assertTrue(os.path.isfile(local_only))
+
+    def test_restore_refuses_before_copying_when_disk_too_small(self):
+        snapshot, _repo_root, _dest = self._legacy_archive()
+        shutil.rmtree(paths.flashchat_dir(snapshot))
+        offload._local_free_bytes = lambda _p: 1024
+        with self.assertRaises(offload.OffloadError) as ctx:
+            offload.restore_runtime_only(self.moe, self.cache, self.dest)
+        self.assertIn("not enough local disk space", str(ctx.exception))
+        self.assertFalse(os.path.isdir(paths.flashchat_dir(snapshot)),
+                         "nothing may be written when the preflight fails")
+
+    def test_plan_skips_files_already_restored(self):
+        snapshot, _repo_root, _dest = self._legacy_archive()
+        self.assertEqual(
+            offload.plan_restore(self.moe, self.cache, self.dest, "runtime").needed_bytes, 0)
+        layer = os.path.join(self._packed_dir(snapshot), "layer_00.bin")
+        size = os.path.getsize(layer)
+        os.unlink(layer)
+        plan = offload.plan_restore(self.moe, self.cache, self.dest, "runtime")
+        self.assertEqual(plan.needed_bytes, size)
+
+    def test_missing_layout_json_reads_as_incomplete_not_mismatch(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        os.unlink(os.path.join(self._packed_dir(snapshot), "layout.json"))
+        from modelmgr.artifacts import variant_status
+        st = next(s for s in variant_status(self.moe, "q4", snapshot)
+                  if s.relpath.startswith("packed_experts"))
+        self.assertEqual(st.state, "incomplete")
+        self.assertIn("layout.json missing", st.detail)
+
+    def test_offload_with_interrupted_local_restore_keeps_archive_intact(self):
+        snapshot, _repo_root, dest_repo = self._legacy_archive()
+        # Simulate the disk-full restore: last layer + layout.json never landed,
+        # shared vocab.bin never landed.
+        local_packed = self._packed_dir(snapshot)
+        layers = sorted(n for n in os.listdir(local_packed) if n.startswith("layer_"))
+        os.unlink(os.path.join(local_packed, layers[-1]))
+        os.unlink(os.path.join(local_packed, "layout.json"))
+        os.unlink(os.path.join(paths.shared_dir(snapshot), "vocab.bin"))
+        problems = offload.local_scope_problems(self.moe, snapshot)
+        self.assertIn("q4", problems)
+        self.assertIn("shared", problems)
+
+        offload.offload_model(self.moe, snapshot, self.dest)
+
+        arch_snapshot = os.path.join(dest_repo, os.path.relpath(
+            snapshot, paths.repo_root_dir(self.cache, self.moe.hf_repo)))
+        arch_packed = self._packed_dir(arch_snapshot)
+        self.assertTrue(os.path.isfile(os.path.join(arch_packed, "layout.json")))
+        self.assertTrue(os.path.isfile(os.path.join(arch_packed, layers[-1])))
+        self.assertTrue(os.path.isfile(
+            os.path.join(paths.shared_dir(arch_snapshot), "vocab.bin")))
+
+    def test_offload_never_deletes_archived_blobs_missing_locally(self):
+        snapshot, repo_root, dest_repo = self._legacy_archive()
+        extra = os.path.join(dest_repo, "blobs", "blob-only-on-archive")
+        with open(extra, "w") as f:
+            f.write("archived original shard")
+        offload.offload_model(self.moe, snapshot, self.dest)
+        self.assertTrue(os.path.isfile(extra))
+
+    def test_scope_sync_refuses_broken_local_scope(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        os.unlink(os.path.join(self._packed_dir(snapshot), "layout.json"))
+        with self.assertRaises(offload.OffloadError) as ctx:
+            offload.sync_artifact_scopes(self.moe, snapshot, self.dest, ["q4"])
+        self.assertIn("refusing to overwrite", str(ctx.exception))
 
 
 if __name__ == "__main__":
