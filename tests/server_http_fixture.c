@@ -1,4 +1,5 @@
 #include "../metal_infer/server_http.h"
+#include "../metal_infer/server_title.h"
 #include <netinet/in.h>
 
 static volatile sig_atomic_t stopping;
@@ -23,7 +24,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     server_http_t server = {.listener = listener, .shutdown = &stopping,
-        .status_json = status, .model_id = "fixture"};
+        .status_json = status, .model_id = "fixture", .direct_response = server_title_response};
     if (server_http_start(&server)) return 2;
     printf("%d\n", ntohs(addr.sin_port));
     fflush(stdout);

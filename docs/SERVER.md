@@ -68,6 +68,17 @@ Flashchat runs one generation at a time. A second generation request receives
 HTTP 503 with error type `server_busy`; there is no conversation queue or
 concurrent model execution. Clients can retry after the active request finishes.
 
+OpenCode title requests receive the opening words of the first usable user request
+directly from the HTTP thread, before inference admission. The title skips OpenCode's
+wrapper message, collapses whitespace, and fits within 50 visible characters,
+including an ellipsis when truncated. Truncation prefers a word boundary and never
+splits an emoji or combined character. Empty input falls back to `New conversation`.
+Both streaming and JSON title responses bypass the busy check and never acquire
+the inference slot or touch conversation caches; a concurrent first chat therefore
+does not contend with its
+background title request. Matching uses the leading system/developer instruction,
+not title-like text in user messages.
+
 The HTTP event thread accepts bounded requests, handles `/health`, `/v1`,
 `/v1/models` and preflight requests, and relays inference output. The original
 inference thread owns all model state, caches, and accelerator operations.

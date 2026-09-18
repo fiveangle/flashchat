@@ -45,6 +45,9 @@ typedef struct {
     volatile sig_atomic_t *shutdown;
     // Called only on the event thread; copies published state, never model buffers.
     void (*status_json)(char *, size_t);
+    // Optional model-free response, before admission. Returns owned HTTP bytes
+    // or NULL to use the inference worker; must not access mutable model state.
+    char *(*direct_response)(const char *, const char *, const char *);
     const char *model_id;
     void (*trace)(const char *, const char *);
 } server_http_t;
@@ -214,9 +217,23 @@ static void *http_event_loop(void *arg) {
                 http_reply(c, 200, "{\"object\":\"service\",\"id\":\"flashchat\",\"api\":\"openai-compatible\",\"endpoints\":[\"/v1/chat/completions\",\"/v1/responses\",\"/v1/models\",\"/health\"]}");
             } else if (strcmp(method, "POST") || (strcmp(path, "/v1/chat/completions") && strcmp(path, "/v1/responses"))) {
                 http_reply(c, 404, "{\"error\":{\"message\":\"Not found\"}}");
-            } else if (s->busy) {
-                http_reply(c, 503, "{\"error\":{\"type\":\"server_busy\",\"message\":\"Flashchat is processing another request. Try again when it finishes.\"}}");
             } else {
+                char *response = s->direct_response
+                    ? s->direct_response(path, strstr(c->data, "\r\n\r\n") + 4, s->model_id) : NULL;
+                if (response) {
+                    free(c->data);
+                    c->data = response;
+                    c->len = strlen(response);
+                    c->sent = 0;
+                    c->output = 1;
+                    c->deadline = now + 5;
+                    if (c->trace) c->trace("response", response);
+                    continue;
+                }
+                if (s->busy) {
+                    http_reply(c, 503, "{\"error\":{\"type\":\"server_busy\",\"message\":\"Flashchat is processing another request. Try again when it finishes.\"}}");
+                    continue;
+                }
                 int pair[2];
                 if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) {
                     http_reply(c, 503, "{\"error\":{\"message\":\"Unable to accept generation\"}}"); continue;

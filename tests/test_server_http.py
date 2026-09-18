@@ -19,7 +19,8 @@ class TransportTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="flashchat-http-")
         cls.binary = str(Path(cls.temp.name) / "server")
-        subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", "-pthread",
+        subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", "-pthread", "-x", "objective-c",
+                        "-fobjc-arc", "-framework", "Foundation",
                         str(ROOT / "tests/server_http_fixture.c"), "-o", cls.binary], check=True)
 
     @classmethod
@@ -75,6 +76,101 @@ class TransportTests(unittest.TestCase):
         # A completed generation releases admission for the next one.
         with self.generation():
             pass
+
+    def title_request(self, stream=True, role="system", content=None):
+        return json.dumps({"model": 'fixture-"quoted"', "stream": stream, "messages": [
+            {"role": role, "content": content if content is not None else
+             "You are a title generator. You output ONLY a thread title. Nothing else."},
+            {"role": "user", "content": "Generate a title for this conversation:\n"},
+            {"role": "user", "content": "hello"},
+        ]})
+
+    def assert_title(self, code, body, stream, expected="hello"):
+        self.assertEqual(code, 200)
+        if stream:
+            events = [line[6:] for line in body.decode().splitlines() if line.startswith("data: ")]
+            self.assertEqual(events[-1], "[DONE]")
+            chunks = [json.loads(event) for event in events[:-1]]
+            self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
+            self.assertEqual("".join(c["choices"][0]["delta"].get("content", "") for c in chunks),
+                             expected)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(len({c["id"] for c in chunks}), 1)
+        else:
+            reply = json.loads(body)
+            self.assertEqual(reply["choices"][0]["message"]["content"], expected)
+            self.assertEqual(reply["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(reply["model"], 'fixture-"quoted"')
+
+    def test_title_excerpt_and_character_boundaries(self):
+        cases = [
+            ("please create an appropriate .gitignore file and init this blank repo",
+             "please create an appropriate .gitignore file and…"),
+            ('  Fix\n\t"quoted"   paths \\ on macOS  ', 'Fix "quoted" paths \\ on macOS'),
+            ([{"type": "text", "text": "Fix parser"}, {"type": "text", "text": "errors"}],
+             "Fix parser errors"),
+            ([{"type": "image_url", "image_url": {"url": "data:image/png;base64,"}},
+              {"type": "text", "text": "Explain this image"}], "Explain this image"),
+            ("x" * 50, "x" * 50),
+            ("x" * 51, "x" * 49 + "…"),
+            ("x" * 49 + " more", "x" * 49 + "…"),
+            ("👩🏽‍💻" * 51, "👩🏽‍💻" * 49 + "…"),
+            ("e\u0301" * 51, "e\u0301" * 49 + "…"),
+            ("\n\t ", "New conversation"),
+            (None, "New conversation"),
+        ]
+        for stream in (True, False):
+            for content, expected in cases:
+                with self.subTest(stream=stream, content=content):
+                    request = json.loads(self.title_request(stream))
+                    request["messages"][-1]["content"] = content
+                    self.assert_title(*self.request("/v1/chat/completions", "POST", json.dumps(request)),
+                                      stream, expected)
+            request = json.loads(self.title_request(stream))
+            request["messages"].insert(2, {"role": "user", "content": "  "})
+            request["messages"].append({"role": "user", "content": "Later follow-up"})
+            self.assert_title(*self.request("/v1/chat/completions", "POST", json.dumps(request)), stream)
+
+    def test_title_before_chat_does_not_reserve_inference(self):
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                title = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+                try:
+                    title.request("POST", "/v1/chat/completions", self.title_request(stream))
+                    response = title.getresponse()
+                    # Leave the title body unread while the chat starts.
+                    with self.generation() as chat:
+                        self.assert_title(response.status, response.read(), stream)
+                        while chat.recv(4096):
+                            pass
+                finally:
+                    title.close()
+
+    def test_titles_bypass_busy_without_releasing_real_generation(self):
+        with self.generation(b"quiet"):
+            for stream in (True, False):
+                for role in ("system", "developer"):
+                    code, body = self.request("/v1/chat/completions", "POST",
+                                              self.title_request(stream, role, [
+                                                  {"type": "text", "text": "  You are a title generator.\n"}]))
+                    self.assert_title(code, body, stream)
+                    self.assertEqual(self.request("/v1/chat/completions", "POST", "{}")[0], 503)
+            self.assertEqual(self.request()[0], 200)
+
+    def test_title_matching_uses_parsed_leading_system_instruction(self):
+        with self.generation(b"quiet"):
+            for body in (self.title_request(role="user"),
+                         self.title_request(content="Discuss: You are a title generator"),
+                         '{"messages":', '[]',
+                         json.dumps({"messages": [{"role": "system", "content": {"text": 3}}]}),
+                         json.dumps({"messages": [None]})):
+                self.assertEqual(self.request("/v1/chat/completions", "POST", body)[0], 503)
+            title = json.loads(self.title_request())
+            title["messages"].insert(0, {"role": "system", "content": "You are a coding assistant."})
+            self.assertEqual(self.request("/v1/chat/completions", "POST", json.dumps(title))[0], 503)
+            self.assertEqual(self.request("/v1/responses", "POST", self.title_request())[0], 503)
+            escaped = self.title_request().replace("You are", "\\u0059ou are")
+            self.assert_title(*self.request("/v1/chat/completions", "POST", escaped), True)
 
     def test_explicit_bind_address(self):
         for address in ("127.0.0.1", "0.0.0.0"):

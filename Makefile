@@ -243,7 +243,7 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine (links the ANE MLP library for batched-prefill offload)
-$(INFER_TARGET): $(INFER_SRC) $(BUILD_DIR)/server_http.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(INFER_TARGET): $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) $(INFER_SRC) $(ANE_MLP_SRC) -o $(INFER_TARGET)
 
@@ -376,7 +376,7 @@ chat-render-smoke: $(CHAT_TARGET)
 tool-template-smoke: $(INFER_TARGET)
 	bash tests/test_tool_template_render.sh
 
-$(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/conversation_cache_fixture.m $(ANE_MLP_SRC) -o $@
 
 .PHONY: conversation-cache-smoke

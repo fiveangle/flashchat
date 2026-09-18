@@ -82,6 +82,7 @@
 
 #include "model_config.h"
 #include "server_http.h"
+#include "server_title.h"
 
 #define FLASHCHAT_BUILD_STAMP __DATE__ " " __TIME__
 
@@ -14819,6 +14820,13 @@ static void server_transport_trace(const char *direction, const char *payload) {
     server_http_log_block(NULL, direction, "http transport", payload);
 }
 
+static char *server_direct_response(const char *path, const char *body, const char *model_id) {
+    char *response = server_title_response(path, body, model_id);
+    if (response)
+        server_log_errorf("[serve] title_gen_shortcut active; returning request-derived title before inference admission\n");
+    return response;
+}
+
 static void server_status_json(char *out, size_t capacity) {
     pthread_mutex_lock(&g_progress_mutex);
     server_progress_t p = g_progress;
@@ -15055,7 +15063,7 @@ static void serve_loop(
 
     server_http_t http = {.listener = server_fd, .shutdown = &g_server_shutdown_signal,
                          .status_json = server_status_json, .model_id = g_cfg.model_id,
-                         .trace = server_transport_trace};
+                         .trace = server_transport_trace, .direct_response = server_direct_response};
     if (server_http_start(&http)) {
         server_log_errorf("[serve] Unable to start HTTP event thread\n");
         close(server_fd);
@@ -15143,38 +15151,6 @@ static void serve_loop(
                           req.temperature, req.top_p,
                           req.top_k, req.min_p, req.presence_penalty, req.repetition_penalty,
                           req.reasoning_enabled, req.used_snapshot);
-
-        // Workaround: opencode fires a "title generator" request before every chat.
-        // The 35B model loops on this prompt (degenerate \n / token spam) and blocks
-        // the real request behind it for minutes. Until the EOS / chat-template bug
-        // is diagnosed, short-circuit any request whose system prompt begins with
-        // the unmistakable opencode title-gen signature and return a fixed string.
-        if (is_chat && req.system_prompt &&
-            strncmp(req.system_prompt, "You are a title generator", 25) == 0) {
-            const char *fixed_title = "New conversation";
-            server_log_errorf("[serve] %s title_gen_shortcut active; returning fixed string \"%s\"\n",
-                              request_id, fixed_title);
-            if (req.stream) {
-                sse_send_delta(client_fd, request_id, fixed_title);
-                sse_send_done(client_fd, request_id, NULL, 0, 0, NULL, NULL);
-            } else {
-                char *final_json = build_chat_completion_json(request_id, req.model, fixed_title, NULL, NULL);
-                if (final_json) {
-                    send_json_ok(client_fd, final_json);
-                    free(final_json);
-                } else {
-                    send_json_error(client_fd, 500, "server_error", "title shortcut alloc failed");
-                }
-            }
-            api_request_free(&req);
-            free(reqbuf);
-            close(client_fd);
-            if (g_server_shutdown_signal) {
-                server_log_errorf("[serve] Shutdown requested by signal %d after request drain\n", g_server_shutdown_signal);
-                break;
-            }
-            continue;
-        }
 
         // Build system prompt and hash it for cache lookup
         char *req_sys_prompt = build_system_prompt_for_request(&req, NULL);
