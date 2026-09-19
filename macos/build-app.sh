@@ -1,8 +1,10 @@
 #!/bin/bash
 # Build macos/build/Flashchat.app from the Swift package.
 #
-#   macos/build-app.sh            release build, ad-hoc signed
-#   CODESIGN_IDENTITY="Developer ID Application: …" macos/build-app.sh
+#   make menubar                 (preferred: applies macos/local.mk settings)
+#   macos/build-app.sh           release build, ad-hoc signed
+#
+# Signing is done by macos/sign-app.sh (see it for SIGN_IDENTITY values).
 #
 # The bundle records this checkout's path (FlashchatRepoRoot) so it finds the
 # launcher and modelmgr; the app also lets the user pick another folder.
@@ -60,5 +62,5 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --options runtime --sign "${CODESIGN_IDENTITY:--}" "$APP"
 echo "Built $APP ($VERSION)"
+"$ROOT/macos/sign-app.sh" "$APP"

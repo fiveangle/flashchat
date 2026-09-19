@@ -64,3 +64,4 @@ metal_infer/request_sampling_fixture
 # Menubar app (macos/FlashchatBar)
 macos/FlashchatBar/.build/
 macos/build/
+macos/local.mk

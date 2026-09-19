@@ -6,19 +6,71 @@ TUI's configuration and model-management menus with native windows. The
 terminal menu (`./flashchat`) and every CLI command keep working, and both use
 the same backend, so you can switch between them freely.
 
-## Build and run
+## Build, install, and sign
 
 ```bash
-make menubar        # builds macos/build/Flashchat.app (ad-hoc signed)
-make menubar-run    # builds, then launches it
-make menubar-test   # Swift unit tests for the app's core library
+make menubar             # build macos/build/Flashchat.app (ad-hoc signed)
+make menubar-run         # build and launch it
+make menubar-install     # build and install to /Applications (INSTALL_DIR=… to change)
+make menubar-uninstall   # remove the installed app; settings are kept
+make menubar-test        # Swift unit tests for the app's core library
+make menubar-clean       # remove build output
 ```
 
-Requires macOS 14 or later and the Xcode command line tools. Drag
-`macos/build/Flashchat.app` to `/Applications` if you like. It remembers the
-Flashchat folder it was built from, and you can point it at another checkout
-from **Overview → Flashchat folder**. To sign for distribution, set
-`CODESIGN_IDENTITY` when running `macos/build-app.sh`.
+Requires macOS 14 or later and the Xcode command line tools. Installing quits
+a running copy of the app and relaunches the new one. The inference server
+runs as a separate process and keeps running. The app remembers which
+Flashchat folder it was built from; you can point it at another checkout from
+**Overview → Flashchat folder**.
+
+### Signing
+
+`SIGN_IDENTITY` picks the certificate for `make menubar`,
+`make menubar-install` and `make menubar-sign`. The make targets never read
+environment variables. Settings come from:
+
+1. Defaults in the Makefile (ad-hoc signing, install to `/Applications`).
+2. `macos/local.mk`, an optional git-ignored file with your per-machine
+   defaults. Copy `macos/local.mk.example` to start; for example, set
+   `SIGN_IDENTITY := development` to always sign with your Apple Development
+   certificate.
+3. The make command line, for a one-off override, e.g.
+   `make menubar SIGN_IDENTITY=-`.
+
+| `SIGN_IDENTITY` | Certificate | Use |
+|---|---|---|
+| `-` (default) | ad-hoc | Runs on this Mac |
+| `development` | your "Apple Development" certificate | Your own Macs |
+| `developer-id` | your "Developer ID Application" certificate | Distribution; required for notarization |
+| a full name or SHA-1 | exactly that certificate | When you have more than one of a kind |
+
+```bash
+make menubar SIGN_IDENTITY=developer-id       # build + sign with Developer ID
+make menubar-sign SIGN_IDENTITY=development   # re-sign the existing build, no rebuild
+make menubar-verify                        # show the signature and Gatekeeper's verdict
+```
+
+`security find-identity -v -p codesigning` lists your certificates. A
+Developer ID Application certificate needs a paid Apple Developer Program
+membership; create it in Xcode → Settings → Accounts → Manage Certificates.
+Every build uses the hardened runtime, plus the Apple Events entitlement the
+app needs to open chats in Terminal (`macos/Flashchat.entitlements`).
+
+### Notarization (distribution)
+
+One-time setup, which stores your credentials in the keychain:
+
+```bash
+xcrun notarytool store-credentials flashchat-notary --apple-id <you@example.com> --team-id <TEAMID>
+```
+
+Then set `SIGN_IDENTITY := developer-id` and
+`NOTARY_PROFILE := flashchat-notary` in `macos/local.mk`, and run:
+
+```bash
+make menubar
+make menubar-notarize   # submit, wait, staple, check
+```
 
 Opening the app again while it is running brings up its window.
 `open Flashchat.app --args --show Models` opens a specific section.

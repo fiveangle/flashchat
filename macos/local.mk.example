@@ -1,0 +1,18 @@
+# Per-machine settings for the menubar app's make targets.
+# Copy to macos/local.mk (git-ignored) and edit. Values here override the
+# Makefile defaults; `make VAR=value` on the command line overrides both.
+
+# Signing certificate:
+#   -             ad-hoc (Makefile default): runs on this Mac only
+#   development   your "Apple Development" certificate: stable identity, so
+#                 macOS permission grants survive rebuilds
+#   developer-id  your "Developer ID Application" certificate: distribution
+#                 and notarization (paid Apple Developer Program)
+#   or a full certificate name / SHA-1 from `security find-identity -v -p codesigning`
+SIGN_IDENTITY := development
+
+# Where `make menubar-install` puts Flashchat.app.
+# INSTALL_DIR := /Applications
+
+# notarytool keychain profile for `make menubar-notarize` (Developer ID builds).
+# NOTARY_PROFILE := flashchat-notary

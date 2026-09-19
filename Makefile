@@ -196,9 +196,16 @@ help:
 	@printf "  make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test\n"
 	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
 	@printf "  make py-tests  Run modelmgr unit tests\n"
-	@printf "  make menubar   Build the menubar app (macos/build/Flashchat.app)\n"
+	@printf "  make menubar   Build the menubar app (macos/build/Flashchat.app), ad-hoc signed\n"
+	@printf "  make menubar SIGN_IDENTITY=developer-id  Build signed with your Developer ID (or =development)\n"
 	@printf "  make menubar-run   Build and launch the menubar app\n"
+	@printf "  make menubar-install   Build and install to INSTALL_DIR (default /Applications)\n"
+	@printf "  make menubar-uninstall Remove the installed app\n"
+	@printf "  make menubar-sign  Re-sign the built app with SIGN_IDENTITY (no rebuild)\n"
+	@printf "  make menubar-verify    Show and check the app's signature and Gatekeeper status\n"
+	@printf "  make menubar-notarize NOTARY_PROFILE=name  Notarize + staple a Developer ID build\n"
 	@printf "  make menubar-test  Run the menubar app's Swift unit tests\n"
+	@printf "  make menubar-clean Remove menubar build output\n"
 	@printf "  make registry-check  Verify assets/model_configs.json matches the manifests\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
@@ -352,15 +359,59 @@ registry-check:
 	python3 -c "import json,sys; a=json.load(open('assets/model_configs.json')); b=json.load(open('/tmp/flashchat_registry_check.json')); sys.exit(0 if a==b else ('assets/model_configs.json is out of sync with assets/models/*.json -- run: make registry', 1)[1])" && \
 	echo "registry in sync"
 
-.PHONY: menubar menubar-run menubar-test
+# Menubar app. Settings come only from this Makefile, the optional git-ignored
+# macos/local.mk (per-machine defaults; see macos/local.mk.example), or the make
+# command line — never from environment variables.
+#   SIGN_IDENTITY: - (ad-hoc) | development | developer-id | <certificate name or SHA-1>
+#   INSTALL_DIR:   where menubar-install puts Flashchat.app
+#   NOTARY_PROFILE: notarytool keychain profile name (Developer ID builds only)
+SIGN_IDENTITY := -
+INSTALL_DIR := /Applications
+NOTARY_PROFILE :=
+-include macos/local.mk
+MENUBAR_APP := macos/build/Flashchat.app
+
+.PHONY: menubar menubar-run menubar-test menubar-sign menubar-verify menubar-notarize \
+	menubar-install menubar-uninstall menubar-clean
 menubar:
-	bash macos/build-app.sh
+	SIGN_IDENTITY="$(SIGN_IDENTITY)" bash macos/build-app.sh
 
 menubar-run: menubar
-	open macos/build/Flashchat.app
+	open $(MENUBAR_APP)
 
 menubar-test:
 	swift test --package-path macos/FlashchatBar
+
+menubar-sign:
+	SIGN_IDENTITY="$(SIGN_IDENTITY)" bash macos/sign-app.sh $(MENUBAR_APP)
+
+menubar-verify:
+	@codesign --verify --strict --verbose=2 $(MENUBAR_APP)
+	@codesign -dv $(MENUBAR_APP) 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Signature|Timestamp|Runtime)' || true
+	@spctl --assess --type execute --verbose $(MENUBAR_APP) 2>&1 || \
+		echo "(Gatekeeper rejects apps that aren't Developer ID signed and notarized; they still run on this Mac.)"
+
+menubar-notarize:
+	NOTARY_PROFILE="$(NOTARY_PROFILE)" bash macos/notarize-app.sh $(MENUBAR_APP)
+
+menubar-install: menubar
+	@was_running=0; \
+	if pgrep -x Flashchat >/dev/null; then was_running=1; pkill -x Flashchat; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x Flashchat >/dev/null || break; sleep 0.5; done; fi; \
+	rm -rf "$(INSTALL_DIR)/Flashchat.app" && \
+	ditto $(MENUBAR_APP) "$(INSTALL_DIR)/Flashchat.app" && \
+	echo "Installed $(INSTALL_DIR)/Flashchat.app (the inference server, if running, is unaffected)"; \
+	if [ $$was_running = 1 ]; then open "$(INSTALL_DIR)/Flashchat.app"; echo "Relaunched Flashchat."; \
+	else echo "Launch it with: open \"$(INSTALL_DIR)/Flashchat.app\""; fi
+
+menubar-uninstall:
+	@if pgrep -x Flashchat >/dev/null; then pkill -x Flashchat; fi
+	@rm -rf "$(INSTALL_DIR)/Flashchat.app" && echo "Removed $(INSTALL_DIR)/Flashchat.app"
+	@echo "Settings in ~/.config/flashchat are kept. If you enabled Launch at login, turn it off first in"
+	@echo "the app (or System Settings → General → Login Items)."
+
+menubar-clean:
+	rm -rf macos/build macos/FlashchatBar/.build
 
 py-tests:
 	@FLASHCHAT_CONFIG_DIR="$$(mktemp -d /tmp/flashchat-py-tests.XXXXXX)" \
