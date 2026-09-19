@@ -97,8 +97,8 @@ def run(registry: Registry) -> None:
     from ..status import hf_cache_dir
     snapshot = paths.snapshot_dir(hf_cache_dir(), manifest.hf_repo)
     if not (snapshot and variant_ready(manifest, variant_name, snapshot)):
-        print(f"\n{manifest.name} [{variant_name}] is not built yet.")
-        if common.confirm("Build now?"):
+        print(f"\n{manifest.name} [{variant_name}] is not ready locally.")
+        if common.confirm("Prepare now?"):
             build.ensure_variant_built(registry, manifest, variant_name)
 
 

@@ -736,11 +736,22 @@ class RestorePlan:
 
 
 def plan_restore(manifest: Manifest, cache_dir: str, offload_dir: str,
-                 what: str) -> RestorePlan:
+                 what: str, variant_name: str | None = None) -> RestorePlan:
     """What a restore of `what` (originals|runtime|full) would copy locally."""
     dest = dest_repo_dir(offload_dir, manifest)
     repo_root = paths.repo_root_dir(os.path.expanduser(cache_dir), manifest.hf_repo)
     select = _RESTORE_SELECTORS[what]
+    if variant_name is not None:
+        if what != "runtime":
+            raise ValueError("variant selection requires a runtime restore")
+        manifest.variant(variant_name)
+        snapshot = paths.snapshot_dir(os.path.expanduser(offload_dir), manifest.hf_repo)
+        if not snapshot:
+            raise OffloadError("no archived snapshot found for this model")
+        runtime = os.path.relpath(paths.flashchat_dir(snapshot), dest)
+        prefixes = tuple(os.path.join(runtime, scope) + os.sep
+                         for scope in ("shared", variant_name))
+        select = lambda rel: rel.startswith(prefixes)
     files, links = archive_inventory(dest)
     files = {r: e for r, e in files.items() if select(r)}
     links = {r: t for r, t in links.items() if select(r)}
@@ -761,8 +772,8 @@ _RESTORE_LABELS = {"originals": "archived originals",
 
 
 def _restore(manifest: Manifest, cache_dir: str, offload_dir: str, what: str,
-             progress=None) -> int:
-    plan = plan_restore(manifest, cache_dir, offload_dir, what)
+             progress=None, variant_name: str | None = None) -> int:
+    plan = plan_restore(manifest, cache_dir, offload_dir, what, variant_name)
     if not plan.files and not plan.links:
         raise OffloadError(f"no {_RESTORE_LABELS[what]} found under {plan.dest}")
     if not plan.fits:
@@ -783,9 +794,10 @@ def restore_originals(manifest: Manifest, cache_dir: str, offload_dir: str,
 
 
 def restore_runtime_only(manifest: Manifest, cache_dir: str, offload_dir: str,
-                         progress=None) -> int:
+                         progress=None, variant_name: str | None = None) -> int:
     """Bring back only flashchat runtime artifacts (no original blobs)."""
-    return _restore(manifest, cache_dir, offload_dir, "runtime", progress)
+    return _restore(manifest, cache_dir, offload_dir, "runtime", progress,
+                    variant_name)
 
 
 def restore_full(manifest: Manifest, cache_dir: str, offload_dir: str,

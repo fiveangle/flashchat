@@ -7,6 +7,7 @@ Shared by onboarding, the config wizard, manage, and the launch-time
 import os
 
 from .. import configfile, offload, paths, recipes, runner
+from ..artifacts import variant_ready
 from ..manifest import Manifest
 from ..registry import Registry
 from ..steps.download import download_snapshot
@@ -31,32 +32,37 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
     cache_dir = hf_cache_dir()
     local_snapshot = paths.snapshot_dir(cache_dir, manifest.hf_repo)
     optional = include_optional or want_optional()
+    source = source_snapshot
+    if not local_snapshot and not force and source is None:
+        restored = _offer_runtime_restore(manifest, variant_name, cache_dir, optional)
+        if restored is not None:
+            return restored
     if not local_snapshot:
-        source = source_snapshot or _offer_build_source(
+        source = source or _offer_build_source(
             manifest, cache_dir, None, prefer_offload=False)
+        if not source:
+            return False
         local_snapshot = paths.snapshot_dir(cache_dir, manifest.hf_repo)
-        if not local_snapshot and source and os.path.commonpath([
+        if not local_snapshot and os.path.commonpath([
                 os.path.abspath(source), os.path.abspath(cache_dir)]) == os.path.abspath(cache_dir):
             local_snapshot = source
-        if not source or source != local_snapshot:
-            print(common.red("local model snapshot is missing; restore or download it locally first"))
-            return False
+        if not local_snapshot:
+            local_snapshot = os.path.join(
+                paths.repo_root_dir(cache_dir, manifest.hf_repo),
+                "snapshots", os.path.basename(os.path.normpath(source)))
 
     plan = recipes.plan(manifest, variant_name, local_snapshot,
                         want_optional=optional, want_mtp=want_mtp(),
                         force=force)
-    source = source_snapshot or local_snapshot
-    if plan.needs_download and source_snapshot is None:
+    if plan.needs_download and source is None:
         source = _offer_build_source(manifest, cache_dir, local_snapshot,
                                      prefer_offload=include_optional)
         if not source:
             return False
+    source = source or local_snapshot
 
     if plan.needs_download:
-        source_plan = recipes.plan(manifest, variant_name, source,
-                                   want_optional=optional, want_mtp=want_mtp(),
-                                   force=False)
-        if source_plan.needs_download:
+        if not recipes.source_blobs_present(manifest, source):
             print(common.red("selected build source does not contain original model files"))
             return False
         plan.needs_download = False
@@ -93,7 +99,6 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
     finally:
         progress.finish()
 
-    from ..artifacts import variant_ready
     if not variant_ready(manifest, variant_name, local_snapshot,
                          want_optional=optional, want_mtp=want_mtp()):
         print(common.red("build finished but local verification failed — "
@@ -118,6 +123,44 @@ def ensure_variant_built(registry: Registry, manifest: Manifest, variant_name: s
     elif source == local_snapshot:
         offer_offload_model(registry, manifest, local_snapshot, assume_yes=assume_yes)
     return True
+
+
+def _offer_runtime_restore(manifest: Manifest, variant_name: str,
+                           cache_dir: str, optional: bool) -> bool | None:
+    """Restore a ready archived variant; None means continue to the build flow."""
+    od = offload_dir()
+    snapshot = paths.snapshot_dir(od, manifest.hf_repo) if od else None
+    if not snapshot or not variant_ready(
+            manifest, variant_name, snapshot,
+            want_optional=optional, want_mtp=want_mtp()):
+        return None
+    plan = offload.plan_restore(manifest, cache_dir, od, "runtime", variant_name)
+    print(f"\nReady runtime files for {manifest.name} [{variant_name}] "
+          f"are available in the offload archive at {od}.")
+    print(f"Restore size: {paths.human_bytes(plan.needed_bytes)} "
+          f"(free: {paths.human_bytes(plan.free_bytes)}). "
+          "Original model files stay in the archive.")
+    if not common.confirm("Restore runtime files locally?", default=True):
+        return False
+    progress = common.ProgressLine()
+    try:
+        offload.restore_runtime_only(manifest, cache_dir, od, progress=progress,
+                                     variant_name=variant_name)
+    except offload.OffloadError as e:
+        print(common.red(f"restore failed: {e}"))
+        return False
+    finally:
+        progress.finish()
+    local_snapshot = paths.snapshot_dir(cache_dir, manifest.hf_repo)
+    if not local_snapshot or not variant_ready(
+            manifest, variant_name, local_snapshot,
+            want_optional=optional, want_mtp=want_mtp()):
+        print(common.red("restore finished but local verification failed — "
+                         "check 'flashchat manage' for details"))
+        return False
+    print(common.green(f"{manifest.name} [{variant_name}] local artifacts are ready."))
+    return True
+
 
 def _offer_build_source(manifest: Manifest, cache_dir: str,
                         local_snapshot: str | None,

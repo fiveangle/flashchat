@@ -77,5 +77,8 @@ def execute_plan(manifest: Manifest, variant_name: str, snapshot: str,
 
 
 def free_space_ok(snapshot: str, needed_bytes: int) -> tuple[bool, int]:
-    free = paths.free_space_bytes(os.path.dirname(snapshot))
+    probe = os.path.abspath(os.path.dirname(snapshot))
+    while not os.path.isdir(probe):
+        probe = os.path.dirname(probe)
+    free = paths.free_space_bytes(probe)
     return free >= needed_bytes, free
