@@ -258,13 +258,21 @@ final class AppModel {
 
     private func pollOnce() async {
         updateQuietMode()
-        memory = SystemMemorySnapshot.current()
+        // Assign only on change: @Observable notifies (and SwiftUI redraws)
+        // even when the new value is equal.
+        let snapshot = SystemMemorySnapshot.current()
+        if snapshot != memory { memory = snapshot }
         let hadHealth = health != nil
-        health = await fetchHealth()
+        let fresh = await fetchHealth()
+        if fresh != health { health = fresh }
         meter.record(health: health, at: Date().timeIntervalSinceReferenceDate)
         updateDockBadge()
+        // `status --json` is expensive (~0.65 CPU-seconds: bash, a cksum of the
+        // engine binary and sources for the restart-needed signature, lsof), so
+        // poll it rarely. /health already covers moment-to-moment state, and
+        // actions refresh it directly.
         let statusAge = Date().timeIntervalSince(lastStatusRefresh)
-        if hadHealth != (health != nil) || statusAge > (quietMode ? 120 : 15) {
+        if hadHealth != (health != nil) || statusAge > (quietMode ? 600 : 60) {
             await refreshStatus()
         }
     }
