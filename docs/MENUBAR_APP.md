@@ -102,8 +102,9 @@ Dock icon.
 - Start, Stop and Restart buttons
 
 **Overview.** Server details, the memory estimate broken down (weights in
-RAM, context cache, expert cache limit), launch at login, quiet mode, and
-shortcuts to a terminal chat or the terminal menu.
+RAM, context cache, expert cache limit), launch at login, Dock/menu bar
+presence, how often to check server status, quiet mode, and shortcuts to a
+terminal chat or the terminal menu.
 
 **Models.** Every registry model with per-variant status. Available actions:
 - **Use** a variant.
@@ -137,6 +138,24 @@ running server needs a restart and offers to do it.
   crashing the app never stops inference.
 - **Confirmation.** Every destructive or long action shows what it will do
   and asks first. The app never starts downloads or builds on its own.
+
+## Resource use
+
+Measured on an M-series Mac with a server running and the app idle:
+
+| | Memory | CPU while idle |
+|---|---|---|
+| Menubar app | 77 MB | ~0.4 CPU-seconds a minute (~0.7% of one core) |
+| Menubar app, quiet mode | 77 MB | ~0.1 CPU-seconds a minute |
+| Terminal.app, one window + shell | ~140 MB | ~0 at a prompt |
+
+The app's memory is flat; a terminal's grows with scrollback and with every
+window it restores, which is why the TUI's real cost depends on how you use
+your terminal. The app's CPU is the price of live status: it polls
+`GET /health` on an interval you choose (**Overview → Check server status**,
+5 seconds by default, halved while a prompt is being read or a response
+generated), and `flashchat status --json` once a minute for the
+restart-needed check. The TUI does the equivalent work on every menu redraw.
 
 ## Quiet mode (benchmarks)
 

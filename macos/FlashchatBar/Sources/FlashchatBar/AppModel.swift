@@ -248,12 +248,17 @@ final class AppModel {
         }
     }
 
+    var statusPollSeconds: Double = AppPresence.statusPollSeconds {
+        didSet { AppPresence.statusPollSeconds = statusPollSeconds }
+    }
+
     private var pollInterval: Double {
         if quietMode { return 30 }
         if transition != nil { return 1 }
-        if display.isBusy { return 1 }
-        if health != nil { return 3 }
-        return 5
+        // Prompt reading and generation move fast; halve the interval so
+        // progress and tok/s stay readable.
+        if display.isBusy { return max(1, statusPollSeconds / 2) }
+        return statusPollSeconds
     }
 
     private func pollOnce() async {

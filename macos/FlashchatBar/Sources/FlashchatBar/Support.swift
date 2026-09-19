@@ -221,6 +221,7 @@ enum AppPresence {
     private static let dockKey = "showDockIcon"
     private static let menuBarKey = "showMenuBarIcon"
     private static let launchWindowKey = "openWindowAtLaunch"
+    private static let pollKey = "statusPollSeconds"
 
     static var showDockIcon: Bool {
         get { UserDefaults.standard.object(forKey: dockKey) as? Bool ?? false }
@@ -237,6 +238,18 @@ enum AppPresence {
     static var wantsWindowAtLaunch: Bool {
         !showMenuBarIcon || (showDockIcon && openWindowAtLaunch)
     }
+
+    /// Seconds between /health polls while the server is running and idle.
+    /// Busy phases poll twice as often so progress stays live.
+    static var statusPollSeconds: Double {
+        get {
+            let stored = UserDefaults.standard.double(forKey: pollKey)
+            return stored > 0 ? stored : 5
+        }
+        set { UserDefaults.standard.set(newValue, forKey: pollKey) }
+    }
+
+    static let pollChoices: [Double] = [1, 2, 3, 5, 10, 30]
 
     static var openWindowAtLaunch: Bool {
         get { UserDefaults.standard.object(forKey: launchWindowKey) as? Bool ?? true }

@@ -220,6 +220,14 @@ private struct AppSection: View {
                 Text("At least one of the Dock icon and the menu bar icon stays on.")
             }
             Toggle("Show generation speed on the icon", isOn: $model.showSpeedInMenuBar)
+            Picker(selection: $model.statusPollSeconds) {
+                ForEach(AppPresence.pollChoices, id: \.self) { seconds in
+                    Text(seconds < 2 ? "Every second" : "Every \(Int(seconds)) seconds").tag(seconds)
+                }
+            } label: {
+                Text("Check server status")
+                Text("How often Flashchat asks the server how it is doing. It checks twice as often while a prompt is being read or a response generated, and every 30 seconds in quiet mode.")
+            }
             Toggle(isOn: Binding(get: { model.quietMode }, set: { model.setQuietMode($0) })) {
                 Text("Quiet mode")
                 Text("Polls every 30 s and keeps the menu bar icon static, so benchmarks see no GPU or CPU from this app. Scripts can toggle it with the menubar-quiet file in the Flashchat config folder.")
