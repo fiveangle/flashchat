@@ -681,6 +681,68 @@ _flashchat_migrate_config() {
     return 0
 }
 
+# One python call for every registry value flashchat_load_config needs.
+# Reading them one at a time cost ~35 ms of interpreter startup each (15 calls,
+# ~500 ms) on every config load — paid by each TUI menu redraw and by every
+# `flashchat status --json` the menubar app polls.
+_FLASHCHAT_SNAPSHOT_KEY=""
+_FLASHCHAT_SNAPSHOT_VALUE=""
+_flashchat_registry_snapshot() {
+    local model_id="$1"
+    local profile_id="$2"
+    local config_file="$FLASHCHAT_MODEL_CONFIG"
+    [ -f "$config_file" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    local key="$config_file|$model_id|$profile_id"
+    if [ "$key" = "$_FLASHCHAT_SNAPSHOT_KEY" ]; then
+        printf '%s\n' "$_FLASHCHAT_SNAPSHOT_VALUE"
+        return 0
+    fi
+    local out
+    out="$(python3 -c "
+import json, shlex, sys
+
+path, model_id, profile_id, fallback_model = sys.argv[1:5]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+models = data.get('models', {})
+default_model = data.get('default_model') or fallback_model
+known = model_id in models
+model = models.get(model_id, {})
+profiles = model.get('sampling_profiles', {})
+# Fall back to the model's default profile so one call covers the common
+# case where the user config names no profile.
+effective_profile = profile_id or model.get('default_sampling_profile', '')
+profile = profiles.get(effective_profile, {}) if effective_profile else {}
+
+def emit(name, value):
+    print('%s=%s' % (name, shlex.quote('' if value is None else str(value))))
+
+emit('FC_DEFAULT_MODEL', default_model)
+emit('FC_MODEL_KNOWN', '1' if known else '')
+emit('FC_MODEL_REPO', model.get('hf_repo', ''))
+emit('FC_MODEL_DEFAULT_PROFILE', model.get('default_sampling_profile', ''))
+emit('FC_MODEL_MTP_DEFAULT', model.get('mtp_default_predictions', ''))
+emit('FC_SERVER_MTP_DEFAULT', data.get('server_defaults', {}).get('mtp_default_predictions', ''))
+emit('FC_PROFILE_SELECTED', effective_profile)
+emit('FC_PROFILE_KNOWN', '1' if profile else '')
+for field in ('temperature', 'top_p', 'top_k', 'min_p',
+              'presence_penalty', 'repetition_penalty', 'reasoning'):
+    emit('FC_PROFILE_' + field.upper(), profile.get(field, ''))
+mtp = profile.get('mtp_default_predictions', '')
+if mtp == '':
+    mtp = profile.get('mtp', '')
+emit('FC_PROFILE_MTP', mtp)
+" "$config_file" "$model_id" "$profile_id" "$FLASHCHAT_DEFAULT_MODEL" 2>/dev/null)" || return 1
+    _FLASHCHAT_SNAPSHOT_KEY="$key"
+    _FLASHCHAT_SNAPSHOT_VALUE="$out"
+    printf '%s\n' "$out"
+}
+
 flashchat_load_config() {
     mkdir -p "$FLASHCHAT_CONFIG_DIR"
 
@@ -796,12 +858,21 @@ flashchat_load_config() {
     [ -n "$FLASHCHAT_WEIGHTS_DIR" ] && WEIGHTS_DIR="$FLASHCHAT_WEIGHTS_DIR"
     [ -n "$FLASHCHAT_EXPERTS_DIR" ] && EXPERTS_DIR="$FLASHCHAT_EXPERTS_DIR"
     
+    local FC_DEFAULT_MODEL="" FC_MODEL_KNOWN="" FC_MODEL_REPO="" FC_MODEL_DEFAULT_PROFILE=""
+    local FC_MODEL_MTP_DEFAULT="" FC_SERVER_MTP_DEFAULT="" FC_PROFILE_KNOWN="" FC_PROFILE_SELECTED=""
+    local FC_PROFILE_TEMPERATURE="" FC_PROFILE_TOP_P="" FC_PROFILE_TOP_K="" FC_PROFILE_MIN_P=""
+    local FC_PROFILE_PRESENCE_PENALTY="" FC_PROFILE_REPETITION_PENALTY="" FC_PROFILE_REASONING=""
+    local FC_PROFILE_MTP=""
+    local _snapshot
+    _snapshot="$(_flashchat_registry_snapshot "$MODEL" "$SAMPLING_PROFILE")" && eval "$_snapshot"
+
     local default_model
-    default_model=$(flashchat_default_model)
+    default_model="${FC_DEFAULT_MODEL:-$(flashchat_default_model)}"
     if [ -z "$MODEL" ]; then
         MODEL="$default_model"
+        _snapshot="$(_flashchat_registry_snapshot "$MODEL" "$SAMPLING_PROFILE")" && eval "$_snapshot"
     fi
-    if ! flashchat_model_exists "$MODEL"; then
+    if [ -z "$FC_MODEL_KNOWN" ]; then
         if [ -n "$MODEL_REPO" ]; then
             local derived_id="${MODEL_REPO//\//-}"
             derived_id="${derived_id//./}"
@@ -823,32 +894,33 @@ flashchat_load_config() {
             MODEL="$default_model"
         fi
     fi
-    local looked_up_repo
-    looked_up_repo=$(_flashchat_lookup_model_repo "$MODEL")
-    if [ -n "$looked_up_repo" ]; then
-        MODEL_REPO="$looked_up_repo"
+    # MODEL may have changed above; refresh the snapshot before using its values.
+    _snapshot="$(_flashchat_registry_snapshot "$MODEL" "$SAMPLING_PROFILE")" && eval "$_snapshot"
+    if [ -n "$FC_MODEL_REPO" ]; then
+        MODEL_REPO="$FC_MODEL_REPO"
     fi
     local default_profile
-    default_profile=$(flashchat_model_default_sampling_profile "$MODEL")
+    default_profile="$FC_MODEL_DEFAULT_PROFILE"
     SAMPLING_PROFILE="${SAMPLING_PROFILE:-${default_profile:-$FLASHCHAT_DEFAULT_SAMPLING_PROFILE}}"
+    if [ "$SAMPLING_PROFILE" != "$FC_PROFILE_SELECTED" ]; then
+        _snapshot="$(_flashchat_registry_snapshot "$MODEL" "$SAMPLING_PROFILE")" && eval "$_snapshot"
+    fi
     if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ] &&
-       [ -z "$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")" ]; then
+       [ -z "$FC_PROFILE_TEMPERATURE" ]; then
         echo "WARNING: sampling profile '$SAMPLING_PROFILE' is unavailable for '$MODEL'; using '$default_profile'." >&2
         SAMPLING_PROFILE="$default_profile"
+        _snapshot="$(_flashchat_registry_snapshot "$MODEL" "$SAMPLING_PROFILE")" && eval "$_snapshot"
     fi
     if [ -n "$SAMPLING_PROFILE" ] && [ "$SAMPLING_PROFILE" != "custom" ]; then
         local profile_temperature profile_top_p profile_top_k profile_min_p profile_presence_penalty profile_repetition_penalty profile_reasoning profile_mtp
-        profile_temperature=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "temperature")
-        profile_top_p=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_p")
-        profile_top_k=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "top_k")
-        profile_min_p=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "min_p")
-        profile_presence_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "presence_penalty")
-        profile_repetition_penalty=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "repetition_penalty")
-        profile_reasoning=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "reasoning")
-        profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp_default_predictions")
-        if [ -z "$profile_mtp" ]; then
-            profile_mtp=$(flashchat_model_sampling_profile_field "$MODEL" "$SAMPLING_PROFILE" "mtp")
-        fi
+        profile_temperature="$FC_PROFILE_TEMPERATURE"
+        profile_top_p="$FC_PROFILE_TOP_P"
+        profile_top_k="$FC_PROFILE_TOP_K"
+        profile_min_p="$FC_PROFILE_MIN_P"
+        profile_presence_penalty="$FC_PROFILE_PRESENCE_PENALTY"
+        profile_repetition_penalty="$FC_PROFILE_REPETITION_PENALTY"
+        profile_reasoning="$FC_PROFILE_REASONING"
+        profile_mtp="$FC_PROFILE_MTP"
         [ -n "$profile_temperature" ] && TEMPERATURE="$profile_temperature"
         [ -n "$profile_top_p" ] && TOP_P="$profile_top_p"
         [ -n "$profile_top_k" ] && TOP_K="$profile_top_k"
@@ -858,15 +930,11 @@ flashchat_load_config() {
         [ -n "$profile_reasoning" ] && REASONING="$profile_reasoning"
         [ -z "$MTP" ] && [ -n "$profile_mtp" ] && MTP="$profile_mtp"
     fi
-    if [ -z "$MTP" ]; then
-        local server_mtp_default
-        server_mtp_default=$(flashchat_server_mtp_default)
-        [ -n "$server_mtp_default" ] && MTP="$server_mtp_default"
+    if [ -z "$MTP" ] && [ -n "$FC_SERVER_MTP_DEFAULT" ]; then
+        MTP="$FC_SERVER_MTP_DEFAULT"
     fi
-    if [ -z "$MTP" ]; then
-        local model_mtp_default
-        model_mtp_default=$(flashchat_model_mtp_default "$MODEL")
-        [ -n "$model_mtp_default" ] && MTP="$model_mtp_default"
+    if [ -z "$MTP" ] && [ -n "$FC_MODEL_MTP_DEFAULT" ]; then
+        MTP="$FC_MODEL_MTP_DEFAULT"
     fi
     MAX_TOKENS="${MAX_TOKENS:-$FLASHCHAT_DEFAULT_MAX_TOKENS}"
     SERVER_PORT="${SERVER_PORT:-$FLASHCHAT_DEFAULT_SERVER_PORT}"
