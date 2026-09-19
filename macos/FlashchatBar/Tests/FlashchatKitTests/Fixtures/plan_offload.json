@@ -1,0 +1,1 @@
+{"model": "qwen3-next-80b-a3b-instruct", "offload_dir": "", "originals_bytes": 22, "any_ready": true, "held_back": {"q8": "not present locally"}, "errors": ["No offload folder is configured."], "warnings": [], "available": false}

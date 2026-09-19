@@ -98,6 +98,10 @@ modelmgr/           # Model management core (registry, manifests, recipes,
                     # repack, compile_native, materialize)
   tui/              # Onboarding, config wizard, manage flows
 
+macos/FlashchatBar/ # Native menubar app (SwiftUI) — thin client over
+                    # `flashchat status --json` / `serve --non-interactive`
+                    # and `modelmgr api`; see docs/MENUBAR_APP.md
+
 assets/models/      # Per-model manifests; assets/model_configs.json is
                     # GENERATED from them (`make registry`)
 
@@ -214,9 +218,10 @@ reach without exporting `FLASHCHAT_*` by hand is effectively undiscoverable.
 
 The menu's advanced section is the home for these toggles:
 
-- **Menu UI:** `modelmgr/tui/config_wizard.py` → `_advanced_settings()`
-  ("Configure advanced options (debug, MTP, cache)?"). Add a
-  `(KEY, "label", "default")` tuple here.
+- **Menu UI:** `modelmgr/settings.py` → `ADVANCED`. Add a `Setting(...)` entry
+  (key, title, TUI label, help, kind). The TUI wizard's advanced section
+  (`config_wizard._advanced_settings()`) and the menubar app's Settings window
+  both render from it.
 
 A new debug key must be wired through the whole config chain, or it won't reach
 the engine. Use an existing debug flag (e.g. `SERVER_HTTP_LOG`) as the template —

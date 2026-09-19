@@ -1,0 +1,14 @@
+{"event": "progress", "phase": "verify", "current": 0, "total": 0, "message": "shared"}
+{"event": "artifact", "scope": "shared", "relpath": "vocab.bin", "state": "ok", "detail": "", "required": true, "satisfied": true}
+{"event": "artifact", "scope": "shared", "relpath": "bf16/mtp_weights.bin", "state": "ok", "detail": "", "required": false, "satisfied": true}
+{"event": "artifact", "scope": "q4", "relpath": "model_weights.bin", "state": "ok", "detail": "", "required": true, "satisfied": true}
+{"event": "artifact", "scope": "q4", "relpath": "packed_experts/", "state": "ok", "detail": "", "required": true, "satisfied": true}
+{"event": "artifact", "scope": "q4", "relpath": "packed_mtp_experts/", "state": "ok", "detail": "", "required": true, "satisfied": true}
+{"event": "artifact", "scope": "q4", "relpath": "vocab.bin", "state": "ok", "detail": "", "required": true, "satisfied": true}
+{"event": "artifact", "scope": "q4", "relpath": "bf16/", "state": "missing", "detail": "", "required": false, "satisfied": true}
+{"event": "artifact", "scope": "q8", "relpath": "model_weights.bin", "state": "missing", "detail": "", "required": true, "satisfied": false}
+{"event": "artifact", "scope": "q8", "relpath": "packed_experts/", "state": "missing", "detail": "", "required": true, "satisfied": false}
+{"event": "artifact", "scope": "q8", "relpath": "packed_mtp_experts/", "state": "missing", "detail": "", "required": true, "satisfied": false}
+{"event": "artifact", "scope": "q8", "relpath": "vocab.bin", "state": "missing", "detail": "", "required": true, "satisfied": false}
+{"event": "artifact", "scope": "q8", "relpath": "bf16/", "state": "missing", "detail": "", "required": false, "satisfied": true}
+{"event": "done", "ok": true, "message": "All hashed artifacts match.", "corrupt": 0, "unhashed": 0}

@@ -60,3 +60,7 @@ tests/ane_mlp_smoke
 
 metal_infer/conversation_cache_fixture
 metal_infer/request_sampling_fixture
+
+# Menubar app (macos/FlashchatBar)
+macos/FlashchatBar/.build/
+macos/build/

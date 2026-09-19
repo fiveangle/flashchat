@@ -1,0 +1,1 @@
+{"schema":1,"server":{"state":"stopped","pid":null,"port":9999,"host":"localhost","bind":"0.0.0.0","url":"http://localhost:9999/v1","log":"/Users/example/logs/","pid_file":"/Users/example/.config/flashchat/server.pid"},"model":"Qwen-Qwen36-35B-A3B","config_file":"/Users/example/.config/flashchat/config","binaries_current":false}

@@ -10,6 +10,7 @@ Subcommands:
   add-model          create a user manifest from a HuggingFace repo
   resolve            write the engine-facing registry view
   doctor             environment sanity checks
+  api                JSON interface for native front ends (menubar app)
 """
 
 import argparse
@@ -279,6 +280,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("doctor", help="environment sanity checks")
     p.set_defaults(func=cmd_doctor)
+
+    from . import api
+    api.add_parser(sub)
+    sub.choices["api"].set_defaults(func=api.main)
 
     args = parser.parse_args(argv)
     try:

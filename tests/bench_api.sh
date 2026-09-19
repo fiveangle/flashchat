@@ -68,7 +68,19 @@ SYSTEM_NOTES=""
 SYSTEM_CONFOUNDED=0
 SYSTEM_REASONS=()
 
-cleanup() { stop_server; rm -rf "${TMPDIR}"; }
+# Put the menubar app (if running) into quiet mode for the run: 30 s polling and a
+# static status icon. Only remove the flag if this run created it.
+MENUBAR_QUIET_FLAG="${FLASHCHAT_CONFIG_DIR:-${HOME}/.config/flashchat}/menubar-quiet"
+MENUBAR_QUIET_CREATED=0
+if [[ -d "$(dirname "$MENUBAR_QUIET_FLAG")" && ! -e "$MENUBAR_QUIET_FLAG" ]]; then
+    touch "$MENUBAR_QUIET_FLAG" && MENUBAR_QUIET_CREATED=1
+fi
+
+cleanup() {
+    stop_server
+    rm -rf "${TMPDIR}"
+    if [[ "$MENUBAR_QUIET_CREATED" == 1 ]]; then rm -f "$MENUBAR_QUIET_FLAG"; fi
+}
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------

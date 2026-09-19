@@ -177,13 +177,11 @@ def _backfill_hashes(manifest, snapshot, progress=None) -> None:
     print(common.green("hash baselines recorded"))
 
 
-def _rebuild_artifacts(registry, manifest, status, targets, variants) -> None:
-    """Executor: delete the given (scope, rel, spec) artifacts, then (re)build the
-    named variants. The recipe planner sees the holes and heals them plus any
-    dependents. Callers are responsible for the serving guard and confirmation."""
+def delete_artifact_targets(manifest, snapshot: str, targets) -> None:
+    """Delete (scope, rel, spec) artifacts and forget their manifest entries."""
     for scope, rel, spec in targets:
-        root = (paths.shared_dir(status.snapshot) if scope == "shared"
-                else paths.variant_dir(status.snapshot, scope))
+        root = (paths.shared_dir(snapshot) if scope == "shared"
+                else paths.variant_dir(snapshot, scope))
         target_path = os.path.join(root, rel.rstrip("/"))
         if os.path.isdir(target_path) and not os.path.islink(target_path):
             shutil.rmtree(target_path)
@@ -197,6 +195,38 @@ def _rebuild_artifacts(registry, manifest, status, targets, variants) -> None:
                 os.unlink(cpath)
             adir.forget(companion)
         adir.commit()
+
+
+def repair_targets(manifest, snapshot: str, variants) -> tuple:
+    """(create labels, rebuild (scope, rel, spec) targets, rebuild labels) for
+    buildable artifacts that are missing or present-but-broken."""
+    create, rebuild_targets, rebuild_labels = [], [], []
+
+    def _consider(scope, s, spec):
+        if spec is None or not spec.step or s.satisfied:
+            return
+        if s.state == "missing":
+            create.append(_scoped_artifact_label(scope, s.relpath))
+        else:
+            rebuild_targets.append((scope, s.relpath, spec))
+            detail = s.state + (f": {s.detail}" if s.detail else "")
+            rebuild_labels.append(f"{_scoped_artifact_label(scope, s.relpath)} ({detail})")
+
+    for v in variants:
+        var = manifest.variant(v)
+        for s in variant_status(manifest, v, snapshot,
+                                want_optional=True, want_mtp=build.want_mtp()):
+            _consider(v, s, var.artifacts.get(s.relpath))
+    for s in shared_status(manifest, snapshot, want_optional=True):
+        _consider("shared", s, manifest.shared_artifacts.get(s.relpath))
+    return create, rebuild_targets, rebuild_labels
+
+
+def _rebuild_artifacts(registry, manifest, status, targets, variants) -> None:
+    """Executor: delete the given (scope, rel, spec) artifacts, then (re)build the
+    named variants. The recipe planner sees the holes and heals them plus any
+    dependents. Callers are responsible for the serving guard and confirmation."""
+    delete_artifact_targets(manifest, status.snapshot, targets)
     source_snapshot = status.snapshot
     if not recipes.source_blobs_present(manifest, status.snapshot):
         source_snapshot = build._offer_build_source(
@@ -236,27 +266,8 @@ def _build_repair(registry, manifest, status) -> None:
 
     # Partition unsatisfied, buildable artifacts into create (absent) vs rebuild
     # (present-but-broken). Only specs with a build `step` can be (re)generated.
-    create = []                 # display labels for missing artifacts
-    rebuild_targets = []        # (scope, rel, spec) to delete-then-rebuild
-    rebuild_labels = []         # display labels with the failure reason
-
-    def _consider(scope, s, spec):
-        if spec is None or not spec.step or s.satisfied:
-            return
-        if s.state == "missing":
-            create.append(_scoped_artifact_label(scope, s.relpath))
-        else:
-            rebuild_targets.append((scope, s.relpath, spec))
-            detail = s.state + (f": {s.detail}" if s.detail else "")
-            rebuild_labels.append(f"{_scoped_artifact_label(scope, s.relpath)} ({detail})")
-
-    for v in chosen:
-        var = manifest.variant(v)
-        for s in variant_status(manifest, v, status.snapshot,
-                                want_optional=True, want_mtp=build.want_mtp()):
-            _consider(v, s, var.artifacts.get(s.relpath))
-    for s in shared_status(manifest, status.snapshot, want_optional=True):
-        _consider("shared", s, manifest.shared_artifacts.get(s.relpath))
+    create, rebuild_targets, rebuild_labels = repair_targets(
+        manifest, status.snapshot, chosen)
 
     if not create and not rebuild_targets:
         print("nothing buildable is missing or broken for the selected variant(s)")
@@ -372,15 +383,10 @@ def _restore_menu(registry, manifest) -> None:
         progress.finish()
 
 
-def _delete_components(registry, manifest, status) -> None:
-    if not status.snapshot:
-        print(common.yellow("no local components exist for this model — nothing to reclaim"))
-        if status.archive != "none":
-            print(common.dim("archive/offload storage is remote backup state; use restore if you want files local again"))
-        return
-
+def local_components(manifest, snapshot: str) -> list:
+    """Deletable local components: original source blobs and q4/q8 runtimes."""
     components = []
-    originals = offload.list_blob_files(status.snapshot)
+    originals = offload.list_blob_files(snapshot)
     originals_size = sum(os.path.getsize(target) for _rel, target in originals
                          if os.path.isfile(target))
     if originals_size:
@@ -395,7 +401,7 @@ def _delete_components(registry, manifest, status) -> None:
     for v in ("q4", "q8"):
         if v not in manifest.variants:
             continue
-        root = paths.variant_dir(status.snapshot, v)
+        root = paths.variant_dir(snapshot, v)
         if os.path.isdir(root):
             components.append({
                 "kind": "variant",
@@ -405,6 +411,18 @@ def _delete_components(registry, manifest, status) -> None:
                 "size": paths.dir_size_bytes(root),
                 "ids": [resolved_id(manifest, v)],
             })
+
+    return components
+
+
+def _delete_components(registry, manifest, status) -> None:
+    if not status.snapshot:
+        print(common.yellow("no local components exist for this model — nothing to reclaim"))
+        if status.archive != "none":
+            print(common.dim("archive/offload storage is remote backup state; use restore if you want files local again"))
+        return
+
+    components = local_components(manifest, status.snapshot)
 
     if not components:
         print("no local source blobs or q4/q8 runtime artifacts exist")
@@ -431,19 +449,27 @@ def _delete_components(registry, manifest, status) -> None:
             f"deleting {item['label']} ({paths.human_bytes(item['size'])})"):
         return
 
+    removed = delete_component(status.snapshot, item)
     if item["kind"] == "originals":
-        removed = 0
-        for _rel, target in originals:
-            if os.path.isfile(target):
-                removed += os.path.getsize(target)
-                os.unlink(target)
         print(common.green(
             f"deleted original source blobs ({paths.human_bytes(removed)})"))
     else:
-        shutil.rmtree(paths.variant_dir(status.snapshot, item["variant"]))
         print(common.green(f"deleted {item['variant']} runtime artifacts "
-                           f"({paths.human_bytes(item['size'])})"))
+                           f"({paths.human_bytes(removed)})"))
     resolved.write(registry)
+
+
+def delete_component(snapshot: str, item: dict) -> int:
+    """Delete one entry from local_components(); returns bytes removed."""
+    if item["kind"] == "originals":
+        removed = 0
+        for _rel, target in offload.list_blob_files(snapshot):
+            if os.path.isfile(target):
+                removed += os.path.getsize(target)
+                os.unlink(target)
+        return removed
+    shutil.rmtree(paths.variant_dir(snapshot, item["variant"]))
+    return item["size"]
 
 def _delete_local(registry, manifest, status) -> None:
     if not status.snapshot:

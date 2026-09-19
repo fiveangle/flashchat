@@ -12,14 +12,10 @@ import re
 from .. import configfile, paths, resolved
 from ..artifacts import source_mtp_tensors_present, template_supports_thinking
 from ..registry import Registry, resolved_id
+from ..settings import SAMPLING_KEYS as _SAMPLING_KEYS
 from ..status import all_statuses, hf_cache_dir, selected_model
+from .. import settings
 from . import build, common, status_view
-
-_SAMPLING_KEYS = (("temperature", "TEMPERATURE"), ("top_p", "TOP_P"),
-                  ("top_k", "TOP_K"), ("min_p", "MIN_P"),
-                  ("presence_penalty", "PRESENCE_PENALTY"),
-                  ("repetition_penalty", "REPETITION_PENALTY"),
-                  ("reasoning", "REASONING"))
 
 
 def _runtime_max_active_experts() -> int:
@@ -348,19 +344,8 @@ def _kv_quant_setting(manifest, window: int) -> dict:
     """KV cache quantization (off/q8/q4) as a numbered menu. Each option shows
     the wired GPU KV-buffer RAM it needs at the chosen window, computed from the
     model's KV geometry."""
-    a = manifest.architecture
-    n_kv = int(a.get("num_key_value_heads", 0) or 0)
-    head_dim = int(a.get("head_dim", 0) or 0)
-    n_full = int(a.get("num_hidden_layers", 0) or 0) // max(
-        1, int(a.get("full_attention_interval", 1) or 1))
-    kv_dim = n_kv * head_dim
-    have_ram = kv_dim > 0 and n_full > 0
-    # mode, GPU bytes/token across all full-attn layers (K + V [+ fp16 scales]), note
-    modes = [
-        ("off", 2 * kv_dim * 4,              "fp32, lossless"),
-        ("q8",  2 * kv_dim + 2 * (n_kv * 2), "~lossless, best for large windows"),
-        ("q4",  2 * (kv_dim // 2) + 2 * (n_kv * 2), "lossy, smallest"),
-    ]
+    have_ram = settings.kv_cache_bytes(manifest, 1, "off") > 0
+    modes = settings.KV_MODES
     names = [m[0] for m in modes]
     current = (configfile.get("KV_QUANT", "off" if configfile.exists() else configfile.shipping_defaults()["KV_QUANT"]) or "off").lower()
     default_idx = names.index(current) + 1 if current in names else 1
@@ -368,8 +353,8 @@ def _kv_quant_setting(manifest, window: int) -> dict:
     common.heading("KV cache quantization")
     if have_ram:
         print(f"GPU KV-buffer RAM at {window:,}-token window:\n")
-    for i, (name, per_tok, note) in enumerate(modes, 1):
-        ram = f"{_fmt_bytes(per_tok * n_full * window):>9}" if have_ram else ""
+    for i, (name, note) in enumerate(modes, 1):
+        ram = f"{_fmt_bytes(settings.kv_cache_bytes(manifest, window, name)):>9}" if have_ram else ""
         mark = common.dim(" (current)") if name == current else ""
         print(f"  {i}) {name:<3} {ram}   {note}{mark}")
 
@@ -380,24 +365,17 @@ def _kv_quant_setting(manifest, window: int) -> dict:
 
 def _server_settings() -> dict:
     common.heading("Server")
-    return {
-        "SERVER_PORT": common.prompt("Port", configfile.get("SERVER_PORT")),
-        "SERVER_HOST": common.prompt("Host clients connect to", configfile.get("SERVER_HOST")),
-        "SERVER_BIND": common.prompt("Listen on IPv4 address (0.0.0.0 = all interfaces)",
-                                     configfile.get("SERVER_BIND")),
-        "SERVER_LOG_PATH": common.prompt(
-            "Log path", configfile.get("SERVER_LOG_PATH")),
-    }
+    return {s.key: common.prompt(s.label, configfile.get(s.key)) for s in settings.SERVER}
 
 
 def _storage_settings() -> dict:
     common.heading("Storage")
     out = {
         "HUGGINGFACE_CACHE_DIR": common.prompt(
-            "HuggingFace cache dir",
+            settings.BY_KEY["HUGGINGFACE_CACHE_DIR"].label,
             configfile.get("HUGGINGFACE_CACHE_DIR")),
     }
-    od = common.prompt("Offload dir for archived models ('-' to disable)",
+    od = common.prompt(settings.BY_KEY["OFFLOAD_DIR"].label,
                        configfile.get("OFFLOAD_DIR"))
     out["OFFLOAD_DIR"] = "" if od == "-" else od
     if out["OFFLOAD_DIR"]:
@@ -489,52 +467,8 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
     # label carries the value space; help exists only where the label alone
     # cannot explain the consequence. No headers, no blank lines — the section
     # reads as a serial choice log.
-    for key, label, help_text in (
-            ("IO_THREADS", "Parallel expert disk readers (1-16)", None),
-            ("GPU_ROPE", "GPU rotary position encoding (0/1)", None),
-            ("FUSED_ATTN", "Fused attention for fp32 context cache (0/1)",
-             "Quantized context caches use their own attention path."),
-            ("PREFILL_RELEASE", "Release temporary prompt-processing memory (0/1)", None),
-            ("SERVER_DEBUG", "Server debug logging to server.log (0/1)", None),
-            ("SERVER_HTTP_LOG", "HTTP request/response log to http.log (0/1)", None),
-            ("BATCH_PREFILL", "Batched prompt processing (0/1)",
-             "~4-6x faster prompt reading; responses unchanged in normal use."),
-            ("PREFILL_CHUNK", "  ^ chunk size in tokens (8-4096)",
-             "Bigger = faster but more working RAM: 1024 ~170 MB, 2048 ~340 MB."),
-            ("ANE_PREFILL", "  ^ Neural Engine expert offload (0/1)",
-             "Faster prompt reading on long prompts; auto-falls back to GPU if the hardware lacks a Neural Engine."),
-            ("ANE_MIN_CHUNK", "  ^ GPU below this prompt length in tokens (0=always Neural Engine)",
-             "Short prompts run the exact GPU path (measured faster AND bit-faithful); long prompts keep the Neural Engine overlap."),
-            ("FUSE_LINEAR", "Fused GPU scheduling for linear-attention layers (0/1)",
-             "~12% faster generation with byte-identical outputs; disable only for A/B comparisons."),
-            ("ADAPTIVE_K_MASS", "Adaptive expert count by routing mass (off, or 0.85-0.99)",
-             "Skips tail experts below this probability mass: ~0.90 reads ~13% fewer expert bytes; outputs can differ slightly."),
-            ("PREFILL_DEBUG", "  ^ debug (0=off, 1=chunk timings, 2=+state dump, slow)", None),
-            ("PREAD_PROFILE", "Disk-read timing log (off, or a .tsv path)",
-             "For diagnosing slow expert streaming; analyze with tools/pread_profile_analyze.py."),
-            ("PREAD_PROFILE_CAP", "  ^ max recorded events before it stops", None),
-            ("EXPERT_PIN_MAX_EXPERTS", "Expert RAM cache target in complete experts (auto=use GiB cap)",
-             None),
-            ("EXPERT_PIN_MAX_GB", "  ^ maximum GiB cache limit (0 disables cache)",
-             None),
-            ("EXPERT_PIN_AUTO_FRAC", "  ^ also capped to this fraction of free RAM (0.1-0.9)", None),
-            ("EXPERT_PIN_MLOCK", "  ^ lock pin cache against swap (0/1)",
-             "Faster hits under memory pressure; skipped automatically if free RAM is too low."),
-            ("LM_HEAD_MLOCK", "Lock vocabulary head in RAM (0/1)",
-             "~0.3 GB on q4 35B; keeps generation from re-faulting the big final projection. Skipped if free RAM is too low."),
-            ("EXPERT_SPLIT_IO", "Overlap expert disk reads with GPU (0/1)",
-             "Starts GPU on gate+up while the down half still streams from SSD; byte-identical outputs."),
-            ("CONVERSATION_CACHE", "Reuse unchanged conversation turns (0/1)",
-             "Keeps one active conversation in memory; falls back safely when input changes."),
-            ("SYSTEM_PROMPT_CACHE", "System prompt cache (0/1)",
-             "Repeat requests skip re-reading the system prompt — big win for long agent prompts."),
-            ("SYSTEM_PROMPT_CACHE_MAX_ENTRIES", "  ^ max saved prompts (1-64; entries can be tens of MB)", None),
-            ("SYSTEM_PROMPT_CACHE_DIR", "  ^ cache folder ('-' = beside the model)", None),
-            ("MTP", "Multi-token prediction (0=off, auto=model default, 2+=batch size)",
-             "Lossless speculative decoding for models that ship a predictor head."),
-            ("MTP_BF16", "  ^ BF16 predictor weights (0/1; more RAM, slightly better drafts)", None),
-            ("SHOW_THINKING", "Show thinking tokens (0/1)", None),
-            ("COLOR_OUTPUT", "Color output (0/1)", None)):
+    for setting in settings.ADVANCED:
+        key, label, help_text = setting.key, setting.label, setting.help
         if help_text:
             print(common.dim(f"  {help_text}"))
         if key == "EXPERT_PIN_MAX_EXPERTS":
@@ -557,16 +491,7 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
     return out
 
 
-def _mtp_value_enables(raw: str) -> bool:
-    """Mirror the engine's parse_mtp_predictions truthiness: 0/off/no/false and
-    empty (registry default) do not actively request MTP; auto/on/yes and any
-    positive integer do."""
-    s = (raw or "").strip().lower()
-    if s in ("", "0", "off", "no", "false"):
-        return False
-    if s in ("auto", "on", "yes", "true"):
-        return True
-    return s.isdigit() and int(s) > 0
+_mtp_value_enables = settings.mtp_value_enables
 
 
 def _warn_if_mtp_unsupported(manifest, mtp_raw: str, out: dict) -> None:

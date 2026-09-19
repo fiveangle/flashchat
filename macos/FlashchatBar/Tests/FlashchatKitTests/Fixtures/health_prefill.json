@@ -1,0 +1,1 @@
+{"status":"ok","ready":true,"model":"Qwen-Qwen36-35B-A3B","context_used":1200,"max_context":65536,"kv_quantization":"q8","kv_total_bytes":676331520,"phase":"prefill","cached_tokens":0,"prompt_tokens":4000,"prefill_done":1000,"generated_tokens":0,"chunk":1,"chunks":4,"layer":12,"layers":40}

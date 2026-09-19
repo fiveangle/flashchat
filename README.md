@@ -35,6 +35,10 @@ cd flashchat
 
 …and follow the prompts to set up and run.
 
+Prefer a native app? `make menubar-run` builds and launches the Flashchat
+menubar app. It shows server status in the menu bar and has native windows for
+models, settings, and logs. See [the menubar app](docs/MENUBAR_APP.md).
+
 New installations default to Qwen3.6-35B-A3B q4 weights, a q8 context cache,
 and a 64K context window. The API listens on localhost by default; remote access
 requires an explicit listen address in configuration. Existing context-cache
@@ -43,6 +47,7 @@ choices are preserved. See [server configuration](docs/SERVER.md).
 ## Features
 I've extended the original project from a research project to usable system including:
 * TUI driven setup wizard
+* Native macOS menubar app for server control, model management, and settings ([docs](docs/MENUBAR_APP.md))
 * Menu-driven configuration system
 * OpenAI-compatible v1 API endpoints with true tool calling support:
 

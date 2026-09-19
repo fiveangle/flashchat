@@ -196,6 +196,9 @@ help:
 	@printf "  make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test\n"
 	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
 	@printf "  make py-tests  Run modelmgr unit tests\n"
+	@printf "  make menubar   Build the menubar app (macos/build/Flashchat.app)\n"
+	@printf "  make menubar-run   Build and launch the menubar app\n"
+	@printf "  make menubar-test  Run the menubar app's Swift unit tests\n"
 	@printf "  make registry-check  Verify assets/model_configs.json matches the manifests\n"
 	@printf "  make api-smoke     Run HTTP API smoke test\n"
 	@printf "  make test          Run all functional smoke tests\n"
@@ -348,6 +351,16 @@ registry-check:
 	@python3 -m modelmgr resolve --all -q -o /tmp/flashchat_registry_check.json && \
 	python3 -c "import json,sys; a=json.load(open('assets/model_configs.json')); b=json.load(open('/tmp/flashchat_registry_check.json')); sys.exit(0 if a==b else ('assets/model_configs.json is out of sync with assets/models/*.json -- run: make registry', 1)[1])" && \
 	echo "registry in sync"
+
+.PHONY: menubar menubar-run menubar-test
+menubar:
+	bash macos/build-app.sh
+
+menubar-run: menubar
+	open macos/build/Flashchat.app
+
+menubar-test:
+	swift test --package-path macos/FlashchatBar
 
 py-tests:
 	@FLASHCHAT_CONFIG_DIR="$$(mktemp -d /tmp/flashchat-py-tests.XXXXXX)" \

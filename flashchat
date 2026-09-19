@@ -369,6 +369,7 @@ Commands:
   serve --stop      Stop running API server
   serve --stop --external  Stop external Flashchat server on configured port
   serve --stop --force  Force-stop running API server
+  serve --non-interactive  Start without prompts; fail instead of asking (for apps)
   prompt "..."      Run single prompt and exit
   benchmark         Run benchmarks (run, verify, bench, moe, moebench, full, fullbench)
   config            Edit configuration settings (model, variant, sampling, storage)
@@ -380,6 +381,7 @@ Commands:
   verify            Verify artifacts for a model (--deep for full hashes)
   doctor            Environment sanity checks
   status            Show system status
+  status --json     Server state as JSON (for apps)
   sessions          List chat sessions
   help              Show this help
 
@@ -507,7 +509,49 @@ flashchat_server_connect_host() {
 # -----------------------------------------------------------------------------
 # Command: status
 # -----------------------------------------------------------------------------
+json_string() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+# Machine-readable server state for native front ends (the menubar app).
+# state: running | stale (running, restart needed) | external | stopped
+cmd_status_json() {
+    flashchat_load_config
+    local port host bind state="stopped" pid="null" pid_file binaries=false
+    port="$(flashchat_get SERVER_PORT)"
+    [[ "$port" =~ ^[0-9]+$ ]] || port=0
+    host="$(flashchat_server_connect_host)"
+    bind="$(flashchat_get SERVER_BIND)"
+    pid_file="$(flashchat_get_pid_file)"
+    if is_server_running; then
+        pid="$(cat "$pid_file")"
+        if server_signature_matches_config "$port"; then
+            state="running"
+        else
+            state="stale"
+        fi
+    elif [ "$port" -gt 0 ] && is_port_listening "$port"; then
+        state="external"
+        pid="$(get_port_listener_pid "$port")"
+    fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || pid="null"
+    check_binaries_current && binaries=true
+    printf '{"schema":1,"server":{"state":"%s","pid":%s,"port":%s,"host":%s,"bind":%s,"url":%s,"log":%s,"pid_file":%s},"model":%s,"config_file":%s,"binaries_current":%s}\n' \
+        "$state" "$pid" "$port" "$(json_string "$host")" "$(json_string "$bind")" \
+        "$(json_string "http://${host}:${port}/v1")" \
+        "$(json_string "$(flashchat_get SERVER_LOG_PATH)")" "$(json_string "$pid_file")" \
+        "$(json_string "$(flashchat_get MODEL)")" "$(json_string "$(flashchat_get CONFIG_FILE)")" \
+        "$binaries"
+}
+
 cmd_status() {
+    if [ "${1:-}" = "--json" ]; then
+        cmd_status_json
+        return
+    fi
     flashchat_load_config
     
     echo "=== Flashchat Show Status ==="
@@ -1234,6 +1278,7 @@ cmd_serve() {
     local stop=0
     local force=0
     local external=0
+    local non_interactive=0
     local port=""
     
     while [[ $# -gt 0 ]]; do
@@ -1253,6 +1298,10 @@ cmd_serve() {
                 ;;
             --force)
                 force=1
+                shift
+                ;;
+            --non-interactive)
+                non_interactive=1
                 shift
                 ;;
             -p|--port)
@@ -1321,7 +1370,13 @@ cmd_serve() {
     flashchat_load_config
     
     # Verify the model is ready (download/extract/repair via Python core)
-    if ! ensure_model_ready; then
+    if [ "$non_interactive" -eq 1 ]; then
+        ensure_venv || return 1
+        if ! run_python -m modelmgr ensure --non-interactive; then
+            echo "Model not ready — server not started. Prepare it from Models first."
+            return 1
+        fi
+    elif ! ensure_model_ready; then
         echo "Model not ready — server not started."
         return 1
     fi
@@ -1358,6 +1413,10 @@ cmd_serve() {
     # Check if port is available (may be used by another process)
     if is_port_listening "$server_port"; then
         echo "Port $server_port is in use by another process."
+        if [ "$non_interactive" -eq 1 ]; then
+            echo "Stop that process or choose another port in Settings."
+            return 1
+        fi
         local suggested
         suggested=$(find_available_port $((server_port + 1)))
         echo "Suggested available port: $suggested"
