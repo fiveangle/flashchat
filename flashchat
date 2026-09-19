@@ -549,12 +549,16 @@ cmd_status_json() {
     fi
     [[ "$pid" =~ ^[0-9]+$ ]] || pid="null"
     check_binaries_current && binaries=true
-    printf '{"schema":1,"server":{"state":"%s","pid":%s,"port":%s,"host":%s,"bind":%s,"url":%s,"log":%s,"pid_file":%s},"model":%s,"config_file":%s,"binaries_current":%s}\n' \
+    local watch="" file
+    while IFS= read -r file; do
+        watch="${watch:+$watch,}$(json_string "$file")"
+    done < <(server_signature_watch_files)
+    printf '{"schema":1,"server":{"state":"%s","pid":%s,"port":%s,"host":%s,"bind":%s,"url":%s,"log":%s,"pid_file":%s},"model":%s,"config_file":%s,"binaries_current":%s,"watch":[%s]}\n' \
         "$state" "$pid" "$port" "$(json_string "$host")" "$(json_string "$bind")" \
         "$(json_string "http://${host}:${port}/v1")" \
         "$(json_string "$(flashchat_get SERVER_LOG_PATH)")" "$(json_string "$pid_file")" \
         "$(json_string "$(flashchat_get MODEL)")" "$(json_string "$(flashchat_get CONFIG_FILE)")" \
-        "$binaries"
+        "$binaries" "$watch"
 }
 
 cmd_status() {
@@ -1059,28 +1063,51 @@ file_signature_part() {
     fi
 }
 
+# Files whose contents feed the runtime signature, as "LABEL PATH" lines.
+# Config inputs come first in the signature, engine inputs last; both lists are
+# also published by `status --json` so watchers stay in sync with this code.
+_signature_config_inputs() {
+    printf '%s %s\n' MODEL_CONFIG "$(flashchat_get MODEL_CONFIG)"
+    # Hash the whole user config file: the engine reads it directly, so ANY edit
+    # to it must invalidate the running server. This makes the signature robust to
+    # new settings without having to enumerate every key below.
+    printf '%s %s\n' CONFIG_FILE "$(flashchat_get CONFIG_FILE)"
+}
+
+_signature_engine_inputs() {
+    printf '%s %s\n' INFER_BIN "$SCRIPT_DIR/metal_infer/infer" \
+        INFER_SRC "$SCRIPT_DIR/metal_infer/infer.m" \
+        HTTP_SRC "$SCRIPT_DIR/metal_infer/server_http.h" \
+        MODEL_CONFIG_SRC "$SCRIPT_DIR/metal_infer/model_config.h" \
+        SHADERS_SRC "$SCRIPT_DIR/metal_infer/shaders.metal"
+}
+
+# Everything a watcher must stat to notice a possible signature change: the
+# hashed files, plus lib/config.sh, where the FLASHCHAT_DEFAULT_* values live.
+server_signature_watch_files() {
+    { _signature_config_inputs; _signature_engine_inputs; } | cut -d' ' -f2-
+    printf '%s\n' "$SCRIPT_DIR/lib/config.sh"
+}
+
 server_runtime_signature() {
     local effective_port="${1:-$(flashchat_get SERVER_PORT)}"
+    local label path
     {
         echo "MODEL=$(flashchat_get MODEL)"
         echo "MODEL_REPO=$(flashchat_get MODEL_REPO)"
         echo "MODEL_PATH=$(flashchat_get MODEL_PATH)"
-        echo "MODEL_CONFIG=$(file_signature_part "$(flashchat_get MODEL_CONFIG)")"
-        # Hash the whole user config file: the engine reads it directly, so ANY edit
-        # to it must invalidate the running server. This makes the signature robust to
-        # new settings without having to enumerate every key below.
-        echo "CONFIG_FILE=$(file_signature_part "$(flashchat_get CONFIG_FILE)")"
+        while read -r label path; do
+            echo "$label=$(file_signature_part "$path")"
+        done < <(_signature_config_inputs)
         echo "SERVER_PORT=$effective_port"
         local default_key key
         for default_key in ${!FLASHCHAT_DEFAULT_@}; do
             key="${default_key#FLASHCHAT_DEFAULT_}"
             printf '%s=%s\n' "$key" "$(flashchat_get "$key")"
         done
-        echo "INFER_BIN=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer")"
-        echo "INFER_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/infer.m")"
-        echo "HTTP_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/server_http.h")"
-        echo "MODEL_CONFIG_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/model_config.h")"
-        echo "SHADERS_SRC=$(file_signature_part "$SCRIPT_DIR/metal_infer/shaders.metal")"
+        while read -r label path; do
+            echo "$label=$(file_signature_part "$path")"
+        done < <(_signature_engine_inputs)
     } | cksum | awk '{print $1 ":" $2}'
 }
 

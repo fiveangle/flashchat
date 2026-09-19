@@ -262,21 +262,13 @@ final class AppModel {
         return statusPollSeconds
     }
 
-    /// Files whose contents decide the launcher's "restart needed" signature.
-    /// Watching their timestamps costs microseconds, so `status --json` only
-    /// runs when something actually changed.
+    /// The launcher publishes exactly which files feed its "restart needed"
+    /// signature; watching their timestamps costs microseconds, so
+    /// `status --json` only runs when one of them changed. The pid file covers
+    /// the server being started or stopped from a terminal.
     private func watchedFiles() -> [String] {
-        var paths: [String] = []
-        if let state = apiState {
-            paths.append(state.configFile)
-            if let registry = state.config["MODEL_CONFIG"], !registry.isEmpty { paths.append(registry) }
-        }
-        if let status = launcherStatus { paths.append(status.server.pidFile) }
-        if let root = env?.repoRoot.path {
-            paths.append(root + "/metal_infer/infer")
-            paths.append(root + "/metal_infer/infer.m")
-        }
-        return paths
+        guard let status = launcherStatus else { return [] }
+        return (status.watch ?? [status.configFile]) + [status.server.pidFile]
     }
 
     private func watchedFilesChanged() -> Bool {

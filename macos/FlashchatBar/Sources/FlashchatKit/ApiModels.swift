@@ -443,9 +443,12 @@ public struct LauncherStatus: Decodable, Sendable, Equatable {
     public var model: String
     public var configFile: String
     public var binariesCurrent: Bool
+    /// Files that feed the launcher's restart-needed signature. Watching their
+    /// timestamps tells a client when `status --json` is worth re-running.
+    public var watch: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case schema, server, model
+        case schema, server, model, watch
         case configFile = "config_file"
         case binariesCurrent = "binaries_current"
     }
