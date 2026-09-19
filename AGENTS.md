@@ -4,8 +4,15 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
 
 ## Working Rules: Benchmarks and Git
 
-- **Check the branch before making changes.** If on `main`, alert Dave and ask
-  permission to switch to `develop` or a dedicated task branch before editing.
+- **Check the branch before making changes.** If on `main`, `develop`, or another
+  shared integration/release branch, create and switch to a dedicated task branch
+  before editing. Do not use `develop` as a task branch. Branch creation is
+  authorized by this rule; no separate permission is needed. Name branches by
+  work type: `fix/<task>` for fixes, `feat/<task>` for features,
+  `refactor/<task>` for refactoring, `doc/<task>` for documentation, and
+  `exp/<count>-<experiment-name>` for experiments/explorations. Use a concise,
+  lowercase, hyphen-separated task name. These prefixes replace the default
+  `codex/` prefix. Reuse an existing task branch only for that same task.
 - **Run the standard watchdog; do not duplicate it.** Any change to `infer.m`
   requires `make bench-api` followed by `make bench-report`, even when the change
   appears unrelated to the hot path. The same applies to decode/prefill, kernel,
