@@ -82,6 +82,11 @@ final class WindowRouter {
     var buildRequest: BuildRequest?
     var showingOperation = false
     var openMainWindow: (() -> Void)?
+    /// True once a window is open on purpose. Now that the app is a regular
+    /// app type, SwiftUI opens the Window scene at launch on its own; in
+    /// menu-bar-only mode that window is unwanted and closes itself.
+    var windowWanted = AppPresence.wantsWindowAtLaunch
+    private var launchWindowSettled = false
 
     struct BuildRequest: Identifiable, Equatable {
         let id = UUID()
@@ -91,6 +96,7 @@ final class WindowRouter {
     }
 
     func open(_ section: MainSection, model: String? = nil, buildVariant: String? = nil) {
+        windowWanted = true
         self.section = section
         if let model { selectedModel = model }
         if let model, let buildVariant {
@@ -104,7 +110,47 @@ final class WindowRouter {
         bringForward()
     }
 
+    /// SwiftUI opens the Window scene at launch by itself (the app is a
+    /// regular app type) and sizes it from its content, ignoring defaultSize.
+    /// Menu-bar-only mode closes that window; otherwise it gets a sane first
+    /// size. Both are AppKit calls because the SwiftUI equivalents are
+    /// unreliable here.
+    func settleLaunchWindow() {
+        guard !launchWindowSettled else { return }
+        launchWindowSettled = true
+        // macOS 14 has no way to suppress SwiftUI's launch window, and the
+        // window is not in NSApp.windows immediately, so retry briefly.
+        closeUnwantedWindow(attempt: 0)
+        DispatchQueue.main.async { [self] in
+            guard windowWanted, let window = mainWindow() else { return }
+            if UserDefaults.standard.object(forKey: "NSWindow Frame main") == nil,
+               let screen = window.screen ?? NSScreen.main {
+                let size = NSSize(width: min(1000, screen.visibleFrame.width - 80),
+                                  height: min(740, screen.visibleFrame.height - 80))
+                window.setContentSize(size)
+                window.center()
+            }
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    private func closeUnwantedWindow(attempt: Int) {
+        guard !windowWanted, attempt < 10 else { return }
+        if let window = mainWindow() {
+            window.close()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [self] in
+            closeUnwantedWindow(attempt: attempt + 1)
+        }
+    }
+
+    private func mainWindow() -> NSWindow? {
+        NSApp.windows.first { $0.canBecomeMain && $0.contentView != nil && $0.frame.width > 400 }
+    }
+
     func bringForward() {
+        windowWanted = true
         if let openMainWindow {
             openMainWindow()
         } else {
@@ -114,6 +160,11 @@ final class WindowRouter {
             openViaWindowMenu()
         }
         NSApp.activate(ignoringOtherApps: true)
+        // Opening a window makes SwiftUI promote an accessory app to a Dock
+        // app; menu-bar-only mode should stay out of the Dock.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            AppPresence.applyActivationPolicy()
+        }
     }
 
     private func openViaWindowMenu() {
@@ -181,6 +232,12 @@ enum AppPresence {
         set { UserDefaults.standard.set(newValue, forKey: menuBarKey) }
     }
 
+    /// Menu-bar-only mode keeps quiet at launch; a Dock app opens its window
+    /// unless the user turned that off; with no menu bar icon it must open.
+    static var wantsWindowAtLaunch: Bool {
+        !showMenuBarIcon || (showDockIcon && openWindowAtLaunch)
+    }
+
     static var openWindowAtLaunch: Bool {
         get { UserDefaults.standard.object(forKey: launchWindowKey) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: launchWindowKey) }
@@ -201,4 +258,6 @@ enum AppPresence {
         }
     }
 }
+
+
 

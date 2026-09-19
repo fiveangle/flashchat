@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // icon it is the only way in. macOS gives no reliable way to tell a
         // login-item launch from a user launch, so this is a preference
         // instead of a guess.
-        if !AppPresence.showMenuBarIcon || (AppPresence.showDockIcon && AppPresence.openWindowAtLaunch) {
+        if AppPresence.wantsWindowAtLaunch {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 MainActor.assumeIsolated { WindowRouter.shared.bringForward() }
             }
@@ -26,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             MainActor.assumeIsolated { WindowRouter.shared.open(section) }
         }
+    }
+
+    /// Flashchat keeps running with no window: the menu bar icon (or the Dock
+    /// icon) is the way back in, and the server does not depend on the window.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     /// Launching the app again (Finder, Spotlight) while it runs opens the window.
@@ -52,14 +58,18 @@ struct FlashchatBarApp: App {
         }
         .menuBarExtraStyle(.window)
 
+        // SwiftUI opens this window at launch on its own; WindowRouter closes
+        // it again when menu-bar-only mode did not want one.
         Window("Flashchat", id: "main") {
             MainWindow()
                 .environment(model)
                 .environment(router)
-                .frame(minWidth: 820, minHeight: 540)
+                // Min height keeps the model actions above the fold; SwiftUI
+                // sizes this window from its content and ignores defaultSize.
+                .frame(minWidth: 860, idealWidth: 1000, minHeight: 700, idealHeight: 720)
         }
         .windowResizability(.contentMinSize)
-        .defaultSize(width: 960, height: 640)
+        .defaultSize(width: 1000, height: 740)
         .commands { AppCommands(model: model, router: router) }
     }
 }

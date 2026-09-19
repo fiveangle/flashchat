@@ -55,11 +55,26 @@ struct SettingsView: View {
                 ForEach(Self.sections, id: \.id) { section in
                     let defs = visibleSettings(state, section: section.id)
                     if section.id == "advanced" {
+                        // A plain header button, not DisclosureGroup: inside a
+                        // grouped Form the disclosure never expanded.
                         Section {
-                            DisclosureGroup("Advanced options (performance, debugging, caches)",
-                                            isExpanded: $showAdvanced) {
+                            if showAdvanced {
                                 ForEach(defs) { def in row(def, state: state) }
                             }
+                        } header: {
+                            Button {
+                                withAnimation { showAdvanced.toggle() }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "chevron.right")
+                                        .rotationEffect(.degrees(showAdvanced ? 90 : 0))
+                                        .font(.caption.weight(.semibold))
+                                    Text("Advanced options (performance, debugging, caches)")
+                                    Spacer()
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
                         }
                     } else if !defs.isEmpty {
                         Section(section.title) {

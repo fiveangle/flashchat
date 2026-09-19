@@ -369,6 +369,12 @@ struct BuildSheet: View {
                     }
                 }
                 .pickerStyle(.radioGroup)
+                if let detail = plan.sources.first(where: { $0.id == source })?.detail {
+                    Text(detail)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if source.hasPrefix("download") {
                     Text("Downloads the original model from HuggingFace. This can be tens of gigabytes.")
                         .font(.caption).foregroundStyle(.secondary)

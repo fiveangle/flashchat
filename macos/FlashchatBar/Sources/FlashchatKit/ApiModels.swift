@@ -226,6 +226,8 @@ public struct RestoreInfo: Decodable, Sendable, Hashable {
 public struct BuildSource: Decodable, Sendable, Identifiable, Hashable {
     public var id: String
     public var title: String
+    /// Where the files come from or land; shown under the picker, not in the row.
+    public var detail: String?
     public var restore: RestoreInfo?
 }
 

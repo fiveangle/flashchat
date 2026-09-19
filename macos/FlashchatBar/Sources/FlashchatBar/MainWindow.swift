@@ -32,8 +32,8 @@ struct MainWindow: View {
             }
         }
         .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
             WindowRouter.shared.openMainWindow = { openWindow(id: "main") }
+            WindowRouter.shared.settleLaunchWindow()
         }
     }
 }
@@ -271,6 +271,9 @@ struct LogsView: View {
                     Group {
                         if source == 0 {
                             Text(serverLog.isEmpty ? "No server log yet." : serverLog)
+                        } else if model.activity.isEmpty {
+                            Text("Nothing yet. Actions you take in Flashchat are logged here.")
+                                .foregroundStyle(.secondary)
                         } else {
                             Text(model.activity.map { entry in
                                 "\(entry.date.formatted(date: .omitted, time: .standard))  \(entry.isError ? "⚠︎ " : "")\(entry.text)"

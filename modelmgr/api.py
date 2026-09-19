@@ -473,30 +473,31 @@ def plan_build(model_id: str, variant_name: str, repair: bool = False) -> dict:
                                          want_optional=optional, want_mtp=want_mtp))
     sources = []
     if local and recipes.source_blobs_present(manifest, local):
-        sources.append({"id": "local", "title": "Original files on this Mac"})
+        sources.append({"id": "local", "title": "Original files already on this Mac",
+                        "detail": local})
     runtime_restore = None
     if od:
         archive = offload.archive_state(manifest, od)
         osnap = paths.snapshot_dir(od, manifest.hf_repo)
         if osnap and recipes.source_blobs_present(manifest, osnap):
-            sources.append({"id": "offload",
-                            "title": f"Original files in offload storage ({od})"})
+            sources.append({"id": "offload", "title": "Original files in offload storage",
+                            "detail": od})
         if archive in ("originals", "full") and not (
                 local and recipes.source_blobs_present(manifest, local)):
             rp = offload.plan_restore(manifest, cache, od, "originals")
             if rp.files:
                 sources.append({"id": "restore-originals",
-                                "title": "Restore original files from offload storage first",
-                                "restore": _restore_json(rp)})
+                                "title": "Restore the original files from offload storage first",
+                                "detail": od, "restore": _restore_json(rp)})
         if not ready and osnap and variant_ready(manifest, variant_name, osnap,
                                                  want_optional=optional, want_mtp=want_mtp):
             rp = offload.plan_restore(manifest, cache, od, "runtime", variant_name)
             runtime_restore = _restore_json(rp)
-    sources.append({"id": "download-local",
-                    "title": f"Download from HuggingFace to {cache}"})
+    sources.append({"id": "download-local", "title": "Download from HuggingFace to this Mac",
+                    "detail": cache})
     if od:
         sources.append({"id": "download-offload",
-                        "title": f"Download from HuggingFace to offload storage ({od})"})
+                        "title": "Download from HuggingFace to offload storage", "detail": od})
 
     target = local or os.path.join(paths.repo_root_dir(cache, manifest.hf_repo),
                                    "snapshots", "pending")
