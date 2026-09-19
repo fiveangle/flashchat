@@ -102,6 +102,7 @@ final class AppModel {
     private var meter = ThroughputMeter()
     private var pollTask: Task<Void, Never>?
     private var lastStatusRefresh = Date.distantPast
+    private var fileStamps: [String: Date] = [:]
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 2
@@ -261,6 +262,34 @@ final class AppModel {
         return statusPollSeconds
     }
 
+    /// Files whose contents decide the launcher's "restart needed" signature.
+    /// Watching their timestamps costs microseconds, so `status --json` only
+    /// runs when something actually changed.
+    private func watchedFiles() -> [String] {
+        var paths: [String] = []
+        if let state = apiState {
+            paths.append(state.configFile)
+            if let registry = state.config["MODEL_CONFIG"], !registry.isEmpty { paths.append(registry) }
+        }
+        if let status = launcherStatus { paths.append(status.server.pidFile) }
+        if let root = env?.repoRoot.path {
+            paths.append(root + "/metal_infer/infer")
+            paths.append(root + "/metal_infer/infer.m")
+        }
+        return paths
+    }
+
+    private func watchedFilesChanged() -> Bool {
+        var stamps: [String: Date] = [:]
+        for path in watchedFiles() {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            stamps[path] = (attributes?[.modificationDate] as? Date) ?? .distantPast
+        }
+        defer { fileStamps = stamps }
+        guard !fileStamps.isEmpty else { return false }
+        return stamps != fileStamps
+    }
+
     private func pollOnce() async {
         updateQuietMode()
         // Assign only on change: @Observable notifies (and SwiftUI redraws)
@@ -272,14 +301,23 @@ final class AppModel {
         if fresh != health { health = fresh }
         meter.record(health: health, at: Date().timeIntervalSinceReferenceDate)
         updateDockBadge()
-        // `status --json` is expensive (~0.65 CPU-seconds: bash, a cksum of the
-        // engine binary and sources for the restart-needed signature, lsof), so
-        // poll it rarely. /health already covers moment-to-moment state, and
-        // actions refresh it directly.
-        let statusAge = Date().timeIntervalSince(lastStatusRefresh)
-        if hadHealth != (health != nil) || statusAge > (quietMode ? 600 : 60) {
+        // `status --json` costs ~0.28 CPU-seconds (bash, cksums for the
+        // restart-needed signature, lsof), so it is never on a plain timer.
+        // /health covers moment-to-moment state; this runs when the server
+        // appears or disappears, when a watched file changes (a config edit or
+        // an engine rebuild from a terminal), and on demand — when the popover
+        // opens, the window appears, or an action finishes.
+        if hadHealth != (health != nil) || watchedFilesChanged() {
             await refreshStatus()
         }
+    }
+
+    /// Called when the user actually looks: the popover opening or the window
+    /// appearing. Cheap enough at human speed, and keeps "restart needed"
+    /// honest exactly when it is read.
+    func refreshStatusOnDemand() {
+        guard Date().timeIntervalSince(lastStatusRefresh) > 2 else { return }
+        Task { await refreshStatus() }
     }
 
     private func fetchHealth() async -> Health? {

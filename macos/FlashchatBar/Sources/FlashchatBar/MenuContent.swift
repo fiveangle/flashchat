@@ -32,7 +32,10 @@ struct MenuContent: View {
         }
         .padding(14)
         .frame(width: 330)
-        .onAppear(perform: clearInitialFocus)
+        .onAppear {
+            clearInitialFocus()
+            model.refreshStatusOnDemand()
+        }
     }
 
     /// SwiftUI focuses the first control when the popover opens, which draws a

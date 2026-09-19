@@ -34,6 +34,7 @@ struct MainWindow: View {
         .onAppear {
             WindowRouter.shared.openMainWindow = { openWindow(id: "main") }
             WindowRouter.shared.settleLaunchWindow()
+            model.refreshStatusOnDemand()
         }
     }
 }
