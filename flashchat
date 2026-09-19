@@ -1037,10 +1037,13 @@ is_server_running() {
     return 1
 }
 
+# Content only, no timestamp: the checksum is what decides whether the running
+# server is stale. Including mtime meant a touch, an rsync restore or a git
+# checkout reported "restart needed" for a file whose contents never changed.
 file_signature_part() {
     local path="$1"
     if [ -f "$path" ]; then
-        printf "%s:%s:%s" "$path" "$(stat -f %m "$path" 2>/dev/null || echo 0)" "$(cksum "$path" 2>/dev/null | awk '{print $1 ":" $2}')"
+        printf "%s:%s" "$path" "$(cksum "$path" 2>/dev/null | awk '{print $1 ":" $2}')"
     else
         printf "%s:missing" "$path"
     fi
