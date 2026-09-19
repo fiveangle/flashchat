@@ -200,6 +200,16 @@ flashchat_set_config_value() {
     fi
 }
 
+# Discard keystrokes typed ahead (e.g. "quit" instead of "q") so they cannot
+# leak to the shell after the menu exits. bash 3.2 on macOS has no sub-second
+# read timeout, so flush the terminal's own input queue.
+flashchat_drain_input() {
+    [ -t 0 ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c 'import sys, termios; termios.tcflush(sys.stdin, termios.TCIFLUSH)' 2>/dev/null
+    return 0
+}
+
 read_menu_key() {
     local prompt="$1"
     local valid="$2"
@@ -1823,6 +1833,7 @@ interactive_menu() {
                 ;;
             q|Q)
                 echo ""
+                flashchat_drain_input
                 echo "Goodbye!"
                 break
                 ;;
@@ -2020,4 +2031,8 @@ main() {
     esac
 }
 
-main "$@"
+# `exit` on the same line as the call: bash reads this script lazily from a
+# file offset, so if the file is edited while an instance is running, whatever
+# it reads next comes from the wrong place and executes as a fragment. Exiting
+# without returning to the reader closes that window.
+main "$@"; exit $?
