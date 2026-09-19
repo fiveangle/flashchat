@@ -32,6 +32,18 @@ struct MenuContent: View {
         }
         .padding(14)
         .frame(width: 330)
+        .onAppear(perform: clearInitialFocus)
+    }
+
+    /// SwiftUI focuses the first control when the popover opens, which draws a
+    /// focus ring for anyone using keyboard navigation. Start with nothing
+    /// focused; Tab still enters the key-view loop at the first control.
+    private func clearInitialFocus() {
+        DispatchQueue.main.async {
+            guard let panel = NSApp.windows.first(where: { $0.isKeyWindow && $0.level != .normal })
+                    ?? NSApp.keyWindow else { return }
+            panel.makeFirstResponder(nil)
+        }
     }
 }
 
