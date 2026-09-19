@@ -189,16 +189,30 @@ private struct MemoryLine: View {
 
     var body: some View {
         let mem = model.memory
-        HStack {
-            Image(systemName: "memorychip").foregroundStyle(.secondary)
-            Text("\(Format.bytes(mem.availableBytes)) available")
-            Spacer()
-            Text(mem.pressure.title)
-                .foregroundStyle(mem.pressure == .normal ? Color.secondary
-                                 : mem.pressure == .warning ? Color.orange : Color.red)
+        VStack(alignment: .leading, spacing: 4) {
+            if let server = model.serverMemory {
+                HStack {
+                    Image(systemName: "server.rack").foregroundStyle(.secondary)
+                    Text("Server using \(Format.bytes(server.footprintBytes))")
+                    Spacer()
+                }
+                .help("The server process's memory, as Activity Monitor reports it. "
+                      + "The memory-mapped weights (\(Format.bytes(server.residentBytes)) resident "
+                      + "in total) are excluded because macOS can reclaim them.")
+            }
+            HStack {
+                Image(systemName: "memorychip").foregroundStyle(.secondary)
+                Text("\(Format.bytes(mem.availableBytes)) available")
+                Spacer()
+                Text(mem.pressure.title)
+                    .foregroundStyle(mem.pressure == .normal ? Color.secondary
+                                     : mem.pressure == .warning ? Color.orange : Color.red)
+            }
+            .help("Free + reclaimable RAM. Swap used: \(Format.bytes(mem.swapUsedBytes))")
         }
         .font(.callout)
-        .help("Free + reclaimable RAM. Swap used: \(Format.bytes(mem.swapUsedBytes))")
+        .onAppear { model.startShowingServerMemory() }
+        .onDisappear { model.stopShowingServerMemory() }
     }
 }
 

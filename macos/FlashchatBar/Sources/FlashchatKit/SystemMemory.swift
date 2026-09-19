@@ -96,3 +96,33 @@ public enum MemoryPreflight {
         return .ok
     }
 }
+
+/// Memory a running process is using, read with one proc_pid_rusage call — no
+/// subprocess, and no special permission for the user's own processes.
+public struct ProcessMemory: Sendable, Equatable {
+    /// What Activity Monitor calls "Memory": dirty and compressed pages plus
+    /// memory the process has wired through the kernel (Metal buffers). Clean
+    /// file-backed pages such as the mmap'd weights are excluded, which is the
+    /// right answer here because macOS can reclaim them at any time.
+    public var footprintBytes: Int64
+    /// Resident size, including those reclaimable file-backed pages.
+    public var residentBytes: Int64
+
+    public init(footprintBytes: Int64, residentBytes: Int64) {
+        self.footprintBytes = footprintBytes
+        self.residentBytes = residentBytes
+    }
+
+    public static func read(pid: Int32) -> ProcessMemory? {
+        guard pid > 0 else { return nil }
+        var info = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, $0)
+            }
+        }
+        guard result == 0 else { return nil }
+        return ProcessMemory(footprintBytes: Int64(info.ri_phys_footprint),
+                             residentBytes: Int64(info.ri_resident_size))
+    }
+}

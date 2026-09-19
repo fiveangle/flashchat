@@ -161,6 +161,14 @@ final class MemoryPreflightTests: XCTestCase {
         }
     }
 
+    func testProcessMemoryReadsOwnProcess() throws {
+        let own = try XCTUnwrap(ProcessMemory.read(pid: getpid()))
+        XCTAssertGreaterThan(own.footprintBytes, 0)
+        XCTAssertGreaterThan(own.residentBytes, 0)
+        XCTAssertNil(ProcessMemory.read(pid: 0))
+        XCTAssertNil(ProcessMemory.read(pid: 999_999))
+    }
+
     func testLiveSnapshotIsPlausible() {
         let mem = SystemMemorySnapshot.current()
         XCTAssertGreaterThan(mem.totalBytes, 0)

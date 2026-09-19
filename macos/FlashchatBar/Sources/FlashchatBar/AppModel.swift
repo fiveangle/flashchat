@@ -67,6 +67,9 @@ final class AppModel {
     var health: Health?
     var transition: ServerTransition?
     var memory = SystemMemorySnapshot.current()
+    /// The server's own memory, read only while a view that shows it is open.
+    var serverMemory: ProcessMemory?
+    private var serverMemoryViewers = 0
     var operation: OperationState?
     var activity: [ActivityEntry] = []
     var isLoadingState = false
@@ -282,6 +285,27 @@ final class AppModel {
         return stamps != fileStamps
     }
 
+    /// Views that display the server's memory register while visible, so the
+    /// (already cheap) read happens only when someone is looking.
+    func startShowingServerMemory() {
+        serverMemoryViewers += 1
+        updateServerMemory()
+    }
+
+    func stopShowingServerMemory() {
+        serverMemoryViewers = max(0, serverMemoryViewers - 1)
+    }
+
+    private func updateServerMemory() {
+        guard serverMemoryViewers > 0, health != nil,
+              let pid = launcherStatus?.server.pid else {
+            if serverMemory != nil { serverMemory = nil }
+            return
+        }
+        let reading = ProcessMemory.read(pid: Int32(pid))
+        if reading != serverMemory { serverMemory = reading }
+    }
+
     private func pollOnce() async {
         updateQuietMode()
         // Assign only on change: @Observable notifies (and SwiftUI redraws)
@@ -293,6 +317,7 @@ final class AppModel {
         if fresh != health { health = fresh }
         meter.record(health: health, at: Date().timeIntervalSinceReferenceDate)
         updateDockBadge()
+        updateServerMemory()
         // `status --json` costs ~0.28 CPU-seconds (bash, cksums for the
         // restart-needed signature, lsof), so it is never on a plain timer.
         // /health covers moment-to-moment state; this runs when the server
