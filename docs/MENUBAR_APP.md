@@ -81,6 +81,17 @@ Opening the app again while it is running brings up its window.
 ready, busy, or needs a restart. While a response is being generated it also
 shows tokens per second (you can turn this off).
 
+**Dock icon or menu bar icon, your choice.** Flashchat ships as a menubar-only
+app, and **Overview → Show Dock icon** turns it into an ordinary Mac app: a
+Dock icon, ⌘-Tab, a full menu bar (including Edit, so cut/copy/paste work in
+text fields, and a Server menu), and a Dock badge that warns when the server
+needs a restart or shows the decode speed. The switch takes effect
+immediately, no relaunch. You can also hide the menu bar icon and keep only
+the Dock icon; at least one of the two always stays on. In Dock mode,
+**Open the window when Flashchat starts** controls whether launching opens the
+window — turn it off if Flashchat launches at login and you only want the
+Dock icon.
+
 **Popover.** Shows:
 - server status, including prompt-reading progress with the current layer
 - the API URL, with a copy button

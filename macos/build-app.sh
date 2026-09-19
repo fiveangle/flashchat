@@ -55,7 +55,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$BUILD</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSUIElement</key><true/>
     <key>NSAppleEventsUsageDescription</key><string>Flashchat opens chats and the terminal menu in Terminal.</string>
     <key>FlashchatRepoRoot</key><string>$(plist_escape "$ROOT")</string>
 </dict>

@@ -105,8 +105,21 @@ final class WindowRouter {
     }
 
     func bringForward() {
-        openMainWindow?()
+        if let openMainWindow {
+            openMainWindow()
+        } else {
+            // No view has handed us SwiftUI's window opener yet (menu bar icon
+            // hidden, window never shown). The Window scene's own item in the
+            // Window menu opens it.
+            openViaWindowMenu()
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func openViaWindowMenu() {
+        guard let windowMenu = NSApp.mainMenu?.items.first(where: { $0.title == "Window" })?.submenu,
+              let item = windowMenu.items.first(where: { $0.title == "Flashchat" }) else { return }
+        windowMenu.performActionForItem(at: windowMenu.index(of: item))
     }
 }
 
@@ -150,3 +163,42 @@ struct Pill: View {
             .foregroundStyle(color)
     }
 }
+
+/// Dock vs. menu-bar-only presence. Read before the app finishes launching, so
+/// it lives in UserDefaults rather than on the model.
+enum AppPresence {
+    private static let dockKey = "showDockIcon"
+    private static let menuBarKey = "showMenuBarIcon"
+    private static let launchWindowKey = "openWindowAtLaunch"
+
+    static var showDockIcon: Bool {
+        get { UserDefaults.standard.object(forKey: dockKey) as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: dockKey) }
+    }
+
+    static var showMenuBarIcon: Bool {
+        get { UserDefaults.standard.object(forKey: menuBarKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: menuBarKey) }
+    }
+
+    static var openWindowAtLaunch: Bool {
+        get { UserDefaults.standard.object(forKey: launchWindowKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: launchWindowKey) }
+    }
+
+    @MainActor
+    static func applyActivationPolicy() {
+        let policy: NSApplication.ActivationPolicy = showDockIcon ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        let hadVisibleWindow = NSApp.windows.contains { $0.isVisible && $0.canBecomeMain }
+        NSApp.setActivationPolicy(policy)
+        // Switching to .accessory deactivates the app; keep an open window in front.
+        if hadVisibleWindow {
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first { $0.canBecomeMain && $0.isVisible }?.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+}
+

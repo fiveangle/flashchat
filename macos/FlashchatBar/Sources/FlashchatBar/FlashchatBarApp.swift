@@ -3,7 +3,22 @@ import FlashchatKit
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Before any window or Dock tile appears, so menu-bar-only mode never
+    /// flashes a Dock icon.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated { AppPresence.applyActivationPolicy() }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A window at launch is the Dock-app convention, and with no menu bar
+        // icon it is the only way in. macOS gives no reliable way to tell a
+        // login-item launch from a user launch, so this is a preference
+        // instead of a guess.
+        if !AppPresence.showMenuBarIcon || (AppPresence.showDockIcon && AppPresence.openWindowAtLaunch) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                MainActor.assumeIsolated { WindowRouter.shared.bringForward() }
+            }
+        }
         let args = CommandLine.arguments
         guard let index = args.firstIndex(of: "--show") else { return }
         let name = index + 1 < args.count ? args[index + 1] : "Overview"
@@ -27,7 +42,8 @@ struct FlashchatBarApp: App {
     @State private var router = WindowRouter.shared
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: Binding(get: { model.showMenuBarIcon },
+                                         set: { model.showMenuBarIcon = $0 })) {
             MenuContent()
                 .environment(model)
                 .environment(router)
@@ -44,6 +60,7 @@ struct FlashchatBarApp: App {
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 960, height: 640)
+        .commands { AppCommands(model: model, router: router) }
     }
 }
 
@@ -69,3 +86,44 @@ struct MenuBarLabel: View {
     }
 }
 
+
+/// Main menu for Dock mode (menu-bar-only mode never shows it). SwiftUI keeps
+/// its standard Edit menu, so cut/copy/paste work in text fields.
+struct AppCommands: Commands {
+    let model: AppModel
+    let router: WindowRouter
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") { router.open(.settings) }
+                .keyboardShortcut(",", modifiers: .command)
+        }
+        CommandGroup(replacing: .newItem) {}
+        CommandMenu("Server") {
+            let display = model.display
+            if display.isRunning {
+                Button("Stop Server") { Task { await model.stopServer() } }
+                    .disabled(model.transition != nil)
+                Button("Restart Server") { Task { await model.restartServer() } }
+                    .disabled(model.transition != nil || !display.isOwned)
+            } else {
+                Button("Start Server") { Task { await model.startServer() } }
+                    .disabled(model.transition != nil || model.apiState?.selected == nil)
+            }
+            Divider()
+            Button("Copy API URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.apiURL, forType: .string)
+            }
+            Toggle("Quiet Mode (for Benchmarks)", isOn: Binding(
+                get: { model.quietMode }, set: { model.setQuietMode($0) }))
+        }
+        CommandGroup(before: .sidebar) {
+            ForEach(Array(MainSection.allCases.enumerated()), id: \.element) { index, section in
+                Button(section.rawValue) { router.open(section) }
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+            }
+            Divider()
+        }
+    }
+}

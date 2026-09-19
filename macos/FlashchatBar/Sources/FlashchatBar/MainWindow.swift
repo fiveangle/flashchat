@@ -5,6 +5,7 @@ import SwiftUI
 struct MainWindow: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowRouter.self) private var router
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var router = router
@@ -30,7 +31,10 @@ struct MainWindow: View {
                 OperationSheet(operation: op)
             }
         }
-        .onAppear { NSApp.activate(ignoringOtherApps: true) }
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            WindowRouter.shared.openMainWindow = { openWindow(id: "main") }
+        }
     }
 }
 
@@ -201,7 +205,21 @@ private struct AppSection: View {
             }
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin },
                                                      set: { model.launchAtLogin = $0 }))
-            Toggle("Show generation speed in the menu bar", isOn: $model.showSpeedInMenuBar)
+            Toggle(isOn: $model.showDockIcon) {
+                Text("Show Dock icon")
+                Text("Adds Flashchat to the Dock and ⌘-Tab, with a standard menu bar.")
+            }
+            if model.showDockIcon {
+                Toggle(isOn: $model.openWindowAtLaunch) {
+                    Text("Open the window when Flashchat starts")
+                    Text("Turn this off if Flashchat launches at login and you only want the Dock icon.")
+                }
+            }
+            Toggle(isOn: $model.showMenuBarIcon) {
+                Text("Show menu bar icon")
+                Text("At least one of the Dock icon and the menu bar icon stays on.")
+            }
+            Toggle("Show generation speed on the icon", isOn: $model.showSpeedInMenuBar)
             Toggle(isOn: Binding(get: { model.quietMode }, set: { model.setQuietMode($0) })) {
                 Text("Quiet mode")
                 Text("Polls every 30 s and keeps the menu bar icon static, so benchmarks see no GPU or CPU from this app. Scripts can toggle it with the menubar-quiet file in the Flashchat config folder.")

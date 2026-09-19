@@ -270,6 +270,8 @@ private struct Footer: View {
                     get: { model.quietMode }, set: { model.setQuietMode($0) }))
                 Toggle("Show speed in menu bar", isOn: Binding(
                     get: { model.showSpeedInMenuBar }, set: { model.showSpeedInMenuBar = $0 }))
+                Toggle("Show Dock icon", isOn: Binding(
+                    get: { model.showDockIcon }, set: { model.showDockIcon = $0 }))
                 Divider()
                 Button("New Chat in Terminal") { model.openInTerminal(["chat"]) }
                 Button("Open Terminal Menu") { model.openInTerminal() }

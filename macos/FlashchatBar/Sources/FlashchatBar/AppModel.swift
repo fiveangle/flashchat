@@ -75,6 +75,30 @@ final class AppModel {
         didSet { UserDefaults.standard.set(showSpeedInMenuBar, forKey: "showSpeedInMenuBar") }
     }
 
+    /// Dock icon and menu bar icon; at least one is always on, or the app
+    /// would have no way back in.
+    var showDockIcon: Bool = AppPresence.showDockIcon {
+        didSet {
+            guard showDockIcon != oldValue else { return }
+            AppPresence.showDockIcon = showDockIcon
+            if !showDockIcon && !showMenuBarIcon { showMenuBarIcon = true }
+            AppPresence.applyActivationPolicy()
+            updateDockBadge()
+        }
+    }
+
+    var openWindowAtLaunch: Bool = AppPresence.openWindowAtLaunch {
+        didSet { AppPresence.openWindowAtLaunch = openWindowAtLaunch }
+    }
+
+    var showMenuBarIcon: Bool = AppPresence.showMenuBarIcon {
+        didSet {
+            guard showMenuBarIcon != oldValue else { return }
+            AppPresence.showMenuBarIcon = showMenuBarIcon
+            if !showMenuBarIcon && !showDockIcon { showDockIcon = true }
+        }
+    }
+
     private var meter = ThroughputMeter()
     private var pollTask: Task<Void, Never>?
     private var lastStatusRefresh = Date.distantPast
@@ -238,6 +262,7 @@ final class AppModel {
         let hadHealth = health != nil
         health = await fetchHealth()
         meter.record(health: health, at: Date().timeIntervalSinceReferenceDate)
+        updateDockBadge()
         let statusAge = Date().timeIntervalSince(lastStatusRefresh)
         if hadHealth != (health != nil) || statusAge > (quietMode ? 120 : 15) {
             await refreshStatus()
@@ -510,6 +535,28 @@ final class AppModel {
                 Alerts.error("Could not change the login item", error.localizedDescription)
             }
         }
+    }
+
+    // MARK: Dock
+
+    /// Mirrors the menu bar icon: "!" when attention is needed, the decode
+    /// speed while generating (unless quiet), nothing otherwise.
+    func updateDockBadge() {
+        guard showDockIcon else {
+            NSApp.dockTile.badgeLabel = nil
+            return
+        }
+        let display = self.display
+        var badge: String?
+        switch display.activity {
+        case .restartNeeded, .unreachable:
+            badge = "!"
+        case .generating:
+            if !quietMode, showSpeedInMenuBar, let tps = tokensPerSecond { badge = String(format: "%.0f", tps) }
+        default:
+            badge = nil
+        }
+        if NSApp.dockTile.badgeLabel != badge { NSApp.dockTile.badgeLabel = badge }
     }
 
     // MARK: Logging and notifications
