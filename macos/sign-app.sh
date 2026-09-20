@@ -68,3 +68,10 @@ codesign --force --options runtime $TIMESTAMP \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
 codesign --verify --strict "$APP"
 echo "Signed $APP ($LABEL)"
+case "$LABEL" in
+    "Apple Development"*)
+        echo "Note: an Apple Development signature embeds your Apple ID in the app" >&2
+        echo "      (visible via codesign -dvv). Keep these builds to your own Macs;" >&2
+        echo "      use a Developer ID certificate for anything you share." >&2
+        ;;
+esac

@@ -139,6 +139,38 @@ running server needs a restart and offers to do it.
 - **Confirmation.** Every destructive or long action shows what it will do
   and asks first. The app never starts downloads or builds on its own.
 
+## Privacy
+
+The app talks to nothing but your own machine: `GET /health` on the local
+server, the `flashchat` launcher, and `modelmgr`. It has no analytics and no
+network access of its own. Downloads happen only when you ask for them, and
+they go to HuggingFace from `modelmgr`, as they do in the TUI.
+
+What a **signed app bundle** tells anyone who receives it:
+
+- **The signing certificate's name**, readable with `codesign -dvv`. An
+  *Apple Development* certificate carries the Apple ID it was issued to — your
+  email address. Keep those builds on your own Macs; sign anything you share
+  with a Developer ID certificate, whose name is the one on your developer
+  account. `make menubar-sign` prints this warning when it signs with a
+  development certificate.
+- **Your team identifier**, in any signed build. That is not sensitive.
+- **This checkout's path**, which contains your username. Local builds embed
+  it so the app can find the launcher; builds signed with a Developer ID leave
+  it out, as does `EMBED_REPO_ROOT=0 macos/build-app.sh`, and the app then
+  asks the person for a folder on first run. The compiled binary carries no
+  build paths.
+
+**Notarization uploads the app bundle to Apple**, so do it on a build that
+left the checkout path out. That is automatic for Developer ID builds.
+
+Things that stay local but are worth knowing about: **Copy Diagnostics** in
+Overview puts your model list and folder paths on the clipboard, for pasting
+into a bug report; the **Logs** tab reads the server log, which records prompt
+text when you turn on `SERVER_HTTP_LOG`; and the app runs unsandboxed with the
+Apple Events entitlement, which it uses only to open Terminal for
+**New Chat in Terminal**.
+
 ## Resource use
 
 Measured on an M-series Mac with a server running and the app idle:
