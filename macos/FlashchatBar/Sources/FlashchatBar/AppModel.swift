@@ -67,8 +67,20 @@ final class AppModel {
     var health: Health?
     var transition: ServerTransition?
     var memory = SystemMemorySnapshot.current()
-    /// The server's own memory, read only while a view that shows it is open.
+    /// What Flashchat costs in RAM: the server process plus this app. Read
+    /// only while a view that shows it is open.
     var serverMemory: ProcessMemory?
+    var appMemory: ProcessMemory?
+
+    /// Server + app, or just the app when no server is running.
+    var flashchatMemory: ProcessMemory? {
+        switch (serverMemory, appMemory) {
+        case let (server?, app?): return server + app
+        case let (server?, nil): return server
+        case let (nil, app?): return app
+        default: return nil
+        }
+    }
     private var serverMemoryViewers = 0
     var operation: OperationState?
     var activity: [ActivityEntry] = []
@@ -297,8 +309,14 @@ final class AppModel {
     }
 
     private func updateServerMemory() {
-        guard serverMemoryViewers > 0, health != nil,
-              let pid = launcherStatus?.server.pid else {
+        guard serverMemoryViewers > 0 else {
+            if serverMemory != nil { serverMemory = nil }
+            if appMemory != nil { appMemory = nil }
+            return
+        }
+        let app = ProcessMemory.read(pid: getpid())
+        if app != appMemory { appMemory = app }
+        guard health != nil, let pid = launcherStatus?.server.pid else {
             if serverMemory != nil { serverMemory = nil }
             return
         }
@@ -603,6 +621,19 @@ final class AppModel {
                 Alerts.error("Could not change the login item", error.localizedDescription)
             }
         }
+    }
+
+    /// Tooltip text: what the total is made of, and the caveat about the
+    /// memory-mapped weights that Activity Monitor also leaves out.
+    var memoryBreakdown: String {
+        var parts: [String] = []
+        if let server = serverMemory { parts.append("server \(Format.bytes(server.footprintBytes))") }
+        if let app = appMemory { parts.append("this app \(Format.bytes(app.footprintBytes))") }
+        if serverMemory == nil { parts.append("no server running") }
+        let resident = flashchatMemory.map { Format.bytes($0.residentBytes) } ?? "—"
+        return parts.joined(separator: " + ")
+            + ". As Activity Monitor reports it: the memory-mapped weights are excluded because "
+            + "macOS can reclaim them (\(resident) resident in total)."
     }
 
     // MARK: Dock

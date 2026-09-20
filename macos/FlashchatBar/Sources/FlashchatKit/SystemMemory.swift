@@ -113,6 +113,11 @@ public struct ProcessMemory: Sendable, Equatable {
         self.residentBytes = residentBytes
     }
 
+    public static func + (lhs: ProcessMemory, rhs: ProcessMemory) -> ProcessMemory {
+        ProcessMemory(footprintBytes: lhs.footprintBytes + rhs.footprintBytes,
+                      residentBytes: lhs.residentBytes + rhs.residentBytes)
+    }
+
     public static func read(pid: Int32) -> ProcessMemory? {
         guard pid > 0 else { return nil }
         var info = rusage_info_v4()

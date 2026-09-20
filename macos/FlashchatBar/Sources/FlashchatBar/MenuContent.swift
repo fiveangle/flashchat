@@ -190,15 +190,13 @@ private struct MemoryLine: View {
     var body: some View {
         let mem = model.memory
         VStack(alignment: .leading, spacing: 4) {
-            if let server = model.serverMemory {
+            if let total = model.flashchatMemory {
                 HStack {
                     Image(systemName: "server.rack").foregroundStyle(.secondary)
-                    Text("Server using \(Format.bytes(server.footprintBytes))")
+                    Text("Flashchat using \(Format.bytes(total.footprintBytes))")
                     Spacer()
                 }
-                .help("The server process's memory, as Activity Monitor reports it. "
-                      + "The memory-mapped weights (\(Format.bytes(server.residentBytes)) resident "
-                      + "in total) are excluded because macOS can reclaim them.")
+                .help(model.memoryBreakdown)
             }
             HStack {
                 Image(systemName: "memorychip").foregroundStyle(.secondary)

@@ -178,10 +178,15 @@ private struct MemorySection: View {
             LabeledContent("Available now", value: "\(Format.bytes(mem.availableBytes)) of \(Format.bytes(mem.totalBytes))")
             LabeledContent("Pressure", value: mem.pressure.title)
             LabeledContent("Swap used", value: Format.bytes(mem.swapUsedBytes))
-            if let server = model.serverMemory {
-                LabeledContent("Server using now", value: Format.bytes(server.footprintBytes))
-                    .help("As Activity Monitor reports it; excludes the memory-mapped weights, "
-                          + "which macOS can reclaim (\(Format.bytes(server.residentBytes)) resident in total).")
+            if let total = model.flashchatMemory {
+                LabeledContent("Flashchat using now", value: Format.bytes(total.footprintBytes))
+                    .help(model.memoryBreakdown)
+                if let server = model.serverMemory {
+                    LabeledContent("  Server", value: Format.bytes(server.footprintBytes))
+                }
+                if let app = model.appMemory {
+                    LabeledContent("  This app", value: Format.bytes(app.footprintBytes))
+                }
             }
             if let estimate = model.apiState?.selected?.memory {
                 LabeledContent("Server needs (est.)", value: Format.bytes(estimate.totalBytes))
