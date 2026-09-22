@@ -96,9 +96,16 @@ pre-landing "opt-in" wording is also corrected in its notes using `5af6a43`.
 
 ### Registered after shipping (2026-09-22)
 
+These features shipped before they had exploration IDs. Each was given one
+above the 26–44 proposal reserve: 45 from `5f3fdcd` (2026-09-16), and 46 and 47
+from the single July 8 commit `86c8846`. 00 remains the August baseline. None of
+the three is a newly run experiment.
+
 | # | Notes | Disposition |
 |---|-------|-------------|
-| 45 | [Dedicated HTTP thread](45-http-server-threading/NOTES.md) | Shipped in `5f3fdcd` before it had an ID. Health during inference 0.7 ms / 1.5 ms; tokens/sec neutral. Validation note lives in that directory. |
+| 45 | [Dedicated HTTP thread](45-http-server-threading/NOTES.md) | Responsiveness result: health during inference 0.7 ms / 1.5 ms; tokens/sec neutral. Validation note lives in that directory. |
+| 46 | [Prefill-buffer release](46-prefill-buffer-release/NOTES.md) | 401.43 MiB engine-side release; speed not established |
+| 47 | [Expert pin slot cap](47-expert-pin-slots/NOTES.md) | Control surface only; no throughput run |
 
 ### Other-checkout recovery
 

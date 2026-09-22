@@ -14,7 +14,7 @@ today's main ~1.9–2.6s.
 1. **Nothing unmerged**: ane-prefill tip (8bd1680) has zero commits main
    lacks. 4f2356a (the fast rows' HEAD) is an ancestor of main.
 2. **The fast rows ran on a dirty tree**: the 13:51 debug session
-   (docs/PREFILL_RELEASE_BENCHMARK_LOG.md) used FLASHCHAT_PREFILL_RELEASE,
+   ([prefill-release log](../46-prefill-buffer-release/PREFILL_RELEASE_BENCHMARK_LOG.md)) used FLASHCHAT_PREFILL_RELEASE,
    which only exists in 86c8846 — committed at 15:40, AFTER the 13:54 bench.
    So the fast rows came from uncommitted WIP whose exact state is
    unrecoverable.

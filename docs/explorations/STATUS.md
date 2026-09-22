@@ -14,8 +14,6 @@ board below is historical evidence, not the allocator for new experiment IDs.
 |------|------|
 | `docs/explorations/<index>-<experiment>/` | All experiments (NOTES + raw results) |
 | `docs/POTENTIAL_OPTIMIZATIONS.md` | Code-review candidates (prefill RAM, pin slots, MTP KV) |
-| `docs/PINNED_EXPERT_CACHE_SIZING_LOG.md` | Slot-based pin sizing control surface |
-| `docs/PREFILL_RELEASE_BENCHMARK_LOG.md` | Post-prefill buffer release A/B |
 | `12-pin-default-on/campaign-analysis/` | Shared August 24 hot-path analysis + ranked roadmap |
 
 ## Reading the historical results
