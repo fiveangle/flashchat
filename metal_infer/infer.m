@@ -2831,9 +2831,6 @@ typedef struct {
     id<MTLBuffer> buf_moe_hidden;     // [g_cfg.hidden_dim floats] GPU combine output (hidden state)
     id<MTLBuffer> buf_combine_params; // [MAX_K+2 floats] expert weights[0..MAX_K-1] + shared_gate_score
     id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
-    // Shared event for CPU-GPU synchronization (async pipeline)
-    id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
-    uint64_t event_value;                // monotonically increasing event counter
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
@@ -3316,10 +3313,6 @@ static MetalCtx *metal_setup(void) {
                g_cfg.num_linear_layers * (64*128*128*4 + 3*12288*4) / 1e6,
                (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
     }
-
-    // Create shared event for CPU-GPU async pipeline
-    ctx->pipeline_event = [ctx->device newSharedEvent];
-    ctx->event_value = 0;
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
