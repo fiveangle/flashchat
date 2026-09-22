@@ -6,10 +6,15 @@ latest commit's value against the previous one, flagging changes beyond a thresh
 Hardware is keyed on hw_model (stable) rather than hostname (the box was renamed
 fiveangle-6.lan -> FiveAngle.local; same Mac17,2).
 
+Only models installed on this machine count toward the regression exit status. A
+model's latest comparison stays in the log after it is offloaded, removed, or retired
+from the registry, and would otherwise be flagged on every run until it is benchmarked
+again. Those models are still reported, labeled, and counted with --include-uninstalled.
+
 Higher-is-better: decode_tok_per_sec, stream_deltas, tok_per_sec.
 Lower-is-better:  prefill_ms, tool_call_ms, duration_ms.
 
-stdlib only. Usage: tests/bench_report.py [--all-hw] [--threshold 5] [--last 6] [--log FILE]
+Usage: tests/bench_report.py [--all-hw] [--include-uninstalled] [--threshold 5] [--last 6] [--log FILE]
 """
 import argparse, csv, os, subprocess, sys
 from collections import defaultdict
@@ -23,6 +28,24 @@ def this_hw_model():
     except Exception:
         return None
 
+def install_states(repo):
+    """Registry model id -> install state on this machine, or None if unknown."""
+    try:
+        sys.path.insert(0, repo)
+        from modelmgr.registry import Registry
+        from modelmgr.status import all_statuses
+        statuses = all_statuses(Registry.load())
+    except Exception as e:
+        print(f"# install state unavailable ({e}); counting every model\n")
+        return None
+    states = {}
+    for status in statuses:
+        for name, v in status.variants.items():
+            state = "installed" if v.ready else ("offloaded" if v.offloaded else "not installed")
+            for model_id in {v.resolved_id, *status.manifest.variant(name).legacy_ids}:
+                states[model_id] = state
+    return states
+
 def fnum(s):
     try:
         return float(s)
@@ -34,6 +57,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default=os.path.join(repo, "assets", "api_perf_log.tsv"))
     ap.add_argument("--all-hw", action="store_true", help="don't filter to this machine's hw.model")
+    ap.add_argument("--include-uninstalled", action="store_true",
+                    help="count regressions for models not installed on this machine")
     ap.add_argument("--threshold", type=float, default=5.0, help="percent change to flag (default 5)")
     ap.add_argument("--last", type=int, default=6, help="history points to show per metric")
     args = ap.parse_args()
@@ -41,7 +66,8 @@ def main():
     if not os.path.exists(args.log):
         print(f"no perf log at {args.log}", file=sys.stderr); return 1
 
-    hw = None if args.all_hw else this_hw_model()
+    local_hw = this_hw_model()
+    hw = None if args.all_hw else local_hw
     rows = []
     excluded = 0
     with open(args.log) as f:
@@ -74,12 +100,23 @@ def main():
     if excluded:
         print(f"# excluded {excluded} non-pass/confounded row(s)\n")
 
+    states = None if args.include_uninstalled else install_states(repo)
+
+    def uncounted_reason(hwm, model):
+        if states is None or hwm != local_hw:
+            return None
+        state = states.get(model, "no longer in registry")
+        return None if state == "installed" else state
+
     regressions = 0
+    uncounted = {}
     last_model = None
     for key in sorted(groups):
         hwm, model, scenario, mt = key
+        reason = uncounted_reason(hwm, model)
         if model != last_model:
-            print(f"\n## {model}   [{hwm}]"); last_model = model
+            note = f"   ({reason} — not counted)" if reason else ""
+            print(f"\n## {model}   [{hwm}]{note}"); last_model = model
         pts = sorted(groups[key], key=lambda x: x[0])
         latest, prev = pts[-1], (pts[-2] if len(pts) > 1 else None)
         tail = pts[-args.last:]
@@ -93,11 +130,19 @@ def main():
             elif better:
                 verdict = f"▲ {pct:+.1f}%"
             else:
-                verdict = f"▼ {pct:+.1f}%"; regressions += 1
+                verdict = f"▼ {pct:+.1f}%"
+                if reason:
+                    uncounted[(model, reason)] = uncounted.get((model, reason), 0) + 1
+                else:
+                    regressions += 1
         unit = "tok/s" if mt in ("decode_tok_per_sec", "tok_per_sec") else ("ms" if mt.endswith("_ms") else "")
         print(f"  {scenario:26} {mt:18} {latest[2]:8g} {unit:5} {verdict:>10}   [{hist}]")
 
     print(f"\n# {regressions} regression(s) beyond ±{args.threshold:.0f}% vs previous commit.")
+    if uncounted:
+        models = ", ".join(f"{m} ({n}, {why})" for (m, why), n in sorted(uncounted.items()))
+        print(f"# not counted, model not installed here: {models}")
+        print("# pass --include-uninstalled to count them.")
     return 1 if regressions else 0
 
 if __name__ == "__main__":

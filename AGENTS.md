@@ -170,7 +170,9 @@ with `"benchmark": false` is benchmarked in its as-shipped default config, again
 real HTTP server, with one uniform spec (fixed prompts, temp 0, warmup + repeats),
 recording **prefill (TTFT)** and **decode (tok/s)** separately to `assets/api_perf_log.tsv`.
 `make bench-report` compares the latest rows to prior commits (keyed on `hw_model`) and
-flags regressions.
+flags regressions. Only models installed on this machine count toward its failure exit;
+offloaded, uninstalled, and retired models are still reported and labeled, and
+`--include-uninstalled` counts them too.
 
 Preserve and commit the performance log under the working rules above, including
 rows from functional smoke tests. Report flags are investigation hints, not a demand
