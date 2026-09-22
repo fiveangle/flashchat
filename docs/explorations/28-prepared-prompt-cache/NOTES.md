@@ -4,8 +4,8 @@ Date: 2026-09-21. Branch: `exp/28-prepared-prompt-cache`.
 Base: `9c62991`.
 Status (2026-09-22): implemented; correctness checks, standard watchdog, and focused
 preparation comparison completed. **About 3.9 ms saved per hit on the tested 26 KiB
-tool prefix; no demonstrated end-to-end speedup.** Dave approved committing the
-implementation and results on 2026-09-22; watchdog warnings remain preserved.
+tool prefix; no demonstrated end-to-end speedup.** Retained as a modest CPU
+preparation optimization; the standard watchdog remains inconclusive.
 
 ## Hypothesis
 
