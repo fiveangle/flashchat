@@ -96,16 +96,31 @@ pre-landing "opt-in" wording is also corrected in its notes using `5af6a43`.
 
 ### Registered after shipping (2026-09-22)
 
-These features shipped before they had exploration IDs. Each was given one
-above the 26–44 proposal reserve: 45 from `5f3fdcd` (2026-09-16), and 46 and 47
-from the single July 8 commit `86c8846`. 00 remains the August baseline. None of
-the three is a newly run experiment.
+These features shipped, or were probed, before they had exploration IDs. Each was
+given one above the 26–44 proposal reserve: 45 from `5f3fdcd` (2026-09-16); 46 and
+47 from the single July 8 commit `86c8846`; 54 from `54d9447` (2026-06-22); 55 from
+the July 6–8 prefill campaign; 57 from system-prompt caching, which originated
+upstream; and 58 from the June TensorOps probe. 00 remains the August baseline.
+None is a newly run experiment.
 
 | # | Notes | Disposition |
 |---|-------|-------------|
 | 45 | [Dedicated HTTP thread](45-http-server-threading/NOTES.md) | Responsiveness result: health during inference 0.7 ms / 1.5 ms; tokens/sec neutral. Validation note lives in that directory. |
 | 46 | [Prefill-buffer release](46-prefill-buffer-release/NOTES.md) | 401.43 MiB engine-side release; speed not established |
 | 47 | [Expert pin slot cap](47-expert-pin-slots/NOTES.md) | Control surface only; no throughput run |
+| 54 | [Context-cache quantization](54-context-cache-quant/NOTES.md) | ~671 MB → ~170 MB (q8) / ~86 MB (q4) at 8K, commit's own figure; inside 00 |
+| 55 | [Batched and ANE prefill](55-batched-ane-prefill/NOTES.md) | ~2.4x prompt TTFT, commit's own figure; inside 00 |
+| 57 | [System-prompt context caching](57-system-prompt-cache/NOTES.md) | ~6 s TTFT per request, upstream 397B claim; inside 00 |
+| 58 | [Metal 4 TensorOps prefill probe](58-tensorops-prefill/NOTES.md) | Parked on resource-layout limits; findings recovered from deleted AGENTS.md text |
+
+### Upstream recovery
+
+[56 — upstream flash-moe campaign](56-upstream-flash-moe/NOTES.md) restores Dan Woods'
+pre-fork `danveloper/flash-moe` experiment record (through `3601d41`, 2026-03-19),
+which the fork deleted in `71fdcb7`. The originals are byte-identical under
+`56-upstream-flash-moe/original/`, and its notes map every upstream experiment to a
+register ID. Measured on Qwen3.5-397B-A17B and an M3 Max 48 GB, so its numbers never
+compare directly with fork rows. Like 25, it is an archival assignment.
 
 ### Other-checkout recovery
 
