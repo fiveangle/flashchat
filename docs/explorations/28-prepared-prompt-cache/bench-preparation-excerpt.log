@@ -1,0 +1,38 @@
+[serve] chatcmpl-1 prepared_prompt_cache miss
+[serve] chatcmpl-1 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] chatcmpl-2 prepared_prompt_cache hit
+[serve] chatcmpl-2 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] chatcmpl-3 prepared_prompt_cache hit
+[serve] chatcmpl-3 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] resp-4 prepared_prompt_cache miss
+[serve] resp-4 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] resp-5 prepared_prompt_cache hit
+[serve] resp-5 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] resp-6 prepared_prompt_cache hit
+[serve] resp-6 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=190 total_chars=441
+[serve] chatcmpl-7 prepared_prompt_cache miss
+[serve] chatcmpl-7 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] chatcmpl-8 prepared_prompt_cache hit
+[serve] chatcmpl-8 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] chatcmpl-9 prepared_prompt_cache hit
+[serve] chatcmpl-9 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] resp-10 prepared_prompt_cache miss
+[serve] resp-10 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] resp-11 prepared_prompt_cache hit
+[serve] resp-11 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] resp-12 prepared_prompt_cache hit
+[serve] resp-12 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=166 total_chars=417
+[serve] chatcmpl-13 prepared_prompt_cache miss
+[serve] chatcmpl-13 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] chatcmpl-14 prepared_prompt_cache hit
+[serve] chatcmpl-14 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] chatcmpl-15 prepared_prompt_cache hit
+[serve] chatcmpl-15 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] resp-16 prepared_prompt_cache miss
+[serve] resp-16 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] resp-17 prepared_prompt_cache hit
+[serve] resp-17 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] resp-18 prepared_prompt_cache hit
+[serve] resp-18 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=0 final_system_chars=123 conversation_chars=245 total_chars=496
+[serve] chatcmpl-19 prepared_prompt_cache miss
+[serve] chatcmpl-19 prompt_parts upstream_system_chars=0 default_system_chars=28 tool_instruction_chars=1078 final_system_chars=1108 conversation_chars=129 total_chars=1365

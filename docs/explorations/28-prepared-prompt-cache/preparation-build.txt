@@ -1,0 +1,19 @@
+2026-09-22T09:55:08Z
+Mac17,2
+34359738368
+exp/28-prepared-prompt-cache
+9c62991ad80953b38f62d2f5969d61e053a8e0d1
+922ee7ee2de7bcaf58338e9f64ec5d369a1928f4ac9f79fb663841cb14a2c55d  /Users/speedster/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0/flashchat/q4/vocab.bin
+7cce2f8b57b57a6e1322ac894cd1df93a76e5e310bc0b4d0a119435d0cad73f7  tests/prepared_prompt_probe.m
+f68d510971e744a0ebe560dd0deb56954bc0cf80e016506f50d9f67a31f0f883  metal_infer/prepared_prompt_probe
+393c52338ca5db7f6717f5a7fe7a95f1d85367bc413ae71d871917ced9590a8b  metal_infer/infer.m
+1543d137d403aecb459044a20527c6e20b8c88c3ed54aca06f4806cbe3b3434d  metal_infer/prepared_prompt.h
+Compiler command: clang
+Compiler path: /opt/homebrew/opt/llvm/bin/clang
+Homebrew clang version 22.1.8
+Optimization profile: aggressive
+Detected CPU: Apple M5
+CPU flags: -mcpu=native
+CFLAGS: -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK -O3 -mcpu=native -flto -ffast-math -funroll-loops -fvectorize -fslp-vectorize -ftree-vectorize -falign-functions=16
+LDFLAGS: -lpthread -lcompression -ldl -flto
+CHAT_CFLAGS: -O2 -mcpu=native -Wall -fobjc-arc

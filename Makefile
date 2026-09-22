@@ -189,6 +189,7 @@ help:
 	@printf "  make manage-smoke  Run model management integration test\n"
 	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
 	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
+	@printf "  make prepared-prompt-smoke  Check prepared prompt cache correctness (no inference)\n"
 	@printf "  make conversation-cache-smoke  Check exact conversation matching and state restoration\n"
 	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
 	@printf "  make quant-helper-smoke  Run native checkpoint quantization helper tests\n"
@@ -253,7 +254,7 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine (links the ANE MLP library for batched-prefill offload)
-$(INFER_TARGET): $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(INFER_TARGET): $(INFER_SRC) $(BUILD_DIR)/prepared_prompt.h $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	@$(MAKE) --no-print-directory print-build-config
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) $(INFER_SRC) $(ANE_MLP_SRC) -o $(INFER_TARGET)
 
@@ -440,14 +441,24 @@ chat-render-smoke: $(CHAT_TARGET)
 tool-template-smoke: $(INFER_TARGET)
 	bash tests/test_tool_template_render.sh
 
-$(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(BUILD_DIR)/prepared_prompt_fixture: tests/prepared_prompt_fixture.m $(INFER_SRC) $(BUILD_DIR)/prepared_prompt.h $(BUILD_DIR)/tokenizer.h $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/prepared_prompt_fixture.m $(ANE_MLP_SRC) -o $@
+
+.PHONY: prepared-prompt-smoke
+prepared-prompt-smoke: $(BUILD_DIR)/prepared_prompt_fixture
+	./$(BUILD_DIR)/prepared_prompt_fixture
+
+$(BUILD_DIR)/prepared_prompt_probe: tests/prepared_prompt_probe.m $(INFER_SRC) $(BUILD_DIR)/prepared_prompt.h $(BUILD_DIR)/tokenizer.h $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/prepared_prompt_probe.m $(ANE_MLP_SRC) -o $@
+
+$(BUILD_DIR)/conversation_cache_fixture: tests/conversation_cache_fixture.m $(INFER_SRC) $(BUILD_DIR)/prepared_prompt.h $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/conversation_cache_fixture.m $(ANE_MLP_SRC) -o $@
 
 .PHONY: conversation-cache-smoke
 conversation-cache-smoke: $(BUILD_DIR)/conversation_cache_fixture
 	./$(BUILD_DIR)/conversation_cache_fixture
 
-$(BUILD_DIR)/request_sampling_fixture: tests/request_sampling_fixture.m $(INFER_SRC) $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
+$(BUILD_DIR)/request_sampling_fixture: tests/request_sampling_fixture.m $(INFER_SRC) $(BUILD_DIR)/prepared_prompt.h $(BUILD_DIR)/server_http.h $(BUILD_DIR)/server_title.h $(ANE_MLP_SRC) $(ANE_MLP_HDR)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -framework IOSurface $(LDFLAGS) tests/request_sampling_fixture.m $(ANE_MLP_SRC) -o $@
 
 .PHONY: request-sampling-smoke
@@ -469,4 +480,4 @@ native-qwen-compile-smoke: $(INFER_TARGET)
 mtp-config-smoke:
 	bash tests/test_mtp_config.sh
 
-test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke conversation-cache-smoke request-sampling-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke
+test: registry-check py-tests cli-smoke manage-smoke chat-render-smoke server-http-smoke q-norm-smoke tool-template-smoke prepared-prompt-smoke conversation-cache-smoke request-sampling-smoke cache-roundtrip-smoke quant-helper-smoke tokenizer-export-smoke native-qwen-compile-smoke mtp-config-smoke api-smoke

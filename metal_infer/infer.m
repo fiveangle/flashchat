@@ -2264,6 +2264,7 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
+static uint64_t g_tokenizer_generation = 0;
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
@@ -2297,6 +2298,7 @@ static void init_tokenizer(void) {
         if (access(paths[i], R_OK) == 0) {
             if (bpe_load(&g_tokenizer, paths[i]) == 0) {
                 g_tokenizer_loaded = 1;
+                g_tokenizer_generation++;
                 return;
             }
         }
@@ -10368,6 +10370,8 @@ typedef struct {
     char description[MAX_TOOL_DESC];
     char *parameters;
     int has_parameters;
+    CFTypeRef prepared_schema;
+    int schema_prepared;
 } ToolDef;
 
 static char *build_tool_instructions(ToolDef *tools, int tool_count);
@@ -10561,6 +10565,9 @@ static void api_request_free(ApiRequest *req) {
     for (int i = 0; i < req->tool_count && i < MAX_TOOLS; i++) {
         free(req->tools[i].parameters);
         req->tools[i].parameters = NULL;
+        if (req->tools[i].prepared_schema) CFRelease(req->tools[i].prepared_schema);
+        req->tools[i].prepared_schema = NULL;
+        req->tools[i].schema_prepared = 0;
     }
     req->system_prompt = NULL;
     req->conversation_text = NULL;
@@ -11006,11 +11013,12 @@ static int validate_parsed_tool_call(ApiRequest *req, const ParsedToolCall *tool
     }
     if (!tool->has_parameters || !tool->parameters || !tool->parameters[0]) return 0;
 
-    NSData *schema_data = [NSData dataWithBytes:tool->parameters length:strlen(tool->parameters)];
-    NSError *schema_error = nil;
-    id schema = [NSJSONSerialization JSONObjectWithData:schema_data
-                                                options:NSJSONReadingFragmentsAllowed
-                                                  error:&schema_error];
+    id schema = (__bridge id)tool->prepared_schema;
+    if (!tool->schema_prepared) {
+        NSData *schema_data = [NSData dataWithBytes:tool->parameters length:strlen(tool->parameters)];
+        schema = [NSJSONSerialization JSONObjectWithData:schema_data
+                                                options:NSJSONReadingFragmentsAllowed error:NULL];
+    }
     if (!schema) {
         tool_validation_unsupported(result, "schema", "$", "$");
         return 0;
@@ -11282,11 +11290,9 @@ static int extract_think_toggle(NSMutableString *content_io) {
 // The returned string is the body of the <|im_start|>system ... <|im_end|>
 // block; callers wrap it. Trailing newline is intentionally NOT included so
 // the wrapping is symmetric with the template.
-static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *info) {
+static char *build_system_prompt_with_base(ApiRequest *req, const char *base_c, PromptBuildInfo *info) {
     if (info) memset(info, 0, sizeof(*info));
-    char *base_c = load_system_prompt();
     NSString *base = [NSString stringWithUTF8String:base_c ?: "You are a helpful assistant."];
-    free(base_c);
     NSString *user_sys = req->system_prompt && req->system_prompt[0]
         ? [NSString stringWithUTF8String:req->system_prompt]
         : base;
@@ -11323,6 +11329,13 @@ static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *i
     return dup_nsstring(final);
 }
 
+static char *build_system_prompt_for_request(ApiRequest *req, PromptBuildInfo *info) {
+    char *base = load_system_prompt();
+    char *result = build_system_prompt_with_base(req, base, info);
+    free(base);
+    return result;
+}
+
 static int count_sys_prompt_tokens(const char *sys_prompt) {
     size_t len = strlen(sys_prompt);
     size_t total = len + 64;
@@ -11336,7 +11349,10 @@ static int count_sys_prompt_tokens(const char *sys_prompt) {
     return count;
 }
 
-static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *request_id) {
+#include "prepared_prompt.h"
+
+static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *request_id,
+                                              const PreparedPrompt *prepared) {
     if (!req || !req->conversation_text) return NULL;
     size_t conv_len = strlen(req->conversation_text);
     if (req->used_snapshot) {
@@ -11347,8 +11363,8 @@ static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *reques
                           request_id ? request_id : "request", pt ? pt->count : -1);
         return pt;
     }
-    PromptBuildInfo build_info;
-    char *sys_prompt = build_system_prompt_for_request(req, &build_info);
+    PromptBuildInfo build_info = prepared->build_info;
+    const char *sys_prompt = prepared->system;
     size_t total = strlen(sys_prompt) + conv_len + 128;
     server_log_errorf("[serve] %s prompt_parts upstream_system_chars=%zu default_system_chars=%zu tool_instruction_chars=%zu final_system_chars=%zu conversation_chars=%zu total_chars=%zu\n",
                       request_id ? request_id : "request",
@@ -11360,18 +11376,18 @@ static PromptTokens *tokenize_request_prompt(ApiRequest *req, const char *reques
     if (g_server_debug_enabled) {
         server_debug_write_text(request_id ? request_id : "request", "system_prompt.txt", sys_prompt);
     }
-    char *prompt = malloc(total);
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n%s", sys_prompt, req->conversation_text);
     server_log_errorf("[serve] %s tokenizing prompt chars=%zu\n",
-                      request_id ? request_id : "request", strlen(prompt));
+                      request_id ? request_id : "request", strlen(prepared->prefix) + conv_len);
     if (g_server_debug_enabled) {
+        char *prompt = malloc(total);
+        if (!prompt) return NULL;
+        snprintf(prompt, total, "%s%s", prepared->prefix, req->conversation_text);
         server_debug_write_text(request_id ? request_id : "request", "assembled_prompt.txt", prompt);
+        free(prompt);
     }
-    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    PromptTokens *pt = prepared_prompt_tokens(prepared, req->conversation_text);
     server_log_errorf("[serve] %s tokenized prompt tokens=%d\n",
                       request_id ? request_id : "request", pt ? pt->count : -1);
-    free(sys_prompt);
-    free(prompt);
     return pt;
 }
 
@@ -15045,6 +15061,7 @@ static void serve_loop(
     // On first request with a given system prompt, prefill it and save state.
     // On subsequent requests with the same hash, restore the snapshot.
     ConversationCache conversation_cache = {0};
+    PreparedPrompt prepared_cache = {0};
     uint64_t cached_sys_hash = 0;
     int cached_sys_token_count = 0;
     int cached_sys_disk_backed = 0;
@@ -15153,20 +15170,24 @@ static void serve_loop(
                           req.top_k, req.min_p, req.presence_penalty, req.repetition_penalty,
                           req.reasoning_enabled, req.used_snapshot);
 
-        // Build system prompt and hash it for cache lookup
-        char *req_sys_prompt = build_system_prompt_for_request(&req, NULL);
-        uint64_t req_sys_hash = hash_string_djb2(req_sys_prompt);
-        int sys_prompt_token_count = count_sys_prompt_tokens(req_sys_prompt);
+        PreparedPrompt uncached_prompt = {0};
+        int prepared_hit = 0;
+        const PreparedPrompt *prepared = prepare_request_prompt(&prepared_cache, &uncached_prompt,
+                                                                &req, &prepared_hit);
+        uint64_t req_sys_hash = prepared ? hash_string_djb2(prepared->system) : 0;
+        int sys_prompt_token_count = prepared ? prepared->tokens->count : 0;
+        server_log_errorf("[serve] %s prepared_prompt_cache %s\n", request_id,
+                          prepared_hit ? "hit" : "miss");
         int snapshot_restored = 0;
         int disk_cache_invalid = 0;
         int pos = 0;
 
         // Match the full rendered input before restoring or clearing any live state.
-        PromptTokens *pt = tokenize_request_prompt(&req, request_id);
+        PromptTokens *pt = prepared ? tokenize_request_prompt(&req, request_id, prepared) : NULL;
         if (!pt || pt->count <= 0 || pt->count >= GPU_KV_SEQ) {
             send_json_error(client_fd, 400, "invalid_request_error", "prompt is empty, cannot be tokenized, or exceeds the context window");
             if (pt) { free(pt->ids); free(pt); }
-            free(req_sys_prompt);
+            prepared_prompt_free(&uncached_prompt);
             api_request_free(&req);
             free(reqbuf); close(client_fd);
             continue;
@@ -15458,7 +15479,7 @@ prefill_finished:
             conversation_cache_invalidate(&conversation_cache);
             clear_runtime_state_serve(layer_states, kv_caches);
             server_progress_decode(0, 0);
-            free(req_sys_prompt);
+            prepared_prompt_free(&uncached_prompt);
             free(token_counts);
             free(pt->ids); free(pt);
             api_request_free(&req);
@@ -15468,7 +15489,7 @@ prefill_finished:
         }
         prefill_log_memory("before transient release");
         prefill_release_transient_buffers();
-        free(req_sys_prompt);
+        prepared_prompt_free(&uncached_prompt);
         server_log_errorf("[serve] %s prefill=%d tokens in %.0fms\n", request_id, pt->count - prefill_origin, now_ms() - t_prefill);
         conversation_cache.live_valid = cache_recording;
         ane_prefill_engagement_log(request_id);
@@ -16229,6 +16250,7 @@ tool_call_checked:
     }
 
     conversation_cache_free(&conversation_cache);
+    prepared_prompt_free(&prepared_cache);
     server_http_join(&http);
     if (server_fd >= 0 && g_server_listen_fd == server_fd) close(server_fd);
     g_server_listen_fd = -1;
