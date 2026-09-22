@@ -125,6 +125,10 @@ and post a notification when they finish.
 **Settings.** Generation, sampling, server, storage and advanced options, with
 validation and the model's sampling profiles. Saving tells you when the
 running server needs a restart and offers to do it.
+Expand Advanced options below Storage, then hover over a setting for its
+explanation. “Use reduced-precision predictor weights” is on for the
+quantized predictor and off to request BF16 weights. Existing preferences are
+preserved; the saved `MTP_BF16` key retains its original meaning.
 
 **Logs.** A live view of the server log, plus the app's own activity log.
 

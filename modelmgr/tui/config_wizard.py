@@ -478,6 +478,13 @@ def _advanced_settings(manifest, variant_name: str, active_experts: str = "") ->
         elif key == "EXPERT_PIN_MAX_EXPERTS":
             value = common.prompt_clearable(
                 label, configfile.get(key), clear_word="auto")
+        elif setting.inverted:
+            current = "0" if configfile.get(key) == "1" else "1"
+            value = common.prompt(label, current)
+            while value not in ("0", "1"):
+                print(common.yellow("  Enter 0 (off) or 1 (on)."))
+                value = common.prompt(label, current)
+            value = "0" if value == "1" else "1"
         else:
             value = common.prompt(label, configfile.get(key))
         if key == "MTP":

@@ -170,16 +170,25 @@ public struct SettingDef: Decodable, Sendable, Identifiable, Hashable {
     public var clearWord: String?
     public var emptyTitle: String?
     public var parent: String?
+    public var inverted: Bool?
     public var id: String { key }
 
     enum CodingKeys: String, CodingKey {
-        case key, section, title, label, help, kind, choices, minimum, maximum, parent
+        case key, section, title, label, help, kind, choices, minimum, maximum, parent, inverted
         case clearWord = "clear_word"
         case emptyTitle = "empty_title"
     }
 
     public var allowsEmpty: Bool {
         clearWord != nil || emptyTitle != nil || ["text", "path", "mtp"].contains(kind)
+    }
+
+    public func toggleIsOn(_ value: String) -> Bool {
+        (value == "1") != (inverted == true)
+    }
+
+    public func toggleValue(isOn: Bool) -> String {
+        isOn != (inverted == true) ? "1" : "0"
     }
 }
 

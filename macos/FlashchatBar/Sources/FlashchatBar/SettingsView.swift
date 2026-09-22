@@ -181,7 +181,7 @@ private struct SettingRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             control
-            if let help = def.help {
+            if let help = def.help, def.section != "advanced" {
                 Text(help).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -195,7 +195,8 @@ private struct SettingRow: View {
     private var control: some View {
         switch def.kind {
         case "bool":
-            Toggle(def.title, isOn: Binding(get: { value == "1" }, set: { value = $0 ? "1" : "0" }))
+            Toggle(def.title, isOn: Binding(get: { def.toggleIsOn(value) },
+                                            set: { value = def.toggleValue(isOn: $0) }))
         case "choice" where def.key == "SAMPLING_PROFILE":
             Picker(def.title, selection: Binding(get: { value }, set: { value = $0; onProfile($0) })) {
                 ForEach(profiles) { Text($0.label).tag($0.name) }

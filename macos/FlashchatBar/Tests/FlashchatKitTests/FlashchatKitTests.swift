@@ -31,6 +31,23 @@ final class DecodingTests: XCTestCase {
         XCTAssertFalse(detail.artifacts.isEmpty)
     }
 
+    func testPredictorToggleMapsToExistingBF16Preference() throws {
+        let json = #"{"key":"MTP_BF16","section":"advanced","title":"Use reduced-precision predictor weights","label":"","kind":"bool","choices":[],"inverted":true}"#
+        let def = try Backend.decode(SettingDef.self, from: json)
+        XCTAssertTrue(def.toggleIsOn("0"))
+        XCTAssertFalse(def.toggleIsOn("1"))
+        XCTAssertEqual(def.toggleValue(isOn: true), "0")
+        XCTAssertEqual(def.toggleValue(isOn: false), "1")
+
+        let state = try Backend.decode(ApiState.self, from: fixture("state.json"))
+        let ordinary = try XCTUnwrap(state.settings.first { $0.key == "SERVER_DEBUG" })
+        XCTAssertNil(ordinary.inverted)
+        XCTAssertTrue(ordinary.toggleIsOn("1"))
+        XCTAssertFalse(ordinary.toggleIsOn("0"))
+        XCTAssertEqual(ordinary.toggleValue(isOn: true), "1")
+        XCTAssertEqual(ordinary.toggleValue(isOn: false), "0")
+    }
+
     func testLauncherStatusAndHealthDecode() throws {
         let status = try Backend.decode(LauncherStatus.self, from: fixture("status.json"))
         XCTAssertEqual(status.server.state, "stopped")

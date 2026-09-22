@@ -133,6 +133,26 @@ class TestConfigWizardCustomProfile(unittest.TestCase):
         self.assertIn("Active experts (K, default 8, max 16) [16]:", out.getvalue())
         self.assertEqual(changes["ACTIVE_EXPERTS"], "16")
 
+    def test_quantized_predictor_toggle_preserves_and_inverts_saved_bf16_preference(self):
+        manifest = self.registry.get("qwen3.6-35b-a3b")
+        for saved, answer, expected in (("0", None, "0"), ("1", None, "1"),
+                                        ("1", "1", "0"), ("0", "0", "1")):
+            with self.subTest(saved=saved, answer=answer):
+                with open(self.config_path, "a") as f:
+                    f.write(f'MTP_BF16="{saved}"\n')
+
+                def reply(message, default=""):
+                    if "use reduced-precision predictor weights" in message:
+                        self.assertEqual(default, "1" if saved == "0" else "0")
+                        return default if answer is None else answer
+                    return default
+
+                with patch.object(common, "confirm", return_value=True), \
+                        patch.object(common, "prompt", side_effect=reply), \
+                        redirect_stdout(io.StringIO()):
+                    changes = config_wizard._advanced_settings(manifest, "q4")
+                self.assertEqual(changes["MTP_BF16"], expected)
+
     def test_advanced_optional_values_can_be_cleared(self):
         with open(self.config_path, "a") as f:
             f.write('ADAPTIVE_K_MASS="0.95"\n')
