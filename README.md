@@ -63,9 +63,9 @@ I've extended the original project from a research project to usable system incl
 
 ## Model Support
 
-* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) q4, q8 - 52GB (default - 17 tok/s)
-* [Qwen/Qwen3.5-80B-A3B](https://huggingface.co/Qwen/Qwen3.5-80B-A3B) q4, q8 - 92GB (12 tok/s)
-* [Qwen/Qwen3-Coder-Next (80B-A3B)](https://huggingface.co/Qwen/Qwen3-Coder-Next) q4, q8 - 92GB (12 tok/s)
+* [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) q4, q8 - 52GB (default q4 - 24-31 tok/s; q8 - 13-17 tok/s)
+* [Qwen/Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) q4, q8 - 92GB (17 tok/s)
+* [Qwen/Qwen3-Coder-Next (80B-A3B)](https://huggingface.co/Qwen/Qwen3-Coder-Next) q4, q8 - 92GB (17 tok/s)
 * [mlx-community/Qwen3.5-397B-A17B-4bit](https://huggingface.co/mlx-community/Qwen3.5-397B-A17B-4bit) q4 - 417GB (3.5 tok/s)
 
 ## Requirements
