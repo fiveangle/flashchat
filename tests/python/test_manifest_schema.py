@@ -25,7 +25,7 @@ def load_shipped():
 class TestShippedManifests(unittest.TestCase):
     def test_all_shipped_manifests_parse(self):
         shipped = load_shipped()
-        self.assertEqual(len(shipped), 4)
+        self.assertEqual(len(shipped), 5)
         ids = set()
         for path, data in shipped.items():
             m = parse_manifest(data, source_path=path)

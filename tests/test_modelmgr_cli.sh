@@ -128,8 +128,8 @@ echo ""
 echo "=== Manage TUI (non-destructive) ==="
 output=$(printf 'q\n' | run_fc manage 2>&1)
 assert_contains "manage lists models" "Manage models" "$output"
-# index 4 = the native qwen3.6-35b-a3b in the sorted manage list
-output=$(printf '4\nq\nq\n' | run_fc manage 2>&1)
+native_index=$(printf '%s\n' "$output" | sed -n 's/^ *\([0-9][0-9]*\)) .*(Qwen\/Qwen3\.6-35B-A3B).*/\1/p')
+output=$(printf '%s\nq\nq\n' "$native_index" | run_fc manage 2>&1)
 assert_contains "manage model view shows snapshot" "snapshot:" "$output"
 assert_contains "manage model view shows artifacts" "packed_experts/" "$output"
 assert_contains "manage offers verify actions" "deep verify" "$output"
