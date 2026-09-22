@@ -120,7 +120,7 @@ with old rounded summaries are explicit. No missing historical measurement was i
 |---|---|---|---|---|---|---|
 | 00 | [Baseline capture](explorations/00-baseline/NOTES.md) | Closed | Baseline | — Baseline only | Warm 32 GB Mac17,2; q4, q8 context cache, 8 active experts, pinning/MTP off: 150-token runs 16.42 / 17.33 / 17.37 tok/s; median **17.33 tok/s**. No optimization delta. | Retain as historical reference, not a current baseline. Pin-off was a test configuration, not the shipping default (12). |
 | 01 | [Zero-copy expert pin cache](explorations/01-pin-zero-copy/NOTES.md) | Closed | Successful | **+10.7%** decode (4 GiB) | Warm 32 GB, 150-token medians: pin-off **17.33 → 19.18 tok/s** with 4 GiB zero-copy pinning (**+10.7%**). 8/12/16 GiB gave 18.98/18.77/18.48; no extra speed from larger arenas. Tested greedy output matched. | Keep zero-copy hits and active-slot protection (25, 21). Revisit sizing when the workload changes, not simply to maximize hit rate. |
-| 02 | [RAM discipline](explorations/02-ram-discipline/NOTES.md) | Closed | Mixed | Locking: **+15–21%** pressure / **+6.3%** warm<br>Bypass: inconsistent; decay: no benefit | **Locking cache pages (mlock):** 3 GiB pinning under simulated 16 GB pressure gave **11.13→12.84, 10.37→12.28, 10.55→12.81 tok/s (+15–21%)**; warm 32 GB/4 GiB **21.44→22.78 (+6.3%)**. **Filesystem-cache bypass:** inconsistent. **Frequency decay at decode start:** no hit-rate or speed benefit. Notes headline says +15–24%; the listed round pairs support +15–21%. | Keep the locking capability with headroom; reject tested bypass/decay policies. No pending action. Revisit for materially different memory pressure or prompt/decode routing distributions. Emulation is not real 16 GB hardware; sustained bypass failure is also preserved in 25. |
+| 02 | [RAM discipline](explorations/02-ram-discipline/NOTES.md) | Closed | Mixed | Locking: **+15–21%** pressure / **+6.3%** warm<br>Bypass: inconsistent; decay: no benefit | **Locking cache pages (mlock):** 3 GiB pinning under simulated 16 GB pressure gave **11.13→12.84, 10.37→12.28, 10.55→12.81 tok/s (+15–21%)**; warm 32 GB/4 GiB **21.44→22.78 (+6.3%)**. **Filesystem-cache bypass:** inconsistent. **Frequency decay at decode start:** no hit-rate or speed benefit. Notes headline says +15–24%; the listed round pairs support +15–21%. | Keep the locking capability with headroom; reject tested bypass/decay policies. No pending action. Two admission variants from the retired July review remain untested and belong here rather than under new IDs: weighting decode hits above prefill hits, and shrinking the arena back down when a new long prompt arrives. Revisit for materially different memory pressure or prompt/decode routing distributions. Emulation is not real 16 GB hardware; sustained bypass failure is also preserved in 25. |
 | 03 | [Adaptive expert count](explorations/03-adaptive-k/NOTES.md) | Closed | Successful, quality trade-off | **+4.6%** decode; output differs | Reported interleaved 100-token A/B: **16.55/16.39 → 17.24/17.21 tok/s (+4.6%)**, mass=0.90/minimum 5; mean active experts 6.921 vs 8 (**13.5% fewer reads**). Mass=0.95 was +0.4%; 0.98 never triggered. Greedy output eventually diverged. | Keep opt-in, default off. Require task-quality evidence before broader adoption. Small throughput delta is workload-specific; fewer reads do not establish equal answer quality. |
 | 04 | [Batched MTP verification](explorations/04-mtp-batched-default/NOTES.md) | Parked | Unsuccessful | **−25.8%** decode (pressure test) | Two-position MTP verification: **75.9% acceptance**, but warm decode **14.46 vs ~18+ tok/s**. Listed pressure-test pair **21.59→16.03 tok/s (−25.8%, 0.742x)**; notes summarize ~0.76x. Low-confidence fallback paid sequential verification on 39/58 iterations. | Do not enable this variant by default. Continue only through 20 with a cheaper fallback/drafting policy and total-cost evidence; high acceptance alone was insufficient. |
 | 05 | [Matrix-vector occupancy remap](explorations/05-matvec-occupancy/NOTES.md) | Reviewed / parked | No measurement | — Not measured | Review rejected the premise that only one SIMD group was useful: the current kernel already assigns eight groups to output rows. No numbered implementation or timing result recovered; historical DEAD was a review judgment. | No active work. Reopen only for a concrete alternative mapping and evidence of a different bottleneck; do not repeatedly treat the original premise as untouched. |
@@ -166,6 +166,12 @@ with old rounded summaries are explicit. No missing historical measurement was i
 | 45 | [Dedicated HTTP thread](explorations/45-http-server-threading/NOTES.md) | Closed | Successful for responsiveness; neutral for throughput | Decode: **neutral** (−1.8% to +1.6%)<br>Prefill: **neutral** (−1.8% to +3.0% time)<br>Health during inference: **0.7 ms / 1.5 ms** | Shipped in `5f3fdcd` before registration. Mac17,2, Coder-Next q4, canonical A/B vs `b803619` sources: six scenarios stayed inside −1.8% to +1.6% decode and −1.8% to +3.0% prefill time. Worst sampled `/health` while the inference worker was active: **0.7 ms** (short prompt) and **1.5 ms** (409 new prompt tokens). No paired baseline health latency; the previous server ran HTTP on the inference thread. Overlapping generation returned `503`. Rows retained in `assets/api_perf_log.tsv`. | Keep the HTTP/inference split. Do not cite this as a tokens/sec win. Queueing and multi-conversation batching remain 36. Revisit only if health-during-inference latency regresses. |
 | 46 | [Prefill-buffer release](explorations/46-prefill-buffer-release/NOTES.md) | Closed | Memory accounting only | — Speed not established | Shipped in `86c8846` before registration. One 2026-07-08 pair, Qwen3.6 q4, 1231 prompt tokens, 16 generated: engine sum **401.43 MiB** released; prefill **32790→32850 ms**; decode **4.85→4.60 tok/s**. RSS did not move (1.40→1.40 GiB). Single short run, not a benchmark. MTP skips the release. | Keep the release, default on. Do not cite a tokens/sec change. Claim OS return only with a later RSS or device-allocation reading. |
 | 47 | [Expert pin slot cap](explorations/47-expert-pin-slots/NOTES.md) | Closed | Control surface; no speed test | — Not measured | Shipped in `86c8846` before registration. `EXPERT_PIN_MAX_EXPERTS` requests whole experts; GiB cap remains the ceiling and off switch. Schema v9. Native check: 2560 requested under a 1 GiB cap resolved to **606 experts (1022.62 MiB)**. No throughput run. | Keep the slot cap. Do not add this to 01/02/12 speed gains. 16 GB slot-count benchmarks were not run. |
+| 48 | Quantize or window the MTP context cache | Parked | Excluded by design | — Not measured for MTP | Not an untested idea: `54d9447` (2026-06-22) shipped production KV quantization and states that MTP buffers stay fp32, enforced by a fatal guard making `--mtp-*` mutually exclusive with KV-quant because the two share fp32 buffers. The production path it excluded measured **~671 MB to ~170 MB (q8) / ~86 MB (q4) at 8K context**, byte-identical with the default off. MTP still allocates fp32 K/V at the full window (`GPU_KV_SEQ`). | Unpark only if MTP returns to the default path; it is opt-in and off it today. Removing the guard means unsharing those buffers first. Judge any saving against draft acceptance, not in isolation. |
+| 49 | Mirror MTP context cache incrementally for GPU attention | Untested | Never attempted | — Not measured | No measurement and no attempt in history. `mtp_try_gpu_attention` copies the whole `ctx_len * kv_dim` float block per draft, so cost grows with context; production `kv_append_token` already appends incrementally. Proposed in the 2026-07-08 `infer.m` review; the MTP KV path has not been touched for this since. | Only matters if GPU MTP attention becomes worth using. Measure the copy against total draft cost first. Ranked low for the same reason as 48. |
+| 50 | Admit pinned experts during chunked prefill | Untested | Never attempted | — Not measured | No measurement and no attempt in history. Decode admits experts through the pin arena, but `parallel_pread_experts_into` (prefill) contains no pin references at all, so a long prompt warms only the OS page cache. Unchanged in this respect since `6c04132` (2026-07-07). | Whether prompt-routed experts belong in the arena is the open question, not an assumed win: 09 measured cheap predictors at 5.7-8.2% coverage once pinning was on, and 02 rejected the prefill-biased admission policies it tested. Establish that prefill routing predicts decode routing first. |
+| 51 | Reuse prefill chunk scratch instead of per-layer allocation | Untested | Never attempted | — Not measured | No measurement and no attempt in history. `batched_layer_forward_N` still mallocs and frees large per-layer, per-chunk buffers, including one allocation per attention head per token in the full-attention path. Unchanged since `6c04132` (2026-07-07). Distinct from 30, which covers autorelease-pool lifetime and chunk-local embeddings. | Attribute allocator cost before restructuring. Reuse alone does not lower steady-state resident bytes unless the scratch is also released, which is 46's territory. |
+| 52 | Stage remaining prefill intermediates below fp32 | Partly shipped | fp16 at the accelerator boundary; fp32 intermediates remain | — Not measured for the remainder | Partly done before the review proposed it. `__fp16` entered `infer.m` with the ANE prefill work (`ae0544e`, `6c04132`, `2a34a7e`, 2026-07-06 to 07-07): the ANE producer boundary and the KV-quant per-head scales are fp16 today. What remains fp32 is the per-layer chunk staging inside `batched_layer_forward_N`. | Routing inputs must stay fp32: changing precision there moves expert selection, which is a correctness change rather than an optimization. Hold routing and expert selection bit-identical and check prefill output against the fp32 path. |
+| 53 | Precompute RoPE inverse frequencies on the CPU K path | Untested | Never attempted | — Not measured | No measurement and no attempt in history. `1ab37b7` (2026-06-23) added the GPU RoPE table for Q, which is why the review scoped this to K only. CPU K RoPE still calls `powf`, `cosf`, and `sinf` per full-attention token and head, and `gpu_rope_upload_freq` recomputes `powf` per position upload. Expected small. | Needs a profile showing the trigonometric cost is visible at all, and unchanged token output. Cheap and low risk if it is. |
 
 ## Evidence audit notes and interactions
 
@@ -179,7 +185,12 @@ experiments.
   not hit rate (70.9% at 3 GiB, 76.8% at 4 GiB). More pinned memory did not improve
   the emulated case because it competed with the file cache. Preserve the positive
   locking result, the inconsistent bypass result, and the null frequency-decay
-  result separately. Source: [02 notes](explorations/02-ram-discipline/NOTES.md).
+  result separately. What 02 rejected was decay itself, not every phase-aware
+  policy: weighting decode hits above prefill hits was never tested, and neither
+  was shrinking the pin arena when a new long prompt arrives — post-prefill growth
+  is already satisfied by lazy arena init. Both arrived with the retired July
+  review and stay under 02 so a measured negative is not re-litigated under a fresh
+  ID. Source: [02 notes](explorations/02-ram-discipline/NOTES.md).
 - **03 — acceptance of a quality trade-off:** +4.6% is the notes' explicitly
   interleaved pair comparison. Other saved short probes have different rates;
   they are not interchangeable matched controls. The observed read reduction is
@@ -582,6 +593,106 @@ Registered after the fact from `86c8846`. After batched prefill, the engine nils
 
 Registered after the fact from the same commit. A slot count requests whole experts; the GiB setting stays the ceiling and the off switch. No throughput measurement. Details: [47 notes](explorations/47-expert-pin-slots/NOTES.md).
 
+### 48 — Quantize or window the MTP context cache
+
+Not an untested idea. `54d9447` (2026-06-22) shipped production context-cache
+quantization and deliberately left MTP out: its message records that MTP buffers
+stay fp32, and it added a fatal guard making `--mtp-*` mutually exclusive with
+KV-quant, because the two share fp32 buffers. The production path it excluded went
+from roughly 671 MB to 170 MB at q8 and 86 MB at q4 at 8K context, byte-identical
+with the default off; that is the magnitude MTP currently forgoes, not a prediction
+of what MTP would gain.
+
+MTP is opt-in and off the default path, which is why the July review also ranked
+this low. Unparking it means unsharing those buffers first, and any saving has to
+be judged against draft acceptance rather than in isolation.
+
+### 49 — Mirror MTP context cache incrementally for GPU attention
+
+`mtp_try_gpu_attention` copies the whole context K/V block into dedicated GPU
+buffers before each draft, so the copy grows with context length. Production
+`kv_append_token` already appends incrementally; the MTP path has not been changed
+to match. Only matters if GPU MTP attention becomes worth using, so measure the
+copy against total draft cost first. Ranked low for the same reason as 48.
+
+### 50 — Admit pinned experts during chunked prefill
+
+Decode admits experts through the pin arena, but the chunked-prefill read path
+contains no pin references, so a long prompt warms only the OS page cache. Whether
+prompt-routed experts belong in the arena is the open question rather than an
+assumed win: 09 measured cheap predictors at 5.7-8.2% coverage once pinning was on,
+and 02 rejected the prefill-biased admission policies it tested. Establish that
+prefill routing predicts decode routing before building this.
+
+### 51 — Reuse prefill chunk scratch instead of per-layer allocation
+
+Batched prefill still allocates and frees large float buffers per layer and chunk,
+including one allocation per attention head per token in the full-attention path.
+A reusable scratch object would cut allocator churn and make further prefill-memory
+release easier. Distinct from 30, which covers per-request autorelease-pool lifetime
+and chunk-local embeddings. Reuse alone does not lower steady-state resident bytes
+unless the scratch is also released, which is 46's territory.
+
+### 52 — Stage remaining prefill intermediates below fp32
+
+Partly done before the review proposed it. Reduced precision already reaches the
+accelerator boundary: `__fp16` entered the engine with the ANE prefill work of
+2026-07-06 to 07-07, and both the ANE producer boundary and the KV-quant per-head
+scales are fp16 today. What remains fp32 is the per-layer chunk staging inside the
+batched prefill forward.
+
+Routing inputs must stay fp32. Changing precision there moves expert selection,
+which is a correctness change rather than an optimization. Any extension has to
+hold routing and expert selection bit-identical and check prefill output against
+the fp32 path.
+
+### 53 — Precompute RoPE inverse frequencies on the CPU K path
+
+`1ab37b7` (2026-06-23) added the GPU RoPE frequency table for Q, which is why the
+review scoped this to K. CPU K RoPE still calls `powf`, `cosf`, and `sinf` per
+full-attention token and head, and the GPU table's own uploader recomputes `powf`
+per position. A persistent inverse-frequency table removes the repeated `powf`.
+Expected to be small, so it needs a profile showing the trigonometric cost is
+visible at all, plus unchanged token output.
+
+## Retired code-review list (2026-09-22)
+
+`docs/POTENTIAL_OPTIMIZATIONS.md` held a 2026-07-08 review of the live `infer.m`
+path, written and committed alongside the work it recommended (`86c8846`). It ran
+no benchmarks and was superseded by this register. Every distinct proposal in it
+now has a home here, so the file was deleted; its text remains in Git history.
+
+Each item was checked against the commit history for the dates it concerns, not
+only against current `HEAD`. That distinction matters: absence from today's code
+can mean never attempted, or attempted and reverted, and only the second is a
+negative result. It also prevents recording work as unmeasured when a merged
+commit carries a result. Where a proposal was implemented and kept, the shipped
+commit and its recorded effect are cited instead of "no measurement".
+
+The review made two passes over the same ground, an initial list of ten and a
+re-prioritized restatement. Both are mapped below. Nothing here is a new benchmark.
+
+| Review item | Now | History checked | Disposition |
+|---|---|---|---|
+| 1, Highest 1 — release prefill-only GPU buffers | [46](explorations/46-prefill-buffer-release/NOTES.md) | Shipped `86c8846`, 2026-07-08 | Closed. Shipped in the same commit as the review. 401.43 MiB engine accounting; no speed result established. Inside the 00 baseline. |
+| 4, Highest 2 — pin cache slot-based, not GB-based | [47](explorations/47-expert-pin-slots/NOTES.md) | Shipped `86c8846`, 2026-07-08 | Closed. Shipped as `EXPERT_PIN_MAX_EXPERTS` in the same commit. Control surface only. Inside the 00 baseline. |
+| 6, Medium 5 — copy pinned experts outside the mutex | [01](explorations/01-pin-zero-copy/NOTES.md), [21](explorations/21-io-event-gating/NOTES.md) | `expert_pin_lookup` added `76eb38a` 2026-06-25, removed by `5624690` 2026-08-17 | **Closed, and measured.** The copy-under-lock function the review flagged no longer exists: 01 replaced the hit path with zero-copy slot buffers bound directly to the GPU (**+10% decode**), and 21a moved the miss path to a reserved-slot pread (**+2.5%**). A copy under the lock survives only in the fallback admission path. Do not re-propose as new headroom. |
+| 5, Highest 3 — phase-aware pin admission | [02](explorations/02-ram-discipline/NOTES.md) | Measured under 02 | Partly closed. Frequency decay at decode start was measured and gave no hit-rate or speed benefit. Weighting decode hits above prefill hits was never tested; recorded in 02's revisit criteria. |
+| Medium 4 — regrow pin cache from freed prefill memory | [02](explorations/02-ram-discipline/NOTES.md) | Answered under 02 | Partly closed. Post-prefill pin growth is already satisfied by lazy arena init. Shrinking the arena back for a new long prompt was never tested; recorded in 02's revisit criteria. |
+| 2 — quantize or window the MTP KV cache | 48 | Excluded by `54d9447`, 2026-06-22 | Parked by design, not untested. That commit shipped production KV quantization, recorded that MTP buffers stay fp32, and added a fatal guard making `--mtp-*` mutually exclusive with it. |
+| 9 — bf16/fp16 prefill staging | 52 | fp16 landed `ae0544e`/`6c04132`/`2a34a7e`, 2026-07-06 to 07-07 | Partly shipped before the review proposed it. The ANE producer boundary and KV-quant scales are fp16; per-layer chunk staging is still fp32. |
+| 3 — incremental MTP KV mirror for GPU attention | 49 | No attempt found | Open. Never implemented, never reverted. |
+| 7 — admit pinned experts during chunked prefill | 50 | No attempt found since `6c04132`, 2026-07-07 | Open. Never implemented, never reverted, and gated on prefill routing predicting decode routing. |
+| 8, Medium 6 — reusable prefill chunk scratch | 51 | No attempt found since `6c04132`, 2026-07-07 | Open. Never implemented, never reverted. |
+| 10 — precompute RoPE inverse frequencies | 53 | GPU Q table `1ab37b7`, 2026-06-23; CPU K untouched | Open for the CPU K path only, which is why the review scoped it that way. |
+| Lower 7 — deprioritize MTP memory work | Context for 48 and 49 | — | A prioritization stance, not a proposal. MTP is opt-in and off the default path, which is why both MTP items rank low. |
+
+The review's "suggested experiment order" is not carried forward. Its first step,
+memory logging around prefill end, was satisfied by the instrumentation in
+`86c8846`; the rest are the items above. Its closing recommendation — hand memory
+from the prefill phase to the decode phase — is the theme shared by 46, 50, 51,
+and 02, not a separate proposal.
+
 ## Related implementation history without separate new IDs
 
 - System/tool prompt caching is implemented.
@@ -663,4 +774,5 @@ inventory does not authorize benchmarking or constitute performance sign-off.
 
 - **2026-09-16 — Experiment 26 measurement correction:** desktop restoration after the initial standard run left Codex UI visible during both three-turn runs. All six conversation rows are confounded; token-reuse and correctness evidence remain valid, while timing impact is unquantified.
 - **2026-09-22 — Experiment 45 registered after shipping:** assigned 45 to the dedicated HTTP thread (`5f3fdcd`), above reserved 26–44. Moved the 2026-09-16 validation note into the exploration directory. Recorded neutral tokens/sec and the sampled health latencies. No new benchmark.
-- **2026-09-22 — Experiments 46 and 47 registered after shipping:** assigned 46 and 47, above 45, to the 2026-07-08 prefill-buffer release and expert-slot cap (`86c8846`). Moved those two logs into their exploration directories. Reviewed the commit diff; no new benchmark. `docs/POTENTIAL_OPTIMIZATIONS.md` stays a review list, not an exploration.
+- **2026-09-22 — Experiments 46 and 47 registered after shipping:** assigned 46 and 47, above 45, to the 2026-07-08 prefill-buffer release and expert-slot cap (`86c8846`). Moved those two logs into their exploration directories. Reviewed the commit diff; no new benchmark.
+- **2026-09-22 — Retired the code-review candidate list:** migrated every distinct proposal in `docs/POTENTIAL_OPTIMIZATIONS.md` into this register and deleted the file, so open work is recorded in one place. Each item was checked against the commit history for the dates it concerns rather than against current `HEAD`, so never-attempted items are distinguished from implemented ones. Four items were already shipped and are cited with their commits and recorded effects (46, 47, and the pin-cache lock work measured as 01 and 21a); two are covered by 02; six became 48–53, of which one is parked by design and one is partly shipped. No benchmark was run and no measurement was invented.

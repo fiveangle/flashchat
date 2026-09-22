@@ -13,7 +13,6 @@ board below is historical evidence, not the allocator for new experiment IDs.
 | Path | What |
 |------|------|
 | `docs/explorations/<index>-<experiment>/` | All experiments (NOTES + raw results) |
-| `docs/POTENTIAL_OPTIMIZATIONS.md` | Code-review candidates (prefill RAM, pin slots, MTP KV) |
 | `12-pin-default-on/campaign-analysis/` | Shared August 24 hot-path analysis + ranked roadmap |
 
 ## Reading the historical results
