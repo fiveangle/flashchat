@@ -154,7 +154,7 @@ with old rounded summaries are explicit. No missing historical measurement was i
 | 33 | Return multiple independent tool calls per turn | Untested | No measurement | — Not measured | No measurement. Generation stops after the first valid call; emitting several independent calls per response requires compatible template and client behavior. | Establish model-template and client support. |
 | 34 | Reduce unnecessary generated tokens | Untested | No measurement | — Not measured | No measurement. Reasoning toggles/budgets already exist; finer task policies, concise output and patch-oriented generation are proposed. Fewer tokens alone do not prove faster successful completion. | Evaluate task completion and quality, including retries. |
 | 35 | Compact useful input and tool results | Untested | No measurement | — Not measured | No measurement. Client/tool-side result selection and compaction are proposed; they can remove useful information or invalidate cached prefixes. | Preserve information and prefix stability. |
-| 36 | Coordinate competing and ancillary requests | Untested | No measurement | — Not measured | No measurement of scheduling extensions. HTTP separation (`5f3fdcd`) and disconnect cancellation (`fccc672`) already ship; queueing, priority and multi-conversation batching remain proposed. | Establish actual concurrent demand and latency priorities. |
+| 36 | Coordinate competing and ancillary requests | Untested | No measurement | — Not measured | No measurement of scheduling extensions. Dedicated HTTP/inference split and its responsiveness result are [45](explorations/45-http-server-threading/NOTES.md); disconnect cancellation (`fccc672`) ships on that split. Queueing, priority, and multi-conversation batching remain proposed. | Establish actual concurrent demand and latency priorities. Do not treat 45 as this proposal. |
 | 37 | Reuse completed work after explicit retries | Untested | No measurement | — Not measured | No measurement. Exact completed-response reuse/reconnect is proposed; it is separate from existing cancellation and must not duplicate tool execution. | Define idempotency and delivery semantics. |
 | 38 | Parse tool output incrementally | Untested | No measurement | — Not measured | No measurement. Current tool parsing searches accumulated output repeatedly; a stateful parser is proposed for large arguments. | Check large-argument parsing cost. |
 | 39 | Reduce sampling and response-assembly overhead | Untested | No measurement | — Not measured | No measurement. CPU sampling, repeated scans and unnecessary streaming-response assembly are candidates; no demonstrated bottleneck or speedup. | Attribute CPU cost before changing algorithms. |
@@ -163,6 +163,7 @@ with old rounded summaries are explicit. No missing historical measurement was i
 | 42 | Audit client rendering and stream buffering | Untested | No measurement | — Not measured | No measurement. Ordinary server text already streams; proxy/client buffering and transcript rendering are integration audit targets, not established causes of delay. | Compare server emission with visible client updates. |
 | 43 | Sparse attention or context-state compression | Untested | No measurement | — Not measured | No measurement. Sparse attention/state compression beyond existing context-cache quantization is a research proposal; architecture and task quality constrain it. | Establish quality and architecture compatibility. |
 | 44 | Better specialized speculative drafter | Untested | No measurement | — Not measured | No measurement. A specialized drafter beyond the current MTP head is proposed; no compatible artifact or favorable memory/verification budget established here. | Establish artifact compatibility, RAM cost, and verification economics. |
+| 45 | [Dedicated HTTP thread](explorations/45-http-server-threading/NOTES.md) | Closed | Successful for responsiveness; neutral for throughput | Decode: **neutral** (−1.8% to +1.6%)<br>Prefill: **neutral** (−1.8% to +3.0% time)<br>Health during inference: **0.7 ms / 1.5 ms** | Shipped in `5f3fdcd` before registration. Mac17,2, Coder-Next q4, canonical A/B vs `b803619` sources: six scenarios stayed inside −1.8% to +1.6% decode and −1.8% to +3.0% prefill time. Worst sampled `/health` while the inference worker was active: **0.7 ms** (short prompt) and **1.5 ms** (409 new prompt tokens). No paired baseline health latency; the previous server ran HTTP on the inference thread. Overlapping generation returned `503`. Rows retained in `assets/api_perf_log.tsv`. | Keep the HTTP/inference split. Do not cite this as a tokens/sec win. Queueing and multi-conversation batching remain 36. Revisit only if health-during-inference latency regresses. |
 
 ## Evidence audit notes and interactions
 
@@ -501,9 +502,10 @@ change the information available and therefore require task-quality evaluation.
 
 ### 36 — Coordinate competing and ancillary requests
 
-The dedicated HTTP thread and disconnect cancellation are already implemented.
-Generation currently accepts one request at a time and rejects competitors with
-`503`. See [SERVER.md](SERVER.md).
+The dedicated HTTP thread, its responsiveness measurement, and disconnect
+cancellation are [45](explorations/45-http-server-threading/NOTES.md), not this
+proposal. Generation currently accepts one request at a time and rejects
+competitors with `503`. See [SERVER.md](SERVER.md).
 
 Extensions include a bounded queue with deadlines, interactive priority over
 background summaries, cache-aware request selection, and cancellation of queued
@@ -561,12 +563,20 @@ Reduce long-context generation cost. Changes model behavior; substantial quality
 
 Improve speculative decoding beyond the current MTP head. Compatible artifacts, memory headroom, and favorable verification costs required.
 
+### 45 — Dedicated HTTP thread
+
+Registered after the fact. `5f3fdcd` split HTTP serving from inference so health,
+status, and busy rejection stay available during generation. Canonical A/B was
+neutral for tokens/sec and prefill time. Sampled health latency during inference
+was 0.7 ms and 1.5 ms; there is no paired baseline because the previous server
+ran HTTP on the inference thread. Details:
+[45 notes](explorations/45-http-server-threading/NOTES.md).
+
 ## Related implementation history without separate new IDs
 
 - System/tool prompt caching is implemented.
 - Conversation caching was implemented, then its active-session path was removed
   during the API rewrite; 26 is recovery with stronger matching requirements.
-- HTTP-thread separation and disconnect cancellation are implemented.
 - Prefill transient-buffer release is implemented.
 - Forced tool choice already inserts an opening function prefix.
 - TensorOps prefill, GPU tail fusion, idle warming, and MTP follow-ups remain
@@ -643,3 +653,4 @@ inventory does not authorize benchmarking or constitute performance sign-off.
 - **2026-09-16 — Experiment 26 validated:** restored exact conversation reuse, recorded observed 40.7%/53.9% lower continuation first-token wait (confounded by visible Codex UI), functional results, and benchmark limitations in the exploration notes.
 
 - **2026-09-16 — Experiment 26 measurement correction:** desktop restoration after the initial standard run left Codex UI visible during both three-turn runs. All six conversation rows are confounded; token-reuse and correctness evidence remain valid, while timing impact is unquantified.
+- **2026-09-22 — Experiment 45 registered after shipping:** assigned 45 to the dedicated HTTP thread (`5f3fdcd`), above reserved 26–44. Moved the 2026-09-16 validation note into the exploration directory. Recorded neutral tokens/sec and the sampled health latencies. No new benchmark.

@@ -94,6 +94,12 @@ The old pending entry for 09 is superseded by
 [its measured prefetch notes](09-expert-prefetch/NOTES.md). Experiment 14's
 pre-landing "opt-in" wording is also corrected in its notes using `5af6a43`.
 
+### Registered after shipping (2026-09-22)
+
+| # | Notes | Disposition |
+|---|-------|-------------|
+| 45 | [Dedicated HTTP thread](45-http-server-threading/NOTES.md) | Shipped in `5f3fdcd` before it had an ID. Health during inference 0.7 ms / 1.5 ms; tokens/sec neutral. Validation note lives in that directory. |
+
 ### Other-checkout recovery
 
 [25 — recovered wonderment campaign](25-wonderment-recovered/NOTES.md) preserves

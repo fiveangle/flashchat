@@ -158,7 +158,8 @@ make bench-api              # Idle machine, canonical performance validation
 make bench-report
 ```
 
-See [live acceptance and baseline comparison](HTTP_RESPONSIVENESS_VALIDATION.md)
+See [live acceptance and baseline comparison](explorations/45-http-server-threading/HTTP_RESPONSIVENESS_VALIDATION.md)
+and [experiment 45](explorations/45-http-server-threading/NOTES.md)
 for the measured results and test-artifact provenance.
 
 Sampling uses the selected model profile, with explicit API parameters taking
