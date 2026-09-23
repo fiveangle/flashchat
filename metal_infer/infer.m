@@ -10572,13 +10572,25 @@ static void parsed_tool_call_free(ParsedToolCall *tool_call) {
     tool_call->arguments = NULL;
 }
 
+// A tag is a candidate while it is still forming one character at a time
+// ("<too"), and also when it arrives whole in a single token ("<tool_call>").
+// Past the tag's own length the delimiter has to match too, so ordinary prose
+// that merely starts the same way ("<tool_calls", "<functional") is released
+// instead of being mistaken for a call that never parses.
+static int tool_call_tag_partial_match(const char *tag, char delim, const char *p, size_t n) {
+    size_t tag_len = strlen(tag);
+    if (n < tag_len) return strncmp(tag, p, n) == 0;
+    if (strncmp(tag, p, tag_len) != 0) return 0;
+    return n == tag_len || p[tag_len] == delim;
+}
+
 static int tool_call_tag_prefix_candidate(const char *buf) {
     const char *lt = strrchr(buf, '<');
     if (!lt) return 0;
     const char *p = lt + 1;
     size_t n = strlen(p);
-    if (n > strlen("tool_call") && n > strlen("function")) return 0;
-    return strncmp("tool_call", p, n) == 0 || strncmp("function", p, n) == 0;
+    return tool_call_tag_partial_match("tool_call", '>', p, n) ||
+           tool_call_tag_partial_match("function", '=', p, n);
 }
 
 static int append_bytes(char **buf, size_t *len, size_t *cap, const char *src, size_t src_len) {
@@ -12855,6 +12867,84 @@ static int sse_send_response_text_delta(int fd, const char *response_id, const c
     return write(fd, chunk, n) <= 0 ? -1 : 0;
 }
 
+// Bytes withheld from the stream while a tag might be forming. Released as a
+// normal delta the moment the text turns out to be ordinary output.
+// A multi-byte character can straddle two tokens, and each delta is its own JSON
+// document: emitting half a sequence hands the client bytes it cannot decode, and
+// the damage is done at parse time, so concatenation never recovers it. Trailing
+// bytes of an unfinished character wait here for the token that completes them.
+typedef struct {
+    char hold[8];
+    int len;
+    int in_think;
+} Utf8DeltaStream;
+
+static int utf8_incomplete_tail(const char *s, int len) {
+    int max = len < 4 ? len : 4;
+    for (int back = 1; back <= max; back++) {
+        unsigned char c = (unsigned char)s[len - back];
+        if ((c & 0xC0) == 0x80) continue;
+        int need;
+        if ((c & 0x80) == 0x00) need = 1;
+        else if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else return 0;
+        return back < need ? back : 0;
+    }
+    return 0;
+}
+
+static int sse_send_text_utf8(int client_fd, const char *request_id, int is_chat,
+                              int in_think, Utf8DeltaStream *st, const char *text) {
+    if (!text || !*text) return 0;
+    char joined[2048];
+    const char *send_text = text;
+    if (st) {
+        if (st->len > 0 && st->in_think != in_think) {
+            st->len = 0;
+            st->hold[0] = '\0';
+        }
+        int tlen = (int)strlen(text);
+        int jlen = st->len + tlen;
+        if (jlen < (int)sizeof(joined)) {
+            memcpy(joined, st->hold, (size_t)st->len);
+            memcpy(joined + st->len, text, (size_t)tlen);
+            joined[jlen] = '\0';
+            st->len = 0;
+            st->hold[0] = '\0';
+            int tail = utf8_incomplete_tail(joined, jlen);
+            if (tail > 0 && tail < (int)sizeof(st->hold)) {
+                memcpy(st->hold, joined + jlen - tail, (size_t)tail);
+                st->len = tail;
+                st->hold[tail] = '\0';
+                st->in_think = in_think;
+                jlen -= tail;
+                joined[jlen] = '\0';
+            }
+            if (jlen == 0) return 0;
+            send_text = joined;
+        }
+    }
+    return is_chat
+        ? (in_think ? sse_send_reasoning_delta(client_fd, request_id, send_text)
+                    : sse_send_delta(client_fd, request_id, send_text))
+        : sse_send_response_text_delta(client_fd, request_id, send_text);
+}
+
+static void flush_tool_tag_hold(int client_fd, const char *request_id, int is_chat,
+                                int in_think, int stream, Utf8DeltaStream *utf8,
+                                char *hold, int *hold_len) {
+    if (!hold || !hold_len || *hold_len <= 0) return;
+    if (stream) {
+        if (sse_send_text_utf8(client_fd, request_id, is_chat, in_think, utf8, hold) < 0) {
+            server_log_errorf("[serve] %s client disconnected releasing held tag bytes\n", request_id);
+        }
+    }
+    *hold_len = 0;
+    hold[0] = '\0';
+}
+
 static int sse_send_response_tool_call(int fd, const char *response_id, const ParsedToolCall *tool_call) {
     char escaped_name[256];
     char *escaped_args = json_escape_alloc(tool_call->arguments ?: "{}");
@@ -14864,7 +14954,7 @@ static void serve_loop(
     void **layer_states, KVCache **kv_caches,
     void **layer_mmaps, int *layer_fds,
     float *hidden, float *logits,
-    uint16_t *final_norm_w, int K, int max_tokens)
+    uint16_t *final_norm_w, int K)
 {
     g_server_shutdown_signal = 0;
     g_server_listen_fd = -1;
@@ -14918,7 +15008,7 @@ static void serve_loop(
                     g_cfg.num_experts, K, g_cfg.num_experts_per_tok,
                     expert_bytes, expert_size_per_token_mib);
     }
-    server_logf("[serve]   max_response_tokens: %d\n", max_tokens);
+    server_logf("[serve]   max_response_tokens: %d\n", g_default_max_tokens);
     server_logf("[serve]   reasoning: %s\n", g_default_reasoning_enabled ? "enabled" : "disabled");
     server_logf("[serve]   show_thinking: %s\n", g_show_thinking_enabled ? "enabled" : "disabled");
     server_logf("[serve]   sampling: temp=%.3f top_p=%.3f top_k=%d min_p=%.3f presence=%.3f repetition=%.3f\n",
@@ -15492,6 +15582,15 @@ prefill_finished:
         size_t tool_call_len = 0;
         size_t tool_call_cap = 0;
         int saw_tool_call_start = 0;
+        // Length of gen_response at the token that opened the tool call, so the
+        // tag and its body can be cut back out of the non-streaming content once
+        // the call parses. -1 means no tool call has started.
+        int tool_call_resp_mark = -1;
+        // Speculatively withheld bytes: text that could still turn into a tag
+        // opener. Released to the client as soon as it cannot.
+        char tag_hold[64] = "";
+        int tag_hold_len = 0;
+        Utf8DeltaStream utf8_delta = {{0}, 0, 0};
         // When tool_choice forces a specific function, the prompt was prefilled
         // with `<tool_call>\n<function=NAME>\n`. Mirror that prefix into the
         // parser's buffer so it can match `<tool_call>` and extract NAME the
@@ -15502,6 +15601,7 @@ prefill_finished:
                                       "<tool_call>\n<function=%s>\n", req.forced_tool_name);
             append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, prefix, (size_t)prefix_len);
             saw_tool_call_start = 1;
+            tool_call_resp_mark = 0;
         }
 
         float mtp_backbone_hidden[g_cfg.hidden_dim];
@@ -15704,14 +15804,35 @@ prefill_finished:
                     }
                 }
                 if (req.tool_count > 0 && req.tool_choice_mode != TOOL_CHOICE_NONE) {
+                    int would_send = send_as_delta;
                     if (append_bytes(&tool_call_buf, &tool_call_len, &tool_call_cap, tok_str, (size_t)tlen) == 0 &&
                         tool_call_buf && (saw_tool_call_start || tool_call_tag_prefix_candidate(tool_call_buf))) {
-                        if (!saw_tool_call_start && (strstr(tool_call_buf, "<tool_call") || strstr(tool_call_buf, "<function"))) {
+                        if (!saw_tool_call_start && (strstr(tool_call_buf, "<tool_call>") || strstr(tool_call_buf, "<function="))) {
                             saw_tool_call_start = 1;
+                            tag_hold_len = 0;
+                            tag_hold[0] = '\0';
+                            const char *tag_at = in_think ? NULL : strrchr(gen_response, '<');
+                            tool_call_resp_mark = tag_at ? (int)(tag_at - gen_response) : gen_resp_len;
                             server_log_errorf("[serve] %s detected native tool_call start at generated=%d\n",
                                               request_id, gen_count);
                         }
-                        send_as_delta = 0;
+                        int hold_overflow = 0;
+                        if (!saw_tool_call_start && would_send) {
+                            if (tag_hold_len + tlen < (int)sizeof(tag_hold)) {
+                                memcpy(tag_hold + tag_hold_len, tok_str, (size_t)tlen);
+                                tag_hold_len += tlen;
+                                tag_hold[tag_hold_len] = '\0';
+                            } else {
+                                // Longer than any tag opener, so it is not one.
+                                flush_tool_tag_hold(client_fd, request_id, is_chat, in_think,
+                                                    req.stream, &utf8_delta, tag_hold, &tag_hold_len);
+                                hold_overflow = 1;
+                            }
+                        }
+                        if (!hold_overflow) send_as_delta = 0;
+                    } else {
+                        flush_tool_tag_hold(client_fd, request_id, is_chat, in_think,
+                                            req.stream, &utf8_delta, tag_hold, &tag_hold_len);
                     }
                     if (tool_call_buf && parse_tool_call_from_buffer(tool_call_buf, &parsed_tool_call)) {
                         if (!request_has_tool_named(&req, parsed_tool_call.name)) {
@@ -15725,6 +15846,7 @@ prefill_finished:
                             tool_call_len = 0;
                             if (tool_call_buf) tool_call_buf[0] = '\0';
                             saw_tool_call_start = 0;
+                            tool_call_resp_mark = -1;
                             goto tool_call_checked;
                         }
                         ToolValidationResult validation;
@@ -15753,6 +15875,7 @@ prefill_finished:
                                     tool_call_len = 0;
                                     if (tool_call_buf) tool_call_buf[0] = '\0';
                                     saw_tool_call_start = 0;
+                                    tool_call_resp_mark = -1;
                                     if (force_retry_tool) {
                                         char prefix[256];
                                         int prefix_len = snprintf(prefix, sizeof(prefix),
@@ -15760,6 +15883,7 @@ prefill_finished:
                                         append_bytes(&tool_call_buf, &tool_call_len,
                                                      &tool_call_cap, prefix, (size_t)prefix_len);
                                         saw_tool_call_start = 1;
+                                        tool_call_resp_mark = 0;
                                     }
                                     gen_resp_len = 0;
                                     gen_response[0] = '\0';
@@ -15808,6 +15932,14 @@ prefill_finished:
                         }
                         static int tool_call_counter = 0;
                         snprintf(parsed_tool_call.id, sizeof(parsed_tool_call.id), "call_%d", ++tool_call_counter);
+                        if (tool_call_resp_mark >= 0 && tool_call_resp_mark <= gen_resp_len) {
+                            while (tool_call_resp_mark > 0 &&
+                                   isspace((unsigned char)gen_response[tool_call_resp_mark - 1])) {
+                                tool_call_resp_mark--;
+                            }
+                            gen_resp_len = tool_call_resp_mark;
+                            gen_response[gen_resp_len] = '\0';
+                        }
                         if (g_server_debug_enabled) {
                             server_debug_write_text(request_id, "tool_call_buf.txt", tool_call_buf);
                         }
@@ -15819,18 +15951,12 @@ tool_call_checked:
             }
 
             if (send_as_delta && req.stream && tok_str) {
-                int rc;
-                if (is_chat) {
-                    // DeepSeek-style routing: in-think tokens → delta.reasoning_content,
-                    // post-think tokens → delta.content. OpenAI-extension-aware clients
-                    // (and our chat template renderer on the next turn) can then keep
-                    // reasoning structurally separated from the assistant response.
-                    rc = in_think
-                        ? sse_send_reasoning_delta(client_fd, request_id, tok_str)
-                        : sse_send_delta(client_fd, request_id, tok_str);
-                } else {
-                    rc = sse_send_response_text_delta(client_fd, request_id, tok_str);
-                }
+                // DeepSeek-style routing: in-think tokens → delta.reasoning_content,
+                // post-think tokens → delta.content. OpenAI-extension-aware clients
+                // (and our chat template renderer on the next turn) can then keep
+                // reasoning structurally separated from the assistant response.
+                int rc = sse_send_text_utf8(client_fd, request_id, is_chat, in_think,
+                                            &utf8_delta, tok_str);
                 if (rc < 0) {
                     server_log_errorf("[serve] %s client disconnected during stream\n", request_id);
                     break;
@@ -16106,6 +16232,12 @@ tool_call_checked:
         g_overlap_in_decode = 0;
         if (mtp_snap_ready) gpu_snap_free(&mtp_snap);
         free(mtp_hs); free(mtp_ln); free(mtp_mh); free(mtp_margins); free(mtp_drafts); free(mtp_posv); free(mtp_seed_hidden);
+
+        // Generation ended mid-hold (a trailing "<", say): that text was never a
+        // tag opener after all, so it still belongs to the client.
+        if (!parsed_tool_call.is_tool_call) {
+            flush_tool_tag_hold(client_fd, request_id, is_chat, 0, req.stream, &utf8_delta, tag_hold, &tag_hold_len);
+        }
 
         if (!parsed_tool_call.is_tool_call && saw_tool_call_start) {
             server_log_errorf("[serve] %s native tool_call started but was not parsed before completion\n", request_id);
@@ -17057,7 +17189,7 @@ int main(int argc, char **argv) {
             serve_loop(serve_port, loaded_config_path, model_path, weights_path, manifest_path, vocab_path, wf, vocab,
                        layer_states, kv_caches,
                        (void **)layer_mmaps, layer_fds,
-                       hidden, logits, final_norm_w, K, max_tokens);
+                       hidden, logits, final_norm_w, K);
             // serve_loop never returns, but cleanup just in case
             free(hidden); free(logits);
             return 0;

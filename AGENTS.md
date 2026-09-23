@@ -22,7 +22,19 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
   Do not assume an automatic watchdog ran: verify its results and include changed
   `assets/api_perf_log.tsv` rows in the commit. Additional measurements beyond the
   watchdog need a specific unanswered question or concrete anomaly and Dave's
-  explicit approval. Continue to run relevant correctness tests.
+  explicit approval.
+- **The watchdog runs once, at the end of the batch.** It gates the commit, not
+  each edit. Finish the whole batch of fixes first, then run it against the
+  finalized code. Do not pause mid-task to ask about it after every change, and
+  do not run it on intermediate states that will not be committed.
+- **Functional and correctness tests are normal work, not benchmarking.**
+  `make cli-smoke`, `manage-smoke`, `py-tests`, `registry-check`,
+  `tool-template-smoke`, `api-smoke`, `make test`, and live client checks against
+  a running server verify behavior, not performance. Run the ones relevant to the
+  change as a matter of course: they need no benchmark approval, they are never
+  the "additional measurements" the watchdog rule restricts, and they are not a
+  substitute for it either. They still have to respect the memory and contention
+  rules below, and must never disturb a measurement already in progress.
 - **Ask Dave before any benchmarking.** Get explicit approval for the proposed
   scope and configuration before running performance measurements, including
   ad-hoc timing probes and reruns. Approval covers the agreed bounded run or suite,
@@ -49,6 +61,12 @@ This is a pure C/Metal inference engine for running 397B parameter MoE models on
   for functional testing only when neither workload needs performance measurements.
   If either does, do not start a competing server or disturb the running workload.
   Ask when unclear; never stop Dave's server without permission.
+- **Needing Dave's server is a one-line question, not a status report.** When a
+  running server blocks the next step, ask "Your server is running — can I quit
+  it?" and stop there. Do not stand the task down, re-summarize finished work,
+  restate branch state, or list what remains: Dave knows what he asked for. A
+  blocked step and a verification deferred for want of a free server each cost
+  one sentence, at the point they come up.
 - **Target shipping defaults, not Dave's current settings.** Use the Make-based
   benchmarks and the out-of-box Qwen3.6-35B-A3B-q4 model with q8 context cache unless
   another target is explicitly agreed. Dave's running configuration is experimental
@@ -195,9 +213,11 @@ measured. Coverage is now structural, not manual — **but two things still requ
 hot-path impact.** Run `make bench-api` and review `make bench-report` against the
 finalized code before committing; decode/prefill, kernel, attention, and
 speculative-decoding changes have the same requirement. Seek the bounded approval
-required above unless Dave has already authorized the run. If it cannot run safely,
-report the performance-validation gap explicitly rather than treating functional
-tests as watchdog coverage. Preserve and commit its log, including noisy rows and
+required above unless Dave has already authorized the run, once the batch is
+final rather than after each edit. If it cannot run safely, report the
+performance-validation gap explicitly rather than treating functional tests as
+watchdog coverage — run those tests regardless, since they cover correctness the
+watchdog never does. Preserve and commit its log, including noisy rows and
 report warnings. Do not duplicate this run with ad-hoc baselines or rerun it merely
 to clear small or historical flags. Ad-hoc `--mtp-generate-*` numbers are for
 approved experiments, not routine regression sign-off.
