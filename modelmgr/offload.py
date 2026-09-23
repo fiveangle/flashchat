@@ -311,6 +311,50 @@ def _set_pending_scopes(manifest: Manifest, scopes: list[str]) -> None:
     _save_pending(data)
 
 
+def scope_fingerprint(scope_root: str) -> dict:
+    """Stat-only identity of an artifact scope, using rsync's own quick check
+    (size plus whole-second mtime, link targets): equal fingerprints mean a
+    sync would transfer nothing. Never reads file contents."""
+    out = {}
+    if not os.path.isdir(scope_root):
+        return out
+    for rel, kind in _walk_tree(scope_root, skip_dirs=_FULL_ARCHIVE_SKIP_DIRS):
+        full = os.path.join(scope_root, rel)
+        if kind == "link":
+            out[rel] = ("link", os.readlink(full))
+        else:
+            st = os.stat(full)
+            out[rel] = ("file", st.st_size, int(st.st_mtime))
+    return out
+
+
+def scope_fingerprints(snapshot: str, scopes) -> dict:
+    return {s: scope_fingerprint(_scope_dir(snapshot, s)) for s in scopes}
+
+
+def reconcile_pending_scopes(manifest: Manifest, snapshot: str | None,
+                             offload_dir: str) -> list[str]:
+    """Pending scopes whose offload copy still differs from the local one.
+    Scopes that already match are cleared, so a flag left by a rebuild that
+    changed nothing stops asking. Costs a stat walk of the pending scopes
+    only while something is pending."""
+    pending = pending_scopes(manifest)
+    if not pending or not snapshot or not offload_dir \
+            or archive_state(manifest, offload_dir) != "full":
+        return pending
+    dest = dest_repo_dir(offload_dir, manifest)
+    dest_snapshot = os.path.join(dest, "snapshots", os.path.basename(snapshot))
+    local = scope_fingerprints(snapshot, pending)
+    archived = scope_fingerprints(dest_snapshot, pending)
+    stale = [s for s in pending if local[s] != archived[s]]
+    if stale != pending:
+        _set_pending_scopes(manifest, stale)
+        journal = Journal(dest)
+        journal.data["dirty_scopes"] = stale
+        journal.save()
+    return stale
+
+
 def mark_artifact_scopes_dirty(manifest: Manifest, offload_dir: str,
                                scopes: list[str]) -> None:
     scopes = sorted(set(scopes))

@@ -779,17 +779,11 @@ cmd_manage() {
 }
 
 # -----------------------------------------------------------------------------
-# Model readiness — quick non-interactive check, interactive repair on failure
+# Model readiness — interactive repair and launch-time offers, silent when ready
 # -----------------------------------------------------------------------------
 ensure_model_ready() {
     ensure_venv || return 1
-    if run_python -m modelmgr ensure --non-interactive >/dev/null 2>&1; then
-        return 0
-    fi
-    if run_python -m modelmgr ensure; then
-        return 0
-    fi
-    return 1
+    run_python -m modelmgr ensure
 }
 
 FLASHCHAT_VENV=""
@@ -1609,10 +1603,6 @@ cmd_chat() {
 cmd_prompt() {
     local prompt="$1"
     
-    if [ -z "$prompt" ]; then
-        error "Usage: flashchat prompt \"your message here\""
-    fi
-    
     flashchat_load_config
     
     # Quick readiness check only: chat/prompt are reached via ensure_setup
@@ -2039,6 +2029,10 @@ main() {
             cmd_serve "$@"
             ;;
         prompt)
+            # Reject a missing message before setup/repair work runs.
+            if [ -z "${1:-}" ]; then
+                error "Usage: flashchat prompt \"your message here\""
+            fi
             ensure_setup
             cmd_prompt "$@"
             ;;

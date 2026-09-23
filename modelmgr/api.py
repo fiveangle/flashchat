@@ -752,7 +752,7 @@ def _op_sync_offload(em: Emitter, model_id: str) -> dict:
     manifest = _manifest(registry, model_id)
     status = model_status(registry, manifest)
     od = offload_dir()
-    scopes = offload.pending_scopes(manifest)
+    scopes = offload.reconcile_pending_scopes(manifest, status.snapshot, od) if od else []
     if not od or not status.snapshot or not scopes:
         return {"message": "The offload copy is already up to date."}
     synced = offload.sync_artifact_scopes(manifest, status.snapshot, od, scopes,

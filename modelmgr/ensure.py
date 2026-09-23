@@ -11,6 +11,7 @@ Order matters:
 from __future__ import annotations
 
 import os
+import sys
 
 from . import configfile, migrate, offload, paths, resolved
 from .registry import Registry, resolved_id
@@ -143,12 +144,12 @@ def run(interactive: bool = True) -> bool:
 
 
 def _offer_pending_offload_sync(manifest, snapshot: str | None) -> None:
-    if not snapshot:
+    if not snapshot or not sys.stdin.isatty():
         return
     od = offload_dir()
     if not od or offload.archive_state(manifest, od) != "full":
         return
-    scopes = offload.pending_scopes(manifest)
+    scopes = offload.reconcile_pending_scopes(manifest, snapshot, od)
     if not scopes:
         return
     from .tui import common

@@ -49,12 +49,14 @@ def execute_plan(manifest: Manifest, variant_name: str, snapshot: str,
                  options: dict | None = None,
                  output_snapshot: str | None = None) -> set[str]:
     """Run every planned step in order. Raises on the first failure —
-    completed artifacts stay valid (each step commits its own manifest)."""
+    completed artifacts stay valid (each step commits its own manifest).
+    Returns the scopes whose files the plan actually changed."""
     if plan.needs_download:
         raise RuntimeError(
             "original model files are not local — download/restore them first")
     output_snapshot = output_snapshot or snapshot
-    changed_scopes = set()
+    scopes = {"shared" if s.scope == "shared" else variant_name for s in plan.steps}
+    before = {} if dry_run else offload.scope_fingerprints(output_snapshot, scopes)
     for planned in plan.steps:
         ctx = StepContext(
             manifest=manifest,
@@ -69,8 +71,11 @@ def execute_plan(manifest: Manifest, variant_name: str, snapshot: str,
         )
         runner = load_step(planned.step)
         runner(ctx, planned)
-        changed_scopes.add("shared" if planned.scope == "shared" else variant_name)
-    if changed_scopes and not dry_run:
+    if dry_run:
+        return scopes
+    after = offload.scope_fingerprints(output_snapshot, scopes)
+    changed_scopes = {s for s in scopes if after[s] != before[s]}
+    if changed_scopes:
         offload.mark_artifact_scopes_dirty(
             manifest, configfile.get("OFFLOAD_DIR", ""), sorted(changed_scopes))
     return changed_scopes

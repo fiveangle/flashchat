@@ -124,7 +124,13 @@ Operations: offload model, restore full/runtime-only/originals.
 Automation: after a successful build, and once per launch when the offload
 volume is reachable, flashchat offers to offload complete models and later
 refreshes pending artifact scopes (`shared`, `q4`, `q8`) when local runtime
-artifacts changed while the offload copy was stale or unavailable. `[M]anage`
+artifacts changed while the offload copy was stale or unavailable. A build
+marks a scope pending only when it actually changed files there, and the
+launch offer first drops any pending scope whose offload copy already
+matches. Both checks compare file size and modification time only (rsync's
+quick check), so they never hash artifacts. The offer appears on every
+interactive launch, from the menu or a subcommand alike, and never without
+a terminal. `[M]anage`
 is for everything manual: per-artifact verify/regenerate, variant deletion,
 offload and restore.
 

@@ -616,7 +616,13 @@ echo ""
 echo "=== Prompt Command (no server) ==="
 echo ""
 
-assert_skip "prompt missing argument" "ensure_setup intercepts before arg check"
+if output=$("$FLASHCHAT" prompt </dev/null 2>&1); then
+    assert_fail "prompt missing argument" "exited 0: $output"
+elif [[ "$output" == 'ERROR: Usage: flashchat prompt "your message here"' ]]; then
+    assert_pass "prompt missing argument"
+else
+    assert_fail "prompt missing argument" "expected only the usage error before any setup, got: $output"
+fi
 assert_skip "prompt without server" "tested above with running server"
 
 # ---------------------------------------------------------------------------

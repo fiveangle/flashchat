@@ -235,6 +235,104 @@ class TestFullOffload(OffloadBase):
             self.moe, os.path.join(self.tmp.name, "missing-offload"), ["shared"])
         self.assertEqual(offload.pending_scopes(self.moe), ["shared"])
 
+    def _dest_journal_dirty(self):
+        return offload.Journal(
+            offload.dest_repo_dir(self.dest, self.moe)).data["dirty_scopes"]
+
+    def test_reconcile_clears_scope_whose_offload_copy_matches(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        cache_dir = os.path.join(paths.variant_dir(snapshot, "q4"), "system_prompt_cache")
+        os.makedirs(cache_dir)
+        with open(os.path.join(cache_dir, "local-only.fcache"), "wb") as f:
+            f.write(b"runtime cache, never archived")
+        offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4"])
+
+        self.assertEqual(offload.reconcile_pending_scopes(self.moe, snapshot, self.dest), [])
+        self.assertEqual(offload.pending_scopes(self.moe), [])
+        self.assertEqual(self._dest_journal_dirty(), [])
+
+    def test_reconcile_keeps_scope_whose_offload_copy_differs(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        with open(os.path.join(paths.variant_dir(snapshot, "q4"),
+                               "model_weights.bin"), "ab") as f:
+            f.write(b"changed")
+        offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4", "shared"])
+
+        self.assertEqual(offload.reconcile_pending_scopes(self.moe, snapshot, self.dest), ["q4"])
+        self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
+        self.assertEqual(self._dest_journal_dirty(), ["q4"])
+
+    def test_reconcile_leaves_flag_alone_when_offload_unavailable(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        missing = os.path.join(self.tmp.name, "missing-offload")
+        offload.mark_artifact_scopes_dirty(self.moe, missing, ["q4"])
+        self.assertEqual(offload.reconcile_pending_scopes(self.moe, snapshot, missing), ["q4"])
+        self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
+
+
+class TestLaunchOffloadSyncOffer(OffloadBase):
+    """The launch-time offer asks only about a real difference, and only on a terminal."""
+
+    def _offer(self, snapshot, tty=True):
+        from unittest import mock
+        from modelmgr import ensure
+        with mock.patch.object(ensure, "offload_dir", return_value=self.dest), \
+                mock.patch.object(ensure.sys.stdin, "isatty", return_value=tty), \
+                mock.patch("builtins.input", return_value="n") as ask:
+            ensure._offer_pending_offload_sync(self.moe, snapshot)
+        return ask.call_count
+
+    def test_stale_flag_is_cleared_without_asking(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4"])
+        self.assertEqual(self._offer(snapshot), 0)
+        self.assertEqual(offload.pending_scopes(self.moe), [])
+
+    def test_real_difference_is_offered(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        with open(os.path.join(paths.variant_dir(snapshot, "q4"),
+                               "model_weights.bin"), "ab") as f:
+            f.write(b"changed")
+        offload.mark_artifact_scopes_dirty(self.moe, self.dest, ["q4"])
+        self.assertEqual(self._offer(snapshot), 1)
+        self.assertEqual(self._offer(snapshot, tty=False), 0)
+        self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
+
+
+class TestRunnerDirtyScopes(OffloadBase):
+    """A build marks the offload copy stale only when it changed local files."""
+
+    def _run(self, snapshot, step_fn):
+        from unittest import mock
+        from modelmgr import runner
+        plan = recipes.Plan(self.moe.id, "q4", snapshot, steps=[
+            recipes.PlannedStep("export_tokenizer", "q4", ["model_weights.json"], "forced")])
+        with mock.patch.object(runner, "load_step", return_value=step_fn), \
+                mock.patch.object(runner.configfile, "get", return_value=self.dest):
+            return runner.execute_plan(self.moe, "q4", snapshot, plan)
+
+    def test_step_that_changes_nothing_is_not_marked(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+        self.assertEqual(self._run(snapshot, lambda ctx, planned: None), set())
+        self.assertEqual(offload.pending_scopes(self.moe), [])
+
+    def test_step_that_rewrites_a_file_is_marked(self):
+        snapshot = make_snapshot(self.cache, self.moe, variants=["q4"])
+        offload.offload_model(self.moe, snapshot, self.dest)
+
+        def rewrite(ctx, planned):
+            target = os.path.join(ctx.variant_dir, "model_weights.json")
+            with open(target, "a") as f:
+                f.write(" ")
+
+        self.assertEqual(self._run(snapshot, rewrite), {"q4"})
+        self.assertEqual(offload.pending_scopes(self.moe), ["q4"])
+
 
 class TestLightweightOffload(OffloadBase):
     """The default offload path trusts successful rsync plus lightweight metadata."""
