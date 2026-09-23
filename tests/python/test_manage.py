@@ -98,15 +98,23 @@ class TestManageRepair(unittest.TestCase):
             self.registry, self.manifest, cache_dir=self.tmp.name,
             offload_root="", check_offload=False)
         original_download = manage.build.download_snapshot
+        original_offload_dir = manage.build.offload_dir
+        original_prompt = common.prompt
         calls = []
+        prompts = []
         try:
             manage.build.download_snapshot = lambda *a, **k: calls.append(a) or None
+            manage.build.offload_dir = lambda: ""
+            common.prompt = lambda message, default="": prompts.append(message) or default
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 manage._rebuild_artifacts(
                     self.registry, self.manifest, status, [], ["q4", "q8"])
         finally:
             manage.build.download_snapshot = original_download
+            manage.build.offload_dir = original_offload_dir
+            common.prompt = original_prompt
+        self.assertEqual(prompts, ["Download originals where?"])
         self.assertEqual(calls, [])
         self.assertIn("download originals to the local HuggingFace cache", out.getvalue())
 
