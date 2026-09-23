@@ -5,12 +5,15 @@ import SwiftUI
 struct MenuContent: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowRouter.self) private var router
+    @Environment(\.menuPanel) private var menuPanel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if model.env == nil {
                 SetupNotice(text: "Flashchat folder not found.", action: "Choose Folder…") {
-                    if let url = Alerts.chooseFolder("Choose your Flashchat folder") { model.setRepo(url) }
+                    menuPanel.dismiss {
+                        if let url = Alerts.chooseFolder("Choose your Flashchat folder") { model.setRepo(url) }
+                    }
                 }
             } else if model.env?.pythonReady == false {
                 SetupNotice(text: "Flashchat's Python environment isn't set up.", action: "Set Up…") {
@@ -33,7 +36,6 @@ struct MenuContent: View {
         .padding(14)
         .frame(width: 330)
         .fixedSize(horizontal: false, vertical: true)
-        .background(WindowReader { panel = $0 })
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
             DispatchQueue.main.async { fitPanel(toContentHeight: height) }
         }
@@ -43,14 +45,10 @@ struct MenuContent: View {
         }
     }
 
-    @State private var panel: NSWindow?
-
-    /// MenuBarExtra's panel grows with its content but never shrinks, so a
-    /// shorter state (such as the server stopping) would sit centered in the
-    /// old height. Resize it to the content, keeping the top edge under the
-    /// menu bar.
+    /// Resize the popover to its content as it changes (such as the server
+    /// stopping), keeping the top edge under the menu bar.
     private func fitPanel(toContentHeight height: CGFloat) {
-        guard let panel, height > 0 else { return }
+        guard let panel = menuPanel.window, height > 0 else { return }
         var frame = panel.frame
         let chrome = frame.height - panel.contentRect(forFrameRect: frame).height
         let target = (height + chrome).rounded()
@@ -64,11 +62,7 @@ struct MenuContent: View {
     /// focus ring for anyone using keyboard navigation. Start with nothing
     /// focused; Tab still enters the key-view loop at the first control.
     private func clearInitialFocus() {
-        DispatchQueue.main.async {
-            guard let panel = NSApp.windows.first(where: { $0.isKeyWindow && $0.level != .normal })
-                    ?? NSApp.keyWindow else { return }
-            panel.makeFirstResponder(nil)
-        }
+        DispatchQueue.main.async { menuPanel.window?.makeFirstResponder(nil) }
     }
 }
 
@@ -155,6 +149,7 @@ private struct ModelLine: View {
 private struct ModelSwitcher: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowRouter.self) private var router
+    @Environment(\.menuPanel) private var menuPanel
 
     var body: some View {
         Menu {
@@ -173,7 +168,9 @@ private struct ModelSwitcher: View {
                 }
             }
             Divider()
-            Button("Manage Models…") { router.open(.models) }
+            Button("Manage Models…") {
+                menuPanel.dismiss { router.open(.models) }
+            }
         } label: {
             Text("Switch")
         }
@@ -239,11 +236,14 @@ private struct MemoryLine: View {
 struct OperationRow: View {
     let operation: OperationState
     @Environment(WindowRouter.self) private var router
+    @Environment(\.menuPanel) private var menuPanel
 
     var body: some View {
         Button {
-            router.section = .models
-            router.showOperation()
+            menuPanel.dismiss {
+                router.section = .models
+                router.showOperation()
+            }
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
@@ -309,10 +309,13 @@ private struct ServerButtons: View {
 private struct Footer: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowRouter.self) private var router
+    @Environment(\.menuPanel) private var menuPanel
 
     var body: some View {
         HStack {
-            Button("Open Flashchat…") { router.open(router.section) }
+            Button("Open Flashchat…") {
+                menuPanel.dismiss { router.open(router.section) }
+            }
             Spacer()
             Menu {
                 Toggle("Quiet mode (for benchmarks)", isOn: Binding(
@@ -322,8 +325,12 @@ private struct Footer: View {
                 Toggle("Show Dock icon", isOn: Binding(
                     get: { model.showDockIcon }, set: { model.showDockIcon = $0 }))
                 Divider()
-                Button("New Chat in Terminal") { model.openInTerminal(["chat"]) }
-                Button("Open Terminal Menu") { model.openInTerminal() }
+                Button("New Chat in Terminal") {
+                    menuPanel.dismiss { model.openInTerminal(["chat"]) }
+                }
+                Button("Open Terminal Menu") {
+                    menuPanel.dismiss { model.openInTerminal() }
+                }
                 Button("Refresh") { Task { await model.reloadAll() } }
                 Divider()
                 Button("Quit Flashchat Menu") { NSApp.terminate(nil) }
@@ -333,31 +340,6 @@ private struct Footer: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-        }
-    }
-}
-
-/// Hands back the NSWindow hosting a SwiftUI view once it is attached.
-private struct WindowReader: NSViewRepresentable {
-    let onWindow: (NSWindow) -> Void
-
-    func makeNSView(context: Context) -> NSView { WindowReaderView(onWindow: onWindow) }
-    func updateNSView(_ nsView: NSView, context: Context) {}
-
-    private final class WindowReaderView: NSView {
-        let onWindow: (NSWindow) -> Void
-
-        init(onWindow: @escaping (NSWindow) -> Void) {
-            self.onWindow = onWindow
-            super.init(frame: .zero)
-        }
-
-        required init?(coder: NSCoder) { nil }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            guard let window else { return }
-            DispatchQueue.main.async { self.onWindow(window) }
         }
     }
 }

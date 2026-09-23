@@ -2,7 +2,11 @@ import AppKit
 import FlashchatKit
 import SwiftUI
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel()
+    private var statusItem: StatusItemController?
+
     /// Before any window or Dock tile appears, so menu-bar-only mode never
     /// flashes a Dock icon.
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -10,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = StatusItemController(model: model, router: .shared)
         // A window at launch is the Dock-app convention, and with no menu bar
         // icon it is the only way in. macOS gives no reliable way to tell a
         // login-item launch from a user launch, so this is a preference
@@ -44,20 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct FlashchatBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var model = AppModel()
     @State private var router = WindowRouter.shared
 
-    var body: some Scene {
-        MenuBarExtra(isInserted: Binding(get: { model.showMenuBarIcon },
-                                         set: { model.showMenuBarIcon = $0 })) {
-            MenuContent()
-                .environment(model)
-                .environment(router)
-        } label: {
-            MenuBarLabel(model: model)
-        }
-        .menuBarExtraStyle(.window)
+    private var model: AppModel { delegate.model }
 
+    // The menu bar icon and popover are AppKit (StatusItemController), made
+    // by the app delegate at launch.
+    var body: some Scene {
         // SwiftUI opens this window at launch on its own; WindowRouter closes
         // it again when menu-bar-only mode did not want one.
         Window("Flashchat", id: "main") {
@@ -73,29 +71,6 @@ struct FlashchatBarApp: App {
         .commands { AppCommands(model: model, router: router) }
     }
 }
-
-/// The status item. Deliberately static between polls: no animation, and the
-/// speed text updates at most once a second (never in quiet mode) so the app
-/// stays out of the way of GPU-bound inference and benchmarks.
-struct MenuBarLabel: View {
-    let model: AppModel
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        let display = model.display
-        HStack(spacing: 3) {
-            Image(systemName: model.quietMode ? (display.isRunning ? "bolt" : "bolt.slash") : display.symbol)
-            if !model.quietMode, model.showSpeedInMenuBar, case .generating = display.activity,
-               let tps = model.tokensPerSecond {
-                Text(String(format: "%.0f", tps)).monospacedDigit()
-            }
-        }
-        .onAppear {
-            WindowRouter.shared.openMainWindow = { openWindow(id: "main") }
-        }
-    }
-}
-
 
 /// Main menu for Dock mode (menu-bar-only mode never shows it). SwiftUI keeps
 /// its standard Edit menu, so cut/copy/paste work in text fields.

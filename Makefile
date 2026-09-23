@@ -58,7 +58,7 @@
 #
 # Menubar app:
 #   make menubar                    Build macos/build/Flashchat.app, signed with SIGN_IDENTITY
-#   make menubar-run                Build and launch the menubar app
+#   make menubar-run                Build and (re)launch the menubar app
 #   make menubar-test               Run the menubar app's Swift unit tests
 #   make menubar-install            Build and install to INSTALL_DIR (default /Applications)
 #   make menubar-uninstall          Remove the installed app
@@ -259,7 +259,7 @@ help:
 	@printf "\n"
 	@printf "Menubar app:\n"
 	@printf '  %-30s  %s\n' 'make menubar' 'Build macos/build/Flashchat.app, signed with SIGN_IDENTITY'
-	@printf '  %-30s  %s\n' 'make menubar-run' 'Build and launch the menubar app'
+	@printf '  %-30s  %s\n' 'make menubar-run' 'Build and (re)launch the menubar app'
 	@printf '  %-30s  %s\n' 'make menubar-test' 'Run the menubar app'\''s Swift unit tests'
 	@printf '  %-30s  %s\n' 'make menubar-install' 'Build and install to INSTALL_DIR (default /Applications)'
 	@printf '  %-30s  %s\n' 'make menubar-uninstall' 'Remove the installed app'
@@ -440,6 +440,8 @@ menubar:
 	SIGN_IDENTITY="$(SIGN_IDENTITY)" bash macos/build-app.sh
 
 menubar-run: menubar
+	@if pgrep -x Flashchat >/dev/null; then pkill -x Flashchat; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x Flashchat >/dev/null || break; sleep 0.5; done; fi
 	open $(MENUBAR_APP)
 
 menubar-test:
