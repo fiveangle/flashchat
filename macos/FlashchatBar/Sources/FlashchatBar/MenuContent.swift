@@ -32,10 +32,32 @@ struct MenuContent: View {
         }
         .padding(14)
         .frame(width: 330)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(WindowReader { panel = $0 })
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            DispatchQueue.main.async { fitPanel(toContentHeight: height) }
+        }
         .onAppear {
             clearInitialFocus()
             model.refreshStatusOnDemand()
         }
+    }
+
+    @State private var panel: NSWindow?
+
+    /// MenuBarExtra's panel grows with its content but never shrinks, so a
+    /// shorter state (such as the server stopping) would sit centered in the
+    /// old height. Resize it to the content, keeping the top edge under the
+    /// menu bar.
+    private func fitPanel(toContentHeight height: CGFloat) {
+        guard let panel, height > 0 else { return }
+        var frame = panel.frame
+        let chrome = frame.height - panel.contentRect(forFrameRect: frame).height
+        let target = (height + chrome).rounded()
+        guard abs(frame.height - target) >= 1 else { return }
+        frame.origin.y += frame.height - target
+        frame.size.height = target
+        panel.setFrame(frame, display: true)
     }
 
     /// SwiftUI focuses the first control when the popover opens, which draws a
@@ -311,6 +333,31 @@ private struct Footer: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+        }
+    }
+}
+
+/// Hands back the NSWindow hosting a SwiftUI view once it is attached.
+private struct WindowReader: NSViewRepresentable {
+    let onWindow: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView { WindowReaderView(onWindow: onWindow) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class WindowReaderView: NSView {
+        let onWindow: (NSWindow) -> Void
+
+        init(onWindow: @escaping (NSWindow) -> Void) {
+            self.onWindow = onWindow
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            DispatchQueue.main.async { self.onWindow(window) }
         }
     }
 }

@@ -1,31 +1,84 @@
 # Makefile for Flashchat — Pure C/Metal MoE inference engine
 #
-# Targets:
-#   make           — build inference binaries
-#   make run       — single expert forward pass
-#   make verify    — verify Metal vs CPU reference
-#   make bench     — benchmark single expert (10 iterations)
-#   make moe       — full MoE forward pass (K experts, single layer)
-#   make moebench — benchmark MoE (10 iterations)
-#   make full      — full model MoE forward pass (K=4)
-#   make fullbench — benchmark full model forward (3 iterations)
-#   make chat      — build interactive chat TUI
-#   make api-smoke — run HTTP API smoke test
-#   make cli-smoke — run Flashchat CLI smoke test
-#   make manage-smoke — run model management integration test (Python core via launcher)
-#   make tool-template-smoke — run native tool template render/parser smoke test
-#   make quant-helper-smoke — run native checkpoint quantization helper tests
-#   make tokenizer-export-smoke — run tokenizer export helper tests
-#   make native-qwen-compile-smoke — run native Qwen BF16 compiler smoke test
-#   make mtp-config-smoke — run MTP config/profile precedence smoke test
-#   make py-tests — run modelmgr unit tests
-#   make registry / registry-check — regenerate/verify assets/model_configs.json
-#   make test      — run all functional smoke tests
-#   make help      — list available targets
-#   make clean     — remove build artifacts
-#   make archive-debug — archive repo-local debug contents under debug/.archived
-#   make clean-venv — remove Python setup virtual environment
-#   make distclean — remove build artifacts, repo-local debug, and setup venv
+# Targets (`make help` prints this list):
+#
+# Build:
+#   make / make all                 Build main benchmark and inference binaries
+#   make metal_infer                Build main benchmark binary
+#   make infer                      Build inference server/engine (alias: build-infer)
+#   make chat                       Build interactive chat client (alias: build-chat)
+#   make ram-pressure               Build RAM pressure utility for memory-constrained testing
+#   make metallib                   Precompile Metal shaders (optional; they compile at runtime)
+#   make print-build-config         Show compiler and optimization settings
+#
+# Build options:
+#   OPT=aggressive                  Fastest probed local build (default)
+#   OPT=conservative                Native CPU, fewer risky optimization flags
+#   OPT=debug                       Debug symbols, no speed-oriented flags
+#   CC=clang                        Override compiler command
+#
+# Run:
+#   make infer-run                  Run a short inference prompt
+#   make chat-run                   Launch the chat client
+#
+# Engine benchmarks (configured model):
+#   make run                        Single expert forward pass
+#   make verify                     Metal vs CPU reference verification
+#   make fast                       Fast path verification
+#   make bench                      Single expert benchmark (10 iterations)
+#   make moe                        MoE forward pass (K experts, single layer)
+#   make moebench                   MoE benchmark (10 iterations)
+#   make full                       Full model forward pass (K=4)
+#   make fullbench                  Full model benchmark (3 iterations)
+#
+# Performance regression:
+#   make bench-api                  API benchmark per registry model (BENCH_ARGS=... passes options)
+#   make bench-report               Compare latest benchmark vs prior commits, flag regressions
+#
+# Tests:
+#   make test                       Run all functional tests below except ane-smoke
+#   make registry-check             Verify assets/model_configs.json matches the manifests
+#   make py-tests                   Run modelmgr unit tests
+#   make cli-smoke                  Run Flashchat CLI smoke test
+#   make manage-smoke               Run model management integration test
+#   make chat-render-smoke          Run chat TUI render smoke test
+#   make server-http-smoke          Test responsive HTTP transport and context meter
+#   make q-norm-smoke               Check GPU query normalization against CPU reference
+#   make tool-template-smoke        Run native tool template render/parser smoke test
+#   make prepared-prompt-smoke      Check prepared prompt cache correctness (no inference)
+#   make conversation-cache-smoke   Check exact conversation matching and state restoration
+#   make request-sampling-smoke     Check per-request sampling and penalties (no inference)
+#   make cache-roundtrip-smoke      Run disk-cache save/load roundtrip self-test
+#   make quant-helper-smoke         Run native checkpoint quantization helper tests
+#   make tokenizer-export-smoke     Run tokenizer export helper tests
+#   make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test
+#   make mtp-config-smoke           Run MTP config/profile precedence smoke test
+#   make api-smoke                  Run HTTP API smoke test
+#   make ane-smoke                  Check ANE MLP precision against a CPU reference (no model)
+#
+# Menubar app:
+#   make menubar                    Build macos/build/Flashchat.app, signed with SIGN_IDENTITY
+#   make menubar-run                Build and launch the menubar app
+#   make menubar-test               Run the menubar app's Swift unit tests
+#   make menubar-install            Build and install to INSTALL_DIR (default /Applications)
+#   make menubar-uninstall          Remove the installed app
+#   make menubar-sign               Re-sign the built app with SIGN_IDENTITY (no rebuild)
+#   make menubar-verify             Show and check the app's signature and Gatekeeper status
+#   make menubar-notarize           Notarize + staple a Developer ID build (NOTARY_PROFILE=name)
+#   make menubar-clean              Remove menubar build output
+#
+# Menubar options (or set them in macos/local.mk):
+#   SIGN_IDENTITY=-                 Ad-hoc signature (default); also development, developer-id
+#   INSTALL_DIR=/Applications       Where menubar-install puts Flashchat.app
+#   NOTARY_PROFILE=name             notarytool keychain profile for menubar-notarize
+#
+# Maintenance:
+#   make registry                   Regenerate assets/model_configs.json from assets/models/*.json
+#   make clean                      Remove build artifacts and archive repo-local ./debug contents
+#   make archive-debug              Archive repo-local ./debug contents under debug/.archived
+#   make clean-venv                 Remove Python setup virtual environment
+#   make distclean                  Remove build artifacts, repo-local ./debug, and setup venv
+#   make help                       List available targets
 #
 # Note: Metal shaders are compiled from source at runtime via
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
@@ -103,7 +156,7 @@ SHADER_LIB = $(BUILD_DIR)/shaders.metallib
 INFER_TARGET = $(BUILD_DIR)/infer
 INFER_SRC = $(BUILD_DIR)/infer.m
 
-# Chat TUI (interactive multi-turn)
+# Chat client (interactive multi-turn)
 CHAT_TARGET = $(BUILD_DIR)/chat
 CHAT_SRC = $(BUILD_DIR)/chat.m
 LINENOISE_SRC = $(BUILD_DIR)/linenoise.c
@@ -151,73 +204,82 @@ help:
 	@printf "Flashchat make targets\n"
 	@printf "\n"
 	@printf "Build:\n"
-	@printf "  make               Build main benchmark and inference binaries\n"
-	@printf "  make all           Build main benchmark and inference binaries\n"
-	@printf "  make metal_infer   Build main benchmark binary\n"
-	@printf "  make infer         Build inference server/engine\n"
-	@printf "  make build-infer   Alias for infer\n"
-	@printf "  make chat          Build interactive chat client\n"
-	@printf "  make build-chat    Alias for chat\n"
-	@printf "  make ram-pressure  Build RAM pressure utility for memory-constrained testing\n"
-	@printf "  make metallib      Precompile Metal shaders\n"
-	@printf "  make print-build-config  Show compiler and optimization settings\n"
+	@printf '  %-30s  %s\n' 'make / make all' 'Build main benchmark and inference binaries'
+	@printf '  %-30s  %s\n' 'make metal_infer' 'Build main benchmark binary'
+	@printf '  %-30s  %s\n' 'make infer' 'Build inference server/engine (alias: build-infer)'
+	@printf '  %-30s  %s\n' 'make chat' 'Build interactive chat client (alias: build-chat)'
+	@printf '  %-30s  %s\n' 'make ram-pressure' 'Build RAM pressure utility for memory-constrained testing'
+	@printf '  %-30s  %s\n' 'make metallib' 'Precompile Metal shaders (optional; they compile at runtime)'
+	@printf '  %-30s  %s\n' 'make print-build-config' 'Show compiler and optimization settings'
 	@printf "\n"
 	@printf "Build options:\n"
-	@printf "  OPT=aggressive     Fastest probed local build (default)\n"
-	@printf "  OPT=conservative   Native CPU, fewer risky optimization flags\n"
-	@printf "  OPT=debug          Debug symbols, no speed-oriented flags\n"
-	@printf "  CC=clang           Override compiler command\n"
+	@printf '  %-30s  %s\n' 'OPT=aggressive' 'Fastest probed local build (default)'
+	@printf '  %-30s  %s\n' 'OPT=conservative' 'Native CPU, fewer risky optimization flags'
+	@printf '  %-30s  %s\n' 'OPT=debug' 'Debug symbols, no speed-oriented flags'
+	@printf '  %-30s  %s\n' 'CC=clang' 'Override compiler command'
 	@printf "\n"
 	@printf "Run:\n"
-	@printf "  make infer-run     Run a short inference prompt\n"
-	@printf "  make chat-run      Launch the chat client\n"
+	@printf '  %-30s  %s\n' 'make infer-run' 'Run a short inference prompt'
+	@printf '  %-30s  %s\n' 'make chat-run' 'Launch the chat client'
 	@printf "\n"
-	@printf "Benchmarks:\n"
-	@printf "  make run           Single expert forward pass\n"
-	@printf "  make verify        Metal vs CPU reference verification\n"
-	@printf "  make fast          Fast path verification\n"
-	@printf "  make bench         Single expert benchmark\n"
-	@printf "  make moe           MoE forward pass\n"
-	@printf "  make moebench      MoE benchmark\n"
-	@printf "  make full          Full model forward pass\n"
-	@printf "  make fullbench     Full model benchmark\n"
+	@printf "Engine benchmarks (configured model):\n"
+	@printf '  %-30s  %s\n' 'make run' 'Single expert forward pass'
+	@printf '  %-30s  %s\n' 'make verify' 'Metal vs CPU reference verification'
+	@printf '  %-30s  %s\n' 'make fast' 'Fast path verification'
+	@printf '  %-30s  %s\n' 'make bench' 'Single expert benchmark (10 iterations)'
+	@printf '  %-30s  %s\n' 'make moe' 'MoE forward pass (K experts, single layer)'
+	@printf '  %-30s  %s\n' 'make moebench' 'MoE benchmark (10 iterations)'
+	@printf '  %-30s  %s\n' 'make full' 'Full model forward pass (K=4)'
+	@printf '  %-30s  %s\n' 'make fullbench' 'Full model benchmark (3 iterations)'
+	@printf "\n"
+	@printf "Performance regression:\n"
+	@printf '  %-30s  %s\n' 'make bench-api' 'API benchmark per registry model (BENCH_ARGS=... passes options)'
+	@printf '  %-30s  %s\n' 'make bench-report' 'Compare latest benchmark vs prior commits, flag regressions'
 	@printf "\n"
 	@printf "Tests:\n"
-	@printf "  make cli-smoke     Run Flashchat CLI smoke test\n"
-	@printf "  make server-http-smoke  Test responsive HTTP transport and context meter\n"
-	@printf "  make q-norm-smoke       Check GPU query normalization against CPU reference\n"
-	@printf "  make manage-smoke  Run model management integration test\n"
-	@printf "  make chat-render-smoke  Run chat TUI render smoke test\n"
-	@printf "  make tool-template-smoke  Run native tool template render/parser smoke test\n"
-	@printf "  make prepared-prompt-smoke  Check prepared prompt cache correctness (no inference)\n"
-	@printf "  make conversation-cache-smoke  Check exact conversation matching and state restoration\n"
-	@printf "  make cache-roundtrip-smoke  Run disk-cache save/load roundtrip self-test\n"
-	@printf "  make quant-helper-smoke  Run native checkpoint quantization helper tests\n"
-	@printf "  make tokenizer-export-smoke  Run tokenizer export helper tests\n"
-	@printf "  make native-qwen-compile-smoke  Run native Qwen BF16 compiler smoke test\n"
-	@printf "  make mtp-config-smoke  Run MTP config/profile precedence smoke test\n"
-	@printf "  make py-tests  Run modelmgr unit tests\n"
-	@printf "  make menubar   Build the menubar app (macos/build/Flashchat.app), ad-hoc signed\n"
-	@printf "  make menubar SIGN_IDENTITY=developer-id  Build signed with your Developer ID (or =development)\n"
-	@printf "  make menubar-run   Build and launch the menubar app\n"
-	@printf "  make menubar-install   Build and install to INSTALL_DIR (default /Applications)\n"
-	@printf "  make menubar-uninstall Remove the installed app\n"
-	@printf "  make menubar-sign  Re-sign the built app with SIGN_IDENTITY (no rebuild)\n"
-	@printf "  make menubar-verify    Show and check the app's signature and Gatekeeper status\n"
-	@printf "  make menubar-notarize NOTARY_PROFILE=name  Notarize + staple a Developer ID build\n"
-	@printf "  make menubar-test  Run the menubar app's Swift unit tests\n"
-	@printf "  make menubar-clean Remove menubar build output\n"
-	@printf "  make registry-check  Verify assets/model_configs.json matches the manifests\n"
-	@printf "  make api-smoke     Run HTTP API smoke test\n"
-	@printf "  make test          Run all functional smoke tests\n"
-	@printf "  make bench-api     Run API performance regression benchmark (per registry model)\n"
-	@printf "  make bench-report  Compare latest benchmark vs prior commits, flag regressions\n"
+	@printf '  %-30s  %s\n' 'make test' 'Run all functional tests below except ane-smoke'
+	@printf '  %-30s  %s\n' 'make registry-check' 'Verify assets/model_configs.json matches the manifests'
+	@printf '  %-30s  %s\n' 'make py-tests' 'Run modelmgr unit tests'
+	@printf '  %-30s  %s\n' 'make cli-smoke' 'Run Flashchat CLI smoke test'
+	@printf '  %-30s  %s\n' 'make manage-smoke' 'Run model management integration test'
+	@printf '  %-30s  %s\n' 'make chat-render-smoke' 'Run chat TUI render smoke test'
+	@printf '  %-30s  %s\n' 'make server-http-smoke' 'Test responsive HTTP transport and context meter'
+	@printf '  %-30s  %s\n' 'make q-norm-smoke' 'Check GPU query normalization against CPU reference'
+	@printf '  %-30s  %s\n' 'make tool-template-smoke' 'Run native tool template render/parser smoke test'
+	@printf '  %-30s  %s\n' 'make prepared-prompt-smoke' 'Check prepared prompt cache correctness (no inference)'
+	@printf '  %-30s  %s\n' 'make conversation-cache-smoke' 'Check exact conversation matching and state restoration'
+	@printf '  %-30s  %s\n' 'make request-sampling-smoke' 'Check per-request sampling and penalties (no inference)'
+	@printf '  %-30s  %s\n' 'make cache-roundtrip-smoke' 'Run disk-cache save/load roundtrip self-test'
+	@printf '  %-30s  %s\n' 'make quant-helper-smoke' 'Run native checkpoint quantization helper tests'
+	@printf '  %-30s  %s\n' 'make tokenizer-export-smoke' 'Run tokenizer export helper tests'
+	@printf '  %-30s  %s\n' 'make native-qwen-compile-smoke' 'Run native Qwen BF16 compiler smoke test'
+	@printf '  %-30s  %s\n' 'make mtp-config-smoke' 'Run MTP config/profile precedence smoke test'
+	@printf '  %-30s  %s\n' 'make api-smoke' 'Run HTTP API smoke test'
+	@printf '  %-30s  %s\n' 'make ane-smoke' 'Check ANE MLP precision against a CPU reference (no model)'
+	@printf "\n"
+	@printf "Menubar app:\n"
+	@printf '  %-30s  %s\n' 'make menubar' 'Build macos/build/Flashchat.app, signed with SIGN_IDENTITY'
+	@printf '  %-30s  %s\n' 'make menubar-run' 'Build and launch the menubar app'
+	@printf '  %-30s  %s\n' 'make menubar-test' 'Run the menubar app'\''s Swift unit tests'
+	@printf '  %-30s  %s\n' 'make menubar-install' 'Build and install to INSTALL_DIR (default /Applications)'
+	@printf '  %-30s  %s\n' 'make menubar-uninstall' 'Remove the installed app'
+	@printf '  %-30s  %s\n' 'make menubar-sign' 'Re-sign the built app with SIGN_IDENTITY (no rebuild)'
+	@printf '  %-30s  %s\n' 'make menubar-verify' 'Show and check the app'\''s signature and Gatekeeper status'
+	@printf '  %-30s  %s\n' 'make menubar-notarize' 'Notarize + staple a Developer ID build (NOTARY_PROFILE=name)'
+	@printf '  %-30s  %s\n' 'make menubar-clean' 'Remove menubar build output'
+	@printf "\n"
+	@printf "Menubar options (or set them in macos/local.mk):\n"
+	@printf '  %-30s  %s\n' 'SIGN_IDENTITY=-' 'Ad-hoc signature (default); also development, developer-id'
+	@printf '  %-30s  %s\n' 'INSTALL_DIR=/Applications' 'Where menubar-install puts Flashchat.app'
+	@printf '  %-30s  %s\n' 'NOTARY_PROFILE=name' 'notarytool keychain profile for menubar-notarize'
 	@printf "\n"
 	@printf "Maintenance:\n"
-	@printf "  make clean         Remove build artifacts and archive repo-local ./debug contents\n"
-	@printf "  make archive-debug Archive repo-local ./debug contents under debug/.archived\n"
-	@printf "  make clean-venv    Remove Python setup virtual environment\n"
-	@printf "  make distclean     Remove build artifacts, repo-local ./debug, and setup venv\n"
+	@printf '  %-30s  %s\n' 'make registry' 'Regenerate assets/model_configs.json from assets/models/*.json'
+	@printf '  %-30s  %s\n' 'make clean' 'Remove build artifacts and archive repo-local ./debug contents'
+	@printf '  %-30s  %s\n' 'make archive-debug' 'Archive repo-local ./debug contents under debug/.archived'
+	@printf '  %-30s  %s\n' 'make clean-venv' 'Remove Python setup virtual environment'
+	@printf '  %-30s  %s\n' 'make distclean' 'Remove build artifacts, repo-local ./debug, and setup venv'
+	@printf '  %-30s  %s\n' 'make help' 'List available targets'
 
 print-build-config:
 	@printf "Compiler command: %s\n" "$(CC)"
@@ -298,7 +360,7 @@ distclean: clean-venv
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 	rm -rf debug
 
-# Run targets
+# Engine benchmark targets (use the configured model)
 run: $(TARGET)
 	$(call RUN_ENGINE_BENCH,--layer 0 --expert 0)
 
@@ -329,7 +391,7 @@ build-infer: $(INFER_TARGET)
 infer-run: $(INFER_TARGET)
 	cd $(BUILD_DIR) && ./infer --prompt "Hello, what is" --tokens 20 --k 4
 
-# Chat TUI targets (use: make chat)
+# Chat client targets
 
 build-chat: $(CHAT_TARGET)
 
